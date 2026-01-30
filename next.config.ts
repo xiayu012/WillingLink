@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
+import { withSerwist } from "@serwist/next";
 
 const nextConfig: NextConfig = {
-  cacheComponents: true,
   images: {
     remotePatterns: [
       {
@@ -16,4 +16,8 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+export default withSerwist({
+  swSrc: "sw.ts",
+  swDest: "public/sw.js",
+  disable: process.env.NODE_ENV === "development",
+})(nextConfig);

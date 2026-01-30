@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { Toaster } from "sonner";
 import { ThemeProvider } from "@/components/theme-provider";
+import { PwaRegister } from "@/components/pwa-register";
 
 import "./globals.css";
 import { SessionProvider } from "next-auth/react";
@@ -10,6 +11,7 @@ export const metadata: Metadata = {
   metadataBase: new URL("https://chat.vercel.ai"),
   title: "Next.js Chatbot Template",
   description: "Next.js chatbot template using the AI SDK.",
+  manifest: "/manifest.webmanifest",
 };
 
 export const viewport = {
@@ -79,6 +81,7 @@ export default function RootLayout({
           enableSystem
         >
           <Toaster position="top-center" />
+          <PwaRegister />
           <SessionProvider>{children}</SessionProvider>
         </ThemeProvider>
       </body>
