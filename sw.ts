@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 
-import { precacheAndRoute } from "serwist";
+import { precacheAndRoute } from "serwist/legacy";
 
 declare const self: ServiceWorkerGlobalScope;
 
