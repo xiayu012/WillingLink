@@ -4,6 +4,12 @@ import { precacheAndRoute } from "serwist/legacy";
 
 declare const self: ServiceWorkerGlobalScope;
 
+declare global {
+  interface ServiceWorkerGlobalScope {
+    __SW_MANIFEST: Array<{ url: string; revision?: string }>;
+  }
+}
+
 self.addEventListener("install", () => {
   self.skipWaiting();
 });
