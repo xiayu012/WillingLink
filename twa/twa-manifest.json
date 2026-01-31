@@ -19,10 +19,10 @@
     "path": "keystore/willinglink-release.keystore",
     "alias": "willinglink"
   },
-  "appVersionName": "1",
-  "appVersionCode": 1,
+  "appVersionName": "2",
+  "appVersionCode": 2,
   "shortcuts": [],
-  "generatorApp": "unknown",
+  "generatorApp": "bubblewrap-cli",
   "webManifestUrl": "https://willinglink.vercel.app/manifest.webmanifest",
   "fallbackType": "customtabs",
   "features": {},
@@ -42,5 +42,5 @@
   "fileHandlers": [],
   "launchHandlerClientMode": "",
   "displayOverride": [],
-  "appVersion": "1"
+  "appVersion": "2"
 }
