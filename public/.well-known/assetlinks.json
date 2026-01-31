@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.willinglink",
+      "sha256_cert_fingerprints": [
+        "3C:BB:3C:6F:60:0F:E2:DC:65:CD:3B:4E:B0:67:CA:B3:F3:27:A8:C3:25:1C:61:53:4E:20:34:F5:60:39:8B:E6"
+      ]
+    }
+  }
+]
