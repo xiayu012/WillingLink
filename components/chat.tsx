@@ -3,7 +3,7 @@
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import useSWR, { useSWRConfig } from "swr";
 import { unstable_serialize } from "swr/infinite";
 import { ChatHeader } from "@/components/chat-header";
@@ -72,6 +72,10 @@ export function Chat({
   const [showCreditCardAlert, setShowCreditCardAlert] = useState(false);
   const [currentModelId, setCurrentModelId] = useState(initialChatModel);
   const currentModelIdRef = useRef(currentModelId);
+  const [awaitingCommunity, setAwaitingCommunity] = useState(false);
+  const [communityName, setCommunityName] = useState<string | null>(null);
+  const suppressNextResponseRef = useRef(false);
+  const suppressionInFlightRef = useRef(false);
 
   useEffect(() => {
     currentModelIdRef.current = currentModelId;
@@ -126,6 +130,13 @@ export function Chat({
             })
           );
 
+        const suppressResponse =
+          suppressNextResponseRef.current && lastMessage?.role === "user";
+
+        if (suppressResponse) {
+          suppressionInFlightRef.current = true;
+        }
+
         return {
           body: {
             id: request.id,
@@ -135,6 +146,7 @@ export function Chat({
               : { message: lastMessage }),
             selectedChatModel: currentModelIdRef.current,
             selectedVisibilityType: visibilityType,
+            suppressResponse,
             ...request.body,
           },
         };
@@ -144,9 +156,16 @@ export function Chat({
       setDataStream((ds) => (ds ? [...ds, dataPart] : []));
     },
     onFinish: () => {
+      if (suppressionInFlightRef.current) {
+        suppressionInFlightRef.current = false;
+        suppressNextResponseRef.current = false;
+      }
       mutate(unstable_serialize(getChatHistoryPaginationKey));
     },
     onError: (error) => {
+      if (suppressionInFlightRef.current) {
+        suppressionInFlightRef.current = false;
+      }
       if (error instanceof ChatSDKError) {
         // Check if it's a credit card error
         if (
@@ -195,12 +214,31 @@ export function Chat({
     setMessages,
   });
 
+  const askForCommunity = useCallback(() => {
+    if (isReadonly || awaitingCommunity) {
+      return;
+    }
+
+    setAwaitingCommunity(true);
+    suppressNextResponseRef.current = true;
+    setMessages((current) => [
+      ...current,
+      {
+        id: generateUUID(),
+        role: "assistant",
+        parts: [{ type: "text", text: "What's your community?" }],
+      },
+    ]);
+  }, [awaitingCommunity, isReadonly, setMessages]);
+
   return (
     <>
       <div className="overscroll-behavior-contain flex h-dvh min-w-0 touch-pan-y flex-col bg-background">
         <ChatHeader
           chatId={id}
           isReadonly={isReadonly}
+          communityName={communityName}
+          onAskCommunity={askForCommunity}
           selectedVisibilityType={initialVisibilityType}
         />
 
@@ -221,7 +259,14 @@ export function Chat({
           {!isReadonly && (
             <MultimodalInput
               attachments={attachments}
+              awaitingCommunity={awaitingCommunity}
               chatId={id}
+              onCommunityResolved={(name) => {
+                if (name) {
+                  setCommunityName(name);
+                }
+                setAwaitingCommunity(false);
+              }}
               input={input}
               messages={messages}
               onModelChange={setCurrentModelId}

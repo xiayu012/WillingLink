@@ -14,10 +14,14 @@ function PureChatHeader({
   chatId,
   selectedVisibilityType,
   isReadonly,
+  communityName,
+  onAskCommunity,
 }: {
   chatId: string;
   selectedVisibilityType: VisibilityType;
   isReadonly: boolean;
+  communityName: string | null;
+  onAskCommunity: () => void;
 }) {
   const router = useRouter();
   const { open } = useSidebar();
@@ -50,9 +54,22 @@ function PureChatHeader({
         />
       )}
 
+      {communityName && (
+        <span className="order-2 font-medium text-sm md:order-3">
+          {communityName}
+        </span>
+      )}
+
+      <button
+        aria-label="Ask community"
+        className="order-3 h-8 flex-1 cursor-pointer bg-transparent hover:bg-black/5 active:bg-black/10 md:order-4 md:h-8 dark:active:bg-white/10 dark:hover:bg-white/5"
+        onClick={onAskCommunity}
+        type="button"
+      />
+
       <Button
         asChild
-        className="order-3 hidden bg-zinc-900 px-2 text-zinc-50 hover:bg-zinc-800 md:ml-auto md:flex md:h-fit dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
+        className="order-4 hidden bg-zinc-900 px-2 text-zinc-50 hover:bg-zinc-800 md:flex md:h-fit dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
       >
         <Link
           href={"https://vercel.com/templates/next.js/nextjs-ai-chatbot"}
@@ -71,6 +88,8 @@ export const ChatHeader = memo(PureChatHeader, (prevProps, nextProps) => {
   return (
     prevProps.chatId === nextProps.chatId &&
     prevProps.selectedVisibilityType === nextProps.selectedVisibilityType &&
-    prevProps.isReadonly === nextProps.isReadonly
+    prevProps.isReadonly === nextProps.isReadonly &&
+    prevProps.communityName === nextProps.communityName &&
+    prevProps.onAskCommunity === nextProps.onAskCommunity
   );
 });

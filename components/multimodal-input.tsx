@@ -68,6 +68,8 @@ function PureMultimodalInput({
   selectedVisibilityType,
   selectedModelId,
   onModelChange,
+  awaitingCommunity,
+  onCommunityResolved,
 }: {
   chatId: string;
   input: string;
@@ -83,6 +85,8 @@ function PureMultimodalInput({
   selectedVisibilityType: VisibilityType;
   selectedModelId: string;
   onModelChange?: (modelId: string) => void;
+  awaitingCommunity?: boolean;
+  onCommunityResolved?: (communityName: string | null) => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { width } = useWindowSize();
@@ -144,6 +148,48 @@ function PureMultimodalInput({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadQueue, setUploadQueue] = useState<string[]>([]);
 
+  const requestCommunityName = useCallback(
+    async (text: string) => {
+      if (!onCommunityResolved) {
+        return;
+      }
+
+      try {
+        const response = await fetch("/api/community", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+
+        if (!response.ok) {
+          const errorBody = await response.json().catch(() => null);
+          const message =
+            errorBody?.error?.message ??
+            errorBody?.message ??
+            "Failed to extract community.";
+          toast.error(message);
+          return;
+        }
+
+        const data = (await response.json()) as { community?: string };
+        const community = data.community?.trim();
+
+        if (!community) {
+          toast.error("Couldn't find a community. Try rephrasing.");
+          onCommunityResolved(null);
+          return;
+        }
+
+        onCommunityResolved(community);
+      } catch (error) {
+        console.error("Failed to extract community:", error);
+        toast.error("Failed to extract community.");
+        onCommunityResolved(null);
+      }
+    },
+    [onCommunityResolved]
+  );
+
   const submitForm = useCallback(() => {
     window.history.pushState({}, "", `/chat/${chatId}`);
 
@@ -163,6 +209,10 @@ function PureMultimodalInput({
       ],
     });
 
+    if (awaitingCommunity) {
+      requestCommunityName(input).catch(() => {});
+    }
+
     setAttachments([]);
     setLocalStorageInput("");
     resetHeight();
@@ -181,6 +231,8 @@ function PureMultimodalInput({
     width,
     chatId,
     resetHeight,
+    awaitingCommunity,
+    requestCommunityName,
   ]);
 
   const uploadFile = useCallback(async (file: File) => {
@@ -421,6 +473,9 @@ export const MultimodalInput = memo(
       return false;
     }
     if (prevProps.selectedModelId !== nextProps.selectedModelId) {
+      return false;
+    }
+    if (prevProps.awaitingCommunity !== nextProps.awaitingCommunity) {
       return false;
     }
 

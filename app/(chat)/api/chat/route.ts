@@ -74,8 +74,14 @@ export async function POST(request: Request) {
   }
 
   try {
-    const { id, message, messages, selectedChatModel, selectedVisibilityType } =
-      requestBody;
+    const {
+      id,
+      message,
+      messages,
+      selectedChatModel,
+      selectedVisibilityType,
+      suppressResponse,
+    } = requestBody;
 
     const session = await auth();
 
@@ -109,6 +115,14 @@ export async function POST(request: Request) {
       if (!isToolApprovalFlow) {
         messagesFromDb = await getMessagesByChatId({ id });
       }
+      if (
+        chat.title === "New chat" &&
+        message?.role === "user" &&
+        !suppressResponse &&
+        !isToolApprovalFlow
+      ) {
+        titlePromise = generateTitleFromUserMessage({ message });
+      }
     } else if (message?.role === "user") {
       // Save chat immediately with placeholder title
       await saveChat({
@@ -119,7 +133,9 @@ export async function POST(request: Request) {
       });
 
       // Start title generation in parallel (don't await)
-      titlePromise = generateTitleFromUserMessage({ message });
+      if (!suppressResponse) {
+        titlePromise = generateTitleFromUserMessage({ message });
+      }
     }
 
     // Use all messages for tool approval, otherwise DB messages + new message
@@ -159,6 +175,10 @@ export async function POST(request: Request) {
       // Pass original messages for tool approval continuation
       originalMessages: isToolApprovalFlow ? uiMessages : undefined,
       execute: async ({ writer: dataStream }) => {
+        if (suppressResponse) {
+          return;
+        }
+
         // Handle title generation in parallel
         if (titlePromise) {
           titlePromise.then((title) => {
@@ -219,6 +239,10 @@ export async function POST(request: Request) {
       },
       generateId: generateUUID,
       onFinish: async ({ messages: finishedMessages }) => {
+        if (suppressResponse) {
+          return;
+        }
+
         if (isToolApprovalFlow) {
           // For tool approval, update existing messages (tool state changed) and save new ones
           for (const finishedMsg of finishedMessages) {
