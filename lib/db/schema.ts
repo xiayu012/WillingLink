@@ -168,3 +168,17 @@ export const stream = pgTable(
 );
 
 export type Stream = InferSelectModel<typeof stream>;
+
+export const shift = pgTable("Shift", {
+  id: uuid("id").primaryKey().notNull().defaultRandom(),
+  whattodo: text("whattodo"),
+  startTime: text("startTime"),
+  location: text("location"),
+  skillsNeeded: text("skillsNeeded"),
+  peopleHelped: text("peopleHelped"),
+  laborCredits: text("laborCredits"),
+  rawMessage: text("rawMessage").notNull(),
+  createdAt: timestamp("createdAt").notNull(),
+});
+
+export type Shift = InferSelectModel<typeof shift>;

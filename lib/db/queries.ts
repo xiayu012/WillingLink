@@ -24,6 +24,7 @@ import {
   type DBMessage,
   document,
   message,
+  shift,
   type Suggestion,
   stream,
   suggestion,
@@ -598,5 +599,112 @@ export async function getStreamIdsByChatId({ chatId }: { chatId: string }) {
       "bad_request:database",
       "Failed to get stream ids by chat id"
     );
+  }
+}
+
+export async function searchShifts({
+  queryEmbedding,
+  whattodo,
+  startTime,
+  location,
+  skillsNeeded,
+  peopleHelped,
+  laborCredits,
+}: {
+  queryEmbedding: number[];
+  whattodo?: string | null;
+  startTime?: string | null;
+  location?: string | null;
+  skillsNeeded?: string | null;
+  peopleHelped?: string | null;
+  laborCredits?: string | null;
+}) {
+  try {
+    const vectorStr = `[${queryEmbedding.join(",")}]`;
+
+    // Use raw SQL for pgvector similarity search + ILIKE filters
+    // COUNT(*) OVER() gives total matching rows without a second query
+    const rows = await client`
+      SELECT
+        "id", "whattodo", "startTime", "location", "skillsNeeded",
+        "peopleHelped", "laborCredits", "rawMessage", "createdAt",
+        embedding <=> ${vectorStr}::vector AS distance,
+        COUNT(*) OVER() AS total_count
+      FROM "Shift"
+      WHERE "embedding" IS NOT NULL
+        AND (${whattodo ?? null}::text IS NULL OR "whattodo" ILIKE '%' || ${whattodo ?? null} || '%')
+        AND (${location ?? null}::text IS NULL OR "location" ILIKE '%' || ${location ?? null} || '%')
+        AND (${startTime ?? null}::text IS NULL OR "startTime" ILIKE '%' || ${startTime ?? null} || '%')
+        AND (${skillsNeeded ?? null}::text IS NULL OR "skillsNeeded" ILIKE '%' || ${skillsNeeded ?? null} || '%')
+        AND (${peopleHelped ?? null}::text IS NULL OR "peopleHelped" ILIKE '%' || ${peopleHelped ?? null} || '%')
+        AND (${laborCredits ?? null}::text IS NULL OR "laborCredits" ILIKE '%' || ${laborCredits ?? null} || '%')
+      ORDER BY distance
+      LIMIT 10
+    `;
+
+    const totalCount = rows.length > 0 ? Number(rows[0].total_count) : 0;
+
+    const results = rows.map((row) => ({
+      id: row.id as string,
+      whattodo: row.whattodo as string | null,
+      startTime: row.startTime as string | null,
+      location: row.location as string | null,
+      skillsNeeded: row.skillsNeeded as string | null,
+      peopleHelped: row.peopleHelped as string | null,
+      laborCredits: row.laborCredits as string | null,
+      rawMessage: row.rawMessage as string,
+      createdAt: row.createdAt as Date,
+      distance: Number(row.distance),
+    }));
+
+    return { totalCount, results };
+  } catch (_error) {
+    console.error("Failed to search shifts:", _error);
+    throw new ChatSDKError("bad_request:database", "Failed to search shifts");
+  }
+}
+
+export async function saveShift({
+  id,
+  whattodo,
+  startTime,
+  location,
+  skillsNeeded,
+  peopleHelped,
+  laborCredits,
+  rawMessage,
+  embedding,
+}: {
+  id: string;
+  whattodo: string | null;
+  startTime: string | null;
+  location: string | null;
+  skillsNeeded: string | null;
+  peopleHelped: string | null;
+  laborCredits: string | null;
+  rawMessage: string;
+  embedding?: number[];
+}) {
+  try {
+    // Insert the shift record via Drizzle
+    await db.insert(shift).values({
+      id,
+      whattodo,
+      startTime,
+      location,
+      skillsNeeded,
+      peopleHelped,
+      laborCredits,
+      rawMessage,
+      createdAt: new Date(),
+    });
+
+    // Update the embedding column via raw SQL (pgvector type not supported by Drizzle)
+    if (embedding) {
+      const vectorStr = `[${embedding.join(",")}]`;
+      await client`UPDATE "Shift" SET "embedding" = ${vectorStr}::vector WHERE "id" = ${id}`;
+    }
+  } catch (_error) {
+    throw new ChatSDKError("bad_request:database", "Failed to save shift");
   }
 }

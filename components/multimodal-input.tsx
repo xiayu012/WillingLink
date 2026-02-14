@@ -304,6 +304,7 @@ function PureMultimodalInput({
             chatId={chatId}
             selectedVisibilityType={selectedVisibilityType}
             sendMessage={sendMessage}
+            setMessages={setMessages}
           />
         )}
 
@@ -421,6 +422,9 @@ export const MultimodalInput = memo(
       return false;
     }
     if (prevProps.selectedModelId !== nextProps.selectedModelId) {
+      return false;
+    }
+    if (prevProps.messages.length !== nextProps.messages.length) {
       return false;
     }
 

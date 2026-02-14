@@ -112,27 +112,14 @@ export function Chat({
       prepareSendMessagesRequest(request) {
         const lastMessage = request.messages.at(-1);
 
-        // Check if this is a tool approval continuation:
-        // - Last message is NOT a user message (meaning no new user input)
-        // - OR any message has tool parts that were responded to (approved or denied)
-        const isToolApprovalContinuation =
-          lastMessage?.role !== "user" ||
-          request.messages.some((msg) =>
-            msg.parts?.some((part) => {
-              const state = (part as { state?: string }).state;
-              return (
-                state === "approval-responded" || state === "output-denied"
-              );
-            })
-          );
-
         return {
           body: {
             id: request.id,
-            // Send all messages for tool approval continuation, otherwise just the last user message
-            ...(isToolApprovalContinuation
-              ? { messages: request.messages }
-              : { message: lastMessage }),
+            // Send the last user message for chat creation/saving
+            message:
+              lastMessage?.role === "user" ? lastMessage : undefined,
+            // Always send all messages for full conversation context
+            messages: request.messages,
             selectedChatModel: currentModelIdRef.current,
             selectedVisibilityType: visibilityType,
             ...request.body,

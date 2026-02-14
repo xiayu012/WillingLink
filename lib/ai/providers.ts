@@ -60,3 +60,7 @@ export function getArtifactModel() {
   }
   return gateway.languageModel("anthropic/claude-haiku-4.5");
 }
+
+export function getEmbeddingModel() {
+  return gateway.textEmbeddingModel("openai/text-embedding-3-small");
+}

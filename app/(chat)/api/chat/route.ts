@@ -17,6 +17,8 @@ import { entitlementsByUserType } from "@/lib/ai/entitlements";
 import { type RequestHints, systemPrompt } from "@/lib/ai/prompts";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { createDocument } from "@/lib/ai/tools/create-document";
+import { createShift } from "@/lib/ai/tools/create-shift";
+import { searchShift } from "@/lib/ai/tools/search-shift";
 import { getWeather } from "@/lib/ai/tools/get-weather";
 import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
 import { updateDocument } from "@/lib/ai/tools/update-document";
@@ -94,8 +96,13 @@ export async function POST(request: Request) {
       return new ChatSDKError("rate_limit:chat").toResponse();
     }
 
-    // Check if this is a tool approval flow (all messages sent)
-    const isToolApprovalFlow = Boolean(messages);
+    // Detect tool approval flow by checking for approval parts (not just messages presence)
+    const isToolApprovalFlow =
+      messages?.some((msg: any) =>
+        msg.parts?.some((part: any) =>
+          ["approval-responded", "output-denied"].includes(part?.state)
+        )
+      ) ?? false;
 
     const chat = await getChatById({ id });
     let messagesFromDb: DBMessage[] = [];
@@ -105,8 +112,8 @@ export async function POST(request: Request) {
       if (chat.userId !== session.user.id) {
         return new ChatSDKError("forbidden:chat").toResponse();
       }
-      // Only fetch messages if chat already exists and not tool approval
-      if (!isToolApprovalFlow) {
+      // Only fetch DB messages when no full context provided by client
+      if (!messages) {
         messagesFromDb = await getMessagesByChatId({ id });
       }
     } else if (message?.role === "user") {
@@ -122,8 +129,9 @@ export async function POST(request: Request) {
       titlePromise = generateTitleFromUserMessage({ message });
     }
 
-    // Use all messages for tool approval, otherwise DB messages + new message
-    const uiMessages = isToolApprovalFlow
+    // Prefer provided messages for full conversation context,
+    // fall back to DB messages + new message
+    const uiMessages = messages
       ? (messages as ChatMessage[])
       : [...convertToUIMessages(messagesFromDb), message as ChatMessage];
 
@@ -136,20 +144,46 @@ export async function POST(request: Request) {
       country,
     };
 
-    // Only save user messages to the database (not tool approval responses)
+    // Save messages to the database
     if (message?.role === "user") {
-      await saveMessages({
-        messages: [
-          {
-            chatId: id,
-            id: message.id,
-            role: "user",
-            parts: message.parts,
-            attachments: [],
-            createdAt: new Date(),
-          },
-        ],
+      const messagesToSave: Array<{
+        chatId: string;
+        id: string;
+        role: string;
+        parts: any;
+        attachments: any[];
+        createdAt: Date;
+      }> = [];
+
+      // For new chats, persist any prior messages (e.g., static action messages
+      // from button clicks) so conversation history is complete on refresh
+      if (!chat && messages) {
+        const now = Date.now();
+        (messages as ChatMessage[])
+          .filter((m) => m.id !== message.id)
+          .forEach((m, index) => {
+            messagesToSave.push({
+              chatId: id,
+              id: m.id,
+              role: m.role,
+              parts: m.parts as any,
+              attachments: [],
+              createdAt: new Date(now - (messages.length - index) * 100),
+            });
+          });
+      }
+
+      // Save the new user message
+      messagesToSave.push({
+        chatId: id,
+        id: message.id,
+        role: "user",
+        parts: message.parts as any,
+        attachments: [],
+        createdAt: new Date(),
       });
+
+      await saveMessages({ messages: messagesToSave as DBMessage[] });
     }
 
     const streamId = generateUUID();
@@ -183,6 +217,8 @@ export async function POST(request: Request) {
                 "createDocument",
                 "updateDocument",
                 "requestSuggestions",
+                "createShift",
+                "searchShift",
               ],
           experimental_transform: isReasoningModel
             ? undefined
@@ -202,6 +238,8 @@ export async function POST(request: Request) {
               session,
               dataStream,
             }),
+            createShift,
+            searchShift,
           },
           experimental_telemetry: {
             isEnabled: isProductionEnvironment,
