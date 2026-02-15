@@ -23,7 +23,7 @@ const suggestedActions = [
   {
     label: "Post shift",
     response:
-      "Talk to members about the shift you want to post.\n\nYou can share things like:\n\n- **What to do**\n- **Start time**\n- **Where**\n- **Skills needed**\n- **People this helped**\n- **Labor credits (hours)**",
+      "Talk to members about the shift you want to post.\n\nYou can share things like:\n\n- **What to do**\n- **Start time**\n- **Where**\n- **Skills needed**\n- **Who is being helped**\n- **Labor credits (hours)**",
   },
   {
     label: "Download labor records of Twin Oaks",

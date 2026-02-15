@@ -24,10 +24,10 @@ export const createShift = tool({
       .string()
       .optional()
       .describe("Skills required for this shift"),
-    peopleHelped: z
+    whoIsBeingHelped: z
       .string()
       .optional()
-      .describe("People this shift helped or benefits"),
+      .describe("Who is being helped by this shift"),
     laborCredits: z
       .string()
       .optional()
@@ -41,7 +41,7 @@ export const createShift = tool({
     startTime,
     location,
     skillsNeeded,
-    peopleHelped,
+    whoIsBeingHelped,
     laborCredits,
     rawMessage,
   }) => {
@@ -65,7 +65,7 @@ export const createShift = tool({
       startTime: startTime ?? null,
       location: location ?? null,
       skillsNeeded: skillsNeeded ?? null,
-      peopleHelped: peopleHelped ?? null,
+      whoIsBeingHelped: whoIsBeingHelped ?? null,
       laborCredits: laborCredits ?? null,
       rawMessage,
       embedding: embeddingVector,

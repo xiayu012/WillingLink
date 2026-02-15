@@ -608,7 +608,7 @@ export async function searchShifts({
   startTime,
   location,
   skillsNeeded,
-  peopleHelped,
+  whoIsBeingHelped,
   laborCredits,
 }: {
   queryEmbedding: number[];
@@ -616,7 +616,7 @@ export async function searchShifts({
   startTime?: string | null;
   location?: string | null;
   skillsNeeded?: string | null;
-  peopleHelped?: string | null;
+  whoIsBeingHelped?: string | null;
   laborCredits?: string | null;
 }) {
   try {
@@ -627,7 +627,7 @@ export async function searchShifts({
     const rows = await client`
       SELECT
         "id", "whattodo", "startTime", "location", "skillsNeeded",
-        "peopleHelped", "laborCredits", "rawMessage", "createdAt",
+        "whoIsBeingHelped", "laborCredits", "rawMessage", "createdAt",
         embedding <=> ${vectorStr}::vector AS distance,
         COUNT(*) OVER() AS total_count
       FROM "Shift"
@@ -636,7 +636,7 @@ export async function searchShifts({
         AND (${location ?? null}::text IS NULL OR "location" ILIKE '%' || ${location ?? null} || '%')
         AND (${startTime ?? null}::text IS NULL OR "startTime" ILIKE '%' || ${startTime ?? null} || '%')
         AND (${skillsNeeded ?? null}::text IS NULL OR "skillsNeeded" ILIKE '%' || ${skillsNeeded ?? null} || '%')
-        AND (${peopleHelped ?? null}::text IS NULL OR "peopleHelped" ILIKE '%' || ${peopleHelped ?? null} || '%')
+        AND (${whoIsBeingHelped ?? null}::text IS NULL OR "whoIsBeingHelped" ILIKE '%' || ${whoIsBeingHelped ?? null} || '%')
         AND (${laborCredits ?? null}::text IS NULL OR "laborCredits" ILIKE '%' || ${laborCredits ?? null} || '%')
       ORDER BY distance
       LIMIT 10
@@ -650,7 +650,7 @@ export async function searchShifts({
       startTime: row.startTime as string | null,
       location: row.location as string | null,
       skillsNeeded: row.skillsNeeded as string | null,
-      peopleHelped: row.peopleHelped as string | null,
+      whoIsBeingHelped: row.whoIsBeingHelped as string | null,
       laborCredits: row.laborCredits as string | null,
       rawMessage: row.rawMessage as string,
       createdAt: row.createdAt as Date,
@@ -670,7 +670,7 @@ export async function saveShift({
   startTime,
   location,
   skillsNeeded,
-  peopleHelped,
+  whoIsBeingHelped,
   laborCredits,
   rawMessage,
   embedding,
@@ -680,7 +680,7 @@ export async function saveShift({
   startTime: string | null;
   location: string | null;
   skillsNeeded: string | null;
-  peopleHelped: string | null;
+  whoIsBeingHelped: string | null;
   laborCredits: string | null;
   rawMessage: string;
   embedding?: number[];
@@ -693,7 +693,7 @@ export async function saveShift({
       startTime,
       location,
       skillsNeeded,
-      peopleHelped,
+      whoIsBeingHelped,
       laborCredits,
       rawMessage,
       createdAt: new Date(),

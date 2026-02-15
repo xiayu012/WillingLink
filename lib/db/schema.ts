@@ -175,7 +175,7 @@ export const shift = pgTable("Shift", {
   startTime: text("startTime"),
   location: text("location"),
   skillsNeeded: text("skillsNeeded"),
-  peopleHelped: text("peopleHelped"),
+  whoIsBeingHelped: text("whoIsBeingHelped"),
   laborCredits: text("laborCredits"),
   rawMessage: text("rawMessage").notNull(),
   createdAt: timestamp("createdAt").notNull(),

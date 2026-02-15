@@ -8,7 +8,7 @@ const SHIFT_FILTER_FIELDS = [
   "startTime",
   "location",
   "skillsNeeded",
-  "peopleHelped",
+  "whoIsBeingHelped",
   "laborCredits",
 ] as const;
 
@@ -39,10 +39,10 @@ export const searchShift = tool({
       .string()
       .optional()
       .describe("Filter: skills required (only if user specified)"),
-    peopleHelped: z
+    whoIsBeingHelped: z
       .string()
       .optional()
-      .describe("Filter: who this shift helps (only if user specified)"),
+      .describe("Filter: who is being helped (only if user specified)"),
     laborCredits: z
       .string()
       .optional()
@@ -54,7 +54,7 @@ export const searchShift = tool({
     startTime,
     location,
     skillsNeeded,
-    peopleHelped,
+    whoIsBeingHelped,
     laborCredits,
   }) => {
     // Generate embedding for the search query
@@ -70,7 +70,7 @@ export const searchShift = tool({
       startTime,
       location,
       skillsNeeded,
-      peopleHelped,
+      whoIsBeingHelped,
       laborCredits,
     });
 
@@ -80,7 +80,7 @@ export const searchShift = tool({
       startTime,
       location,
       skillsNeeded,
-      peopleHelped,
+      whoIsBeingHelped,
       laborCredits,
     };
 
