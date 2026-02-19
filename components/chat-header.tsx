@@ -1,13 +1,15 @@
 "use client";
 
+import { ArrowLeftIcon } from "lucide-react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+// import { useRouter } from "next/navigation";
 import { memo } from "react";
-import { useWindowSize } from "usehooks-ts";
+// import { useWindowSize } from "usehooks-ts";
 import { SidebarToggle } from "@/components/sidebar-toggle";
 import { Button } from "@/components/ui/button";
-import { PlusIcon, VercelIcon } from "./icons";
-import { useSidebar } from "./ui/sidebar";
+import { VercelIcon } from "./icons";
+// PlusIcon was used by New Chat button below (commented out)
+// import { useSidebar } from "./ui/sidebar";
 import { VisibilitySelector, type VisibilityType } from "./visibility-selector";
 
 function PureChatHeader({
@@ -19,15 +21,28 @@ function PureChatHeader({
   selectedVisibilityType: VisibilityType;
   isReadonly: boolean;
 }) {
-  const router = useRouter();
-  const { open } = useSidebar();
-
-  const { width: windowWidth } = useWindowSize();
+  // Uncomment together with the New Chat button block below if restoring it
+  // const router = useRouter();
+  // const { open } = useSidebar();
+  // const { width: windowWidth } = useWindowSize();
 
   return (
     <header className="sticky top-0 flex items-center gap-2 bg-background px-2 py-1.5 md:px-2">
+      <Button
+        asChild
+        aria-label="Back to home"
+        className="h-8 shrink-0 px-2 md:h-fit md:px-2"
+        title="Back to home"
+        variant="ghost"
+      >
+        <Link href="/">
+          <ArrowLeftIcon className="size-4" aria-hidden />
+          <span className="sr-only">Back to home</span>
+        </Link>
+      </Button>
       <SidebarToggle />
 
+      {/* New Chat button (hidden per product request). Restore by uncommenting this block and the hooks/imports above.
       {(!open || windowWidth < 768) && (
         <Button
           className="order-2 ml-auto h-8 px-2 md:order-1 md:ml-0 md:h-fit md:px-2"
@@ -40,7 +55,7 @@ function PureChatHeader({
           <PlusIcon />
           <span className="md:sr-only">New Chat</span>
         </Button>
-      )}
+      )} */}
 
       {!isReadonly && (
         <VisibilitySelector
