@@ -147,12 +147,12 @@ function PureMultimodalInput({
   };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
+
   const [uploadQueue, setUploadQueue] = useState<string[]>([]);
   const [showPostShiftRecorder, setShowPostShiftRecorder] = useState(false);
   const [voiceStartTrigger, setVoiceStartTrigger] = useState(0);
-  const [pendingAudio, setPendingAudio] = useState<ShiftVoiceResult | null>(
-    null,
-  );
 
   const handleVoiceAction = useCallback((action: "post") => {
     if (action === "post") {
@@ -163,13 +163,46 @@ function PureMultimodalInput({
 
   const handleVoiceResult = useCallback(
     (data: ShiftVoiceResult) => {
-      setPendingAudio(data);
-      if (data.transcript) {
-        setInput(data.transcript);
-      }
       setShowPostShiftRecorder(false);
+
+      const transcriptText = (data.transcript || "").trim();
+      const textContent =
+        (transcriptText || "（语音消息）") +
+        `\n[AUDIO_META: url=${data.audioUrl} duration=${data.durationMs} mime=${data.mimeType} size=${data.sizeBytes}]`;
+
+      window.history.pushState({}, "", `/chat/${chatId}`);
+
+      sendMessage({
+        role: "user",
+        parts: [
+          ...attachmentsRef.current.map((attachment) => ({
+            type: "file" as const,
+            url: attachment.url,
+            name: attachment.name,
+            mediaType: attachment.contentType,
+          })),
+          { type: "text", text: textContent },
+        ],
+      });
+
+      setAttachments([]);
+      setLocalStorageInput("");
+      resetHeight();
+      setInput("");
+
+      if (width && width > 768) {
+        textareaRef.current?.focus();
+      }
     },
-    [setInput],
+    [
+      chatId,
+      sendMessage,
+      setAttachments,
+      setLocalStorageInput,
+      resetHeight,
+      setInput,
+      width,
+    ],
   );
 
   const handleTranscriptionChange = useCallback(
@@ -182,11 +215,6 @@ function PureMultimodalInput({
   const submitForm = useCallback(() => {
     window.history.pushState({}, "", `/chat/${chatId}`);
 
-    let textContent = input;
-    if (pendingAudio) {
-      textContent += `\n[AUDIO_META: url=${pendingAudio.audioUrl} duration=${pendingAudio.durationMs} mime=${pendingAudio.mimeType} size=${pendingAudio.sizeBytes}]`;
-    }
-
     sendMessage({
       role: "user",
       parts: [
@@ -196,10 +224,7 @@ function PureMultimodalInput({
           name: attachment.name,
           mediaType: attachment.contentType,
         })),
-        {
-          type: "text",
-          text: textContent,
-        },
+        { type: "text", text: input },
       ],
     });
 
@@ -207,7 +232,6 @@ function PureMultimodalInput({
     setLocalStorageInput("");
     resetHeight();
     setInput("");
-    setPendingAudio(null);
 
     if (width && width > 768) {
       textareaRef.current?.focus();
@@ -222,7 +246,6 @@ function PureMultimodalInput({
     width,
     chatId,
     resetHeight,
-    pendingAudio,
   ]);
 
   const uploadFile = useCallback(async (file: File) => {
@@ -448,7 +471,7 @@ function PureMultimodalInput({
             <PromptInputSubmit
               className="size-8 rounded-full bg-primary text-primary-foreground transition-colors duration-200 hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground"
               data-testid="send-button"
-              disabled={(!input.trim() && !pendingAudio) || uploadQueue.length > 0}
+              disabled={!input.trim() || uploadQueue.length > 0}
               status={status}
             >
               <ArrowUpIcon size={14} />
