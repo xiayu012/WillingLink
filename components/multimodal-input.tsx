@@ -42,7 +42,8 @@ import {
   PromptInputTools,
 } from "./elements/prompt-input";
 import { SpeechInput } from "./ai-elements/speech-input";
-import { ArrowUpIcon, PaperclipIcon, StopIcon } from "./icons";
+// PaperclipIcon was used by AttachmentsButton (toolbar add-attachment button, commented out below)
+import { ArrowUpIcon, StopIcon } from "./icons";
 import { PreviewAttachment } from "./preview-attachment";
 import {
   ShiftVoiceRecorder,
@@ -452,7 +453,7 @@ function PureMultimodalInput({
               fileInputRef={fileInputRef}
               selectedModelId={selectedModelId}
               status={status}
-            />
+            /> */}
             <SpeechInput
               className="h-8"
               disabled={status !== "ready"}
@@ -509,6 +510,7 @@ export const MultimodalInput = memo(
   }
 );
 
+/* Add-attachment toolbar button (commented out per product request). Uncomment together with usage in PromptInputTools above and PaperclipIcon import.
 function PureAttachmentsButton({
   fileInputRef,
   status,
@@ -538,6 +540,7 @@ function PureAttachmentsButton({
 }
 
 const AttachmentsButton = memo(PureAttachmentsButton);
+*/
 
 function PureModelSelectorCompact({
   selectedModelId,
