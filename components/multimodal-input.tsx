@@ -41,8 +41,13 @@ import {
   PromptInputToolbar,
   PromptInputTools,
 } from "./elements/prompt-input";
+import { SpeechInput } from "./ai-elements/speech-input";
 import { ArrowUpIcon, PaperclipIcon, StopIcon } from "./icons";
 import { PreviewAttachment } from "./preview-attachment";
+import {
+  ShiftVoiceRecorder,
+  type ShiftVoiceResult,
+} from "./shift-voice-recorder";
 import { SuggestedActions } from "./suggested-actions";
 import { Button } from "./ui/button";
 import type { VisibilityType } from "./visibility-selector";
@@ -143,9 +148,44 @@ function PureMultimodalInput({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadQueue, setUploadQueue] = useState<string[]>([]);
+  const [showPostShiftRecorder, setShowPostShiftRecorder] = useState(false);
+  const [voiceStartTrigger, setVoiceStartTrigger] = useState(0);
+  const [pendingAudio, setPendingAudio] = useState<ShiftVoiceResult | null>(
+    null,
+  );
+
+  const handleVoiceAction = useCallback((action: "post") => {
+    if (action === "post") {
+      setShowPostShiftRecorder(true);
+      setVoiceStartTrigger((t) => t + 1);
+    }
+  }, []);
+
+  const handleVoiceResult = useCallback(
+    (data: ShiftVoiceResult) => {
+      setPendingAudio(data);
+      if (data.transcript) {
+        setInput(data.transcript);
+      }
+      setShowPostShiftRecorder(false);
+    },
+    [setInput],
+  );
+
+  const handleTranscriptionChange = useCallback(
+    (text: string) => {
+      setInput((prev) => (prev ? `${prev} ${text}` : text));
+    },
+    [setInput],
+  );
 
   const submitForm = useCallback(() => {
     window.history.pushState({}, "", `/chat/${chatId}`);
+
+    let textContent = input;
+    if (pendingAudio) {
+      textContent += `\n[AUDIO_META: url=${pendingAudio.audioUrl} duration=${pendingAudio.durationMs} mime=${pendingAudio.mimeType} size=${pendingAudio.sizeBytes}]`;
+    }
 
     sendMessage({
       role: "user",
@@ -158,7 +198,7 @@ function PureMultimodalInput({
         })),
         {
           type: "text",
-          text: input,
+          text: textContent,
         },
       ],
     });
@@ -167,6 +207,7 @@ function PureMultimodalInput({
     setLocalStorageInput("");
     resetHeight();
     setInput("");
+    setPendingAudio(null);
 
     if (width && width > 768) {
       textareaRef.current?.focus();
@@ -181,6 +222,7 @@ function PureMultimodalInput({
     width,
     chatId,
     resetHeight,
+    pendingAudio,
   ]);
 
   const uploadFile = useCallback(async (file: File) => {
@@ -302,8 +344,8 @@ function PureMultimodalInput({
         uploadQueue.length === 0 && (
           <SuggestedActions
             chatId={chatId}
+            onVoiceAction={handleVoiceAction}
             selectedVisibilityType={selectedVisibilityType}
-            sendMessage={sendMessage}
             setMessages={setMessages}
           />
         )}
@@ -328,6 +370,12 @@ function PureMultimodalInput({
           }
         }}
       >
+        {showPostShiftRecorder && (
+          <ShiftVoiceRecorder
+            onResult={handleVoiceResult}
+            startTrigger={voiceStartTrigger}
+          />
+        )}
         {(attachments.length > 0 || uploadQueue.length > 0) && (
           <div
             className="flex flex-row items-end gap-2 overflow-x-scroll"
@@ -382,6 +430,12 @@ function PureMultimodalInput({
               selectedModelId={selectedModelId}
               status={status}
             />
+            <SpeechInput
+              className="h-8"
+              disabled={status !== "ready"}
+              lang="en-US"
+              onTranscriptionChange={handleTranscriptionChange}
+            />
             <ModelSelectorCompact
               onModelChange={onModelChange}
               selectedModelId={selectedModelId}
@@ -394,7 +448,7 @@ function PureMultimodalInput({
             <PromptInputSubmit
               className="size-8 rounded-full bg-primary text-primary-foreground transition-colors duration-200 hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground"
               data-testid="send-button"
-              disabled={!input.trim() || uploadQueue.length > 0}
+              disabled={(!input.trim() && !pendingAudio) || uploadQueue.length > 0}
               status={status}
             >
               <ArrowUpIcon size={14} />

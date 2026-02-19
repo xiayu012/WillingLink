@@ -95,7 +95,9 @@ export const searchShift = tool({
       }
     }
 
-    const resultData = results.map(({ distance: _distance, ...rest }) => rest);
+    const resultData = results.map(
+      ({ distance: _distance, ...rest }) => rest
+    );
 
     return {
       totalCount,

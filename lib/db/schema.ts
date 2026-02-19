@@ -2,6 +2,7 @@ import type { InferSelectModel } from "drizzle-orm";
 import {
   boolean,
   foreignKey,
+  integer,
   json,
   pgTable,
   primaryKey,
@@ -178,7 +179,24 @@ export const shift = pgTable("Shift", {
   whoIsBeingHelped: text("whoIsBeingHelped"),
   laborCredits: text("laborCredits"),
   rawMessage: text("rawMessage").notNull(),
+  audioUrl: text("audioUrl"),
+  audioDurationMs: integer("audioDurationMs"),
+  audioMimeType: text("audioMimeType"),
+  audioSizeBytes: integer("audioSizeBytes"),
   createdAt: timestamp("createdAt").notNull(),
 });
 
 export type Shift = InferSelectModel<typeof shift>;
+
+export const searchAudio = pgTable("SearchAudio", {
+  id: uuid("id").primaryKey().notNull().defaultRandom(),
+  chatId: text("chatId").notNull(),
+  audioUrl: text("audioUrl").notNull(),
+  audioDurationMs: integer("audioDurationMs"),
+  audioMimeType: text("audioMimeType"),
+  audioSizeBytes: integer("audioSizeBytes"),
+  transcript: text("transcript"),
+  createdAt: timestamp("createdAt").notNull(),
+});
+
+export type SearchAudio = InferSelectModel<typeof searchAudio>;

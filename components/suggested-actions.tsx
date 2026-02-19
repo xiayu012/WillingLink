@@ -10,9 +10,10 @@ import type { VisibilityType } from "./visibility-selector";
 
 type SuggestedActionsProps = {
   chatId: string;
-  sendMessage: UseChatHelpers<ChatMessage>["sendMessage"];
   setMessages: UseChatHelpers<ChatMessage>["setMessages"];
   selectedVisibilityType: VisibilityType;
+  /** Called when user clicks Post shift (to auto-start voice recording) */
+  onVoiceAction?: (action: "post") => void;
 };
 
 const suggestedActions = [
@@ -38,6 +39,7 @@ const suggestedActions = [
 function PureSuggestedActions({
   chatId,
   setMessages,
+  onVoiceAction,
 }: SuggestedActionsProps) {
   return (
     <div
@@ -68,6 +70,9 @@ function PureSuggestedActions({
                   parts: [{ type: "text", text: action.response }],
                 },
               ]);
+              if (action.label === "Post shift") {
+                onVoiceAction?.("post");
+              }
             }}
             suggestion={action.label}
           >

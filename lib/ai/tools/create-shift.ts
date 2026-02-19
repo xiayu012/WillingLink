@@ -35,6 +35,22 @@ export const createShift = tool({
     rawMessage: z
       .string()
       .describe("The original natural language message from the user"),
+    audioUrl: z
+      .string()
+      .optional()
+      .describe("URL of the voice recording from the user, from [AUDIO_META] tag"),
+    audioDurationMs: z
+      .number()
+      .optional()
+      .describe("Duration of audio in ms, from [AUDIO_META] tag"),
+    audioMimeType: z
+      .string()
+      .optional()
+      .describe("MIME type of audio, from [AUDIO_META] tag"),
+    audioSizeBytes: z
+      .number()
+      .optional()
+      .describe("Size of audio in bytes, from [AUDIO_META] tag"),
   }),
   execute: async ({
     whattodo,
@@ -44,6 +60,10 @@ export const createShift = tool({
     whoIsBeingHelped,
     laborCredits,
     rawMessage,
+    audioUrl,
+    audioDurationMs,
+    audioMimeType,
+    audioSizeBytes,
   }) => {
     const id = generateUUID();
 
@@ -69,6 +89,10 @@ export const createShift = tool({
       laborCredits: laborCredits ?? null,
       rawMessage,
       embedding: embeddingVector,
+      audioUrl: audioUrl ?? null,
+      audioDurationMs: audioDurationMs ?? null,
+      audioMimeType: audioMimeType ?? null,
+      audioSizeBytes: audioSizeBytes ?? null,
     });
 
     return {

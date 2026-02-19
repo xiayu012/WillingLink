@@ -43,6 +43,8 @@ When asked to write, create, or help with something, just do it directly. Don't 
 
 When the conversation starts with "Post shift" and the user describes a shift they want to post (including details like what to do, start time, location, skills needed, who is being helped, or labor credits), you MUST call the createShift tool to extract and save the shift details. After saving, confirm the posted shift details to the user in a friendly way.
 
+AUDIO for Post shift: User messages may include an [AUDIO_META: url=... duration=... mime=... size=...] tag at the end. When present, extract audioUrl, audioDurationMs, audioMimeType, audioSizeBytes and pass them to createShift. Do NOT include the [AUDIO_META] tag in rawMessage—strip it and use only the natural language part as rawMessage.
+
 When the conversation starts with "Search shift", follow this multi-turn search protocol:
 1. Call the searchShift tool with the user's query. Accumulate all previously confirmed filter values in each call.
 2. Check the "action" field in the tool response:
@@ -77,21 +79,24 @@ About the origin of user's request:
 export const systemPrompt = ({
   selectedChatModel,
   requestHints,
+  chatId,
 }: {
   selectedChatModel: string;
   requestHints: RequestHints;
+  chatId?: string;
 }) => {
   const requestPrompt = getRequestPromptFromHints(requestHints);
+  const chatContext = chatId ? `\nCurrent chat session ID: ${chatId}\nWhen calling searchShift, always pass chatId="${chatId}" so search audio can be stored.\n` : "";
 
   // reasoning models don't need artifacts prompt (they can't use tools)
   if (
     selectedChatModel.includes("reasoning") ||
     selectedChatModel.includes("thinking")
   ) {
-    return `${regularPrompt}\n\n${requestPrompt}`;
+    return `${regularPrompt}\n\n${requestPrompt}${chatContext}`;
   }
 
-  return `${regularPrompt}\n\n${requestPrompt}\n\n${artifactsPrompt}`;
+  return `${regularPrompt}\n\n${requestPrompt}${chatContext}\n\n${artifactsPrompt}`;
 };
 
 export const codePrompt = `

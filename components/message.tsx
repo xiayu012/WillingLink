@@ -23,6 +23,26 @@ import { MessageEditor } from "./message-editor";
 import { MessageReasoning } from "./message-reasoning";
 import { PreviewAttachment } from "./preview-attachment";
 import { Weather } from "./weather";
+import { AudioPlayer, VoiceMessageBubble } from "./audio-player";
+
+const AUDIO_META_REGEX =
+  /\[AUDIO_META:\s*url=([^\s\]]+)\s+duration=(\d+)\s+mime=[^\s\]]+\s+size=\d+\]/i;
+
+function parseUserTextWithAudio(
+  raw: string,
+): { text: string; audioUrl: string | null; durationMs: number } {
+  const trimmed = raw.trim();
+  const match = trimmed.match(AUDIO_META_REGEX);
+  if (!match) {
+    return { text: trimmed, audioUrl: null, durationMs: 0 };
+  }
+  const text = trimmed.replace(AUDIO_META_REGEX, "").trim();
+  return {
+    text,
+    audioUrl: match[1] ?? null,
+    durationMs: Number.parseInt(match[2] ?? "0", 10),
+  };
+}
 
 const PurePreviewMessage = ({
   addToolApprovalResponse,
@@ -121,24 +141,68 @@ const PurePreviewMessage = ({
 
             if (type === "text") {
               if (mode === "view") {
+                const rawText = part.text ?? "";
+                const isUser = message.role === "user";
+
+                if (isUser) {
+                  const { text: displayText, audioUrl, durationMs } =
+                    parseUserTextWithAudio(rawText);
+
+                  return (
+                    <div
+                      className="flex flex-col items-end gap-1.5"
+                      key={key}
+                    >
+                      {audioUrl && (
+                        <VoiceMessageBubble
+                          className="bg-[#006cff] text-white"
+                          durationMs={durationMs}
+                          src={audioUrl}
+                        />
+                      )}
+                      {displayText ? (
+                        <MessageContent
+                          className="wrap-break-word w-fit rounded-2xl px-3 py-2 text-right text-white"
+                          data-testid="message-content"
+                          style={{ backgroundColor: "#006cff" }}
+                        >
+                          <Response>{sanitizeText(displayText)}</Response>
+                        </MessageContent>
+                      ) : null}
+                    </div>
+                  );
+                }
+
+                const text = sanitizeText(rawText);
+                const audioLinkRegex =
+                  /\[(?:Play audio|🔊[^\]]*|Voice[^\]]*)\]\((https?:\/\/[^\s)]+\.(?:webm|mp4|mpeg|ogg|wav)[^\s)]*)\)/gi;
+                const audioUrls: string[] = [];
+                let match: RegExpExecArray | null;
+                audioLinkRegex.lastIndex = 0;
+                while ((match = audioLinkRegex.exec(text)) !== null) {
+                  audioUrls.push(match[1]);
+                }
+
                 return (
                   <div key={key}>
                     <MessageContent
-                      className={cn({
-                        "wrap-break-word w-fit rounded-2xl px-3 py-2 text-right text-white":
-                          message.role === "user",
-                        "bg-transparent px-0 py-0 text-left":
-                          message.role === "assistant",
-                      })}
+                      className="bg-transparent px-0 py-0 text-left"
                       data-testid="message-content"
-                      style={
-                        message.role === "user"
-                          ? { backgroundColor: "#006cff" }
-                          : undefined
-                      }
                     >
-                      <Response>{sanitizeText(part.text)}</Response>
+                      <Response>{text}</Response>
                     </MessageContent>
+                    {audioUrls.length > 0 && (
+                      <div className="mt-2 flex flex-col gap-1">
+                        {audioUrls.map((url, i) => (
+                          <AudioPlayer
+                            autoPlay={i === 0}
+                            key={url}
+                            label={`Voice recording ${i + 1}`}
+                            src={url}
+                          />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 );
               }

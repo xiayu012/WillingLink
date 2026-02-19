@@ -627,7 +627,7 @@ export async function searchShifts({
     const rows = await client`
       SELECT
         "id", "whattodo", "startTime", "location", "skillsNeeded",
-        "whoIsBeingHelped", "laborCredits", "rawMessage", "createdAt",
+        "whoIsBeingHelped", "laborCredits", "rawMessage", "audioUrl", "createdAt",
         embedding <=> ${vectorStr}::vector AS distance,
         COUNT(*) OVER() AS total_count
       FROM "Shift"
@@ -653,6 +653,7 @@ export async function searchShifts({
       whoIsBeingHelped: row.whoIsBeingHelped as string | null,
       laborCredits: row.laborCredits as string | null,
       rawMessage: row.rawMessage as string,
+      audioUrl: row.audioUrl as string | null,
       createdAt: row.createdAt as Date,
       distance: Number(row.distance),
     }));
@@ -674,6 +675,10 @@ export async function saveShift({
   laborCredits,
   rawMessage,
   embedding,
+  audioUrl,
+  audioDurationMs,
+  audioMimeType,
+  audioSizeBytes,
 }: {
   id: string;
   whattodo: string | null;
@@ -684,6 +689,10 @@ export async function saveShift({
   laborCredits: string | null;
   rawMessage: string;
   embedding?: number[];
+  audioUrl?: string | null;
+  audioDurationMs?: number | null;
+  audioMimeType?: string | null;
+  audioSizeBytes?: number | null;
 }) {
   try {
     // Insert the shift record via Drizzle
@@ -696,6 +705,10 @@ export async function saveShift({
       whoIsBeingHelped,
       laborCredits,
       rawMessage,
+      audioUrl: audioUrl ?? null,
+      audioDurationMs: audioDurationMs ?? null,
+      audioMimeType: audioMimeType ?? null,
+      audioSizeBytes: audioSizeBytes ?? null,
       createdAt: new Date(),
     });
 
@@ -708,3 +721,4 @@ export async function saveShift({
     throw new ChatSDKError("bad_request:database", "Failed to save shift");
   }
 }
+
