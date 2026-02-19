@@ -1110,17 +1110,7 @@ interface SpeechRecognitionErrorEvent extends Event {
   error: string;
 }
 
-declare global {
-  // biome-ignore lint/nursery/useConsistentTypeDefinitions: global augmentation requires interface
-  interface Window {
-    SpeechRecognition: {
-      new (): SpeechRecognition;
-    };
-    webkitSpeechRecognition: {
-      new (): SpeechRecognition;
-    };
-  }
-}
+// Window.SpeechRecognition is augmented in speech-input.tsx; use that global.
 
 export type PromptInputSpeechButtonProps = ComponentProps<
   typeof PromptInputButton
