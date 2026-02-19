@@ -20,7 +20,7 @@
     "alias": "willinglink"
   },
   "appVersionName": "2",
-  "appVersionCode": 2,
+  "appVersionCode": 20260219,
   "shortcuts": [],
   "generatorApp": "bubblewrap-cli",
   "webManifestUrl": "https://willinglink.vercel.app/manifest.webmanifest",

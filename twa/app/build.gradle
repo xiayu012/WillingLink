@@ -57,7 +57,7 @@ android {
         applicationId "com.willinglink"
         minSdkVersion 21
         targetSdkVersion 35
-        versionCode 2
+        versionCode 20260219
         versionName "2"
 
         // The name for the application
