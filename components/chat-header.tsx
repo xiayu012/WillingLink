@@ -30,12 +30,15 @@ function PureChatHeader({
       <Button
         asChild
         aria-label="Back to home"
-        className="h-8 shrink-0 px-2 md:h-fit md:px-2"
+        className="h-16 w-16 min-h-16 min-w-16 max-h-16 max-w-16 shrink-0 grow-0 rounded-full p-0 [&_svg]:size-8 shadow-[0_2px_12px_rgba(120,113,108,0.07)] transition-[transform,box-shadow] duration-200 ease-out hover:scale-105 hover:shadow-[0_4px_20px_rgba(120,113,108,0.12)] active:scale-95 focus-visible:ring-2 focus-visible:ring-stone-400 focus-visible:ring-offset-2 dark:shadow-[0_4px_20px_rgba(0,0,0,0.25)] dark:hover:shadow-[0_6px_28px_rgba(0,0,0,0.4)]"
         title="Back to home"
         variant="ghost"
       >
-        <Link href="/">
-          <ArrowLeftIcon className="size-4" aria-hidden />
+        <Link
+          className="flex size-full min-h-16 min-w-16 max-h-16 max-w-16 shrink-0 items-center justify-center rounded-full bg-gradient-to-b from-stone-100 to-stone-200/90 text-stone-600 ring-1 ring-stone-300/60 transition-colors hover:from-stone-200 hover:to-stone-300/90 hover:text-stone-800 dark:from-slate-800 dark:to-slate-800/95 dark:text-slate-200 dark:ring-slate-600/50 dark:hover:from-slate-700 dark:hover:to-slate-700/95 dark:hover:text-slate-50"
+          href="/"
+        >
+          <ArrowLeftIcon className="size-8" aria-hidden />
           <span className="sr-only">Back to home</span>
         </Link>
       </Button>
