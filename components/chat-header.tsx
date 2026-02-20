@@ -24,6 +24,7 @@ function PureChatHeader({
         aria-label="Back to home"
         className="h-16 w-16 min-h-16 min-w-16 max-h-16 max-w-16 shrink-0 grow-0 rounded-full p-0 [&_svg]:size-8 shadow-[0_2px_12px_rgba(120,113,108,0.07)] transition-[transform,box-shadow] duration-200 ease-out hover:scale-105 hover:shadow-[0_4px_20px_rgba(120,113,108,0.12)] active:scale-95 focus-visible:ring-2 focus-visible:ring-stone-400 focus-visible:ring-offset-2 dark:shadow-[0_4px_20px_rgba(0,0,0,0.25)] dark:hover:shadow-[0_6px_28px_rgba(0,0,0,0.4)]"
         onClick={() => {
+          sessionStorage.setItem("skipInputAutoFocus", "1");
           router.replace("/");
           router.refresh();
         }}

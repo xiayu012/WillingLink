@@ -117,7 +117,11 @@ function PureMultimodalInput({
   useEffect(() => {
     if (!hasAutoFocused.current && width) {
       const timer = setTimeout(() => {
-        textareaRef.current?.focus();
+        if (sessionStorage.getItem("skipInputAutoFocus")) {
+          sessionStorage.removeItem("skipInputAutoFocus");
+        } else {
+          textareaRef.current?.focus();
+        }
         hasAutoFocused.current = true;
       }, 100);
       return () => clearTimeout(timer);
