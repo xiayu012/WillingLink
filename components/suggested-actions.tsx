@@ -19,12 +19,12 @@ type SuggestedActionsProps = {
 const suggestedActions = [
   {
     label: "Search shift",
-    response: "Just tell me what you're looking for.",
+    response: "Give me a clue.",
   },
   {
     label: "Post shift",
     response:
-      "Talk to members about the shift you want to post.\n\nYou can share things like:\n\n- **What to do**\n- **Start time**\n- **Where**\n- **Skills needed**\n- **Who is being helped**\n- **Labor credits (hours)**",
+      " ",
   },
   {
     label: "Download labor records of Twin Oaks",
@@ -36,6 +36,13 @@ const suggestedActions = [
   },
 ];
 
+const actionCardTints = [
+  "from-emerald-500/12 to-teal-500/8 dark:from-emerald-500/20 dark:to-teal-500/12",
+  "from-violet-500/12 to-purple-500/8 dark:from-violet-500/20 dark:to-purple-500/12",
+  "from-amber-500/12 to-orange-500/8 dark:from-amber-500/20 dark:to-orange-500/12",
+  "from-sky-500/12 to-blue-500/8 dark:from-sky-500/20 dark:to-blue-500/12",
+] as const;
+
 function PureSuggestedActions({
   chatId,
   setMessages,
@@ -43,7 +50,7 @@ function PureSuggestedActions({
 }: SuggestedActionsProps) {
   return (
     <div
-      className="grid w-full gap-2 sm:grid-cols-2"
+      className="grid w-full gap-3 sm:gap-4 sm:grid-cols-2"
       data-testid="suggested-actions"
     >
       {suggestedActions.map((action, index) => (
@@ -53,9 +60,17 @@ function PureSuggestedActions({
           initial={{ opacity: 0, y: 20 }}
           key={action.label}
           transition={{ delay: 0.05 * index }}
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
         >
           <Suggestion
-            className="h-auto w-full whitespace-normal p-3 text-left"
+            className={[
+              "h-auto min-h-[52px] w-full whitespace-normal rounded-2xl border-0 p-4 text-left text-base font-medium shadow-sm",
+              "bg-gradient-to-br transition-shadow duration-200",
+              "hover:shadow-md active:shadow-sm focus-visible:ring-2 focus-visible:ring-ring/50",
+              actionCardTints[index],
+            ].join(" ")}
+            variant="ghost"
             onClick={() => {
               window.history.pushState({}, "", `/chat/${chatId}`);
               setMessages([
