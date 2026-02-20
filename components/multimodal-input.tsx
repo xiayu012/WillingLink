@@ -459,10 +459,12 @@ function PureMultimodalInput({
               lang="en-US"
               onTranscriptionChange={handleTranscriptionChange}
             />
-            <ModelSelectorCompact
-              onModelChange={onModelChange}
-              selectedModelId={selectedModelId}
-            />
+            <div data-dev-only="model-selector" style={{ display: "none" }}>
+              <ModelSelectorCompact
+                onModelChange={onModelChange}
+                selectedModelId={selectedModelId}
+              />
+            </div>
           </PromptInputTools>
 
           {status === "submitted" ? (

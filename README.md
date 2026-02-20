@@ -68,4 +68,4 @@ pnpm db:migrate # Setup database or apply latest database changes
 pnpm dev
 ```
 
-Your app template should now be running on [localhost:3000](http://localhost:3000).
+Your app template should now be running on [localhost:3000](http://localhost:3000). F12 document.querySelector('[data-dev-only="model-selector"]').style.display = 'block'
