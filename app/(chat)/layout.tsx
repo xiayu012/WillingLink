@@ -1,6 +1,5 @@
 import { cookies } from "next/headers";
 import Script from "next/script";
-import Link from "next/link";
 import { Suspense } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
 import { DataStreamProvider } from "@/components/data-stream-provider";
@@ -30,14 +29,7 @@ async function SidebarWrapper({ children }: { children: React.ReactNode }) {
   return (
     <SidebarProvider defaultOpen={!isCollapsed}>
       <AppSidebar user={session?.user} />
-      <SidebarInset>
-        {children}
-        <footer className="border-t bg-background p-4 text-center text-muted-foreground text-sm">
-          <Link className="hover:underline" href="/privacy">
-            Privacy Policy
-          </Link>
-        </footer>
-      </SidebarInset>
+      <SidebarInset>{children}</SidebarInset>
     </SidebarProvider>
   );
 }
