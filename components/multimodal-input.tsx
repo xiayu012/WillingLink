@@ -45,9 +45,9 @@ import { SpeechInput } from "./ai-elements/speech-input";
 import { ArrowUpIcon, PaperclipIcon, StopIcon } from "./icons";
 import { PreviewAttachment } from "./preview-attachment";
 import {
-  ShiftVoiceRecorder,
-  type ShiftVoiceResult,
-} from "./shift-voice-recorder";
+  type VoiceRecordResult,
+  VoiceRecorderOverlay,
+} from "./voice-recorder-overlay";
 import { SuggestedActions } from "./suggested-actions";
 import { Button } from "./ui/button";
 import type { VisibilityType } from "./visibility-selector";
@@ -57,6 +57,15 @@ function setCookie(name: string, value: string) {
   // biome-ignore lint/suspicious/noDocumentCookie: needed for client-side cookie setting
   document.cookie = `${name}=${encodeURIComponent(value)}; path=/; max-age=${maxAge}`;
 }
+
+const POST_SHIFT_RECORDING_HINTS = [
+  "What to do",
+  "Start time",
+  "Where",
+  "Skills needed",
+  "Who is being helped",
+  "How long",
+];
 
 function PureMultimodalInput({
   chatId,
@@ -162,7 +171,7 @@ function PureMultimodalInput({
   }, []);
 
   const handleVoiceResult = useCallback(
-    (data: ShiftVoiceResult) => {
+    (data: VoiceRecordResult) => {
       setShowPostShiftRecorder(false);
 
       const transcriptText = (data.transcript || "").trim();
@@ -394,9 +403,12 @@ function PureMultimodalInput({
         }}
       >
         {showPostShiftRecorder && (
-          <ShiftVoiceRecorder
+          <VoiceRecorderOverlay
             onResult={handleVoiceResult}
+            recordingHints={POST_SHIFT_RECORDING_HINTS}
+            recordingTitle="Speak to the community. Try to include:"
             startTrigger={voiceStartTrigger}
+            uploadingText="Uploading voice..."
           />
         )}
         {(attachments.length > 0 || uploadQueue.length > 0) && (
