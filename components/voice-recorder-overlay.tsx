@@ -158,11 +158,7 @@ export function VoiceRecorderOverlay({
         const recognition = new SpeechRecognitionCtor();
         recognition.continuous = true;
         recognition.interimResults = true;
-        recognition.lang =
-          typeof navigator !== "undefined" &&
-          navigator.language?.toLowerCase().startsWith("zh")
-            ? "zh-CN"
-            : "en-US";
+        recognition.lang = "en-US";
         recognitionRef.current = recognition;
 
         recognition.onresult = (event: SpeechRecognitionEvent) => {
