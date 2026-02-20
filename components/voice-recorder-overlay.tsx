@@ -180,7 +180,19 @@ export function VoiceRecorderOverlay({
           }
         };
 
-        recognition.onerror = () => {};
+        recognition.onerror = (event: Event) => {
+          const errEvent = event as { error?: string };
+          const err = errEvent.error ?? "unknown";
+          if (err === "network") {
+            toast.error("Speech recognition failed: check your network connection.");
+          } else if (err === "not-allowed") {
+            toast.error("Microphone permission denied.");
+          } else if (err === "audio-capture") {
+            toast.error("Microphone not available.");
+          } else if (err !== "aborted" && err !== "no-speech") {
+            toast.error(`Speech recognition error: ${err}`);
+          }
+        };
 
         recognition.start();
       }
