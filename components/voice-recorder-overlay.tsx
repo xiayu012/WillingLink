@@ -30,8 +30,12 @@ export type VoiceRecordResult = {
 const DEFAULT_RECORDING_TITLE = "Recording...";
 const DEFAULT_UPLOADING_TEXT = "Uploading...";
 const SESSION_API = "/api/realtime/session";
-const TRANSCRIPT_WAIT_MS = 8000;
-const TRANSCRIPT_GRACE_MS = 2500;
+/** Max recording duration before auto-stop (5 minutes). */
+const MAX_RECORDING_DURATION_MS = 5 * 60 * 1000;
+/** Max wait from recording start (safety net; must be > MAX_RECORDING_DURATION_MS + transcript time). */
+const TRANSCRIPT_SAFETY_MS = 600_000;
+/** Wait for transcript after sending commit (stop); long audio needs more time. */
+const TRANSCRIPT_WAIT_AFTER_COMMIT_MS = 20_000;
 const COMMIT_DELAY_AFTER_STOP_MS = 400;
 
 /** Float32 [-1,1] at sourceRate -> Int16 PCM at TARGET_SAMPLE_RATE, then base64. */
@@ -105,8 +109,13 @@ export function VoiceRecorderOverlay({
   const lastTriggerRef = useRef(0);
   const transcriptPartsRef = useRef<string[]>([]);
   const resolveTranscriptRef = useRef<((text: string) => void) | null>(null);
+  const autoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const stopRecording = useCallback(() => {
+    if (autoStopTimerRef.current) {
+      clearTimeout(autoStopTimerRef.current);
+      autoStopTimerRef.current = null;
+    }
     if (mediaRecorderRef.current?.state === "recording") {
       mediaRecorderRef.current.stop();
     }
@@ -155,25 +164,14 @@ export function VoiceRecorderOverlay({
         resolveTranscriptRef.current = resolve;
       });
       let transcriptTimeoutId: ReturnType<typeof setTimeout>;
-      const scheduleResolve = (delayMs: number) => {
-        transcriptTimeoutId = setTimeout(() => {
-          if (resolveTranscriptRef.current) {
-            const fromParts = transcriptPartsRef.current.join(" ").trim();
-            resolveTranscriptRef.current(fromParts);
-            resolveTranscriptRef.current = null;
-          }
-        }, delayMs);
-      };
-      transcriptTimeoutId = setTimeout(() => {
-        if (!resolveTranscriptRef.current) return;
-        if (transcriptPartsRef.current.length > 0) {
-          clearTimeout(transcriptTimeoutId);
-          scheduleResolve(TRANSCRIPT_GRACE_MS);
-        } else {
-          resolveTranscriptRef.current("");
+      const resolveWithCurrentParts = () => {
+        if (resolveTranscriptRef.current) {
+          const fromParts = transcriptPartsRef.current.join(" ").trim();
+          resolveTranscriptRef.current(fromParts);
           resolveTranscriptRef.current = null;
         }
-      }, TRANSCRIPT_WAIT_MS);
+      };
+      transcriptTimeoutId = setTimeout(resolveWithCurrentParts, TRANSCRIPT_SAFETY_MS);
 
       ws.onmessage = (event: MessageEvent<string>) => {
         try {
@@ -248,6 +246,11 @@ export function VoiceRecorderOverlay({
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(buildInputAudioBufferCommit());
         }
+        clearTimeout(transcriptTimeoutId);
+        transcriptTimeoutId = setTimeout(
+          resolveWithCurrentParts,
+          TRANSCRIPT_WAIT_AFTER_COMMIT_MS,
+        );
 
         let finalTranscript = "";
         try {
@@ -305,6 +308,10 @@ export function VoiceRecorderOverlay({
 
       recorder.start(1000);
 
+      autoStopTimerRef.current = setTimeout(() => {
+        stopRecording();
+      }, MAX_RECORDING_DURATION_MS);
+
       const ctx = new AudioContext();
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
@@ -331,7 +338,7 @@ export function VoiceRecorderOverlay({
         err instanceof Error ? err.message : "Microphone access denied or unavailable",
       );
     }
-  }, [onResult, uploadUrl, recognitionLang]);
+  }, [onResult, uploadUrl, recognitionLang, stopRecording]);
 
   const startRecordingRef = useRef(startRecording);
   startRecordingRef.current = startRecording;
