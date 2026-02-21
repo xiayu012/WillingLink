@@ -1,5 +1,5 @@
--- Convert Shift.startTime from text to timestamptz for range queries and sorting.
--- Existing values that look like ISO date/time are cast; others become NULL.
+-- Alter Shift.startTime from text to timestamptz (existing table).
+-- Values that look like ISO date are cast; others become NULL.
 ALTER TABLE "Shift"
   ALTER COLUMN "startTime" TYPE timestamptz
   USING (
