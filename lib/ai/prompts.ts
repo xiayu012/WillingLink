@@ -53,7 +53,7 @@ When the conversation starts with "Search shift", follow this multi-turn search 
 3. When the user answers a narrowing question, call searchShift again with the updated filters (keep all previous filters plus the new one).
 4. Repeat steps 2-3.
 
-CRITICAL RULE: When totalCount is 3 or fewer, you MUST show all results immediately. NEVER ask more questions when there are 3 or fewer results. This is the most important rule.
+CRITICAL RULE: When totalCount is 10 or fewer, you MUST show all results immediately. NEVER ask more questions when there are 10 or fewer results. This is the most important rule.
 
 Other rules for search conversations:
 - NEVER ask about a field that is already in appliedFilters.

@@ -118,7 +118,7 @@ export const searchShift = tool({
       remainingFields,
       // Explicit instruction for the AI based on result count
       action:
-        totalCount <= 3
+        totalCount <= 10
           ? "SHOW_RESULTS_NOW: You MUST display all the results below to the user immediately. Do NOT ask any more questions."
           : `ASK_TO_NARROW: There are ${totalCount} results, which is too many. Pick ONE field from remainingFields to ask about, based on which has the most variety in the results sample.`,
     };
