@@ -154,15 +154,25 @@ type VoiceMessageBubbleProps = {
   src: string;
   durationMs?: number;
   className?: string;
+  autoPlay?: boolean;
 };
 
 function PureVoiceMessageBubble({
   src,
   durationMs = 0,
   className,
+  autoPlay = false,
 }: VoiceMessageBubbleProps) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
+
+  useEffect(() => {
+    if (!autoPlay) return;
+    const audio = audioRef.current;
+    if (audio) {
+      audio.play().catch(() => {});
+    }
+  }, [autoPlay, src]);
 
   const togglePlay = useCallback(() => {
     const audio = audioRef.current;

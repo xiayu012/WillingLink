@@ -203,6 +203,37 @@ const PurePreviewMessage = ({
                   segments.some((s) => s.type === "signUp") &&
                   typeof onSignUpClick === "function";
 
+                const shiftAudioMap = new Map<
+                  string,
+                  { audioUrl: string; durationMs: number }
+                >();
+                for (const p of message.parts ?? []) {
+                  if (p.type !== "tool-searchShift") continue;
+                  const toolPart = p as {
+                    state?: string;
+                    output?: {
+                      results?: Array<{
+                        id: string;
+                        audioUrl?: string | null;
+                        audioDurationMs?: number | null;
+                      }>;
+                    };
+                  };
+                  if (
+                    toolPart.state !== "output-available" ||
+                    !toolPart.output?.results
+                  )
+                    continue;
+                  for (const r of toolPart.output.results) {
+                    if (r.id && r.audioUrl) {
+                      shiftAudioMap.set(r.id, {
+                        audioUrl: r.audioUrl,
+                        durationMs: r.audioDurationMs ?? 0,
+                      });
+                    }
+                  }
+                }
+
                 const audioLinkRegex =
                   /\[(?:Play audio|🔊[^\]]*|Voice[^\]]*)\]\((https?:\/\/[^\s)]+\.(?:webm|mp4|mpeg|ogg|wav)[^\s)]*)\)/gi;
                 const audioUrls: string[] = [];
@@ -224,23 +255,50 @@ const PurePreviewMessage = ({
                             seg.type === "text" ? (
                               <Response key={`t-${i}`}>{seg.value}</Response>
                             ) : (
-                              <button
+                              <span
+                                className="ml-1 inline-flex shrink-0 items-center gap-2"
                                 key={`s-${i}-${seg.shiftId}`}
-                                className="ml-1 inline-flex shrink-0 rounded-md border border-primary bg-primary/10 px-2 py-1 text-primary text-sm transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                onClick={() => onSignUpClick?.(seg.shiftId)}
-                                onKeyDown={(e) => {
-                                  if (
-                                    (e.key === "Enter" || e.key === " ") &&
-                                    !e.defaultPrevented
-                                  ) {
-                                    e.preventDefault();
-                                    onSignUpClick?.(seg.shiftId);
-                                  }
-                                }}
-                                type="button"
                               >
-                                Sign up this one
-                              </button>
+                                {shiftAudioMap.get(seg.shiftId)?.audioUrl && (
+                                  <VoiceMessageBubble
+                                    autoPlay={
+                                      segments.findIndex(
+                                        (s) =>
+                                          s.type === "signUp" &&
+                                          shiftAudioMap.has(s.shiftId)
+                                      ) === i
+                                    }
+                                    className="bg-[#006cff] text-white"
+                                    durationMs={
+                                      shiftAudioMap.get(seg.shiftId)
+                                        ?.durationMs ?? 0
+                                    }
+                                    src={
+                                      shiftAudioMap.get(seg.shiftId)
+                                        ?.audioUrl ?? ""
+                                    }
+                                  />
+                                )}
+                                <button
+                                  className="inline-flex shrink-0 rounded-md border border-primary bg-primary/10 px-2 py-1 text-primary text-sm transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                  onClick={() =>
+                                    onSignUpClick?.(seg.shiftId)
+                                  }
+                                  onKeyDown={(e) => {
+                                    if (
+                                      (e.key === "Enter" ||
+                                        e.key === " ") &&
+                                      !e.defaultPrevented
+                                    ) {
+                                      e.preventDefault();
+                                      onSignUpClick?.(seg.shiftId);
+                                    }
+                                  }}
+                                  type="button"
+                                >
+                                  Sign up this one
+                                </button>
+                              </span>
                             )
                           )}
                         </span>

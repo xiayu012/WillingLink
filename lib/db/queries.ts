@@ -628,7 +628,7 @@ export async function searchShifts({
     const rows = await client`
       SELECT
         "id", "whattodo", "startTime", "location", "skillsNeeded",
-        "whoIsBeingHelped", "laborCredits", "rawMessage", "audioUrl", "createdAt",
+        "whoIsBeingHelped", "laborCredits", "rawMessage", "audioUrl", "audioDurationMs", "createdAt",
         embedding <=> ${vectorStr}::vector AS distance,
         COUNT(*) OVER() AS total_count
       FROM "Shift"
@@ -656,6 +656,7 @@ export async function searchShifts({
       laborCredits: row.laborCredits as string | null,
       rawMessage: row.rawMessage as string,
       audioUrl: row.audioUrl as string | null,
+      audioDurationMs: row.audioDurationMs as number | null,
       createdAt: row.createdAt as Date,
       distance: Number(row.distance),
     }));
