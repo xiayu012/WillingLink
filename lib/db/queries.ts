@@ -722,3 +722,34 @@ export async function saveShift({
   }
 }
 
+export async function updateShiftSignUp({
+  shiftId,
+  signUpUserName,
+  signUpAudioUrl,
+  signUpAudioDurationMs,
+  signUpAudioMimeType,
+  signUpAudioSizeBytes,
+}: {
+  shiftId: string;
+  signUpUserName: string;
+  signUpAudioUrl: string;
+  signUpAudioDurationMs?: number | null;
+  signUpAudioMimeType?: string | null;
+  signUpAudioSizeBytes?: number | null;
+}) {
+  const [updated] = await db
+    .update(shift)
+    .set({
+      signUpUserName,
+      signUpAudioUrl,
+      signUpAudioDurationMs: signUpAudioDurationMs ?? null,
+      signUpAudioMimeType: signUpAudioMimeType ?? null,
+      signUpAudioSizeBytes: signUpAudioSizeBytes ?? null,
+      signUpCreatedAt: new Date(),
+    })
+    .where(eq(shift.id, shiftId))
+    .returning({ id: shift.id });
+
+  return updated ?? null;
+}
+

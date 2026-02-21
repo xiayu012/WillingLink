@@ -28,6 +28,28 @@ import { AudioPlayer, VoiceMessageBubble } from "./audio-player";
 const AUDIO_META_REGEX =
   /\[AUDIO_META:\s*url=([^\s\]]+)\s+duration=(\d+)\s+mime=[^\s\]]+\s+size=\d+\]/i;
 
+const SIGN_UP_PLACEHOLDER_REGEX = /\[__SIGN_UP__:id=([^\]]+)\]/g;
+
+type SignUpSegment = { type: "text"; value: string } | { type: "signUp"; shiftId: string };
+
+function parseAssistantTextWithSignUpButtons(raw: string): SignUpSegment[] {
+  const segments: SignUpSegment[] = [];
+  let lastEnd = 0;
+  for (const match of raw.matchAll(SIGN_UP_PLACEHOLDER_REGEX)) {
+    const textPart = raw.slice(lastEnd, match.index);
+    if (textPart.length > 0) {
+      segments.push({ type: "text", value: textPart });
+    }
+    segments.push({ type: "signUp", shiftId: match[1] ?? "" });
+    lastEnd = (match.index ?? 0) + (match[0]?.length ?? 0);
+  }
+  const tail = raw.slice(lastEnd);
+  if (tail.length > 0) {
+    segments.push({ type: "text", value: tail });
+  }
+  return segments.length > 0 ? segments : [{ type: "text", value: raw }];
+}
+
 function parseUserTextWithAudio(
   raw: string,
 ): { text: string; audioUrl: string | null; durationMs: number } {
@@ -54,6 +76,7 @@ const PurePreviewMessage = ({
   regenerate,
   isReadonly,
   requiresScrollPadding: _requiresScrollPadding,
+  onSignUpClick,
 }: {
   addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
   chatId: string;
@@ -64,6 +87,7 @@ const PurePreviewMessage = ({
   regenerate: UseChatHelpers<ChatMessage>["regenerate"];
   isReadonly: boolean;
   requiresScrollPadding: boolean;
+  onSignUpClick?: (shiftId: string) => void;
 }) => {
   const [mode, setMode] = useState<"view" | "edit">("view");
 
@@ -174,6 +198,11 @@ const PurePreviewMessage = ({
                 }
 
                 const text = sanitizeText(rawText);
+                const segments = parseAssistantTextWithSignUpButtons(text);
+                const hasSignUpButtons =
+                  segments.some((s) => s.type === "signUp") &&
+                  typeof onSignUpClick === "function";
+
                 const audioLinkRegex =
                   /\[(?:Play audio|🔊[^\]]*|Voice[^\]]*)\]\((https?:\/\/[^\s)]+\.(?:webm|mp4|mpeg|ogg|wav)[^\s)]*)\)/gi;
                 const audioUrls: string[] = [];
@@ -189,7 +218,35 @@ const PurePreviewMessage = ({
                       className="bg-transparent px-0 py-0 text-left"
                       data-testid="message-content"
                     >
-                      <Response>{text}</Response>
+                      {hasSignUpButtons ? (
+                        <span className="contents">
+                          {segments.map((seg, i) =>
+                            seg.type === "text" ? (
+                              <Response key={`t-${i}`}>{seg.value}</Response>
+                            ) : (
+                              <button
+                                key={`s-${i}-${seg.shiftId}`}
+                                className="ml-1 inline-flex shrink-0 rounded-md border border-primary bg-primary/10 px-2 py-1 text-primary text-sm transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                onClick={() => onSignUpClick?.(seg.shiftId)}
+                                onKeyDown={(e) => {
+                                  if (
+                                    (e.key === "Enter" || e.key === " ") &&
+                                    !e.defaultPrevented
+                                  ) {
+                                    e.preventDefault();
+                                    onSignUpClick?.(seg.shiftId);
+                                  }
+                                }}
+                                type="button"
+                              >
+                                Sign up this one
+                              </button>
+                            )
+                          )}
+                        </span>
+                      ) : (
+                        <Response>{text}</Response>
+                      )}
                     </MessageContent>
                     {audioUrls.length > 0 && (
                       <div className="mt-2 flex flex-col gap-1">
@@ -430,7 +487,8 @@ export const PreviewMessage = memo(
       prevProps.message.id === nextProps.message.id &&
       prevProps.requiresScrollPadding === nextProps.requiresScrollPadding &&
       equal(prevProps.message.parts, nextProps.message.parts) &&
-      equal(prevProps.vote, nextProps.vote)
+      equal(prevProps.vote, nextProps.vote) &&
+      prevProps.onSignUpClick === nextProps.onSignUpClick
     ) {
       return true;
     }

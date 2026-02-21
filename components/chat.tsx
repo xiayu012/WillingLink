@@ -3,7 +3,7 @@
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import useSWR, { useSWRConfig } from "swr";
 import { unstable_serialize } from "swr/infinite";
 import { ChatHeader } from "@/components/chat-header";
@@ -31,6 +31,10 @@ import { MultimodalInput } from "./multimodal-input";
 import { getChatHistoryPaginationKey } from "./sidebar-history";
 import { toast } from "./toast";
 import type { VisibilityType } from "./visibility-selector";
+import {
+  type VoiceRecordResult,
+  VoiceRecorderOverlay,
+} from "./voice-recorder-overlay";
 
 export function Chat({
   id,
@@ -150,12 +154,87 @@ export function Chat({
     },
   });
 
+  const [pendingSignUp, setPendingSignUp] = useState<{
+    shiftId: string;
+  } | null>(null);
+  const [signUpRecorder, setSignUpRecorder] = useState<{
+    shiftId: string;
+    userName: string;
+  } | null>(null);
+  const [signUpRecorderTrigger, setSignUpRecorderTrigger] = useState(0);
+
+  const onSignUpClick = useCallback(
+    (shiftId: string) => {
+      setPendingSignUp({ shiftId });
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: generateUUID(),
+          role: "assistant",
+          parts: [{ type: "text", text: "What's your name?" }],
+        } as ChatMessage,
+      ]);
+    },
+    [setMessages]
+  );
+
+  const onSignUpNameSubmit = useCallback(
+    (shiftId: string, userName: string) => {
+      setSignUpRecorder({ shiftId, userName });
+      setSignUpRecorderTrigger((t) => t + 1);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: generateUUID(),
+          role: "user",
+          parts: [{ type: "text", text: userName }],
+        } as ChatMessage,
+      ]);
+      setPendingSignUp(null);
+    },
+    [setMessages]
+  );
+
+  const handleSignUpRecordResult = useCallback(
+    async (data: VoiceRecordResult) => {
+      if (!signUpRecorder) return;
+      const { shiftId, userName } = signUpRecorder;
+      try {
+        const res = await fetch(`/api/shifts/${shiftId}/sign-up`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: userName,
+            audioUrl: data.audioUrl,
+            audioDurationMs: data.durationMs,
+            audioMimeType: data.mimeType,
+            audioSizeBytes: data.sizeBytes,
+          }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error((err as { error?: string }).error ?? "Update failed");
+        }
+        setSignUpRecorder(null);
+        toast({ type: "success", description: "Sign-up recorded." });
+      } catch (err) {
+        toast({
+          type: "error",
+          description:
+            err instanceof Error ? err.message : "Failed to save sign-up",
+        });
+      }
+    },
+    [signUpRecorder]
+  );
+
   // Post shift 成功后 5 秒自动返回首页（只保留一个定时器，避免触发多次）
   useEffect(() => {
     const hasCreateShiftSuccess = messages.some((m) =>
       m.parts?.some(
         (p) =>
-          p.type === "tool-createShift" &&
+          "type" in p &&
+          (p as { type: string }).type === "tool-createShift" &&
           (p as { output?: { success?: boolean } }).output?.success
       )
     );
@@ -202,6 +281,14 @@ export function Chat({
 
   return (
     <>
+      {signUpRecorder && (
+        <VoiceRecorderOverlay
+          onResult={handleSignUpRecordResult}
+          recordingTitle={`Please say "${signUpRecorder.userName}" sign up`}
+          startTrigger={signUpRecorderTrigger}
+          uploadingText="Uploading..."
+        />
+      )}
       <div className="overscroll-behavior-contain flex h-dvh min-w-0 touch-pan-y flex-col bg-background">
         <ChatHeader
           chatId={id}
@@ -215,6 +302,7 @@ export function Chat({
           isArtifactVisible={isArtifactVisible}
           isReadonly={isReadonly}
           messages={messages}
+          onSignUpClick={onSignUpClick}
           regenerate={regenerate}
           selectedModelId={initialChatModel}
           setMessages={setMessages}
@@ -230,6 +318,8 @@ export function Chat({
               input={input}
               messages={messages}
               onModelChange={setCurrentModelId}
+              onSignUpNameSubmit={onSignUpNameSubmit}
+              pendingSignUp={pendingSignUp}
               selectedModelId={currentModelId}
               selectedVisibilityType={visibilityType}
               sendMessage={sendMessage}

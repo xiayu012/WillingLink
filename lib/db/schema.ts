@@ -184,6 +184,12 @@ export const shift = pgTable("Shift", {
   audioMimeType: text("audioMimeType"),
   audioSizeBytes: integer("audioSizeBytes"),
   createdAt: timestamp("createdAt").notNull(),
+  signUpUserName: text("signUpUserName"),
+  signUpAudioUrl: text("signUpAudioUrl"),
+  signUpAudioDurationMs: integer("signUpAudioDurationMs"),
+  signUpAudioMimeType: text("signUpAudioMimeType"),
+  signUpAudioSizeBytes: integer("signUpAudioSizeBytes"),
+  signUpCreatedAt: timestamp("signUpCreatedAt", { withTimezone: true }),
 });
 
 export type Shift = InferSelectModel<typeof shift>;

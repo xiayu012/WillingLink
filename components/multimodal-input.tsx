@@ -82,6 +82,8 @@ function PureMultimodalInput({
   selectedVisibilityType,
   selectedModelId,
   onModelChange,
+  pendingSignUp,
+  onSignUpNameSubmit,
 }: {
   chatId: string;
   input: string;
@@ -97,7 +99,10 @@ function PureMultimodalInput({
   selectedVisibilityType: VisibilityType;
   selectedModelId: string;
   onModelChange?: (modelId: string) => void;
+  pendingSignUp?: { shiftId: string } | null;
+  onSignUpNameSubmit?: (shiftId: string, userName: string) => void;
 }) {
+  const effectivePendingSignUp = pendingSignUp ?? null;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { width } = useWindowSize();
 
@@ -401,9 +406,24 @@ function PureMultimodalInput({
           event.preventDefault();
           if (status !== "ready") {
             toast.error("Please wait for the model to finish its response!");
-          } else {
-            submitForm();
+            return;
           }
+          if (
+            effectivePendingSignUp &&
+            input.trim() &&
+            typeof onSignUpNameSubmit === "function"
+          ) {
+            onSignUpNameSubmit(effectivePendingSignUp.shiftId, input.trim());
+            setAttachments([]);
+            setLocalStorageInput("");
+            setInput("");
+            resetHeight();
+            if (width && width > 768) {
+              textareaRef.current?.focus();
+            }
+            return;
+          }
+          submitForm();
         }}
       >
         {showPostShiftRecorder && (
@@ -520,6 +540,12 @@ export const MultimodalInput = memo(
       return false;
     }
     if (prevProps.messages.length !== nextProps.messages.length) {
+      return false;
+    }
+    if (prevProps.pendingSignUp !== nextProps.pendingSignUp) {
+      return false;
+    }
+    if (prevProps.onSignUpNameSubmit !== nextProps.onSignUpNameSubmit) {
       return false;
     }
 
