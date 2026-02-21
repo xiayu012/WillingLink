@@ -66,7 +66,14 @@ function PureMessages({
               isReadonly={isReadonly}
               key={message.id}
               message={message}
-              onSignUpClick={onSignUpClick}
+              onSignUpClick={
+                onSignUpClick
+                  ? (shiftId) => {
+                      scrollToBottom("smooth");
+                      onSignUpClick(shiftId);
+                    }
+                  : undefined
+              }
               regenerate={regenerate}
               requiresScrollPadding={
                 hasSentMessage && index === messages.length - 1
