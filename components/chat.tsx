@@ -150,6 +150,24 @@ export function Chat({
     },
   });
 
+  // Post shift 成功后 5 秒自动返回首页
+  useEffect(() => {
+    const hasCreateShiftSuccess = messages.some((m) =>
+      m.parts?.some(
+        (p) =>
+          p.type === "tool-createShift" &&
+          (p as { output?: { success?: boolean } }).output?.success
+      )
+    );
+    if (hasCreateShiftSuccess) {
+      setTimeout(() => {
+        sessionStorage.setItem("skipInputAutoFocus", "1");
+        router.replace("/");
+        router.refresh();
+      }, 5000);
+    }
+  }, [messages, router]);
+
   const searchParams = useSearchParams();
   const query = searchParams.get("query");
 
