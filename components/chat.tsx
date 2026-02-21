@@ -150,7 +150,7 @@ export function Chat({
     },
   });
 
-  // Post shift 成功后 5 秒自动返回首页
+  // Post shift 成功后 5 秒自动返回首页（只保留一个定时器，避免触发多次）
   useEffect(() => {
     const hasCreateShiftSuccess = messages.some((m) =>
       m.parts?.some(
@@ -159,13 +159,13 @@ export function Chat({
           (p as { output?: { success?: boolean } }).output?.success
       )
     );
-    if (hasCreateShiftSuccess) {
-      setTimeout(() => {
-        sessionStorage.setItem("skipInputAutoFocus", "1");
-        router.replace("/");
-        router.refresh();
-      }, 5000);
-    }
+    if (!hasCreateShiftSuccess) return;
+    const t = setTimeout(() => {
+      sessionStorage.setItem("skipInputAutoFocus", "1");
+      router.replace("/");
+      router.refresh();
+    }, 5000);
+    return () => clearTimeout(t);
   }, [messages, router]);
 
   const searchParams = useSearchParams();
