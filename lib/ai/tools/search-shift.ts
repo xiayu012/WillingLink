@@ -27,10 +27,18 @@ export const searchShift = tool({
       .string()
       .optional()
       .describe("Filter: what work to do (only if user specified)"),
-    startTime: z
+    startDateFrom: z
       .string()
       .optional()
-      .describe("Filter: when the shift starts (only if user specified)"),
+      .describe(
+        "Filter: start of date/time range in ISO 8601 (Virginia). Use when user says e.g. 明天, 后天, 这周."
+      ),
+    startDateTo: z
+      .string()
+      .optional()
+      .describe(
+        "Filter: end of date/time range in ISO 8601 (Virginia). Use with startDateFrom for a day or range."
+      ),
     location: z
       .string()
       .optional()
@@ -51,33 +59,37 @@ export const searchShift = tool({
   execute: async ({
     query,
     whattodo,
-    startTime,
+    startDateFrom,
+    startDateTo,
     location,
     skillsNeeded,
     whoIsBeingHelped,
     laborCredits,
   }) => {
-    // Generate embedding for the search query
     const { embedding: queryEmbedding } = await embed({
       model: getEmbeddingModel(),
       value: query,
     });
 
-    // Search the database
     const { totalCount, results } = await searchShifts({
       queryEmbedding,
       whattodo,
-      startTime,
+      startDateFrom: startDateFrom ?? null,
+      startDateTo: startDateTo ?? null,
       location,
       skillsNeeded,
       whoIsBeingHelped,
       laborCredits,
     });
 
-    // Build appliedFilters and remainingFields
+    const startTimeFilter =
+      [startDateFrom, startDateTo].filter(Boolean).length > 0
+        ? [startDateFrom, startDateTo].filter(Boolean).join(" → ")
+        : undefined;
+
     const filters: Record<string, string | undefined> = {
       whattodo,
-      startTime,
+      startTime: startTimeFilter,
       location,
       skillsNeeded,
       whoIsBeingHelped,

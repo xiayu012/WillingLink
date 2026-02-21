@@ -605,7 +605,8 @@ export async function getStreamIdsByChatId({ chatId }: { chatId: string }) {
 export async function searchShifts({
   queryEmbedding,
   whattodo,
-  startTime,
+  startDateFrom,
+  startDateTo,
   location,
   skillsNeeded,
   whoIsBeingHelped,
@@ -613,7 +614,8 @@ export async function searchShifts({
 }: {
   queryEmbedding: number[];
   whattodo?: string | null;
-  startTime?: string | null;
+  startDateFrom?: string | null;
+  startDateTo?: string | null;
   location?: string | null;
   skillsNeeded?: string | null;
   whoIsBeingHelped?: string | null;
@@ -622,8 +624,7 @@ export async function searchShifts({
   try {
     const vectorStr = `[${queryEmbedding.join(",")}]`;
 
-    // Use raw SQL for pgvector similarity search + ILIKE filters
-    // COUNT(*) OVER() gives total matching rows without a second query
+    // Use raw SQL for pgvector similarity search + filters. startTime uses range (timestamptz), no ILIKE.
     const rows = await client`
       SELECT
         "id", "whattodo", "startTime", "location", "skillsNeeded",
@@ -634,7 +635,8 @@ export async function searchShifts({
       WHERE "embedding" IS NOT NULL
         AND (${whattodo ?? null}::text IS NULL OR "whattodo" ILIKE '%' || ${whattodo ?? null} || '%')
         AND (${location ?? null}::text IS NULL OR "location" ILIKE '%' || ${location ?? null} || '%')
-        AND (${startTime ?? null}::text IS NULL OR "startTime" ILIKE '%' || ${startTime ?? null} || '%')
+        AND "startTime" >= COALESCE(${startDateFrom ?? null}::timestamptz, '-infinity'::timestamptz)
+        AND "startTime" <= COALESCE(${startDateTo ?? null}::timestamptz, 'infinity'::timestamptz)
         AND (${skillsNeeded ?? null}::text IS NULL OR "skillsNeeded" ILIKE '%' || ${skillsNeeded ?? null} || '%')
         AND (${whoIsBeingHelped ?? null}::text IS NULL OR "whoIsBeingHelped" ILIKE '%' || ${whoIsBeingHelped ?? null} || '%')
         AND (${laborCredits ?? null}::text IS NULL OR "laborCredits" ILIKE '%' || ${laborCredits ?? null} || '%')
@@ -647,7 +649,7 @@ export async function searchShifts({
     const results = rows.map((row) => ({
       id: row.id as string,
       whattodo: row.whattodo as string | null,
-      startTime: row.startTime as string | null,
+      startTime: row.startTime as Date | null,
       location: row.location as string | null,
       skillsNeeded: row.skillsNeeded as string | null,
       whoIsBeingHelped: row.whoIsBeingHelped as string | null,
@@ -682,7 +684,7 @@ export async function saveShift({
 }: {
   id: string;
   whattodo: string | null;
-  startTime: string | null;
+  startTime: string | Date | null;
   location: string | null;
   skillsNeeded: string | null;
   whoIsBeingHelped: string | null;
@@ -690,16 +692,14 @@ export async function saveShift({
   rawMessage: string;
   embedding?: number[];
   audioUrl?: string | null;
-  audioDurationMs?: number | null;
   audioMimeType?: string | null;
   audioSizeBytes?: number | null;
 }) {
   try {
-    // Insert the shift record via Drizzle
     await db.insert(shift).values({
       id,
       whattodo,
-      startTime,
+      startTime: startTime ?? null,
       location,
       skillsNeeded,
       whoIsBeingHelped,

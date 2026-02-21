@@ -15,7 +15,9 @@ export const createShift = tool({
     startTime: z
       .string()
       .optional()
-      .describe("When the shift starts, e.g. 'tomorrow 9am', 'Monday 2pm'"),
+      .describe(
+        "When the shift starts: ISO 8601 datetime in Virginia (America/New_York), e.g. 2026-02-21T09:00:00-05:00. Convert relative phrases like 'tomorrow 9am', '后天上午' to this format."
+      ),
     location: z
       .string()
       .optional()
@@ -79,10 +81,18 @@ export const createShift = tool({
       console.error("Failed to generate embedding for shift:", err);
     }
 
+    const startTimeValue =
+      startTime === undefined || startTime === ""
+        ? null
+        : (() => {
+            const d = new Date(startTime);
+            return Number.isNaN(d.getTime()) ? null : d;
+          })();
+
     await saveShift({
       id,
       whattodo: whattodo ?? null,
-      startTime: startTime ?? null,
+      startTime: startTimeValue,
       location: location ?? null,
       skillsNeeded: skillsNeeded ?? null,
       whoIsBeingHelped: whoIsBeingHelped ?? null,

@@ -173,7 +173,7 @@ export type Stream = InferSelectModel<typeof stream>;
 export const shift = pgTable("Shift", {
   id: uuid("id").primaryKey().notNull().defaultRandom(),
   whattodo: text("whattodo"),
-  startTime: text("startTime"),
+  startTime: timestamp("startTime", { withTimezone: true }),
   location: text("location"),
   skillsNeeded: text("skillsNeeded"),
   whoIsBeingHelped: text("whoIsBeingHelped"),
