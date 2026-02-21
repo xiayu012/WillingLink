@@ -199,6 +199,25 @@ export function Chat({
     async (data: VoiceRecordResult) => {
       if (!signUpRecorder) return;
       const { shiftId, userName } = signUpRecorder;
+
+      const transcript = (data.transcript ?? "").trim().toLowerCase();
+      const transcriptNorm = transcript.replace(/\s+/g, " ");
+      const nameNorm = userName.trim().toLowerCase().replace(/\s+/g, " ");
+      const nameNoSpaces = nameNorm.replace(/\s/g, "");
+      const hasName =
+        nameNorm.length > 0 &&
+        (transcriptNorm.includes(nameNorm) ||
+          (nameNoSpaces.length > 0 && transcriptNorm.includes(nameNoSpaces)));
+      const hasSignUp = transcript.includes("sign up");
+      if (!transcript || !hasName || !hasSignUp) {
+        toast({
+          type: "error",
+          description: "error: Please say your name",
+        });
+        setSignUpRecorderTrigger((t) => t + 1);
+        return;
+      }
+
       try {
         const res = await fetch(`/api/shifts/${shiftId}/sign-up`, {
           method: "PATCH",
