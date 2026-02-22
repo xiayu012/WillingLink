@@ -37,7 +37,9 @@ function PureChatHeader({
           <span className="sr-only">Back to home</span>
         </span>
       </Button>
-      <SidebarToggle />
+      <span className="hidden" data-dev-only="sidebar-toggle">
+        <SidebarToggle />
+      </span>
 
       {!isReadonly && (
         <VisibilitySelector

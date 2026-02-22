@@ -68,4 +68,8 @@ pnpm db:migrate # Setup database or apply latest database changes
 pnpm dev
 ```
 
-Your app template should now be running on [localhost:3000](http://localhost:3000). F12 document.querySelector('[data-dev-only="model-selector"]').style.display = 'block'
+Your app template should now be running on [localhost:3000](http://localhost:3000).
+
+ F12  ：
+-  ：`document.querySelector('[data-dev-only="model-selector"]').style.display = 'block'`
+-   Toggle Sidebar：`document.querySelector('[data-dev-only="sidebar-toggle"]').style.display = 'block'`
