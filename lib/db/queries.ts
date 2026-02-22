@@ -9,6 +9,7 @@ import {
   gt,
   gte,
   inArray,
+  isNotNull,
   lt,
   type SQL,
 } from "drizzle-orm";
@@ -752,5 +753,42 @@ export async function updateShiftSignUp({
     .returning({ id: shift.id });
 
   return updated ?? null;
+}
+
+export type ShiftExportRow = {
+  whattodo: string | null;
+  startTime: Date | null;
+  location: string | null;
+  skillsNeeded: string | null;
+  whoIsBeingHelped: string | null;
+  laborCredits: string | null;
+  audioUrl: string | null;
+  createdAt: Date;
+  signUpUserName: string | null;
+  signUpAudioUrl: string | null;
+  signUpCreatedAt: Date | null;
+};
+
+export async function getShiftsForExport(): Promise<ShiftExportRow[]> {
+  const rows = await db
+    .select({
+      whattodo: shift.whattodo,
+      startTime: shift.startTime,
+      location: shift.location,
+      skillsNeeded: shift.skillsNeeded,
+      whoIsBeingHelped: shift.whoIsBeingHelped,
+      laborCredits: shift.laborCredits,
+      audioUrl: shift.audioUrl,
+      createdAt: shift.createdAt,
+      signUpUserName: shift.signUpUserName,
+      signUpAudioUrl: shift.signUpAudioUrl,
+      signUpCreatedAt: shift.signUpCreatedAt,
+    })
+    .from(shift)
+    .where(
+      and(isNotNull(shift.audioUrl), isNotNull(shift.signUpAudioUrl))
+    )
+    .orderBy(desc(shift.createdAt));
+  return rows;
 }
 

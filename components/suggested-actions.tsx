@@ -72,6 +72,25 @@ function PureSuggestedActions({
             ].join(" ")}
             variant="ghost"
             onClick={() => {
+              if (action.label === "Download labor records of Twin Oaks") {
+                fetch("/api/shifts/export")
+                  .then((res) => {
+                    if (!res.ok) throw new Error("Export failed");
+                    return res.blob();
+                  })
+                  .then((blob) => {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = "labor-records-twin-oaks.csv";
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  })
+                  .catch(() => {
+                    // Silent fail in PWA; user can retry
+                  });
+                return;
+              }
               window.history.pushState({}, "", `/chat/${chatId}`);
               setMessages([
                 {
