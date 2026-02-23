@@ -104,6 +104,9 @@ function PureSuggestedActions({
                   parts: [{ type: "text", text: action.response }],
                 },
               ]);
+              if (action.label === "Feedback to WillingLink") {
+                sessionStorage.setItem("feedbackChatId", chatId);
+              }
               if (action.label === "Post shift") {
                 onVoiceAction?.("post");
               }

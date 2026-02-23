@@ -76,13 +76,62 @@ export async function POST(request: Request) {
   }
 
   try {
-    const { id, message, messages, selectedChatModel, selectedVisibilityType } =
-      requestBody;
+    const {
+      id,
+      message,
+      messages,
+      selectedChatModel,
+      selectedVisibilityType,
+      feedbackMode,
+    } = requestBody;
 
     const session = await auth();
 
     if (!session?.user) {
       return new ChatSDKError("unauthorized:chat").toResponse();
+    }
+
+    // Feedback mode: send user message to Telegram only, no DB, no LLM
+    if (feedbackMode) {
+      const textParts =
+        message?.parts?.filter(
+          (p: { type?: string; text?: string }) => p.type === "text"
+        ) ?? [];
+      const text = textParts
+        .map((p: { text?: string }) => p.text ?? "")
+        .join("\n")
+        .trim();
+      if (!text) {
+        return new ChatSDKError(
+          "bad_request:api",
+          "Feedback message has no text."
+        ).toResponse();
+      }
+      const { sendFeedbackToTelegram } = await import(
+        "@/lib/feedback/telegram"
+      );
+      try {
+        await sendFeedbackToTelegram(text);
+      } catch (err) {
+        console.error("Feedback Telegram send failed:", err);
+        return new ChatSDKError(
+          "offline:chat",
+          "Failed to send feedback. Please try again."
+        ).toResponse();
+      }
+      const staticReply = "Thanks, we've received your feedback.";
+      const feedbackStream = createUIMessageStream<ChatMessage>({
+        execute: async ({ writer }) => {
+          const partId = generateUUID();
+          writer.write({ type: "text-start", id: partId });
+          writer.write({ type: "text-delta", id: partId, delta: staticReply });
+          writer.write({ type: "text-end", id: partId });
+        },
+        generateId: generateUUID,
+      });
+      return new Response(
+        feedbackStream.pipeThrough(new JsonToSseTransformStream())
+      );
     }
 
     const userType: UserType = session.user.type;

@@ -115,6 +115,9 @@ export function Chat({
       fetch: fetchWithErrorHandlers,
       prepareSendMessagesRequest(request) {
         const lastMessage = request.messages.at(-1);
+        const isFeedbackMode =
+          typeof window !== "undefined" &&
+          sessionStorage.getItem("feedbackChatId") === request.id;
 
         return {
           body: {
@@ -126,6 +129,7 @@ export function Chat({
             messages: request.messages,
             selectedChatModel: currentModelIdRef.current,
             selectedVisibilityType: visibilityType,
+            ...(isFeedbackMode ? { feedbackMode: true } : {}),
             ...request.body,
           },
         };
