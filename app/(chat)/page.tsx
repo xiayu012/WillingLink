@@ -1,4 +1,5 @@
 import { cookies } from "next/headers";
+import Link from "next/link";
 import { Suspense } from "react";
 import { Chat } from "@/components/chat";
 import { DataStreamHandler } from "@/components/data-stream-handler";
@@ -18,35 +19,33 @@ async function NewChatPage() {
   const modelIdFromCookie = cookieStore.get("chat-model");
   const id = generateUUID();
 
-  if (!modelIdFromCookie) {
-    return (
-      <>
+  return (
+    <div className="flex min-h-dvh flex-col">
+      <div className="flex-1">
         <Chat
           autoResume={false}
           id={id}
-          initialChatModel={DEFAULT_CHAT_MODEL}
+          initialChatModel={
+            modelIdFromCookie ? modelIdFromCookie.value : DEFAULT_CHAT_MODEL
+          }
           initialMessages={[]}
           initialVisibilityType="private"
           isReadonly={false}
           key={id}
         />
         <DataStreamHandler />
-      </>
-    );
-  }
-
-  return (
-    <>
-      <Chat
-        autoResume={false}
-        id={id}
-        initialChatModel={modelIdFromCookie.value}
-        initialMessages={[]}
-        initialVisibilityType="private"
-        isReadonly={false}
-        key={id}
-      />
-      <DataStreamHandler />
-    </>
+      </div>
+      <footer className="border-t px-4 py-3 text-center text-xs text-muted-foreground">
+        <span className="mr-2">© {new Date().getFullYear()} WillingLink</span>
+        <Link href="/terms" className="underline hover:text-foreground">
+          Terms and Conditions
+        </Link>
+        <span className="mx-1">·</span>
+        <Link href="/privacy" className="underline hover:text-foreground">
+          Privacy Policy
+        </Link>
+      </footer>
+    </div>
   );
 }
+
