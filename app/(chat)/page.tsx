@@ -1,39 +1,47 @@
-import { cookies } from "next/headers";
+"use client";
+
 import Link from "next/link";
-import { Suspense } from "react";
-import { Chat } from "@/components/chat";
-import { DataStreamHandler } from "@/components/data-stream-handler";
-import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
-import { generateUUID } from "@/lib/utils";
+import { useState } from "react";
 
 export default function Page() {
-  return (
-    <Suspense fallback={<div className="flex h-dvh" />}>
-      <NewChatPage />
-    </Suspense>
-  );
-}
+  const [phone, setPhone] = useState("");
+  const [submitted, setSubmitted] = useState(false);
 
-async function NewChatPage() {
-  const cookieStore = await cookies();
-  const modelIdFromCookie = cookieStore.get("chat-model");
-  const id = generateUUID();
+  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setSubmitted(true);
+    setPhone("");
+  };
 
   return (
     <div className="flex min-h-dvh flex-col">
-      <div className="flex-1">
-        <Chat
-          autoResume={false}
-          id={id}
-          initialChatModel={
-            modelIdFromCookie ? modelIdFromCookie.value : DEFAULT_CHAT_MODEL
-          }
-          initialMessages={[]}
-          initialVisibilityType="private"
-          isReadonly={false}
-          key={id}
-        />
-        <DataStreamHandler />
+      <div className="flex flex-1 flex-col items-center justify-center px-4">
+        <form
+          onSubmit={handleSubmit}
+          className="flex w-full max-w-sm flex-col gap-4"
+        >
+          <label htmlFor="phone" className="text-sm font-medium">
+            电话号码
+          </label>
+          <input
+            id="phone"
+            type="tel"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+            placeholder="请输入您的电话号码"
+            className="rounded border border-input bg-background px-3 py-2 text-sm"
+            required
+          />
+          <button
+            type="submit"
+            className="rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground"
+          >
+            提交
+          </button>
+        </form>
+        {submitted && (
+          <p className="mt-4 text-sm text-muted-foreground">提交成功</p>
+        )}
       </div>
       <footer className="border-t px-4 py-3 text-center text-xs text-muted-foreground">
         <span className="mr-2">© {new Date().getFullYear()} WillingLink</span>
@@ -48,4 +56,3 @@ async function NewChatPage() {
     </div>
   );
 }
-
