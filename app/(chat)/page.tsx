@@ -16,19 +16,24 @@ export default function Page() {
   return (
     <div className="flex min-h-dvh flex-col">
       <div className="flex flex-1 flex-col items-center justify-center px-4">
+        <p className="mb-6 max-w-md text-center text-sm text-muted-foreground">
+          Welcome to WillingLink by FretGone LLC. Please submit your phone
+          number, and I’ll text you to discuss your needs and connect you with
+          suitable landlords.
+        </p>
         <form
           onSubmit={handleSubmit}
           className="flex w-full max-w-sm flex-col gap-4"
         >
           <label htmlFor="phone" className="text-sm font-medium">
-            电话号码
+            Phone number
           </label>
           <input
             id="phone"
             type="tel"
             value={phone}
             onChange={(e) => setPhone(e.target.value)}
-            placeholder="请输入您的电话号码"
+            placeholder="Please enter your phone number"
             className="rounded border border-input bg-background px-3 py-2 text-sm"
             required
           />
@@ -36,11 +41,13 @@ export default function Page() {
             type="submit"
             className="rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground"
           >
-            提交
+            Submit
           </button>
         </form>
         {submitted && (
-          <p className="mt-4 text-sm text-muted-foreground">提交成功</p>
+          <p className="mt-4 text-sm text-muted-foreground">
+            Submitted successfully.
+          </p>
         )}
       </div>
       <footer className="border-t px-4 py-3 text-center text-xs text-muted-foreground">
