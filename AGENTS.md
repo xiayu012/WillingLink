@@ -28,7 +28,19 @@ The app reads `.env.local` (not `.env`). Required variables:
 - `AUTH_SECRET` — session encryption key
 - `POSTGRES_URL` — PostgreSQL connection string
 
-For AI features, `AI_GATEWAY_API_KEY` is needed. For file uploads, `BLOB_READ_WRITE_TOKEN` is needed. Redis (`REDIS_URL`) is optional. See `.env.example` for the full list.
+For AI features, `AI_GATEWAY_API_KEY` is needed. For file uploads, `BLOB_READ_WRITE_TOKEN` is needed. For voice transcription (OpenAI Realtime API), `OPENAI_API_KEY` is needed. Redis (`REDIS_URL`) is optional. See `.env.example` for the full list.
+
+These secrets are injected as environment variables by the Cloud Agent VM. To write them into `.env.local`, run:
+
+```bash
+cat > .env.local << EOF
+AUTH_SECRET=$(openssl rand -base64 32)
+POSTGRES_URL=postgresql://chatuser:chatpass@localhost:5432/chatdb
+AI_GATEWAY_API_KEY=$AI_GATEWAY_API_KEY
+BLOB_READ_WRITE_TOKEN=$BLOB_READ_WRITE_TOKEN
+OPENAI_API_KEY=$OPENAI_API_KEY
+EOF
+```
 
 ### Running the dev server
 
@@ -56,9 +68,18 @@ pnpm test
 
 Note: E2e tests require `AI_GATEWAY_API_KEY` and a working Postgres to be meaningful. Without these, chat-related tests will fail.
 
+### Starting the full dev environment
+
+```bash
+sudo pg_ctlcluster 16 main start   # Start PostgreSQL
+pnpm dev                            # Start Next.js dev server on :3000
+```
+
 ### Key architecture notes
 
 - `proxy.ts` acts as Next.js middleware — handles auth redirects and the `/ping` health check.
+- The homepage (`app/(chat)/page.tsx`) is a phone number collection form, NOT the chat UI. The chat interface lives at `/chat/[id]` routes and is created when a message is sent via `/api/chat`.
 - The `Shift` table uses pgvector embeddings via raw SQL (not Drizzle schema) for semantic search.
 - Redis is used for resumable streams but gracefully degrades when unavailable.
 - The service worker (Serwist) is disabled in development mode.
+- When killing the dev server, always remove `/workspace/.next/dev/lock` before restarting, otherwise Next.js may pick a different port.
