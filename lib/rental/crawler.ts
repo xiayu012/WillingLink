@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { chromium } from "@playwright/test";
 import {
   completeRentalCrawlRun,
   createRentalCrawlRun,
@@ -43,6 +42,38 @@ type DetailData = {
   author: string | null;
 };
 
+type BrowserPage = {
+  goto: (
+    url: string,
+    options?: { waitUntil?: "domcontentloaded"; timeout?: number }
+  ) => Promise<unknown>;
+  evaluate: <T>(callback: () => T) => Promise<T>;
+  close: () => Promise<void>;
+};
+
+type BrowserContext = {
+  newPage: () => Promise<BrowserPage>;
+  close: () => Promise<void>;
+};
+
+type Browser = {
+  newContext: (options: {
+    userAgent: string;
+    locale: string;
+  }) => Promise<BrowserContext>;
+  close: () => Promise<void>;
+};
+
+type ChromiumModule = {
+  chromium: {
+    launch: (options: {
+      headless: boolean;
+      executablePath?: string;
+      args: string[];
+    }) => Promise<Browser>;
+  };
+};
+
 type ListEvalResult = {
   items: ForumListItem[];
   nextPageUrl: string | null;
@@ -63,7 +94,7 @@ function sanitizeContentText(input: string): string {
 }
 
 async function extractListPageData(
-  page: import("@playwright/test").Page
+  page: BrowserPage
 ): Promise<ListEvalResult> {
   const result = await page.evaluate<ListEvalResult>(() => {
     const parseNumber = (value: string): number | null => {
@@ -180,7 +211,7 @@ async function extractListPageData(
 }
 
 async function extractDetailData(
-  page: import("@playwright/test").Page,
+  page: BrowserPage,
   detailUrl: string
 ): Promise<DetailData> {
   await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
@@ -255,9 +286,11 @@ export async function crawlChineseInSfBayRentals() {
     sourceForum: SOURCE_FORUM,
   });
 
-  let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+  let browser: Browser | null = null;
 
   try {
+    const { chromium } = (await import("@playwright/test")) as ChromiumModule;
+
     browser = await chromium.launch({
       headless: true,
       executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
