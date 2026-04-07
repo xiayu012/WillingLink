@@ -15,6 +15,7 @@ const START_URL = "https://www.chineseinsfbay.com/f/page_viewforum/f_5.html";
 const STOP_EXISTING_NORMAL_THRESHOLD = Number(
   process.env.RENTAL_CRAWL_EXISTING_THRESHOLD ?? "1"
 );
+const DEFAULT_CHROME_EXECUTABLE = "/usr/local/bin/google-chrome";
 
 type CrawlStats = {
   pagesCrawled: number;
@@ -69,6 +70,7 @@ type ChromiumModule = {
     launch: (options: {
       headless: boolean;
       executablePath?: string;
+      channel?: "chrome";
       args: string[];
     }) => Promise<Browser>;
   };
@@ -290,10 +292,12 @@ export async function crawlChineseInSfBayRentals() {
 
   try {
     const { chromium } = (await import("@playwright/test")) as ChromiumModule;
+    const executablePath =
+      process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ?? DEFAULT_CHROME_EXECUTABLE;
 
     browser = await chromium.launch({
       headless: true,
-      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
+      executablePath,
       args: ["--disable-dev-shm-usage", "--no-sandbox"],
     });
     const context = await browser.newContext({

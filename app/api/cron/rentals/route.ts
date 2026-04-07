@@ -24,6 +24,16 @@ function hasValidCronSecret(request: Request): boolean {
 }
 
 export async function GET(request: Request) {
+  const originalPostgresUrl = process.env.POSTGRES_URL;
+  if (!originalPostgresUrl) {
+    return NextResponse.json(
+      { ok: false, error: "POSTGRES_URL is not configured" },
+      { status: 500 }
+    );
+  }
+  // Ensure runtime env matches migrate script behavior (.env.local source of truth).
+  process.env.POSTGRES_URL = originalPostgresUrl.replace("postgresql://", "postgres://");
+
   if (!hasValidCronSecret(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
