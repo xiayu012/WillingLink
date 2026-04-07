@@ -16,6 +16,8 @@ const STOP_EXISTING_NORMAL_THRESHOLD = Number(
   process.env.RENTAL_CRAWL_EXISTING_THRESHOLD ?? "1"
 );
 const DEFAULT_CHROME_EXECUTABLE = "/usr/local/bin/google-chrome";
+const LIST_PAGE_MAX_RETRY = 3;
+const DETAIL_PAGE_MAX_RETRY = 2;
 
 type CrawlStats = {
   pagesCrawled: number;
@@ -93,6 +95,42 @@ function createContentHash(input: string): string {
 
 function sanitizeContentText(input: string): string {
   return input.replaceAll(/\s+/g, " ").trim();
+}
+
+function hasValidForumListHtml(html: string): boolean {
+  return /page_viewtopic\/t_\d+\.html/i.test(html);
+}
+
+async function openListPageWithRetries(
+  page: BrowserPage,
+  url: string
+): Promise<void> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= LIST_PAGE_MAX_RETRY; attempt += 1) {
+    try {
+      await page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: 45_000,
+      });
+
+      const html = await page.evaluate(() => document.documentElement.outerHTML);
+      if (!hasValidForumListHtml(html)) {
+        throw new Error("Forum list HTML does not include topic links");
+      }
+
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown list error";
+      lastError = new Error(`List page attempt ${attempt} failed: ${message}`);
+
+      if (attempt < LIST_PAGE_MAX_RETRY) {
+        await sleep(800 * attempt);
+      }
+    }
+  }
+
+  throw lastError ?? new Error("Failed to load forum list page");
 }
 
 async function extractListPageData(
@@ -216,56 +254,78 @@ async function extractDetailData(
   page: BrowserPage,
   detailUrl: string
 ): Promise<DetailData> {
-  await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+  let detail: { contentText: string; author: string | null } | null = null;
+  let lastError: Error | null = null;
 
-  const detail = await page.evaluate(() => {
-    const normalize = (value: string): string =>
-      value.replaceAll(/\s+/g, " ").trim();
+  for (let attempt = 1; attempt <= DETAIL_PAGE_MAX_RETRY; attempt += 1) {
+    try {
+      await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+      detail = await page.evaluate(() => {
+        const normalize = (value: string): string =>
+          value.replaceAll(/\s+/g, " ").trim();
 
-    const selectorCandidates = [
-      "#post_content",
-      ".post_content",
-      ".post-content",
-      ".topic-content",
-      ".message",
-      ".viewtopic",
-      ".entry-content",
-      "td.postbody",
-      "article",
-      "main",
-    ];
+        const selectorCandidates = [
+          "#post_content",
+          ".post_content",
+          ".post-content",
+          ".topic-content",
+          ".message",
+          ".viewtopic",
+          ".entry-content",
+          "td.postbody",
+          "article",
+          "main",
+        ];
 
-    const candidateTexts = selectorCandidates
-      .map((selector) => {
-        const element = document.querySelector<HTMLElement>(selector);
-        if (!element) {
-          return "";
+        const candidateTexts = selectorCandidates
+          .map((selector) => {
+            const element = document.querySelector<HTMLElement>(selector);
+            if (!element) {
+              return "";
+            }
+            return normalize(element.innerText || "");
+          })
+          .filter((value) => value.length > 0);
+
+        let contentText = "";
+        for (const candidate of candidateTexts) {
+          if (candidate.length > contentText.length) {
+            contentText = candidate;
+          }
         }
-        return normalize(element.innerText || "");
-      })
-      .filter((value) => value.length > 0);
 
-    let contentText = "";
-    for (const candidate of candidateTexts) {
-      if (candidate.length > contentText.length) {
-        contentText = candidate;
+        if (contentText.length === 0) {
+          contentText = normalize(document.body.innerText || "");
+        }
+
+        const textForAuthor = normalize(document.body.innerText || "");
+        const authorMatch =
+          textForAuthor.match(/作者[:：]\s*([^\s]+)/i) ??
+          textForAuthor.match(/\bby\s+([^\s]+)/i);
+
+        return {
+          contentText,
+          author: authorMatch?.[1] ?? null,
+        };
+      });
+
+      if (detail.contentText.length === 0) {
+        throw new Error("Empty detail page content");
+      }
+
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown detail error";
+      lastError = new Error(`Detail page attempt ${attempt} failed: ${message}`);
+      if (attempt < DETAIL_PAGE_MAX_RETRY) {
+        await sleep(600 * attempt);
       }
     }
+  }
 
-    if (contentText.length === 0) {
-      contentText = normalize(document.body.innerText || "");
-    }
-
-    const textForAuthor = normalize(document.body.innerText || "");
-    const authorMatch =
-      textForAuthor.match(/作者[:：]\s*([^\s]+)/i) ??
-      textForAuthor.match(/\bby\s+([^\s]+)/i);
-
-    return {
-      contentText,
-      author: authorMatch?.[1] ?? null,
-    };
-  });
+  if (!detail) {
+    throw lastError ?? new Error("Failed to parse detail page");
+  }
 
   return {
     contentText: sanitizeContentText(detail.contentText),
@@ -312,10 +372,7 @@ export async function crawlChineseInSfBayRentals() {
     let encounteredExistingNormalCount = 0;
 
     while (currentListUrl) {
-      await listPage.goto(currentListUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: 45_000,
-      });
+      await openListPageWithRetries(listPage, currentListUrl);
 
       const { items, nextPageUrl } = await extractListPageData(listPage);
       stats.pagesCrawled += 1;
