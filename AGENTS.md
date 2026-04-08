@@ -70,7 +70,7 @@ Note: E2e tests require `AI_GATEWAY_API_KEY` and a working Postgres to be meanin
 
 ### Playwright browser (avoid repeated installs)
 
-This repository defaults Playwright to the system Chrome binary at `/usr/local/bin/google-chrome` for both e2e tests and crawler jobs.
+This repository defaults Playwright e2e tests to the system Chrome binary at `/usr/local/bin/google-chrome`.
 
 - If this path exists, you usually **do not** need `pnpm exec playwright install`.
 - You can override with `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` when needed.
