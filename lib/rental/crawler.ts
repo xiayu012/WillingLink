@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { load } from "cheerio";
 import {
   completeRentalCrawlRun,
+  createRentalCrawlRunPost,
   createRentalCrawlRun,
   createRentalPost,
   failRentalCrawlRun,
   getRentalPostBySourcePostId,
+  hasRentalCrawlRunSeenPost,
   updateRentalPostById,
 } from "@/lib/db/rental-queries";
 import { parsePublishedAtRaw, parseStructuredRentalData } from "./parser";
@@ -13,8 +15,8 @@ import { parsePublishedAtRaw, parseStructuredRentalData } from "./parser";
 const SOURCE_SITE = "chineseinsfbay";
 const SOURCE_FORUM = "f_5";
 const START_URL = "https://www.chineseinsfbay.com/f/page_viewforum/f_5.html";
-const STOP_EXISTING_NORMAL_THRESHOLD = Number(
-  process.env.RENTAL_CRAWL_EXISTING_THRESHOLD ?? "1"
+const STOP_SEEN_POST_THRESHOLD = Number(
+  process.env.RENTAL_CRAWL_SEEN_POST_THRESHOLD ?? "1"
 );
 const SCRAPER_PROVIDER = (process.env.SCRAPER_PROVIDER ?? "none").toLowerCase();
 const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY ?? "";
@@ -380,7 +382,7 @@ export async function crawlChineseInSfBayRentals() {
 
   try {
     let currentListUrl: string | null = START_URL;
-    let encounteredExistingNormalCount = 0;
+    let encounteredSeenPostCount = 0;
 
     while (currentListUrl) {
       const listPage = await openListPageWithRetries(currentListUrl);
@@ -391,27 +393,39 @@ export async function crawlChineseInSfBayRentals() {
       stats.pagesCrawled += 1;
 
       for (const item of items) {
+        const seenInPastRun = await hasRentalCrawlRunSeenPost({
+          postId: item.postId,
+          sourceSite: SOURCE_SITE,
+          sourceForum: SOURCE_FORUM,
+        });
+
+        await createRentalCrawlRunPost({
+          runId,
+          postId: item.postId,
+          isPinned: item.isPinned,
+          createdAt: new Date(),
+        });
+
+        if (seenInPastRun) {
+          encounteredSeenPostCount += 1;
+          stats.skippedCount += 1;
+
+          if (encounteredSeenPostCount >= Math.max(1, STOP_SEEN_POST_THRESHOLD)) {
+            stats.stopReason = "encountered_seen_post_from_previous_runs";
+            currentListUrl = null;
+            break;
+          }
+
+          continue;
+        }
+
+        encounteredSeenPostCount = 0;
+
         const existingPost = await getRentalPostBySourcePostId({
           sourceSite: SOURCE_SITE,
           sourceForum: SOURCE_FORUM,
           postId: item.postId,
         });
-
-        if (existingPost && !item.isPinned) {
-          encounteredExistingNormalCount += 1;
-          stats.skippedCount += 1;
-
-          if (
-            encounteredExistingNormalCount >=
-            Math.max(1, STOP_EXISTING_NORMAL_THRESHOLD)
-          ) {
-            stats.stopReason = "encountered_existing_normal_post";
-            currentListUrl = null;
-            break;
-          }
-        } else {
-          encounteredExistingNormalCount = 0;
-        }
 
         try {
           const detailPage = await openDetailPageWithRetries(item.detailUrl);

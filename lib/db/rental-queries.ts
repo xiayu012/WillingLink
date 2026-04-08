@@ -5,7 +5,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { ChatSDKError } from "@/lib/errors";
 import type { RentalStructuredData } from "@/lib/rental/parser";
-import { rentalCrawlRun, rentalPost } from "./schema";
+import { rentalCrawlRun, rentalCrawlRunPost, rentalPost } from "./schema";
 
 const client = postgres(process.env.POSTGRES_URL!);
 const db = drizzle(client);
@@ -181,6 +181,53 @@ export async function createRentalPost(input: RentalPostUpsertInput) {
     });
   } catch (_error) {
     throw new ChatSDKError("bad_request:database", "Failed to create rental post");
+  }
+}
+
+export async function createRentalCrawlRunPost(params: {
+  runId: string;
+  postId: string;
+  isPinned: boolean;
+  createdAt: Date;
+}) {
+  try {
+    await db.insert(rentalCrawlRunPost).values({
+      runId: params.runId,
+      postId: params.postId,
+      isPinned: params.isPinned,
+      createdAt: params.createdAt,
+    });
+  } catch (_error) {
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to create rental crawl run post"
+    );
+  }
+}
+
+export async function hasRentalCrawlRunSeenPost(params: {
+  postId: string;
+  sourceSite: string;
+  sourceForum: string;
+}) {
+  try {
+    const [seenPost] = await client`
+      SELECT rcrp."id"
+      FROM "RentalCrawlRunPost" rcrp
+      INNER JOIN "RentalCrawlRun" rcr ON rcrp."runId" = rcr."id"
+      WHERE rcr."sourceSite" = ${params.sourceSite}
+        AND rcr."sourceForum" = ${params.sourceForum}
+        AND rcrp."postId" = ${params.postId}
+        AND rcr."status" = 'success'
+      LIMIT 1
+    `;
+
+    return Boolean(seenPost);
+  } catch (_error) {
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to query rental crawl run seen post"
+    );
   }
 }
 
