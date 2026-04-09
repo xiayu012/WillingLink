@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
 import Link from "next/link";
+import { useMemo, useState } from "react";
 
 type GuideStep = {
   id: string;
@@ -54,10 +54,12 @@ function StepCard({
   return (
     <div
       className={`rounded-xl border p-3 transition ${
-        isActive ? "border-blue-500 bg-blue-50 dark:bg-blue-950/30" : "border-border bg-background"
+        isActive
+          ? "border-blue-500 bg-blue-50 dark:bg-blue-950/30"
+          : "border-border bg-background"
       }`}
     >
-      <p className="text-xs text-muted-foreground">Step {index + 1}</p>
+      <p className="text-muted-foreground text-xs">Step {index + 1}</p>
       <p className="font-medium text-sm">{step.title}</p>
       <p className="mt-1 text-muted-foreground text-xs">{step.instruction}</p>
     </div>
@@ -76,10 +78,12 @@ function HighlightBox({
   return (
     <div
       className={`${className} relative rounded-lg border transition ${
-        active ? "border-blue-500 shadow-[0_0_0_3px_rgba(59,130,246,0.25)]" : "border-border"
+        active
+          ? "border-blue-500 shadow-[0_0_0_3px_rgba(59,130,246,0.25)]"
+          : "border-border"
       }`}
     >
-      <div className="absolute -top-3 left-3 rounded bg-blue-600 px-2 py-0.5 text-[10px] text-white">
+      <div className="-top-3 absolute left-3 rounded bg-blue-600 px-2 py-0.5 text-[10px] text-white">
         {label}
       </div>
     </div>
@@ -114,7 +118,12 @@ export default function OpsCopilotDemoPage() {
           <p className="mb-2 font-medium text-sm">操作步骤</p>
           <div className="space-y-2">
             {STEPS.map((item, index) => (
-              <StepCard index={index} isActive={index === stepIndex} key={item.id} step={item} />
+              <StepCard
+                index={index}
+                isActive={index === stepIndex}
+                key={item.id}
+                step={item}
+              />
             ))}
           </div>
 
@@ -135,7 +144,9 @@ export default function OpsCopilotDemoPage() {
             <button
               className="rounded bg-blue-600 px-3 py-2 text-sm text-white disabled:opacity-40"
               disabled={stepIndex === STEPS.length - 1}
-              onClick={() => setStepIndex((prev) => Math.min(STEPS.length - 1, prev + 1))}
+              onClick={() =>
+                setStepIndex((prev) => Math.min(STEPS.length - 1, prev + 1))
+              }
               type="button"
             >
               下一步
