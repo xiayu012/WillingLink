@@ -75,12 +75,12 @@ This repository defaults Playwright e2e tests to the system Chrome binary at `/u
 - If this path exists, you usually **do not** need `pnpm exec playwright install`.
 - You can override with `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` when needed.
 
-### Rental crawler provider fallback (cloud-friendly)
+### Rental crawler runtime
 
-The rental crawler first fetches HTML directly, then falls back to a hosted scraper provider if list/detail HTML is blocked.
+The rental crawler runs through Playwright (headless Chromium) for both forum list pages and detail pages.
 
-- `SCRAPER_PROVIDER`: `none` | `zenrows` | `scrapingbee`
-- `SCRAPER_API_KEY`: provider API key
+- It uses the system Chrome path by default: `/usr/local/bin/google-chrome`.
+- You can override with `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` when needed.
 
 ### Starting the full dev environment
 
