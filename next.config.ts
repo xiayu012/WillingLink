@@ -5,7 +5,6 @@ const nextConfig: NextConfig = {
   typescript: {
     ignoreBuildErrors: true,
   },
-  serverExternalPackages: ["@playwright/test", "playwright", "playwright-core"],
   eslint: {
     ignoreDuringBuilds: true,
   },

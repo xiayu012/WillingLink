@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
+import { load } from "cheerio";
 import {
   completeRentalCrawlRun,
-  createRentalCrawlRun,
   createRentalCrawlRunPost,
+  createRentalCrawlRun,
   createRentalPost,
   failRentalCrawlRun,
   getRentalPostBySourcePostId,
@@ -17,9 +18,13 @@ const START_URL = "https://www.chineseinsfbay.com/f/page_viewforum/f_5.html";
 const STOP_SEEN_POST_THRESHOLD = Number(
   process.env.RENTAL_CRAWL_SEEN_POST_THRESHOLD ?? "1"
 );
-const DEFAULT_CHROME_EXECUTABLE = "/usr/local/bin/google-chrome";
+const SCRAPER_PROVIDER = (process.env.SCRAPER_PROVIDER ?? "none").toLowerCase();
+const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY ?? "";
 const LIST_PAGE_MAX_RETRY = 3;
 const DETAIL_PAGE_MAX_RETRY = 2;
+const REQUEST_TIMEOUT_MS = Number(
+  process.env.RENTAL_CRAWL_REQUEST_TIMEOUT_MS ?? "45000"
+);
 
 type CrawlStats = {
   pagesCrawled: number;
@@ -47,37 +52,11 @@ type DetailData = {
   author: string | null;
 };
 
-type BrowserPage = {
-  goto: (
-    url: string,
-    options?: { waitUntil?: "domcontentloaded"; timeout?: number }
-  ) => Promise<unknown>;
-  evaluate: <T>(callback: () => T) => Promise<T>;
-  close: () => Promise<void>;
-};
+type HtmlFetchSource = "direct" | "provider";
 
-type BrowserContext = {
-  newPage: () => Promise<BrowserPage>;
-  close: () => Promise<void>;
-};
-
-type Browser = {
-  newContext: (options: {
-    userAgent: string;
-    locale: string;
-  }) => Promise<BrowserContext>;
-  close: () => Promise<void>;
-};
-
-type ChromiumModule = {
-  chromium: {
-    launch: (options: {
-      headless: boolean;
-      executablePath?: string;
-      channel?: "chrome";
-      args: string[];
-    }) => Promise<Browser>;
-  };
+type HtmlFetchResult = {
+  source: HtmlFetchSource;
+  html: string;
 };
 
 type ListEvalResult = {
@@ -99,32 +78,107 @@ function sanitizeContentText(input: string): string {
   return input.replaceAll(/\s+/g, " ").trim();
 }
 
+function buildRequestHeaders(): Record<string, string> {
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+  };
+}
+
+async function fetchHtml(url: string): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: buildRequestHeaders(),
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} for ${url}`);
+    }
+
+    return await response.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function buildProviderUrl(targetUrl: string): string | null {
+  if (SCRAPER_PROVIDER === "zenrows") {
+    const url = new URL("https://api.zenrows.com/v1/");
+    url.searchParams.set("url", targetUrl);
+    url.searchParams.set("apikey", SCRAPER_API_KEY);
+    url.searchParams.set("js_render", "true");
+    url.searchParams.set("premium_proxy", "true");
+    return url.toString();
+  }
+
+  if (SCRAPER_PROVIDER === "scrapingbee") {
+    const url = new URL("https://app.scrapingbee.com/api/v1/");
+    url.searchParams.set("api_key", SCRAPER_API_KEY);
+    url.searchParams.set("url", targetUrl);
+    url.searchParams.set("render_js", "true");
+    url.searchParams.set("premium_proxy", "true");
+    url.searchParams.set("country_code", "us");
+    return url.toString();
+  }
+
+  return null;
+}
+
+async function fetchHtmlByProvider(targetUrl: string): Promise<string | null> {
+  if (SCRAPER_PROVIDER === "none") {
+    return null;
+  }
+
+  if (SCRAPER_API_KEY.length === 0) {
+    throw new Error(`SCRAPER_API_KEY is required for provider ${SCRAPER_PROVIDER}`);
+  }
+
+  const providerUrl = buildProviderUrl(targetUrl);
+  if (!providerUrl) {
+    throw new Error(`Unsupported SCRAPER_PROVIDER: ${SCRAPER_PROVIDER}`);
+  }
+
+  return await fetchHtml(providerUrl);
+}
+
 function hasValidForumListHtml(html: string): boolean {
   return /page_viewtopic\/t_\d+\.html/i.test(html);
 }
 
 async function openListPageWithRetries(
-  page: BrowserPage,
   url: string
-): Promise<void> {
+): Promise<HtmlFetchResult> {
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= LIST_PAGE_MAX_RETRY; attempt += 1) {
     try {
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: 45_000,
-      });
-
-      const html = await page.evaluate(() => document.documentElement.outerHTML);
-      if (!hasValidForumListHtml(html)) {
-        throw new Error("Forum list HTML does not include topic links");
+      const directHtml = await fetchHtml(url);
+      if (hasValidForumListHtml(directHtml)) {
+        return { source: "direct", html: directHtml };
       }
 
-      return;
+      const providerHtml = await fetchHtmlByProvider(url);
+      if (providerHtml && hasValidForumListHtml(providerHtml)) {
+        return { source: "provider", html: providerHtml };
+      }
+
+      throw new Error("Forum list HTML does not include topic links");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown list error";
       lastError = new Error(`List page attempt ${attempt} failed: ${message}`);
+
       if (attempt < LIST_PAGE_MAX_RETRY) {
         await sleep(800 * attempt);
       }
@@ -134,184 +188,171 @@ async function openListPageWithRetries(
   throw lastError ?? new Error("Failed to load forum list page");
 }
 
-async function extractListPageData(page: BrowserPage): Promise<ListEvalResult> {
-  const result = await page.evaluate<ListEvalResult>(() => {
-    const parseNumber = (value: string): number | null => {
-      const parsed = Number(value);
-      return Number.isFinite(parsed) ? parsed : null;
-    };
+export function extractListPageData(
+  html: string,
+  baseUrl: string
+): Promise<ListEvalResult> {
+  const $ = load(html);
+  const seenPostIds = new Set<string>();
+  const items: ForumListItem[] = [];
 
-    const extractPostId = (url: string): string | null => {
-      const match = url.match(/\/f\/page_viewtopic\/t_(\d+)\.html/i);
-      return match?.[1] ?? null;
-    };
+  const parseNumber = (value: string): number | null => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
 
-    const findPublishedAt = (rowText: string): string | null => {
-      const normalized = rowText.replaceAll(/\s+/g, " ").trim();
-      const dateMatch = normalized.match(/\b\d{4}-\d{2}-\d{2}\b/);
-      if (dateMatch?.[0]) {
-        return dateMatch[0];
-      }
-      const timeMatch = normalized.match(/\b\d{1,2}:\d{2}\s*[ap]m\b/i);
-      return timeMatch?.[0] ?? null;
-    };
+  const findPublishedAt = (rowText: string): string | null => {
+    const normalized = rowText.replaceAll(/\s+/g, " ").trim();
+    const dateMatch = normalized.match(/\b\d{4}-\d{2}-\d{2}\b/);
+    if (dateMatch?.[0]) {
+      return dateMatch[0];
+    }
+    const timeMatch = normalized.match(/\b\d{1,2}:\d{2}\s*[ap]m\b/i);
+    return timeMatch?.[0] ?? null;
+  };
 
-    const findReplyView = (
-      rowText: string
-    ): { replyCount: number | null; viewCount: number | null } => {
-      const slashMatch = rowText.match(/(\d+)\s*\/\s*(\d+)/);
-      if (slashMatch) {
-        return {
-          replyCount: parseNumber(slashMatch[1]),
-          viewCount: parseNumber(slashMatch[2]),
-        };
-      }
-
-      const numbers = [...rowText.matchAll(/\b\d+\b/g)].map((match) =>
-        Number(match[0])
-      );
-      if (numbers.length < 2) {
-        return { replyCount: null, viewCount: null };
-      }
-
+  const findReplyView = (
+    rowText: string
+  ): { replyCount: number | null; viewCount: number | null } => {
+    const slashMatch = rowText.match(/(\d+)\s*\/\s*(\d+)/);
+    if (slashMatch) {
       return {
-        replyCount: numbers.at(-2) ?? null,
-        viewCount: numbers.at(-1) ?? null,
+        replyCount: parseNumber(slashMatch[1]),
+        viewCount: parseNumber(slashMatch[2]),
       };
-    };
-
-    const anchors = Array.from(
-      document.querySelectorAll<HTMLAnchorElement>('a[href*="/f/page_viewtopic/t_"]')
-    );
-    const seenPostIds = new Set<string>();
-    const items: ForumListItem[] = [];
-
-    for (const anchor of anchors) {
-      const row = anchor.closest("tr");
-      if (!row) {
-        continue;
-      }
-
-      const title = anchor.textContent?.trim() ?? "";
-      if (title.length === 0) {
-        continue;
-      }
-
-      const absoluteUrl = new URL(anchor.href, window.location.origin).toString();
-      const postId = extractPostId(absoluteUrl);
-      if (!postId || seenPostIds.has(postId)) {
-        continue;
-      }
-      seenPostIds.add(postId);
-
-      const rowText = row.textContent?.replaceAll(/\s+/g, " ").trim() ?? "";
-      const publishedAtRaw = findPublishedAt(rowText);
-      const { replyCount, viewCount } = findReplyView(rowText);
-      const authorMatch =
-        rowText.match(/作者[:：]?\s*([^\s]+)/i) ?? rowText.match(/\bby\s+([^\s]+)/i);
-
-      items.push({
-        title,
-        detailUrl: absoluteUrl,
-        postId,
-        author: authorMatch?.[1] ?? null,
-        publishedAtRaw,
-        replyCount,
-        viewCount,
-        isPinned: /置顶|top|sticky/i.test(rowText),
-        rawRowText: rowText,
-      });
     }
 
-    const nextAnchor = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"))
-      .map((anchor) => {
-        const text = anchor.textContent?.trim() ?? "";
-        return { text, href: anchor.getAttribute("href") };
-      })
-      .find((item) => item.text.includes("下一页"));
+    const numbers = [...rowText.matchAll(/\b\d+\b/g)].map((match) =>
+      Number(match[0])
+    );
+    if (numbers.length < 2) {
+      return { replyCount: null, viewCount: null };
+    }
 
-    const nextPageUrl =
-      nextAnchor?.href && nextAnchor.href.length > 0
-        ? new URL(nextAnchor.href, window.location.origin).toString()
-        : null;
+    return {
+      replyCount: numbers.at(-2) ?? null,
+      viewCount: numbers.at(-1) ?? null,
+    };
+  };
 
-    return { items, nextPageUrl };
-  });
+  const topicAnchors = $('a[href*="/f/page_viewtopic/t_"]');
 
-  if (result.items.length === 0) {
+  for (const anchorElement of topicAnchors.toArray()) {
+    const anchor = $(anchorElement);
+    const title = anchor.text().trim();
+    if (title.length === 0) {
+      continue;
+    }
+
+    const href = anchor.attr("href");
+    if (!href) {
+      continue;
+    }
+
+    const detailUrl = new URL(href, baseUrl).toString();
+    const postIdMatch = detailUrl.match(/\/f\/page_viewtopic\/t_(\d+)\.html/i);
+    const postId = postIdMatch?.[1];
+    if (!postId || seenPostIds.has(postId)) {
+      continue;
+    }
+
+    seenPostIds.add(postId);
+    const rowText = sanitizeContentText(
+      anchor.closest("tr").text() || anchor.parent().text() || title
+    );
+    const { replyCount, viewCount } = findReplyView(rowText);
+    const publishedAtRaw = findPublishedAt(rowText);
+    const authorMatch =
+      rowText.match(/作者[:：]?\s*([^\s]+)/i) ??
+      rowText.match(/\bby\s+([^\s]+)/i);
+
+    items.push({
+      title,
+      detailUrl,
+      postId,
+      author: authorMatch?.[1] ?? null,
+      publishedAtRaw,
+      replyCount,
+      viewCount,
+      isPinned: /置顶|top|sticky/i.test(rowText),
+      rawRowText: rowText,
+    });
+  }
+
+  let nextPageUrl: string | null = null;
+  for (const anchorElement of $("a").toArray()) {
+    const anchor = $(anchorElement);
+    const text = anchor.text().trim();
+    if (!text.includes("下一页")) {
+      continue;
+    }
+    const href = anchor.attr("href");
+    if (href) {
+      nextPageUrl = new URL(href, baseUrl).toString();
+    }
+    break;
+  }
+
+  if (items.length === 0) {
     throw new Error("No forum items found on list page. Site may be blocking this runtime.");
   }
 
+  return { items, nextPageUrl };
+}
+
+export function extractDetailData(html: string): DetailData {
+  const $ = load(html);
+  const selectors = [
+    "#post_content",
+    ".post_content",
+    ".post-content",
+    ".topic-content",
+    ".message",
+    ".viewtopic",
+    ".entry-content",
+    "td.postbody",
+    "article",
+    "main",
+  ];
+
+  let contentText = "";
+  for (const selector of selectors) {
+    const text = sanitizeContentText($(selector).text());
+    if (text.length > contentText.length) {
+      contentText = text;
+    }
+  }
+
+  if (contentText.length === 0) {
+    contentText = sanitizeContentText($("body").text());
+  }
+
+  const bodyText = sanitizeContentText($("body").text());
+  const authorMatch =
+    bodyText.match(/作者[:：]\s*([^\s]+)/i) ?? bodyText.match(/\bby\s+([^\s]+)/i);
+
   return {
-    items: result.items,
-    nextPageUrl: result.nextPageUrl,
+    contentText,
+    author: authorMatch?.[1] ?? null,
   };
 }
 
-async function extractDetailData(
-  page: BrowserPage,
-  detailUrl: string
-): Promise<DetailData> {
-  let detail: { contentText: string; author: string | null } | null = null;
+async function openDetailPageWithRetries(url: string): Promise<HtmlFetchResult> {
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= DETAIL_PAGE_MAX_RETRY; attempt += 1) {
     try {
-      await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
-      detail = await page.evaluate(() => {
-        const normalize = (value: string): string =>
-          value.replaceAll(/\s+/g, " ").trim();
-
-        const selectorCandidates = [
-          "#post_content",
-          ".post_content",
-          ".post-content",
-          ".topic-content",
-          ".message",
-          ".viewtopic",
-          ".entry-content",
-          "td.postbody",
-          "article",
-          "main",
-        ];
-
-        const candidateTexts = selectorCandidates
-          .map((selector) => {
-            const element = document.querySelector<HTMLElement>(selector);
-            if (!element) {
-              return "";
-            }
-            return normalize(element.innerText || "");
-          })
-          .filter((value) => value.length > 0);
-
-        let contentText = "";
-        for (const candidate of candidateTexts) {
-          if (candidate.length > contentText.length) {
-            contentText = candidate;
-          }
-        }
-
-        if (contentText.length === 0) {
-          contentText = normalize(document.body.innerText || "");
-        }
-
-        const textForAuthor = normalize(document.body.innerText || "");
-        const authorMatch =
-          textForAuthor.match(/作者[:：]\s*([^\s]+)/i) ??
-          textForAuthor.match(/\bby\s+([^\s]+)/i);
-
-        return {
-          contentText,
-          author: authorMatch?.[1] ?? null,
-        };
-      });
-
-      if (detail.contentText.length === 0) {
-        throw new Error("Empty detail page content");
+      const directHtml = await fetchHtml(url);
+      if (extractDetailData(directHtml).contentText.length > 0) {
+        return { source: "direct", html: directHtml };
       }
 
-      break;
+      const providerHtml = await fetchHtmlByProvider(url);
+      if (providerHtml && extractDetailData(providerHtml).contentText.length > 0) {
+        return { source: "provider", html: providerHtml };
+      }
+
+      throw new Error("Empty detail page content");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown detail error";
       lastError = new Error(`Detail page attempt ${attempt} failed: ${message}`);
@@ -321,14 +362,7 @@ async function extractDetailData(
     }
   }
 
-  if (!detail) {
-    throw lastError ?? new Error("Failed to parse detail page");
-  }
-
-  return {
-    contentText: sanitizeContentText(detail.contentText),
-    author: detail.author,
-  };
+  throw lastError ?? new Error("Failed to parse detail page");
 }
 
 export async function crawlChineseInSfBayRentals() {
@@ -346,32 +380,16 @@ export async function crawlChineseInSfBayRentals() {
     sourceForum: SOURCE_FORUM,
   });
 
-  let browser: Browser | null = null;
-
   try {
-    const { chromium } = (await import("@playwright/test")) as ChromiumModule;
-    const executablePath =
-      process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ?? DEFAULT_CHROME_EXECUTABLE;
-
-    browser = await chromium.launch({
-      headless: true,
-      executablePath,
-      args: ["--disable-dev-shm-usage", "--no-sandbox"],
-    });
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      locale: "zh-CN",
-    });
-    const listPage = await context.newPage();
-    const detailPage = await context.newPage();
-
     let currentListUrl: string | null = START_URL;
     let encounteredSeenPostCount = 0;
 
     while (currentListUrl) {
-      await openListPageWithRetries(listPage, currentListUrl);
-      const { items, nextPageUrl } = await extractListPageData(listPage);
+      const listPage = await openListPageWithRetries(currentListUrl);
+      const { items, nextPageUrl } = await extractListPageData(
+        listPage.html,
+        currentListUrl
+      );
       stats.pagesCrawled += 1;
 
       for (const item of items) {
@@ -410,7 +428,8 @@ export async function crawlChineseInSfBayRentals() {
         });
 
         try {
-          const detail = await extractDetailData(detailPage, item.detailUrl);
+          const detailPage = await openDetailPageWithRetries(item.detailUrl);
+          const detail = extractDetailData(detailPage.html);
           const mergedContent = `${item.title}\n${detail.contentText}`;
           const contentHash = createContentHash(mergedContent);
           const seenAt = new Date();
@@ -433,6 +452,7 @@ export async function crawlChineseInSfBayRentals() {
             detail: {
               author: detail.author,
               contentTextLength: detail.contentText.length,
+              source: detailPage.source,
             },
           };
 
@@ -503,10 +523,6 @@ export async function crawlChineseInSfBayRentals() {
       await sleep(1_200 + Math.floor(Math.random() * 500));
     }
 
-    await detailPage.close();
-    await listPage.close();
-    await context.close();
-
     await completeRentalCrawlRun({
       runId,
       pagesCrawled: stats.pagesCrawled,
@@ -534,9 +550,5 @@ export async function crawlChineseInSfBayRentals() {
       errorMessage,
     });
     throw error;
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
   }
 }
