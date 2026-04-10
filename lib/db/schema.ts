@@ -267,22 +267,3 @@ export const rentalCrawlRun = pgTable("RentalCrawlRun", {
 });
 
 export type RentalCrawlRun = InferSelectModel<typeof rentalCrawlRun>;
-
-export const rentalCrawlRunPost = pgTable(
-  "RentalCrawlRunPost",
-  {
-    id: uuid("id").primaryKey().notNull().defaultRandom(),
-    runId: uuid("runId").notNull(),
-    postId: text("postId").notNull(),
-    isPinned: boolean("isPinned").notNull().default(false),
-    createdAt: timestamp("createdAt").notNull(),
-  },
-  (table) => ({
-    runPostUnique: uniqueIndex("RentalCrawlRunPost_run_post_unique").on(
-      table.runId,
-      table.postId
-    ),
-  })
-);
-
-export type RentalCrawlRunPost = InferSelectModel<typeof rentalCrawlRunPost>;
