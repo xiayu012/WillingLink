@@ -9,9 +9,6 @@ type GuideStep = {
   instruction: string;
   targetLabel: string;
   suggestion: string;
-  clickHook: string;
-  clickReason: string;
-  ctaText: string;
 };
 
 const STEPS: GuideStep[] = [
@@ -21,9 +18,6 @@ const STEPS: GuideStep[] = [
     instruction: "请点击左侧平台菜单中的「Create Post」。",
     targetLabel: "Create Post 按钮",
     suggestion: "先用品牌名+活动词做开场，提升首屏识别。",
-    clickHook: "这里是起点：点它，你就进入“可发布”状态。",
-    clickReason: "用户第一眼只认动作入口，先点能降低决策负担。",
-    ctaText: "我已准备好，点击 Create Post",
   },
   {
     id: "fill-title",
@@ -31,9 +25,6 @@ const STEPS: GuideStep[] = [
     instruction: "将 AI 建议标题复制到标题输入框，再按你的语气微调。",
     targetLabel: "Title 输入框",
     suggestion: "标题建议：湾区租房避坑清单：3步找到靠谱房东",
-    clickHook: "标题区是抓眼球的关键位，先点它再写更顺手。",
-    clickReason: "先占住标题输入焦点，能显著提高继续编辑意愿。",
-    ctaText: "点标题框，先占住注意力",
   },
   {
     id: "fill-caption",
@@ -41,9 +32,6 @@ const STEPS: GuideStep[] = [
     instruction: "把正文模板粘贴后，补充你这次活动的具体时间与利益点。",
     targetLabel: "Caption 文本框",
     suggestion: "正文建议：先说痛点，再给方法，最后加明确 CTA。",
-    clickHook: "这是说服区：点进去，你的内容价值才会被看见。",
-    clickReason: "正文一旦开始输入，用户通常会继续完成而不是退出。",
-    ctaText: "点击正文框，开始转化表达",
   },
   {
     id: "review-and-publish",
@@ -51,9 +39,6 @@ const STEPS: GuideStep[] = [
     instruction: "确认账号、分组和可见性后，手动点击发布按钮。",
     targetLabel: "Publish 按钮",
     suggestion: "发布前检查：手机号/链接/时间是否准确。",
-    clickHook: "最后一击：现在点击，才会真正产生结果。",
-    clickReason: "明确的“发布动作”是完成闭环的心理触发点。",
-    ctaText: "确认无误后，手动点击 Publish",
   },
 ];
 
@@ -107,7 +92,6 @@ function HighlightBox({
 
 export default function OpsCopilotDemoPage() {
   const [stepIndex, setStepIndex] = useState(0);
-  const [confirmed, setConfirmed] = useState<string[]>([]);
 
   const step = STEPS[stepIndex];
 
@@ -148,30 +132,6 @@ export default function OpsCopilotDemoPage() {
             <p className="mt-1 text-sm">{titleSuggestion}</p>
           </div>
 
-          <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-3 dark:border-blue-900 dark:bg-blue-950/30">
-            <p className="font-medium text-blue-700 text-sm dark:text-blue-300">
-              点击引导词
-            </p>
-            <p className="mt-1 text-sm">{step.clickHook}</p>
-            <p className="mt-2 text-muted-foreground text-xs">
-              {step.clickReason}
-            </p>
-            <button
-              className="mt-3 w-full rounded bg-blue-600 px-3 py-2 text-sm text-white"
-              onClick={() =>
-                setConfirmed((prev) =>
-                  prev.includes(step.id) ? prev : [...prev, step.id]
-                )
-              }
-              type="button"
-            >
-              {step.ctaText}
-            </button>
-            <p className="mt-2 text-muted-foreground text-xs">
-              已确认步骤：{confirmed.length}/{STEPS.length}
-            </p>
-          </div>
-
           <div className="mt-4 flex gap-2">
             <button
               className="rounded border px-3 py-2 text-sm disabled:opacity-40"
@@ -196,9 +156,6 @@ export default function OpsCopilotDemoPage() {
 
         <main className="rounded-2xl border bg-background p-4">
           <p className="mb-3 font-medium text-sm">模拟平台发布界面</p>
-          <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-amber-800 text-xs dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-            请先看蓝色高亮目标，再读左侧“点击引导词”，最后手动执行点击。
-          </div>
           <div className="grid gap-3 md:grid-cols-[220px_1fr]">
             <div className="space-y-3">
               <HighlightBox
