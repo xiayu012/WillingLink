@@ -12,8 +12,6 @@ config({
 
 /* Use process.env.PORT by default and fallback to port 3000 */
 const PORT = process.env.PORT || 3000;
-const CHROME_EXECUTABLE_PATH =
-  process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/local/bin/google-chrome";
 
 /**
  * Set webServer.url and use.baseURL with the location
@@ -40,9 +38,6 @@ export default defineConfig({
   use: {
     /* Base URL to use in actions like `await page.goto('/')`. */
     baseURL,
-    launchOptions: {
-      executablePath: CHROME_EXECUTABLE_PATH,
-    },
 
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: "retain-on-failure",

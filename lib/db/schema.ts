@@ -8,7 +8,6 @@ import {
   primaryKey,
   text,
   timestamp,
-  uniqueIndex,
   uuid,
   varchar,
 } from "drizzle-orm/pg-core";
@@ -207,63 +206,3 @@ export const searchAudio = pgTable("SearchAudio", {
 });
 
 export type SearchAudio = InferSelectModel<typeof searchAudio>;
-
-export const rentalPost = pgTable(
-  "RentalPost",
-  {
-    id: uuid("id").primaryKey().notNull().defaultRandom(),
-    sourceSite: text("sourceSite").notNull(),
-    sourceForum: text("sourceForum").notNull(),
-    postId: text("postId").notNull(),
-    detailUrl: text("detailUrl").notNull(),
-    title: text("title").notNull(),
-    author: text("author"),
-    publishedAt: timestamp("publishedAt", { withTimezone: true }),
-    publishedAtRaw: text("publishedAtRaw"),
-    replyCount: integer("replyCount"),
-    viewCount: integer("viewCount"),
-    isPinned: boolean("isPinned").notNull().default(false),
-    contentText: text("contentText").notNull(),
-    contactRaw: text("contactRaw"),
-    priceRaw: text("priceRaw"),
-    locationRaw: text("locationRaw"),
-    structured: json("structured").notNull(),
-    contentHash: text("contentHash").notNull(),
-    rawJson: json("rawJson").notNull(),
-    firstSeenAt: timestamp("firstSeenAt").notNull(),
-    lastSeenAt: timestamp("lastSeenAt").notNull(),
-    createdAt: timestamp("createdAt").notNull(),
-    updatedAt: timestamp("updatedAt").notNull(),
-  },
-  (table) => ({
-    sourcePostUnique: uniqueIndex("RentalPost_source_post_unique").on(
-      table.sourceSite,
-      table.sourceForum,
-      table.postId
-    ),
-  })
-);
-
-export type RentalPost = InferSelectModel<typeof rentalPost>;
-
-export const rentalCrawlRun = pgTable("RentalCrawlRun", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  sourceSite: text("sourceSite").notNull(),
-  sourceForum: text("sourceForum").notNull(),
-  startedAt: timestamp("startedAt").notNull(),
-  endedAt: timestamp("endedAt"),
-  status: varchar("status", { enum: ["running", "success", "failed"] })
-    .notNull()
-    .default("running"),
-  pagesCrawled: integer("pagesCrawled").notNull().default(0),
-  newCount: integer("newCount").notNull().default(0),
-  updatedCount: integer("updatedCount").notNull().default(0),
-  skippedCount: integer("skippedCount").notNull().default(0),
-  errorCount: integer("errorCount").notNull().default(0),
-  stopReason: text("stopReason"),
-  errorMessage: text("errorMessage"),
-  createdAt: timestamp("createdAt").notNull(),
-  updatedAt: timestamp("updatedAt").notNull(),
-});
-
-export type RentalCrawlRun = InferSelectModel<typeof rentalCrawlRun>;
