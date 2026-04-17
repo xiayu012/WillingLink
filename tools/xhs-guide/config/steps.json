@@ -1,0 +1,80 @@
+{
+  "app": {
+    "id": "title-judge-v1",
+    "urlPattern": "xiaohongshu.com",
+    "loopIntervalMs": 1800
+  },
+  "titleScan": {
+    "selectorCandidates": [
+      "a[href*=\"/explore/\"] [class*=\"title\"]",
+      "section .title span",
+      "a[href*=\"/explore/\"] h3"
+    ],
+    "minTitleLength": 4,
+    "maxTitlesPerRound": 20
+  },
+  "judgement": {
+    "enableLlmReview": false,
+    "llmTimeoutMs": 12000,
+    "maxLlmReviewsPerRound": 4,
+    "llmMinIntervalMs": 700,
+    "minConfidenceToHighlight": 0.6,
+    "rule": {
+      "cityKeywords": [
+        "湾区",
+        "Bay Area",
+        "San Francisco",
+        "San Jose",
+        "Oakland",
+        "Palo Alto",
+        "Fremont",
+        "Santa Clara",
+        "Mountain View",
+        "Sunnyvale",
+        "伯克利",
+        "旧金山",
+        "硅谷"
+      ],
+      "rentKeywords": [
+        "租房",
+        "转租",
+        "求租",
+        "出租",
+        "找室友",
+        "合租",
+        "lease",
+        "sublease",
+        "roommate",
+        "rent",
+        "studio",
+        "1b1b",
+        "2b2b"
+      ]
+    },
+    "llm": {
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "apiKey": "",
+      "model": "gpt-4o-mini"
+    }
+  },
+  "highlight": {
+    "borderColor": "#ff2442",
+    "overlayShadow": "0 0 0 9999px rgba(0, 0, 0, 0.2)",
+    "hintPrefix": "湾区租房相关"
+  },
+  "detailCopy": {
+    "pathKeyword": "/explore/",
+    "contentSelectorCandidates": [
+      "span[data-v-2de80b2e]",
+      "article span[data-v-2de80b2e]",
+      "article [class*=\"content\"] span",
+      "article span"
+    ],
+    "buttonText": "复制正文",
+    "copiedText": "已复制",
+    "copyFailText": "复制失败",
+    "missingText": "未找到正文",
+    "hintText": "点击右下角按钮复制正文",
+    "pollIntervalMs": 1500
+  }
+}
