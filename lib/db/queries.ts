@@ -791,18 +791,45 @@ export async function getShiftsForExport(): Promise<ShiftExportRow[]> {
   return rows;
 }
 
-export async function createXhsRentalListing({
-  pageUrl,
-  rawText,
-}: {
-  pageUrl: string;
+export type CreateXhsRentalListingInput = {
+  sourceUrl: string;
   rawText: string;
-}) {
+  title?: string | null;
+  rent?: string | null;
+  deposit?: string | null;
+  availableFrom?: string | null;
+  leaseEndDate?: string | null;
+  listingType?: string | null;
+  bedrooms?: string | null;
+  bathrooms?: string | null;
+  roomType?: string | null;
+  propertyName?: string | null;
+  locationText?: string | null;
+  furnished?: string | null;
+  contactMethod?: string | null;
+};
+
+export async function createXhsRentalListing(
+  input: CreateXhsRentalListingInput
+) {
   const [row] = await db
     .insert(xhsRentalListing)
     .values({
-      pageUrl,
-      rawText,
+      sourceUrl: input.sourceUrl,
+      rawText: input.rawText,
+      title: input.title ?? null,
+      rent: input.rent ?? null,
+      deposit: input.deposit ?? null,
+      availableFrom: input.availableFrom ?? null,
+      leaseEndDate: input.leaseEndDate ?? null,
+      listingType: input.listingType ?? null,
+      bedrooms: input.bedrooms ?? null,
+      bathrooms: input.bathrooms ?? null,
+      roomType: input.roomType ?? null,
+      propertyName: input.propertyName ?? null,
+      locationText: input.locationText ?? null,
+      furnished: input.furnished ?? null,
+      contactMethod: input.contactMethod ?? null,
       createdAt: new Date(),
     })
     .returning({ id: xhsRentalListing.id });

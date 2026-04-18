@@ -21,7 +21,7 @@
 
 - URL 命中 `detailCopy.pathKeywords` 时进入详情模式。
 - 高亮右下角 `复制正文` 按钮；点击后复制纯正文。
-- 若 `ingest.enable` 为 true 且填了 `ingest.baseUrl`，复制成功后会 `POST /api/xhs/rental-ingest`（无鉴权），Body 为 `{ pageUrl, rawText }`。
+- 若 `ingest.enable` 为 true 且填了 `ingest.baseUrl`，复制成功后会 `POST /api/xhs/rental-ingest`（无鉴权）。Body 至少含 `pageUrl`（或 `sourceUrl`）与 `rawText`；其余租房字段可选，脚本仅**尽力**附带 `title`，其它字段可留空由服务端存 `null`。
 
 ## 数据库（服务端）
 

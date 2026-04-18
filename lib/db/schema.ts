@@ -207,11 +207,24 @@ export const searchAudio = pgTable("SearchAudio", {
 
 export type SearchAudio = InferSelectModel<typeof searchAudio>;
 
-/** 小红书帖子正文（复制按钮上报） */
+/** 小红书租房帖（复制按钮上报 + 可选结构化字段） */
 export const xhsRentalListing = pgTable("XhsRentalListing", {
   id: uuid("id").primaryKey().notNull().defaultRandom(),
-  pageUrl: text("pageUrl").notNull(),
+  sourceUrl: text("sourceUrl").notNull(),
+  title: text("title"),
   rawText: text("rawText").notNull(),
+  rent: text("rent"),
+  deposit: text("deposit"),
+  availableFrom: text("availableFrom"),
+  leaseEndDate: text("leaseEndDate"),
+  listingType: text("listingType"),
+  bedrooms: text("bedrooms"),
+  bathrooms: text("bathrooms"),
+  roomType: text("roomType"),
+  propertyName: text("propertyName"),
+  locationText: text("locationText"),
+  furnished: text("furnished"),
+  contactMethod: text("contactMethod"),
   createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
 });
 

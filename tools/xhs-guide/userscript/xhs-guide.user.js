@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.5.2
+// @version      0.5.3
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -669,6 +669,31 @@
     state.detailCopyButton.style.opacity = disabled ? "0.6" : "1";
   };
 
+  /** 尽力抓取可选字段；抓不到就不放进 payload（不强求） */
+  const gatherOptionalListingFieldsForIngest = () => {
+    const out = {};
+    const titleSelectors = [
+      "#detail-title",
+      ".note-content .title",
+      ".title",
+      "header h1",
+      "h1",
+    ];
+    for (const selector of titleSelectors) {
+      try {
+        const el = document.querySelector(selector);
+        const t = el?.textContent?.replace(/\s+/g, " ")?.trim();
+        if (t && t.length > 0 && t.length < 400) {
+          out.title = t;
+          break;
+        }
+      } catch {
+        /* ignore invalid selector */
+      }
+    }
+    return out;
+  };
+
   const submitIngestAfterCopy = async (config, plainText) => {
     if (!config.ingest?.enable) {
       return;
@@ -678,10 +703,12 @@
       return;
     }
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/rental-ingest`;
-    const body = JSON.stringify({
+    const payload = {
       pageUrl: window.location.href,
       rawText: plainText,
-    });
+      ...gatherOptionalListingFieldsForIngest(),
+    };
+    const body = JSON.stringify(payload);
 
     try {
       const { status, responseText } = await gmHttpPost(url, {
