@@ -206,3 +206,13 @@ export const searchAudio = pgTable("SearchAudio", {
 });
 
 export type SearchAudio = InferSelectModel<typeof searchAudio>;
+
+/** 小红书帖子正文（复制按钮上报） */
+export const xhsRentalListing = pgTable("XhsRentalListing", {
+  id: uuid("id").primaryKey().notNull().defaultRandom(),
+  pageUrl: text("pageUrl").notNull(),
+  rawText: text("rawText").notNull(),
+  createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+});
+
+export type XhsRentalListing = InferSelectModel<typeof xhsRentalListing>;

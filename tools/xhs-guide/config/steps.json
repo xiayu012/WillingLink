@@ -76,5 +76,9 @@
     "missingText": "未找到正文",
     "hintText": "点击右下角按钮复制正文",
     "pollIntervalMs": 1500
+  },
+  "ingest": {
+    "enable": true,
+    "baseUrl": "http://localhost:3000"
   }
 }

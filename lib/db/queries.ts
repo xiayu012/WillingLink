@@ -25,13 +25,14 @@ import {
   type DBMessage,
   document,
   message,
-  shift,
   type Suggestion,
+  shift,
   stream,
   suggestion,
   type User,
   user,
   vote,
+  xhsRentalListing,
 } from "./schema";
 import { generateHashedPassword } from "./utils";
 
@@ -785,10 +786,25 @@ export async function getShiftsForExport(): Promise<ShiftExportRow[]> {
       signUpCreatedAt: shift.signUpCreatedAt,
     })
     .from(shift)
-    .where(
-      and(isNotNull(shift.audioUrl), isNotNull(shift.signUpAudioUrl))
-    )
+    .where(and(isNotNull(shift.audioUrl), isNotNull(shift.signUpAudioUrl)))
     .orderBy(desc(shift.createdAt));
   return rows;
 }
 
+export async function createXhsRentalListing({
+  pageUrl,
+  rawText,
+}: {
+  pageUrl: string;
+  rawText: string;
+}) {
+  const [row] = await db
+    .insert(xhsRentalListing)
+    .values({
+      pageUrl,
+      rawText,
+      createdAt: new Date(),
+    })
+    .returning({ id: xhsRentalListing.id });
+  return row ?? null;
+}

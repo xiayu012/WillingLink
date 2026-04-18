@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.3.0
+// @version      0.5.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -100,6 +100,11 @@
       missingText: "未找到正文",
       hintText: "点击右下角按钮复制正文",
       pollIntervalMs: 1500,
+    },
+    /** 复制成功后 POST 到 Next 项目 /api/xhs/rental-ingest（无鉴权，仅填部署地址） */
+    ingest: {
+      enable: true,
+      baseUrl: "http://localhost:3000",
     },
   };
 
@@ -585,6 +590,40 @@
     state.detailCopyButton.style.opacity = disabled ? "0.6" : "1";
   };
 
+  const submitIngestAfterCopy = async (config, plainText) => {
+    if (!config.ingest?.enable) {
+      return;
+    }
+    const baseUrl = config.ingest.baseUrl?.trim();
+    if (!baseUrl) {
+      return;
+    }
+    const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/rental-ingest`;
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          pageUrl: window.location.href,
+          rawText: plainText,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data?.ok) {
+        logInfo("已写入远程数据库", { id: data.id });
+        return;
+      }
+      logWarn("写入数据库失败", { status: response.status, data });
+    } catch (error) {
+      logWarn(
+        "写入数据库请求异常",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  };
+
   const copyPlainText = async (plainText) => {
     if (typeof GM_setClipboard === "function") {
       GM_setClipboard(plainText);
@@ -630,6 +669,7 @@
       await copyPlainText(plainText);
       setCopyButtonStatus(config.detailCopy.copiedText, false);
       logInfo("正文复制成功", { chars: plainText.length });
+      await submitIngestAfterCopy(config, plainText);
     } catch (error) {
       setCopyButtonStatus(config.detailCopy.copyFailText, false);
       logWarn("正文复制失败", error instanceof Error ? error.message : String(error));
