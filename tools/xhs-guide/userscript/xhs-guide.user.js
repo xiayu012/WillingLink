@@ -1,18 +1,19 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.5.1
+// @version      0.5.2
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
 // @match        https://xiaohongshu.com/*
 // @run-at       document-idle
 // @grant        GM_setClipboard
+// @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
 // @connect      *
 // ==/UserScript==
 
-/* global GM_setClipboard, GM_xmlhttpRequest */
+/* global GM, GM_setClipboard, GM_xmlhttpRequest */
 
 (() => {
   "use strict";
@@ -142,6 +143,53 @@
       return;
     }
     console.warn(`${LOG_PREFIX} ${message}`, extra);
+  };
+
+  /**
+   * Tampermonkey 5+ 使用 GM.xmlHttpRequest（Promise）；旧版为 GM_xmlhttpRequest（回调）。
+   * 二者均在扩展上下文发请求，不触发页面 CORS 预检；若都不可用会退回 fetch（易 CORS）。
+   */
+  const gmHttpPost = (url, headers, bodyString) => {
+    const detail = {
+      method: "POST",
+      url,
+      headers,
+      data: bodyString,
+    };
+
+    if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM.xmlHttpRequest({
+          ...detail,
+          onload: (response) => {
+            resolve({
+              status: response.status,
+              responseText: response.responseText ?? response.response ?? "",
+            });
+          },
+          onerror: () => reject(new Error("GM.xmlHttpRequest onerror")),
+          ontimeout: () => reject(new Error("GM.xmlHttpRequest timeout")),
+        });
+      });
+    }
+
+    if (typeof GM_xmlhttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          ...detail,
+          onload: (response) => {
+            resolve({
+              status: response.status,
+              responseText: response.responseText ?? "",
+            });
+          },
+          onerror: () => reject(new Error("GM_xmlhttpRequest onerror")),
+          ontimeout: () => reject(new Error("GM_xmlhttpRequest timeout")),
+        });
+      });
+    }
+
+    return Promise.reject(new Error("NO_GM_HTTP"));
   };
 
   const isUrlMatched = (appConfig) => window.location.href.includes(appConfig.urlPattern);
@@ -319,10 +367,43 @@
     };
   };
 
-  const requestByGmXmlHttp = (url, payload, apiKey, timeoutMs) =>
-    new Promise((resolve, reject) => {
+  const requestByGmXmlHttp = (url, payload, apiKey, timeoutMs) => {
+    const body = JSON.stringify(payload);
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    };
+
+    if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM.xmlHttpRequest({
+          method: "POST",
+          url,
+          timeout: timeoutMs,
+          headers,
+          data: body,
+          onload: (response) => {
+            if (response.status < 200 || response.status >= 300) {
+              reject(new Error(`LLM 请求失败: ${response.status}`));
+              return;
+            }
+            try {
+              resolve(
+                JSON.parse(response.responseText ?? response.response ?? ""),
+              );
+            } catch {
+              reject(new Error("LLM 响应 JSON 解析失败"));
+            }
+          },
+          onerror: () => reject(new Error("LLM 网络请求错误")),
+          ontimeout: () => reject(new Error("LLM 请求超时")),
+        });
+      });
+    }
+
+    return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== "function") {
-        reject(new Error("GM_xmlhttpRequest 不可用"));
+        reject(new Error("GM网络 API 不可用"));
         return;
       }
 
@@ -330,11 +411,8 @@
         method: "POST",
         url,
         timeout: timeoutMs,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        data: JSON.stringify(payload),
+        headers,
+        data: body,
         onload: (response) => {
           if (response.status < 200 || response.status >= 300) {
             reject(new Error(`LLM 请求失败: ${response.status}`));
@@ -350,6 +428,7 @@
         ontimeout: () => reject(new Error("LLM 请求超时")),
       });
     });
+  };
 
   const parseLlmJudgement = (rawText) => {
     const content = rawText.trim();
@@ -604,63 +683,51 @@
       rawText: plainText,
     });
 
-    /** 用油猴 GM_xmlhttpRequest，不走页面 CORS，可避免 PreflightDisallowedRedirect（常见于 http→https 重定向） */
-    if (typeof GM_xmlhttpRequest === "function") {
-      await new Promise((resolve) => {
-        GM_xmlhttpRequest({
-          method: "POST",
-          url,
-          headers: { "Content-Type": "application/json" },
-          data: body,
-          onload: (response) => {
-            let data = {};
-            try {
-              data = JSON.parse(response.responseText || "{}");
-            } catch {
-              data = {};
-            }
-            if (response.status >= 200 && response.status < 300 && data?.ok) {
-              logInfo("已写入远程数据库", { id: data.id });
-            } else {
-              logWarn("写入数据库失败", {
-                status: response.status,
-                data,
-              });
-            }
-            resolve();
-          },
-          onerror: () => {
-            logWarn("写入数据库请求失败", "GM_xmlhttpRequest error");
-            resolve();
-          },
-          ontimeout: () => {
-            logWarn("写入数据库请求超时", url);
-            resolve();
-          },
-        });
-      });
-      return;
-    }
-
     try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body,
-      });
-      const data = await response.json().catch(() => ({}));
-      if (response.ok && data?.ok) {
-        logInfo("已写入远程数据库", { id: data.id });
+      const { status, responseText } = await gmHttpPost(url, {
+        "Content-Type": "application/json",
+      }, body);
+      let data = {};
+      try {
+        data = JSON.parse(responseText || "{}");
+      } catch {
+        data = {};
+      }
+      if (status >= 200 && status < 300 && data?.ok) {
+        logInfo("已写入远程数据库", { id: data.id, channel: "GM" });
         return;
       }
-      logWarn("写入数据库失败", { status: response.status, data });
-    } catch (error) {
+      logWarn("写入数据库失败", { status, data });
+    } catch (firstError) {
+      const msg =
+        firstError instanceof Error ? firstError.message : String(firstError);
+      if (msg !== "NO_GM_HTTP") {
+        logWarn("写入数据库（GM）异常", msg);
+        return;
+      }
       logWarn(
-        "写入数据库请求异常",
-        error instanceof Error ? error.message : String(error),
-      );
+        "未检测到 GM.xmlHttpRequest / GM_xmlhttpRequest，改用 fetch（会走页面 CORS，易 PreflightDisallowedRedirect）。请确认脚本元数据含 @grant GM.xmlHttpRequest 并已保存、刷新页面。",
+ );
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.ok && data?.ok) {
+          logInfo("已写入远程数据库", { id: data.id, channel: "fetch" });
+          return;
+        }
+        logWarn("写入数据库失败", { status: response.status, data });
+      } catch (error) {
+        logWarn(
+          "写入数据库请求异常",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
     }
   };
 
