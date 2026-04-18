@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.3.0
+// @version      0.4.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -15,8 +15,6 @@
 /* global GM_setClipboard, GM_xmlhttpRequest */
 
 (() => {
-  "use strict";
-
   const LOG_PREFIX = "[xhs-guide]";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
@@ -38,7 +36,7 @@
     },
     judgement: {
       enableLlmReview: false,
-      llmTimeoutMs: 12000,
+      llmTimeoutMs: 12_000,
       maxLlmReviewsPerRound: 4,
       llmMinIntervalMs: 700,
       minConfidenceToHighlight: 0.6,
@@ -88,11 +86,11 @@
     detailCopy: {
       pathKeywords: ["/explore/", "/discovery/item/"],
       contentSelectorCandidates: [
-        'span[data-v-2de80b2e]',
+        "span[data-v-2de80b2e]",
         "span.note-text",
-        'article span[data-v-2de80b2e]',
+        "article span[data-v-2de80b2e]",
         'article [class*="content"] span',
-        'article span',
+        "article span",
       ],
       buttonText: "复制正文",
       copiedText: "已复制",
@@ -101,7 +99,19 @@
       hintText: "点击右下角按钮复制正文",
       pollIntervalMs: 1500,
     },
+    ingest: {
+      enabled: false,
+      endpoint: "http://127.0.0.1:3847/ingest",
+      token: "",
+      timeoutMs: 15_000,
+    },
   };
+
+  const SCRIPT_VERSION = "0.4.0";
+
+  const LLM_JSON_SNIPPET_REGEX = /\{[\s\S]*\}/;
+  const NOTE_URL_EXPLORE_REGEX = /\/explore\/([0-9a-f]{24})\b/i;
+  const NOTE_URL_DISCOVERY_REGEX = /\/discovery\/item\/([0-9a-f]+)/i;
 
   const state = {
     overlayRoot: null,
@@ -139,7 +149,8 @@
     console.warn(`${LOG_PREFIX} ${message}`, extra);
   };
 
-  const isUrlMatched = (appConfig) => window.location.href.includes(appConfig.urlPattern);
+  const isUrlMatched = (appConfig) =>
+    window.location.href.includes(appConfig.urlPattern);
   const isDetailPage = (config) => {
     const pathKeywords = config.detailCopy.pathKeywords || [];
     for (const keyword of pathKeywords) {
@@ -230,7 +241,9 @@
           continue;
         }
 
-        const text = normalizeTitle(element.innerText || element.textContent || "");
+        const text = normalizeTitle(
+          element.innerText || element.textContent || ""
+        );
         if (text.length < config.titleScan.minTitleLength) {
           continue;
         }
@@ -293,10 +306,10 @@
   const ruleScreenStage = (input, config) => {
     const normalizedLower = input.titleText.toLowerCase();
     const cityHit = config.judgement.rule.cityKeywords.find((word) =>
-      normalizedLower.includes(word.toLowerCase()),
+      normalizedLower.includes(word.toLowerCase())
     );
     const rentHit = config.judgement.rule.rentKeywords.find((word) =>
-      normalizedLower.includes(word.toLowerCase()),
+      normalizedLower.includes(word.toLowerCase())
     );
 
     const passed = Boolean(cityHit && rentHit);
@@ -348,14 +361,15 @@
 
   const parseLlmJudgement = (rawText) => {
     const content = rawText.trim();
-    const matched = content.match(/\{[\s\S]*\}/);
+    const matched = content.match(LLM_JSON_SNIPPET_REGEX);
     const jsonText = matched ? matched[0] : content;
     const parsed = JSON.parse(jsonText);
 
     return {
       related: Boolean(parsed.related),
       confidence: clamp(Number(parsed.confidence) || 0.5, 0, 1),
-      reason: typeof parsed.reason === "string" ? parsed.reason : "LLM 未提供原因",
+      reason:
+        typeof parsed.reason === "string" ? parsed.reason : "LLM 未提供原因",
     };
   };
 
@@ -397,7 +411,7 @@
     }
 
     const systemPrompt =
-      "你是帖子分类器。仅判断标题是否与美国湾区租房相关。输出 JSON: {\"related\": boolean, \"confidence\": 0-1, \"reason\": string}";
+      '你是帖子分类器。仅判断标题是否与美国湾区租房相关。输出 JSON: {"related": boolean, "confidence": 0-1, "reason": string}';
     const userPrompt = `标题: ${input.titleText}`;
 
     const payload = {
@@ -414,7 +428,7 @@
       llmConfig.endpoint,
       payload,
       llmConfig.apiKey,
-      config.judgement.llmTimeoutMs,
+      config.judgement.llmTimeoutMs
     );
     state.lastLlmCallAt = now();
     state.llmReviewedInRound += 1;
@@ -432,10 +446,13 @@
 
   const postProcessStage = (ruleResult, llmResult, config) => {
     const finalPass = llmResult.skipped ? ruleResult.passed : llmResult.passed;
-    const confidence = llmResult.skipped ? ruleResult.confidence : llmResult.confidence;
+    const confidence = llmResult.skipped
+      ? ruleResult.confidence
+      : llmResult.confidence;
     return {
       stageName: "postProcessStage",
-      isBayAreaRentingRelated: finalPass && confidence >= config.judgement.minConfidenceToHighlight,
+      isBayAreaRentingRelated:
+        finalPass && confidence >= config.judgement.minConfidenceToHighlight,
       confidence: clamp(confidence, 0, 1),
       reason: llmResult.reason || ruleResult.reason,
     };
@@ -585,6 +602,66 @@
     state.detailCopyButton.style.opacity = disabled ? "0.6" : "1";
   };
 
+  const getPageTitleText = () => {
+    const raw = document.title || "";
+    return raw.replace(/\s+/g, " ").trim();
+  };
+
+  const extractNoteIdFromUrl = (href) => {
+    try {
+      const url = new URL(href);
+      const matchExplore = url.pathname.match(NOTE_URL_EXPLORE_REGEX);
+      if (matchExplore?.[1]) {
+        return matchExplore[1];
+      }
+      const matchDiscovery = url.pathname.match(NOTE_URL_DISCOVERY_REGEX);
+      if (matchDiscovery?.[1]) {
+        return matchDiscovery[1];
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  };
+
+  const postIngestPayload = (url, payload, bearerToken, timeoutMs) =>
+    new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== "function") {
+        reject(new Error("GM_xmlhttpRequest 不可用"));
+        return;
+      }
+
+      const headers = {
+        "Content-Type": "application/json",
+      };
+      const trimmedToken =
+        typeof bearerToken === "string" ? bearerToken.trim() : "";
+      if (trimmedToken.length > 0) {
+        headers.Authorization = `Bearer ${trimmedToken}`;
+      }
+
+      GM_xmlhttpRequest({
+        method: "POST",
+        url,
+        timeout: timeoutMs,
+        headers,
+        data: JSON.stringify(payload),
+        onload: (response) => {
+          if (response.status < 200 || response.status >= 300) {
+            reject(new Error(`入库请求失败: ${response.status}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(response.responseText));
+          } catch {
+            reject(new Error("入库响应 JSON 解析失败"));
+          }
+        },
+        onerror: () => reject(new Error("入库网络请求错误")),
+        ontimeout: () => reject(new Error("入库请求超时")),
+      });
+    });
+
   const copyPlainText = async (plainText) => {
     if (typeof GM_setClipboard === "function") {
       GM_setClipboard(plainText);
@@ -630,9 +707,48 @@
       await copyPlainText(plainText);
       setCopyButtonStatus(config.detailCopy.copiedText, false);
       logInfo("正文复制成功", { chars: plainText.length });
+      if (config.ingest?.enabled) {
+        const ingestEndpoint =
+          typeof config.ingest.endpoint === "string"
+            ? config.ingest.endpoint
+            : "";
+        if (ingestEndpoint.trim()) {
+          const payload = {
+            pageUrl: window.location.href,
+            pageTitle: getPageTitleText(),
+            noteId: extractNoteIdFromUrl(window.location.href),
+            bodyText: plainText,
+            capturedAt: new Date().toISOString(),
+            source: "xhs-guide",
+            scriptVersion: SCRIPT_VERSION,
+            userAgent: navigator.userAgent,
+          };
+          try {
+            const ingestResult = await postIngestPayload(
+              ingestEndpoint.trim(),
+              payload,
+              config.ingest.token,
+              config.ingest.timeoutMs ?? 15_000
+            );
+            logInfo("正文已入库", ingestResult);
+          } catch (ingestError) {
+            logWarn(
+              "正文入库失败（复制仍成功）",
+              ingestError instanceof Error
+                ? ingestError.message
+                : String(ingestError)
+            );
+          }
+        } else {
+          logWarn("入库已开启但未配置 endpoint");
+        }
+      }
     } catch (error) {
       setCopyButtonStatus(config.detailCopy.copyFailText, false);
-      logWarn("正文复制失败", error instanceof Error ? error.message : String(error));
+      logWarn(
+        "正文复制失败",
+        error instanceof Error ? error.message : String(error)
+      );
     }
 
     window.setTimeout(() => {
@@ -663,9 +779,9 @@
     button.style.color = "#ffffff";
     button.style.boxShadow = "0 6px 18px rgba(0, 0, 0, 0.25)";
     button.style.cursor = "pointer";
-    button.addEventListener("click", () => {
-      void handleCopyButtonClick(config);
-    });
+    button.addEventListener("click", () =>
+      handleCopyButtonClick(config).catch(() => null)
+    );
     document.body.append(button);
     state.detailCopyButton = button;
   };
@@ -676,8 +792,8 @@
     }
     state.rafId = requestAnimationFrame(() => {
       state.rafId = 0;
-      const liveMatches = Array.from(state.matchedById.values()).filter((item) =>
-        document.body.contains(item.element),
+      const liveMatches = Array.from(state.matchedById.values()).filter(
+        (item) => document.body.contains(item.element)
       );
       renderHighlightItems(liveMatches, config);
     });
@@ -731,7 +847,10 @@
     state.detailContentElement = findDetailContentElement(config);
     renderDetailHighlight(config);
 
-    if (state.detailContentElement && getPlainText(state.detailContentElement)) {
+    if (
+      state.detailContentElement &&
+      getPlainText(state.detailContentElement)
+    ) {
       setCopyButtonStatus(config.detailCopy.buttonText, false);
       return;
     }
@@ -739,9 +858,7 @@
   };
 
   const setupObservers = (config) => {
-    const triggerAnalyze = () => {
-      void analyzeRound(config);
-    };
+    const triggerAnalyze = () => analyzeRound(config).catch(() => null);
 
     state.scrollHandler = () => {
       scheduleRender(config);
@@ -826,9 +943,9 @@
   const bootTitleMode = (config) => {
     ensureOverlayRoot();
     setupObservers(config);
-    void analyzeRound(config);
+    analyzeRound(config).catch(() => null);
     state.loopTimer = window.setInterval(() => {
-      void analyzeRound(config);
+      analyzeRound(config).catch(() => null);
     }, config.app.loopIntervalMs);
     logInfo("多标题判断高亮已启动", {
       appId: config.app.id,

@@ -47,5 +47,20 @@
         "noSvgWithoutTitle": "off"
       }
     }
-  }
+  },
+  "overrides": [
+    {
+      "includes": ["tools/xhs-guide/userscript/**/*.js"],
+      "javascript": {
+        "globals": ["GM_setClipboard", "GM_xmlhttpRequest"]
+      },
+      "linter": {
+        "rules": {
+          "performance": {
+            "useTopLevelRegex": "off"
+          }
+        }
+      }
+    }
+  ]
 }
