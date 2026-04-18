@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.5.0
+// @version      0.5.1
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -101,10 +101,10 @@
       hintText: "点击右下角按钮复制正文",
       pollIntervalMs: 1500,
     },
-    /** 复制成功后 POST 到 Next 项目 /api/xhs/rental-ingest（无鉴权，仅填部署地址） */
+    /** 复制成功后 POST 到 Next /api/xhs/rental-ingest。请用 https 根地址，避免 http→https 重定向触发 CORS 预检失败 */
     ingest: {
       enable: true,
-      baseUrl: "http://localhost:3000",
+      baseUrl: "https://你的项目.vercel.app",
     },
   };
 
@@ -599,16 +599,56 @@
       return;
     }
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/rental-ingest`;
+    const body = JSON.stringify({
+      pageUrl: window.location.href,
+      rawText: plainText,
+    });
+
+    /** 用油猴 GM_xmlhttpRequest，不走页面 CORS，可避免 PreflightDisallowedRedirect（常见于 http→https 重定向） */
+    if (typeof GM_xmlhttpRequest === "function") {
+      await new Promise((resolve) => {
+        GM_xmlhttpRequest({
+          method: "POST",
+          url,
+          headers: { "Content-Type": "application/json" },
+          data: body,
+          onload: (response) => {
+            let data = {};
+            try {
+              data = JSON.parse(response.responseText || "{}");
+            } catch {
+              data = {};
+            }
+            if (response.status >= 200 && response.status < 300 && data?.ok) {
+              logInfo("已写入远程数据库", { id: data.id });
+            } else {
+              logWarn("写入数据库失败", {
+                status: response.status,
+                data,
+              });
+            }
+            resolve();
+          },
+          onerror: () => {
+            logWarn("写入数据库请求失败", "GM_xmlhttpRequest error");
+            resolve();
+          },
+          ontimeout: () => {
+            logWarn("写入数据库请求超时", url);
+            resolve();
+          },
+        });
+      });
+      return;
+    }
+
     try {
       const response = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          pageUrl: window.location.href,
-          rawText: plainText,
-        }),
+        body,
       });
       const data = await response.json().catch(() => ({}));
       if (response.ok && data?.ok) {
