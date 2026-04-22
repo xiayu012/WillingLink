@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.5.3
+// @version      0.5.4
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -102,6 +102,18 @@
       hintText: "点击右下角按钮复制正文",
       pollIntervalMs: 1500,
     },
+    detailImage: {
+      nextArrowSelectorCandidates: [
+        'button[aria-label*="右"]',
+        'button[aria-label*="下一"]',
+        'button:has(svg)',
+      ],
+      imageSelectorCandidates: [
+        'img[src*="xhscdn.com"]',
+        'img[src*="sns-webpic"]',
+      ],
+      arrowHintText: "请点击官方右箭头切换图片（我会自动收集）",
+    },
     /** 复制成功后 POST 到 Next /api/xhs/rental-ingest。请用 https 根地址，避免 http→https 重定向触发 CORS 预检失败 */
     ingest: {
       enable: true,
@@ -122,6 +134,8 @@
     observer: null,
     detailContentElement: null,
     detailCopyButton: null,
+    detailNextArrowElement: null,
+    detailCollectedImageUrls: new Set(),
     scrollHandler: null,
     resizeHandler: null,
     mode: "idle",
@@ -341,6 +355,82 @@
       }
     }
     return null;
+  };
+
+  const findDetailNextArrowElement = (config) => {
+    for (const selector of config.detailImage.nextArrowSelectorCandidates) {
+      let elements = [];
+      try {
+        elements = Array.from(document.querySelectorAll(selector));
+      } catch {
+        logWarn("右箭头选择器无效", selector);
+      }
+
+      for (const rawElement of elements) {
+        if (!(rawElement instanceof HTMLElement)) {
+          continue;
+        }
+        const rect = rawElement.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+          continue;
+        }
+        if (rect.left < window.innerWidth * 0.55) {
+          continue;
+        }
+        return rawElement;
+      }
+    }
+    return null;
+  };
+
+  const collectCurrentCarouselImageUrls = (config) => {
+    const urls = [];
+    const dedup = new Set();
+    for (const selector of config.detailImage.imageSelectorCandidates) {
+      let elements = [];
+      try {
+        elements = Array.from(document.querySelectorAll(selector));
+      } catch {
+        logWarn("图片选择器无效", selector);
+      }
+
+      for (const rawElement of elements) {
+        if (!(rawElement instanceof HTMLImageElement)) {
+          continue;
+        }
+        const src = (rawElement.currentSrc || rawElement.src || "").trim();
+        if (!src || dedup.has(src)) {
+          continue;
+        }
+        const rect = rawElement.getBoundingClientRect();
+        if (rect.width < 200 || rect.height < 150) {
+          continue;
+        }
+        if (rect.top > window.innerHeight * 0.8) {
+          continue;
+        }
+        dedup.add(src);
+        urls.push(src);
+      }
+    }
+    return urls;
+  };
+
+  const collectDetailImages = (config) => {
+    const currentUrls = collectCurrentCarouselImageUrls(config);
+    let added = 0;
+    for (const url of currentUrls) {
+      if (!state.detailCollectedImageUrls.has(url)) {
+        state.detailCollectedImageUrls.add(url);
+        added += 1;
+      }
+    }
+    if (added > 0) {
+      logInfo("已收集图片", {
+        added,
+        total: state.detailCollectedImageUrls.size,
+      });
+    }
   };
 
   const ruleScreenStage = (input, config) => {
@@ -617,7 +707,7 @@
     const root = ensureOverlayRoot();
     root.replaceChildren();
 
-    const element = state.detailCopyButton;
+    const element = state.detailNextArrowElement || state.detailCopyButton;
     if (!element) {
       return;
     }
@@ -655,7 +745,9 @@
     bubble.style.padding = "4px 8px";
     bubble.style.borderRadius = "6px";
     bubble.style.pointerEvents = "none";
-    bubble.textContent = config.detailCopy.hintText;
+    bubble.textContent = state.detailNextArrowElement
+      ? config.detailImage.arrowHintText
+      : config.detailCopy.hintText;
 
     root.append(box, bubble);
   };
@@ -690,6 +782,10 @@
       } catch {
         /* ignore invalid selector */
       }
+    }
+    const imageUrls = Array.from(state.detailCollectedImageUrls);
+    if (imageUrls.length > 0) {
+      out.imageUrls = imageUrls;
     }
     return out;
   };
@@ -902,7 +998,9 @@
 
   const refreshDetailMode = (config) => {
     ensureDetailCopyButton(config);
+    state.detailNextArrowElement = findDetailNextArrowElement(config);
     state.detailContentElement = findDetailContentElement(config);
+    collectDetailImages(config);
     renderDetailHighlight(config);
 
     if (state.detailContentElement && getPlainText(state.detailContentElement)) {
@@ -992,6 +1090,8 @@
     state.observer = null;
     state.matchedById.clear();
     state.detailContentElement = null;
+    state.detailNextArrowElement = null;
+    state.detailCollectedImageUrls.clear();
     state.mode = "idle";
     removeDetailCopyButton();
     clearOverlay();
@@ -1049,6 +1149,9 @@
         return;
       }
       state.currentUrl = window.location.href;
+      if (state.mode === "detail" && isDetailPage(config)) {
+        state.detailCollectedImageUrls.clear();
+      }
       switchModeByUrl(config);
     }, 500);
 

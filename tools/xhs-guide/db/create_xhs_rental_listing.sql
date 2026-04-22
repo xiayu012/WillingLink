@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS "XhsRentalListing" (
   "sourceUrl" text NOT NULL,
   "title" text,
   "rawText" text NOT NULL,
+  "imageUrls" json,
   "rent" text,
   "deposit" text,
   "availableFrom" text,
@@ -40,6 +41,7 @@ END $$;
 
 -- 旧库：逐列补齐（新库已含下列列时不会报错）
 ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "title" text;
+ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "imageUrls" json;
 ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "rent" text;
 ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "deposit" text;
 ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "availableFrom" text;

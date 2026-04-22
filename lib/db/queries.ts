@@ -794,6 +794,7 @@ export async function getShiftsForExport(): Promise<ShiftExportRow[]> {
 export type CreateXhsRentalListingInput = {
   sourceUrl: string;
   rawText: string;
+  imageUrls?: string[] | null;
   title?: string | null;
   rent?: string | null;
   deposit?: string | null;
@@ -812,11 +813,76 @@ export type CreateXhsRentalListingInput = {
 export async function createXhsRentalListing(
   input: CreateXhsRentalListingInput
 ) {
-  const [row] = await db
+  const mergeImageUrls = (
+    before: string[] | null | undefined,
+    after: string[] | null | undefined
+  ) => {
+    const set = new Set<string>();
+    for (const url of before || []) {
+      const t = url.trim();
+      if (t) set.add(t);
+    }
+    for (const url of after || []) {
+      const t = url.trim();
+      if (t) set.add(t);
+    }
+    return set.size > 0 ? Array.from(set) : null;
+  };
+
+  const [existing] = await db
+    .select({
+      id: xhsRentalListing.id,
+      title: xhsRentalListing.title,
+      imageUrls: xhsRentalListing.imageUrls,
+      rent: xhsRentalListing.rent,
+      deposit: xhsRentalListing.deposit,
+      availableFrom: xhsRentalListing.availableFrom,
+      leaseEndDate: xhsRentalListing.leaseEndDate,
+      listingType: xhsRentalListing.listingType,
+      bedrooms: xhsRentalListing.bedrooms,
+      bathrooms: xhsRentalListing.bathrooms,
+      roomType: xhsRentalListing.roomType,
+      propertyName: xhsRentalListing.propertyName,
+      locationText: xhsRentalListing.locationText,
+      furnished: xhsRentalListing.furnished,
+      contactMethod: xhsRentalListing.contactMethod,
+    })
+    .from(xhsRentalListing)
+    .where(eq(xhsRentalListing.sourceUrl, input.sourceUrl))
+    .orderBy(desc(xhsRentalListing.createdAt))
+    .limit(1);
+
+  if (existing) {
+    const [updated] = await db
+      .update(xhsRentalListing)
+      .set({
+        rawText: input.rawText,
+        imageUrls: mergeImageUrls(existing.imageUrls, input.imageUrls),
+        title: input.title ?? existing.title ?? null,
+        rent: input.rent ?? existing.rent ?? null,
+        deposit: input.deposit ?? existing.deposit ?? null,
+        availableFrom: input.availableFrom ?? existing.availableFrom ?? null,
+        leaseEndDate: input.leaseEndDate ?? existing.leaseEndDate ?? null,
+        listingType: input.listingType ?? existing.listingType ?? null,
+        bedrooms: input.bedrooms ?? existing.bedrooms ?? null,
+        bathrooms: input.bathrooms ?? existing.bathrooms ?? null,
+        roomType: input.roomType ?? existing.roomType ?? null,
+        propertyName: input.propertyName ?? existing.propertyName ?? null,
+        locationText: input.locationText ?? existing.locationText ?? null,
+        furnished: input.furnished ?? existing.furnished ?? null,
+        contactMethod: input.contactMethod ?? existing.contactMethod ?? null,
+      })
+      .where(eq(xhsRentalListing.id, existing.id))
+      .returning({ id: xhsRentalListing.id });
+    return updated ?? null;
+  }
+
+  const [inserted] = await db
     .insert(xhsRentalListing)
     .values({
       sourceUrl: input.sourceUrl,
       rawText: input.rawText,
+      imageUrls: mergeImageUrls(null, input.imageUrls),
       title: input.title ?? null,
       rent: input.rent ?? null,
       deposit: input.deposit ?? null,
@@ -833,5 +899,5 @@ export async function createXhsRentalListing(
       createdAt: new Date(),
     })
     .returning({ id: xhsRentalListing.id });
-  return row ?? null;
+  return inserted ?? null;
 }
