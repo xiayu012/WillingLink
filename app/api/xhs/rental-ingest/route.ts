@@ -22,16 +22,6 @@ function optString(v: unknown): string | null {
   return t.length > 0 ? t : null;
 }
 
-function optStringArray(v: unknown): string[] | null {
-  if (!Array.isArray(v)) {
-    return null;
-  }
-  const values = v
-    .map((item) => (typeof item === "string" ? item.trim() : ""))
-    .filter((item) => item.length > 0);
-  return values.length > 0 ? values : null;
-}
-
 export async function POST(request: Request) {
   let payload: Record<string, unknown>;
   try {
@@ -54,7 +44,6 @@ export async function POST(request: Request) {
   const row = await createXhsRentalListing({
     sourceUrl: sourceUrlRaw,
     rawText,
-    imageUrls: optStringArray(payload.imageUrls),
     title: optString(payload.title),
     rent: optString(payload.rent),
     deposit: optString(payload.deposit),

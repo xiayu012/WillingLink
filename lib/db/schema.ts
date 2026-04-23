@@ -213,7 +213,6 @@ export const xhsRentalListing = pgTable("XhsRentalListing", {
   sourceUrl: text("sourceUrl").notNull(),
   title: text("title"),
   rawText: text("rawText").notNull(),
-  imageUrls: json("imageUrls").$type<string[] | null>(),
   rent: text("rent"),
   deposit: text("deposit"),
   availableFrom: text("availableFrom"),
