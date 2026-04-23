@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.5.3
+// @version      0.5.4
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -100,12 +100,13 @@
       copyFailText: "复制失败",
       missingText: "未找到正文",
       hintText: "点击右下角按钮复制正文",
+      carouselArrowHint: "手动点右侧箭头翻页，每张主图会上传到后端",
       pollIntervalMs: 1500,
     },
     /** 复制成功后 POST 到 Next /api/xhs/rental-ingest。请用 https 根地址，避免 http→https 重定向触发 CORS 预检失败 */
     ingest: {
       enable: true,
-      baseUrl: "https://你的项目.vercel.app",
+      baseUrl: "https://willinglink.vercel.app",
     },
   };
 
@@ -127,6 +128,11 @@
     mode: "idle",
     currentUrl: window.location.href,
     routeTimer: 0,
+    carouselObserver: null,
+    carouselObserveRoot: null,
+    carouselCheckRaf: 0,
+    uploadedCarouselSrcs: new Set(),
+    carouselInFlight: new Set(),
   };
 
   const logInfo = (message, extra) => {
@@ -190,6 +196,117 @@
     }
 
     return Promise.reject(new Error("NO_GM_HTTP"));
+  };
+
+  const gmHttpGetArrayBuffer = (url) => {
+    const detail = {
+      method: "GET",
+      url,
+      responseType: "arraybuffer",
+      headers: { Referer: "https://www.xiaohongshu.com/" },
+    };
+
+    if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM.xmlHttpRequest({
+          ...detail,
+          onload: (response) => {
+            resolve({
+              status: response.status,
+              response: response.response,
+              responseHeaders: response.responseHeaders ?? "",
+            });
+          },
+          onerror: () => reject(new Error("GM.xmlHttpRequest GET onerror")),
+          ontimeout: () => reject(new Error("GM.xmlHttpRequest GET timeout")),
+        });
+      });
+    }
+
+    if (typeof GM_xmlhttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          ...detail,
+          onload: (response) => {
+            resolve({
+              status: response.status,
+              response: response.response,
+              responseHeaders: response.responseHeaders ?? "",
+            });
+          },
+          onerror: () => reject(new Error("GM_xmlhttpRequest GET onerror")),
+          ontimeout: () => reject(new Error("GM_xmlhttpRequest GET timeout")),
+        });
+      });
+    }
+
+    return Promise.reject(new Error("NO_GM_HTTP"));
+  };
+
+  const gmHttpPostFormData = (url, formData) => {
+    const detail = {
+      method: "POST",
+      url,
+      data: formData,
+    };
+
+    if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM.xmlHttpRequest({
+          ...detail,
+          onload: (response) => {
+            resolve({
+              status: response.status,
+              responseText: response.responseText ?? response.response ?? "",
+            });
+          },
+          onerror: () => reject(new Error("GM.xmlHttpRequest Form onerror")),
+          ontimeout: () => reject(new Error("GM.xmlHttpRequest Form timeout")),
+        });
+      });
+    }
+
+    if (typeof GM_xmlhttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          ...detail,
+          onload: (response) => {
+            resolve({
+              status: response.status,
+              responseText: response.responseText ?? "",
+            });
+          },
+          onerror: () => reject(new Error("GM_xmlhttpRequest Form onerror")),
+          ontimeout: () => reject(new Error("GM_xmlhttpRequest Form timeout")),
+        });
+      });
+    }
+
+    return Promise.reject(new Error("NO_GM_HTTP"));
+  };
+
+  const parseContentTypeFromGmHeaders = (headerText) => {
+    if (!headerText) {
+      return "image/jpeg";
+    }
+    const lines = String(headerText).split("\n");
+    for (const line of lines) {
+      const m = line.match(/^content-type:\s*([^;\s]+)/i);
+      if (m?.[1]) {
+        return m[1].trim();
+      }
+    }
+    return "image/jpeg";
+  };
+
+  const extFromMime = (mime) => {
+    if (mime === "image/png") {
+      return "png";
+    }
+    if (mime === "image/webp") {
+      return "webp";
+    }
+    return "jpg";
   };
 
   const isUrlMatched = (appConfig) => window.location.href.includes(appConfig.urlPattern);
@@ -613,15 +730,7 @@
     }
   };
 
-  const renderDetailHighlight = (config) => {
-    const root = ensureOverlayRoot();
-    root.replaceChildren();
-
-    const element = state.detailCopyButton;
-    if (!element) {
-      return;
-    }
-
+  const appendRectHighlight = (root, config, element, bubbleText) => {
     const rect = element.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
       return;
@@ -655,9 +764,227 @@
     bubble.style.padding = "4px 8px";
     bubble.style.borderRadius = "6px";
     bubble.style.pointerEvents = "none";
-    bubble.textContent = config.detailCopy.hintText;
+    bubble.textContent = bubbleText;
 
     root.append(box, bubble);
+  };
+
+  const renderDetailHighlight = (config) => {
+    const root = ensureOverlayRoot();
+    root.replaceChildren();
+
+    if (state.detailCopyButton) {
+      appendRectHighlight(
+        root,
+        config,
+        state.detailCopyButton,
+        config.detailCopy.hintText,
+      );
+    }
+
+    const arrow = document.querySelector(".arrow-controller.right");
+    if (arrow instanceof HTMLElement) {
+      appendRectHighlight(
+        root,
+        config,
+        arrow,
+        config.detailCopy.carouselArrowHint,
+      );
+    }
+  };
+
+  const findCarouselRootFromArrow = (arrow) => {
+    let n = arrow;
+    for (let i = 0; i < 10 && n; i += 1) {
+      n = n.parentElement;
+      if (!n) {
+        break;
+      }
+      if (n.querySelectorAll("img").length >= 1) {
+        return n;
+      }
+    }
+    return arrow.parentElement ?? arrow;
+  };
+
+  const pickMainImgUrl = (carouselRoot) => {
+    if (!carouselRoot) {
+      return null;
+    }
+    const imgs = carouselRoot.querySelectorAll("img");
+    let bestUrl = null;
+    let bestArea = 0;
+    for (const img of imgs) {
+      if (!(img instanceof HTMLImageElement)) {
+        continue;
+      }
+      const url = img.currentSrc || img.src;
+      if (!url || !/^https?:\/\//.test(url)) {
+        continue;
+      }
+      const rect = img.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (area < 400) {
+        continue;
+      }
+      const cs = window.getComputedStyle(img);
+      if (cs.visibility === "hidden" || cs.display === "none") {
+        continue;
+      }
+      const op = Number.parseFloat(cs.opacity || "1");
+      if (op < 0.05) {
+        continue;
+      }
+      if (area > bestArea) {
+        bestArea = area;
+        bestUrl = url;
+      }
+    }
+    return bestUrl;
+  };
+
+  const teardownCarouselCapture = () => {
+    if (state.carouselCheckRaf) {
+      cancelAnimationFrame(state.carouselCheckRaf);
+      state.carouselCheckRaf = 0;
+    }
+    state.carouselObserver?.disconnect();
+    state.carouselObserver = null;
+    state.carouselObserveRoot = null;
+    state.carouselInFlight.clear();
+  };
+
+  const scheduleCarouselCheck = (config) => {
+    if (state.carouselCheckRaf) {
+      cancelAnimationFrame(state.carouselCheckRaf);
+    }
+    state.carouselCheckRaf = requestAnimationFrame(() => {
+      state.carouselCheckRaf = 0;
+      void onCarouselMaybeChanged(config);
+    });
+  };
+
+  const submitAppendListingImage = async (config, imageBlob, filename) => {
+    if (!config.ingest?.enable) {
+      return;
+    }
+    const baseUrl = config.ingest.baseUrl?.trim();
+    if (!baseUrl) {
+      return;
+    }
+    const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/append-listing-image`;
+    const fd = new FormData();
+    fd.append("sourceUrl", window.location.href);
+    fd.append("file", imageBlob, filename);
+
+    try {
+      const { status, responseText } = await gmHttpPostFormData(url, fd);
+      let data = {};
+      try {
+        data = JSON.parse(responseText || "{}");
+      } catch {
+        data = {};
+      }
+      if (status >= 200 && status < 300 && data?.ok) {
+        logInfo("轮播图已上传", {
+          blobUrl: data.url,
+          imageUrlsLength: data.imageUrlsLength,
+        });
+        return;
+      }
+      logWarn("轮播图上传失败", { status, data });
+    } catch (firstError) {
+      const msg =
+        firstError instanceof Error ? firstError.message : String(firstError);
+      if (msg !== "NO_GM_HTTP") {
+        logWarn("轮播图上传（GM）异常", msg);
+        return;
+      }
+      logWarn(
+        "轮播图上传需要 GM.xmlHttpRequest；请确认 @grant 已配置并刷新页面。",
+      );
+    }
+  };
+
+  const onCarouselMaybeChanged = async (config) => {
+    const arrow = document.querySelector(".arrow-controller.right");
+    if (!arrow || !(arrow instanceof HTMLElement)) {
+      teardownCarouselCapture();
+      return;
+    }
+    if (!state.carouselObserveRoot) {
+      ensureCarouselObserver(config);
+      return;
+    }
+    if (!state.carouselObserveRoot.contains(arrow)) {
+      ensureCarouselObserver(config);
+      return;
+    }
+
+    const imgUrl = pickMainImgUrl(state.carouselObserveRoot);
+    if (!imgUrl) {
+      return;
+    }
+    if (state.uploadedCarouselSrcs.has(imgUrl)) {
+      return;
+    }
+    if (state.carouselInFlight.has(imgUrl)) {
+      return;
+    }
+    state.carouselInFlight.add(imgUrl);
+
+    try {
+      const { status, response, responseHeaders } =
+        await gmHttpGetArrayBuffer(imgUrl);
+      if (status < 200 || status >= 300 || !response) {
+        logWarn("拉取主图失败", { status, imgUrl });
+        return;
+      }
+      const mime = parseContentTypeFromGmHeaders(responseHeaders);
+      if (
+        mime !== "image/jpeg" &&
+        mime !== "image/png" &&
+        mime !== "image/webp"
+      ) {
+        logWarn("主图类型不支持上传", { mime, imgUrl });
+        return;
+      }
+      const blob = new Blob([response], { type: mime });
+      const name = `slide.${extFromMime(mime)}`;
+      await submitAppendListingImage(config, blob, name);
+      state.uploadedCarouselSrcs.add(imgUrl);
+    } catch (e) {
+      logWarn(
+        "轮播图处理异常",
+        e instanceof Error ? e.message : String(e),
+      );
+    } finally {
+      state.carouselInFlight.delete(imgUrl);
+    }
+  };
+
+  const ensureCarouselObserver = (config) => {
+    const arrow = document.querySelector(".arrow-controller.right");
+    if (!arrow || !(arrow instanceof HTMLElement)) {
+      teardownCarouselCapture();
+      return;
+    }
+    const root = findCarouselRootFromArrow(arrow);
+    if (state.carouselObserver && state.carouselObserveRoot === root) {
+      scheduleCarouselCheck(config);
+      return;
+    }
+    teardownCarouselCapture();
+    state.carouselObserveRoot = root;
+    state.carouselObserver = new MutationObserver(() => {
+      scheduleCarouselCheck(config);
+    });
+    state.carouselObserver.observe(root, {
+      subtree: true,
+      attributes: true,
+      childList: true,
+    });
+    scheduleCarouselCheck(config);
   };
 
   const setCopyButtonStatus = (text, disabled) => {
@@ -904,6 +1231,7 @@
     ensureDetailCopyButton(config);
     state.detailContentElement = findDetailContentElement(config);
     renderDetailHighlight(config);
+    ensureCarouselObserver(config);
 
     if (state.detailContentElement && getPlainText(state.detailContentElement)) {
       setCopyButtonStatus(config.detailCopy.buttonText, false);
@@ -993,6 +1321,8 @@
     state.matchedById.clear();
     state.detailContentElement = null;
     state.mode = "idle";
+    teardownCarouselCapture();
+    state.uploadedCarouselSrcs.clear();
     removeDetailCopyButton();
     clearOverlay();
   };

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS "XhsRentalListing" (
   "locationText" text,
   "furnished" text,
   "contactMethod" text,
+  "imageUrls" jsonb DEFAULT '[]'::jsonb,
   "createdAt" timestamptz NOT NULL
 );
 
@@ -52,6 +53,7 @@ ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "propertyName" text;
 ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "locationText" text;
 ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "furnished" text;
 ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "contactMethod" text;
+ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "imageUrls" jsonb DEFAULT '[]'::jsonb;
 
 -- 历史遗留 summary 列（若存在可删）
 -- ALTER TABLE "XhsRentalListing" DROP COLUMN IF EXISTS "summary";

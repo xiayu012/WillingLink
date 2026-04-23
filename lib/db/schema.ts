@@ -225,6 +225,8 @@ export const xhsRentalListing = pgTable("XhsRentalListing", {
   locationText: text("locationText"),
   furnished: text("furnished"),
   contactMethod: text("contactMethod"),
+  /** 上传到 Blob 后的公开 URL 列表，与 sourceUrl 同一帖 */
+  imageUrls: json("imageUrls").$type<string[] | null>(),
   createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
 });
 

@@ -835,3 +835,64 @@ export async function createXhsRentalListing(
     .returning({ id: xhsRentalListing.id });
   return row ?? null;
 }
+
+export type AppendXhsListingImageResult = {
+  id: string | null;
+  imageUrlsLength: number;
+  duplicated: boolean;
+};
+
+/** 按 sourceUrl 将 Blob 公开 URL 追加到 imageUrls；无记录则插入最小行 */
+export async function appendXhsListingImageUrl(
+  sourceUrl: string,
+  blobPublicUrl: string
+): Promise<AppendXhsListingImageResult> {
+  const rows = await db
+    .select()
+    .from(xhsRentalListing)
+    .where(eq(xhsRentalListing.sourceUrl, sourceUrl))
+    .limit(1);
+
+  const existing = rows[0];
+  const list: string[] = Array.isArray(existing?.imageUrls)
+    ? [...existing.imageUrls]
+    : [];
+
+  if (list.includes(blobPublicUrl)) {
+    return {
+      id: existing?.id ?? null,
+      imageUrlsLength: list.length,
+      duplicated: true,
+    };
+  }
+
+  list.push(blobPublicUrl);
+
+  if (existing) {
+    await db
+      .update(xhsRentalListing)
+      .set({ imageUrls: list })
+      .where(eq(xhsRentalListing.id, existing.id));
+    return {
+      id: existing.id,
+      imageUrlsLength: list.length,
+      duplicated: false,
+    };
+  }
+
+  const [row] = await db
+    .insert(xhsRentalListing)
+    .values({
+      sourceUrl,
+      rawText: "",
+      imageUrls: list,
+      createdAt: new Date(),
+    })
+    .returning({ id: xhsRentalListing.id });
+
+  return {
+    id: row?.id ?? null,
+    imageUrlsLength: list.length,
+    duplicated: false,
+  };
+}
