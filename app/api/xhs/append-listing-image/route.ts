@@ -81,6 +81,16 @@ export async function POST(request: Request) {
   }
 
   const result = await appendXhsListingImageUrl(sourceUrl, blobUrl);
+  if (!result.listingFound) {
+    return jsonWithCors(
+      {
+        ok: false,
+        error: "Listing not found for sourceUrl; ingest raw text first",
+        code: "LISTING_NOT_FOUND",
+      },
+      409
+    );
+  }
 
   return jsonWithCors({
     ok: true,

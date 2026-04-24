@@ -133,6 +133,7 @@
     carouselCheckRaf: 0,
     uploadedCarouselSrcs: new Set(),
     carouselInFlight: new Set(),
+    detailIngestReady: false,
   };
 
   const logInfo = (message, extra) => {
@@ -307,6 +308,11 @@
       return "webp";
     }
     return "jpg";
+  };
+
+  const getStableSourceUrl = () => {
+    const { origin, pathname } = window.location;
+    return `${origin}${pathname}`;
   };
 
   const isUrlMatched = (appConfig) => window.location.href.includes(appConfig.urlPattern);
@@ -874,7 +880,7 @@
     }
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/append-listing-image`;
     const fd = new FormData();
-    fd.append("sourceUrl", window.location.href);
+    fd.append("sourceUrl", getStableSourceUrl());
     fd.append("file", imageBlob, filename);
 
     try {
@@ -890,19 +896,25 @@
           blobUrl: data.url,
           imageUrlsLength: data.imageUrlsLength,
         });
-        return;
+        return true;
+      }
+      if (status === 409 && data?.code === "LISTING_NOT_FOUND") {
+        logWarn("先点复制正文入库，再翻页上传图片", { sourceUrl: getStableSourceUrl() });
+        return false;
       }
       logWarn("轮播图上传失败", { status, data });
+      return false;
     } catch (firstError) {
       const msg =
         firstError instanceof Error ? firstError.message : String(firstError);
       if (msg !== "NO_GM_HTTP") {
         logWarn("轮播图上传（GM）异常", msg);
-        return;
+        return false;
       }
       logWarn(
         "轮播图上传需要 GM.xmlHttpRequest；请确认 @grant 已配置并刷新页面。",
       );
+      return false;
     }
   };
 
@@ -918,6 +930,9 @@
     }
     if (!state.carouselObserveRoot.contains(arrow)) {
       ensureCarouselObserver(config);
+      return;
+    }
+    if (!state.detailIngestReady) {
       return;
     }
 
@@ -951,8 +966,10 @@
       }
       const blob = new Blob([response], { type: mime });
       const name = `slide.${extFromMime(mime)}`;
-      await submitAppendListingImage(config, blob, name);
-      state.uploadedCarouselSrcs.add(imgUrl);
+      const uploaded = await submitAppendListingImage(config, blob, name);
+      if (uploaded) {
+        state.uploadedCarouselSrcs.add(imgUrl);
+      }
     } catch (e) {
       logWarn(
         "轮播图处理异常",
@@ -1023,15 +1040,15 @@
 
   const submitIngestAfterCopy = async (config, plainText) => {
     if (!config.ingest?.enable) {
-      return;
+      return false;
     }
     const baseUrl = config.ingest.baseUrl?.trim();
     if (!baseUrl) {
-      return;
+      return false;
     }
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/rental-ingest`;
     const payload = {
-      pageUrl: window.location.href,
+      sourceUrl: getStableSourceUrl(),
       rawText: plainText,
       ...gatherOptionalListingFieldsForIngest(),
     };
@@ -1049,7 +1066,7 @@
       }
       if (status >= 200 && status < 300 && data?.ok) {
         logInfo("已写入远程数据库", { id: data.id, channel: "GM" });
-        return;
+        return true;
       }
       logWarn("写入数据库失败", { status, data });
     } catch (firstError) {
@@ -1057,7 +1074,7 @@
         firstError instanceof Error ? firstError.message : String(firstError);
       if (msg !== "NO_GM_HTTP") {
         logWarn("写入数据库（GM）异常", msg);
-        return;
+        return false;
       }
       logWarn(
         "未检测到 GM.xmlHttpRequest / GM_xmlhttpRequest，改用 fetch（会走页面 CORS，易 PreflightDisallowedRedirect）。请确认脚本元数据含 @grant GM.xmlHttpRequest 并已保存、刷新页面。",
@@ -1073,7 +1090,7 @@
         const data = await response.json().catch(() => ({}));
         if (response.ok && data?.ok) {
           logInfo("已写入远程数据库", { id: data.id, channel: "fetch" });
-          return;
+          return true;
         }
         logWarn("写入数据库失败", { status: response.status, data });
       } catch (error) {
@@ -1083,6 +1100,7 @@
         );
       }
     }
+    return false;
   };
 
   const copyPlainText = async (plainText) => {
@@ -1130,7 +1148,7 @@
       await copyPlainText(plainText);
       setCopyButtonStatus(config.detailCopy.copiedText, false);
       logInfo("正文复制成功", { chars: plainText.length });
-      await submitIngestAfterCopy(config, plainText);
+      state.detailIngestReady = await submitIngestAfterCopy(config, plainText);
     } catch (error) {
       setCopyButtonStatus(config.detailCopy.copyFailText, false);
       logWarn("正文复制失败", error instanceof Error ? error.message : String(error));
@@ -1321,6 +1339,7 @@
     state.matchedById.clear();
     state.detailContentElement = null;
     state.mode = "idle";
+    state.detailIngestReady = false;
     teardownCarouselCapture();
     state.uploadedCarouselSrcs.clear();
     removeDetailCopyButton();

@@ -840,9 +840,10 @@ export type AppendXhsListingImageResult = {
   id: string | null;
   imageUrlsLength: number;
   duplicated: boolean;
+  listingFound: boolean;
 };
 
-/** 按 sourceUrl 将 Blob 公开 URL 追加到 imageUrls；无记录则插入最小行 */
+/** 按 sourceUrl 将 Blob 公开 URL 追加到 imageUrls；无记录则返回未命中 */
 export async function appendXhsListingImageUrl(
   sourceUrl: string,
   blobPublicUrl: string
@@ -863,36 +864,29 @@ export async function appendXhsListingImageUrl(
       id: existing?.id ?? null,
       imageUrlsLength: list.length,
       duplicated: true,
+      listingFound: Boolean(existing),
+    };
+  }
+
+  if (!existing) {
+    return {
+      id: null,
+      imageUrlsLength: 0,
+      duplicated: false,
+      listingFound: false,
     };
   }
 
   list.push(blobPublicUrl);
-
-  if (existing) {
-    await db
-      .update(xhsRentalListing)
-      .set({ imageUrls: list })
-      .where(eq(xhsRentalListing.id, existing.id));
-    return {
-      id: existing.id,
-      imageUrlsLength: list.length,
-      duplicated: false,
-    };
-  }
-
-  const [row] = await db
-    .insert(xhsRentalListing)
-    .values({
-      sourceUrl,
-      rawText: "",
-      imageUrls: list,
-      createdAt: new Date(),
-    })
-    .returning({ id: xhsRentalListing.id });
+  await db
+    .update(xhsRentalListing)
+    .set({ imageUrls: list })
+    .where(eq(xhsRentalListing.id, existing.id));
 
   return {
-    id: row?.id ?? null,
+    id: existing.id,
     imageUrlsLength: list.length,
     duplicated: false,
+    listingFound: true,
   };
 }
