@@ -138,6 +138,9 @@
     carouselUploading: false,
     carouselArrowElement: null,
     carouselClickHandler: null,
+    videoFrameTimer: 0,
+    videoFrameCountBySrc: new Map(),
+    videoFrameInFlight: false,
     detailIngestReady: false,
   };
 
@@ -811,11 +814,36 @@
       if (!n) {
         break;
       }
-      if (n.querySelectorAll("img").length >= 1) {
+      if (n.querySelectorAll("img, video").length >= 1) {
         return n;
       }
     }
     return arrow.parentElement ?? arrow;
+  };
+
+  const findMediaRoot = () => {
+    const player = document.querySelector(".player-el.xgplayer");
+    if (player instanceof HTMLElement && player.querySelector('video[mediatype="video"]')) {
+      return player;
+    }
+
+    const arrow = document.querySelector(".arrow-controller.right");
+    if (arrow instanceof HTMLElement) {
+      return findCarouselRootFromArrow(arrow);
+    }
+
+    const slider = document.querySelector(".xhs-slider-container.slider-zoom-in");
+    if (slider instanceof HTMLElement && slider.querySelector("img, video")) {
+      return slider;
+    }
+
+    const video = document.querySelector(
+      'video[mediatype="video"][src^="blob:https://www.xiaohongshu.com/"], video[mediatype="video"], video',
+    );
+    return video instanceof HTMLVideoElement
+      ? video.closest(".player-el.xgplayer, .xhs-slider-container, .swiper, .note-slider, .media-container") ??
+          video.parentElement
+      : null;
   };
 
   const collectCarouselImgUrls = (carouselRoot) => {
@@ -866,6 +894,10 @@
       window.clearTimeout(timer);
     }
     state.carouselCheckTimers.clear();
+    if (state.videoFrameTimer) {
+      window.clearInterval(state.videoFrameTimer);
+      state.videoFrameTimer = 0;
+    }
     if (state.carouselArrowElement && state.carouselClickHandler) {
       state.carouselArrowElement.removeEventListener(
         "click",
@@ -881,6 +913,8 @@
     state.carouselUploadQueue = [];
     state.carouselQueuedSrcs.clear();
     state.carouselUploading = false;
+    state.videoFrameCountBySrc.clear();
+    state.videoFrameInFlight = false;
   };
 
   const scheduleCarouselCheck = (config, delayMs = 0) => {
@@ -944,6 +978,122 @@
       );
       return false;
     }
+  };
+
+  const pickVideoForFrame = (root) => {
+    if (!root) {
+      return null;
+    }
+    const preferredVideo = root.querySelector(
+      'video[mediatype="video"][src^="blob:https://www.xiaohongshu.com/"], video[mediatype="video"]',
+    );
+    if (
+      preferredVideo instanceof HTMLVideoElement &&
+      preferredVideo.readyState >= 2 &&
+      preferredVideo.videoWidth &&
+      preferredVideo.videoHeight
+    ) {
+      return preferredVideo;
+    }
+
+    const videos = root.querySelectorAll("video");
+    let best = null;
+    let bestArea = 0;
+    for (const video of videos) {
+      if (!(video instanceof HTMLVideoElement)) {
+        continue;
+      }
+      if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+        continue;
+      }
+      const rect = video.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (area < 400) {
+        continue;
+      }
+      const cs = window.getComputedStyle(video);
+      if (cs.visibility === "hidden" || cs.display === "none") {
+        continue;
+      }
+      if (area > bestArea) {
+        best = video;
+        bestArea = area;
+      }
+    }
+    return best;
+  };
+
+  const captureVideoFrameBlob = (video) =>
+    new Promise((resolve) => {
+      const width = video.videoWidth;
+      const height = video.videoHeight;
+      if (!width || !height) {
+        resolve(null);
+        return;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        resolve(null);
+        return;
+      }
+      try {
+        ctx.drawImage(video, 0, 0, width, height);
+        canvas.toBlob(resolve, "image/jpeg", 0.82);
+      } catch (e) {
+        logWarn("视频帧截图失败", e instanceof Error ? e.message : String(e));
+        resolve(null);
+      }
+    });
+
+  const captureCurrentVideoFrame = async (config) => {
+    if (!state.detailIngestReady || state.videoFrameInFlight) {
+      return;
+    }
+    const video = pickVideoForFrame(state.carouselObserveRoot ?? findMediaRoot());
+    if (!video) {
+      return;
+    }
+    const src = video.currentSrc || video.src || getStableSourceUrl();
+    const count = state.videoFrameCountBySrc.get(src) ?? 0;
+    if (count >= 4) {
+      return;
+    }
+
+    state.videoFrameInFlight = true;
+    try {
+      const blob = await captureVideoFrameBlob(video);
+      if (!(blob instanceof Blob)) {
+        return;
+      }
+      const uploaded = await submitAppendListingImage(
+        config,
+        blob,
+        `video-frame-${count + 1}.jpg`,
+      );
+      if (uploaded) {
+        state.videoFrameCountBySrc.set(src, count + 1);
+      }
+    } finally {
+      state.videoFrameInFlight = false;
+    }
+  };
+
+  const ensureVideoFrameTimer = (config) => {
+    const hasVideo = Boolean(
+      (state.carouselObserveRoot ?? findMediaRoot())?.querySelector(
+        'video[mediatype="video"], video',
+      ),
+    );
+    if (!hasVideo || state.videoFrameTimer) {
+      return;
+    }
+    void captureCurrentVideoFrame(config);
+    state.videoFrameTimer = window.setInterval(() => {
+      void captureCurrentVideoFrame(config);
+    }, 5000);
   };
 
   const processCarouselUploadQueue = async (config) => {
@@ -1017,15 +1167,11 @@
 
   const onCarouselMaybeChanged = async (config) => {
     const arrow = document.querySelector(".arrow-controller.right");
-    if (!arrow || !(arrow instanceof HTMLElement)) {
-      teardownCarouselCapture();
-      return;
-    }
     if (!state.carouselObserveRoot) {
       ensureCarouselObserver(config);
       return;
     }
-    if (!state.carouselObserveRoot.contains(arrow)) {
+    if (arrow instanceof HTMLElement && !state.carouselObserveRoot.contains(arrow)) {
       ensureCarouselObserver(config);
       return;
     }
@@ -1034,21 +1180,24 @@
     }
 
     const imgUrls = collectCarouselImgUrls(state.carouselObserveRoot);
-    if (imgUrls.length === 0) {
-      return;
-    }
     for (const imgUrl of imgUrls) {
       enqueueCarouselImage(config, imgUrl);
     }
+    ensureVideoFrameTimer(config);
   };
 
   const ensureCarouselObserver = (config) => {
     const arrow = document.querySelector(".arrow-controller.right");
-    if (!arrow || !(arrow instanceof HTMLElement)) {
+    const root = findMediaRoot();
+    if (!root) {
       teardownCarouselCapture();
       return;
     }
-    if (state.carouselArrowElement !== arrow) {
+    const rootChanged = !state.carouselObserver || state.carouselObserveRoot !== root;
+    if (rootChanged) {
+      teardownCarouselCapture();
+    }
+    if (arrow instanceof HTMLElement && state.carouselArrowElement !== arrow) {
       if (state.carouselArrowElement && state.carouselClickHandler) {
         state.carouselArrowElement.removeEventListener(
           "click",
@@ -1060,13 +1209,15 @@
       };
       arrow.addEventListener("click", state.carouselClickHandler);
       state.carouselArrowElement = arrow;
+    } else if (!(arrow instanceof HTMLElement)) {
+      state.carouselArrowElement = null;
+      state.carouselClickHandler = null;
     }
-    const root = findCarouselRootFromArrow(arrow);
     if (state.carouselObserver && state.carouselObserveRoot === root) {
       scheduleCarouselBurst(config);
+      ensureVideoFrameTimer(config);
       return;
     }
-    teardownCarouselCapture();
     state.carouselObserveRoot = root;
     state.carouselObserver = new MutationObserver(() => {
       scheduleCarouselBurst(config);
@@ -1077,6 +1228,7 @@
       childList: true,
     });
     scheduleCarouselBurst(config);
+    ensureVideoFrameTimer(config);
   };
 
   const setCopyButtonStatus = (text, disabled) => {
