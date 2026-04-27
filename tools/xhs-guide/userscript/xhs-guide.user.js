@@ -130,9 +130,14 @@
     routeTimer: 0,
     carouselObserver: null,
     carouselObserveRoot: null,
-    carouselCheckRaf: 0,
+    carouselCheckTimers: new Set(),
     uploadedCarouselSrcs: new Set(),
     carouselInFlight: new Set(),
+    carouselUploadQueue: [],
+    carouselQueuedSrcs: new Set(),
+    carouselUploading: false,
+    carouselArrowElement: null,
+    carouselClickHandler: null,
     detailIngestReady: false,
   };
 
@@ -813,74 +818,84 @@
     return arrow.parentElement ?? arrow;
   };
 
-  const pickMainImgUrl = (carouselRoot) => {
+  const collectCarouselImgUrls = (carouselRoot) => {
     if (!carouselRoot) {
-      return null;
+      return [];
     }
 
-    // 优先命中你提供的轮播主图特征，避免全量扫页面图片
-    const preferredImg = carouselRoot.querySelector(
+    const urls = [];
+    const seen = new Set();
+    const addUrl = (url) => {
+      if (!url || !/^https?:\/\//.test(url)) {
+        return;
+      }
+      if (!url.includes("xhscdn.com")) {
+        return;
+      }
+      if (seen.has(url)) {
+        return;
+      }
+      seen.add(url);
+      urls.push(url);
+    };
+
+    // 小红书轮播容器会同时挂载多张图，这里一次性收集全部候选图。
+    const preferredImgs = carouselRoot.querySelectorAll(
       'img[crossorigin="anonymous"][style*="object-fit: contain"][style*="position: absolute"]',
     );
-    if (preferredImg instanceof HTMLImageElement) {
-      const preferredUrl = preferredImg.currentSrc || preferredImg.src;
-      if (preferredUrl && /^https?:\/\//.test(preferredUrl)) {
-        return preferredUrl;
+    for (const img of preferredImgs) {
+      if (img instanceof HTMLImageElement) {
+        addUrl(img.currentSrc || img.src);
       }
+    }
+    if (urls.length > 0) {
+      return urls;
     }
 
-    // 兜底：仅在轮播根节点内按可见面积挑选
-    const imgs = carouselRoot.querySelectorAll("img");
-    let bestUrl = null;
-    let bestArea = 0;
-    for (const img of imgs) {
-      if (!(img instanceof HTMLImageElement)) {
-        continue;
-      }
-      const url = img.currentSrc || img.src;
-      if (!url || !/^https?:\/\//.test(url)) {
-        continue;
-      }
-      const rect = img.getBoundingClientRect();
-      const area = rect.width * rect.height;
-      if (area < 400) {
-        continue;
-      }
-      const cs = window.getComputedStyle(img);
-      if (cs.visibility === "hidden" || cs.display === "none") {
-        continue;
-      }
-      const op = Number.parseFloat(cs.opacity || "1");
-      if (op < 0.05) {
-        continue;
-      }
-      if (area > bestArea) {
-        bestArea = area;
-        bestUrl = url;
+    // 兜底：仍只在轮播根节点内收集 xhscdn 图片，不扫全页面。
+    for (const img of carouselRoot.querySelectorAll("img")) {
+      if (img instanceof HTMLImageElement) {
+        addUrl(img.currentSrc || img.src);
       }
     }
-    return bestUrl;
+    return urls;
   };
 
   const teardownCarouselCapture = () => {
-    if (state.carouselCheckRaf) {
-      cancelAnimationFrame(state.carouselCheckRaf);
-      state.carouselCheckRaf = 0;
+    for (const timer of state.carouselCheckTimers) {
+      window.clearTimeout(timer);
     }
+    state.carouselCheckTimers.clear();
+    if (state.carouselArrowElement && state.carouselClickHandler) {
+      state.carouselArrowElement.removeEventListener(
+        "click",
+        state.carouselClickHandler,
+      );
+    }
+    state.carouselArrowElement = null;
+    state.carouselClickHandler = null;
     state.carouselObserver?.disconnect();
     state.carouselObserver = null;
     state.carouselObserveRoot = null;
     state.carouselInFlight.clear();
+    state.carouselUploadQueue = [];
+    state.carouselQueuedSrcs.clear();
+    state.carouselUploading = false;
   };
 
-  const scheduleCarouselCheck = (config) => {
-    if (state.carouselCheckRaf) {
-      cancelAnimationFrame(state.carouselCheckRaf);
-    }
-    state.carouselCheckRaf = requestAnimationFrame(() => {
-      state.carouselCheckRaf = 0;
+  const scheduleCarouselCheck = (config, delayMs = 0) => {
+    const timer = window.setTimeout(() => {
+      state.carouselCheckTimers.delete(timer);
       void onCarouselMaybeChanged(config);
-    });
+    }, delayMs);
+    state.carouselCheckTimers.add(timer);
+  };
+
+  const scheduleCarouselBurst = (config) => {
+    scheduleCarouselCheck(config, 0);
+    scheduleCarouselCheck(config, 80);
+    scheduleCarouselCheck(config, 220);
+    scheduleCarouselCheck(config, 500);
   };
 
   const submitAppendListingImage = async (config, imageBlob, filename) => {
@@ -931,6 +946,75 @@
     }
   };
 
+  const processCarouselUploadQueue = async (config) => {
+    if (state.carouselUploading) {
+      return;
+    }
+    state.carouselUploading = true;
+
+    try {
+      while (state.carouselUploadQueue.length > 0) {
+        const imgUrl = state.carouselUploadQueue.shift();
+        state.carouselQueuedSrcs.delete(imgUrl);
+        if (state.uploadedCarouselSrcs.has(imgUrl)) {
+          continue;
+        }
+        if (state.carouselInFlight.has(imgUrl)) {
+          continue;
+        }
+        state.carouselInFlight.add(imgUrl);
+
+        try {
+          const { status, response, responseHeaders } =
+            await gmHttpGetArrayBuffer(imgUrl);
+          if (status < 200 || status >= 300 || !response) {
+            logWarn("拉取主图失败", { status, imgUrl });
+            continue;
+          }
+          const mime = parseContentTypeFromGmHeaders(responseHeaders);
+          if (
+            mime !== "image/jpeg" &&
+            mime !== "image/png" &&
+            mime !== "image/webp"
+          ) {
+            logWarn("主图类型不支持上传", { mime, imgUrl });
+            continue;
+          }
+          const blob = new Blob([response], { type: mime });
+          const name = `slide.${extFromMime(mime)}`;
+          const uploaded = await submitAppendListingImage(config, blob, name);
+          if (uploaded) {
+            state.uploadedCarouselSrcs.add(imgUrl);
+          }
+        } catch (e) {
+          logWarn(
+            "轮播图处理异常",
+            e instanceof Error ? e.message : String(e),
+          );
+        } finally {
+          state.carouselInFlight.delete(imgUrl);
+        }
+      }
+    } finally {
+      state.carouselUploading = false;
+    }
+  };
+
+  const enqueueCarouselImage = (config, imgUrl) => {
+    if (state.uploadedCarouselSrcs.has(imgUrl)) {
+      return;
+    }
+    if (state.carouselQueuedSrcs.has(imgUrl)) {
+      return;
+    }
+    if (state.carouselInFlight.has(imgUrl)) {
+      return;
+    }
+    state.carouselQueuedSrcs.add(imgUrl);
+    state.carouselUploadQueue.push(imgUrl);
+    void processCarouselUploadQueue(config);
+  };
+
   const onCarouselMaybeChanged = async (config) => {
     const arrow = document.querySelector(".arrow-controller.right");
     if (!arrow || !(arrow instanceof HTMLElement)) {
@@ -949,47 +1033,12 @@
       return;
     }
 
-    const imgUrl = pickMainImgUrl(state.carouselObserveRoot);
-    if (!imgUrl) {
+    const imgUrls = collectCarouselImgUrls(state.carouselObserveRoot);
+    if (imgUrls.length === 0) {
       return;
     }
-    if (state.uploadedCarouselSrcs.has(imgUrl)) {
-      return;
-    }
-    if (state.carouselInFlight.has(imgUrl)) {
-      return;
-    }
-    state.carouselInFlight.add(imgUrl);
-
-    try {
-      const { status, response, responseHeaders } =
-        await gmHttpGetArrayBuffer(imgUrl);
-      if (status < 200 || status >= 300 || !response) {
-        logWarn("拉取主图失败", { status, imgUrl });
-        return;
-      }
-      const mime = parseContentTypeFromGmHeaders(responseHeaders);
-      if (
-        mime !== "image/jpeg" &&
-        mime !== "image/png" &&
-        mime !== "image/webp"
-      ) {
-        logWarn("主图类型不支持上传", { mime, imgUrl });
-        return;
-      }
-      const blob = new Blob([response], { type: mime });
-      const name = `slide.${extFromMime(mime)}`;
-      const uploaded = await submitAppendListingImage(config, blob, name);
-      if (uploaded) {
-        state.uploadedCarouselSrcs.add(imgUrl);
-      }
-    } catch (e) {
-      logWarn(
-        "轮播图处理异常",
-        e instanceof Error ? e.message : String(e),
-      );
-    } finally {
-      state.carouselInFlight.delete(imgUrl);
+    for (const imgUrl of imgUrls) {
+      enqueueCarouselImage(config, imgUrl);
     }
   };
 
@@ -999,22 +1048,35 @@
       teardownCarouselCapture();
       return;
     }
+    if (state.carouselArrowElement !== arrow) {
+      if (state.carouselArrowElement && state.carouselClickHandler) {
+        state.carouselArrowElement.removeEventListener(
+          "click",
+          state.carouselClickHandler,
+        );
+      }
+      state.carouselClickHandler = () => {
+        scheduleCarouselBurst(config);
+      };
+      arrow.addEventListener("click", state.carouselClickHandler);
+      state.carouselArrowElement = arrow;
+    }
     const root = findCarouselRootFromArrow(arrow);
     if (state.carouselObserver && state.carouselObserveRoot === root) {
-      scheduleCarouselCheck(config);
+      scheduleCarouselBurst(config);
       return;
     }
     teardownCarouselCapture();
     state.carouselObserveRoot = root;
     state.carouselObserver = new MutationObserver(() => {
-      scheduleCarouselCheck(config);
+      scheduleCarouselBurst(config);
     });
     state.carouselObserver.observe(root, {
       subtree: true,
       attributes: true,
       childList: true,
     });
-    scheduleCarouselCheck(config);
+    scheduleCarouselBurst(config);
   };
 
   const setCopyButtonStatus = (text, disabled) => {
