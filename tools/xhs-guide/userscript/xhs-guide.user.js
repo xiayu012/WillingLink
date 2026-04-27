@@ -817,6 +817,19 @@
     if (!carouselRoot) {
       return null;
     }
+
+    // 优先命中你提供的轮播主图特征，避免全量扫页面图片
+    const preferredImg = carouselRoot.querySelector(
+      'img[crossorigin="anonymous"][style*="object-fit: contain"][style*="position: absolute"]',
+    );
+    if (preferredImg instanceof HTMLImageElement) {
+      const preferredUrl = preferredImg.currentSrc || preferredImg.src;
+      if (preferredUrl && /^https?:\/\//.test(preferredUrl)) {
+        return preferredUrl;
+      }
+    }
+
+    // 兜底：仅在轮播根节点内按可见面积挑选
     const imgs = carouselRoot.querySelectorAll("img");
     let bestUrl = null;
     let bestArea = 0;
