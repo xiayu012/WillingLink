@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         xhs-guide-title-judge
+// @name         小红书手机 App 私信高亮同款 · 租房标题识别
 // @namespace    https://willinglink.local/
-// @version      0.5.4
-// @description  小红书多标题识别高亮 + 详情页复制正文指引
+// @version      0.5.5
+// @description  高亮逻辑对齐小红书 App 私信列表；网页信息流多标题识别 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
 // @match        https://xiaohongshu.com/*
@@ -1428,7 +1428,7 @@
     state.loopTimer = window.setInterval(() => {
       void analyzeRound(config);
     }, config.app.loopIntervalMs);
-    logInfo("多标题判断高亮已启动", {
+    logInfo("信息流标题高亮已启动（私信同款强调样式）", {
       appId: config.app.id,
       llmEnabled: config.judgement.enableLlmReview,
     });
