@@ -18,8 +18,12 @@ export default function Page() {
       <div className="flex flex-1 flex-col items-center justify-center px-4">
         <p className="mb-6 max-w-md text-center text-sm text-muted-foreground">
           Welcome to WillingLink by FretGone LLC. Please submit your phone
-          number, and I’ll text you to discuss your needs and connect you with
-          suitable landlords.
+          number, and I’ll text you to discuss your needs and help you find
+          suitable rental options. By opting in, you may receive SMS messages
+          with rental listings, landlord contact details, and viewing
+          arrangements. You can also reply to ask questions, share your housing
+          preferences, and discuss living needs so we can better match you with
+          the right place.
         </p>
         <form
           onSubmit={handleSubmit}
