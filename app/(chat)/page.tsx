@@ -23,7 +23,11 @@ export default function Page() {
           with rental listings, landlord contact details, and viewing
           arrangements. You can also reply to ask questions, share your housing
           preferences, and discuss living needs so we can better match you with
-          the right place.
+          the right place. (By providing your phone number, you agree to receive
+          SMS messages from WillingLink by FretGone LLC regarding rental listings,
+          landlord contact details, and coordination. Message frequency varies.
+          Message and data rates may apply. Reply STOP to opt out or HELP for
+          assistance.)
         </p>
         <form
           onSubmit={handleSubmit}
