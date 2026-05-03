@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.5.4
+// @version      0.5.5
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -138,11 +138,15 @@
     carouselUploading: false,
     carouselArrowElement: null,
     carouselClickHandler: null,
-    videoFrameTimer: 0,
-    videoFrameCountBySrc: new Map(),
-    videoFrameInFlight: false,
+    videoSeekRunning: false,
+    videoSeekDoneKey: "",
+    videoSeekAbort: false,
     detailIngestReady: false,
   };
+
+  const VIDEO_SEEK_STEP_SEC = 5;
+  const VIDEO_SEEK_MAX_FRAMES = 120;
+  const VIDEO_SEEK_TIMEOUT_MS = 3500;
 
   const logInfo = (message, extra) => {
     if (extra === undefined) {
@@ -894,10 +898,7 @@
       window.clearTimeout(timer);
     }
     state.carouselCheckTimers.clear();
-    if (state.videoFrameTimer) {
-      window.clearInterval(state.videoFrameTimer);
-      state.videoFrameTimer = 0;
-    }
+    state.videoSeekAbort = true;
     if (state.carouselArrowElement && state.carouselClickHandler) {
       state.carouselArrowElement.removeEventListener(
         "click",
@@ -913,8 +914,7 @@
     state.carouselUploadQueue = [];
     state.carouselQueuedSrcs.clear();
     state.carouselUploading = false;
-    state.videoFrameCountBySrc.clear();
-    state.videoFrameInFlight = false;
+    state.videoSeekDoneKey = "";
   };
 
   const scheduleCarouselCheck = (config, delayMs = 0) => {
@@ -1048,52 +1048,164 @@
       }
     });
 
-  const captureCurrentVideoFrame = async (config) => {
-    if (!state.detailIngestReady || state.videoFrameInFlight) {
+  const seekVideoTo = (video, timeSec) =>
+    new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        cleanup();
+        reject(new Error("seek timeout"));
+      }, VIDEO_SEEK_TIMEOUT_MS);
+      const onSeeked = () => {
+        cleanup();
+        resolve();
+      };
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        video.removeEventListener("seeked", onSeeked);
+      };
+      video.addEventListener("seeked", onSeeked, { once: true });
+      video.currentTime = Math.max(0, timeSec);
+    });
+
+  const waitForVideoDuration = (video, maxWaitMs = 8000) =>
+    new Promise((resolve) => {
+      if (
+        Number.isFinite(video.duration) &&
+        video.duration > 0
+      ) {
+        resolve(true);
+        return;
+      }
+      const timer = window.setTimeout(() => resolve(false), maxWaitMs);
+      const onMeta = () => {
+        window.clearTimeout(timer);
+        video.removeEventListener("loadedmetadata", onMeta);
+        resolve(true);
+      };
+      video.addEventListener("loadedmetadata", onMeta, { once: true });
+    });
+
+  const buildVideoSeekTimes = (durationSec) => {
+    const times = [];
+    const safeEnd = Math.max(0, durationSec - 0.08);
+    for (
+      let t = 0;
+      t <= safeEnd && times.length < VIDEO_SEEK_MAX_FRAMES;
+      t += VIDEO_SEEK_STEP_SEC
+    ) {
+      times.push(Math.min(t, safeEnd));
+    }
+    if (
+      times.length > 0 &&
+      durationSec > 0 &&
+      Math.abs(times[times.length - 1] - safeEnd) > 0.5 &&
+      times.length < VIDEO_SEEK_MAX_FRAMES
+    ) {
+      times.push(safeEnd);
+    }
+    return times;
+  };
+
+  const runVideoSeekCapture = async (config, video, jobKey) => {
+    const root = state.carouselObserveRoot ?? findMediaRoot();
+    if (!video || !root?.contains?.(video)) {
       return;
     }
-    const video = pickVideoForFrame(state.carouselObserveRoot ?? findMediaRoot());
-    if (!video) {
-      return;
-    }
-    const src = video.currentSrc || video.src || getStableSourceUrl();
-    const count = state.videoFrameCountBySrc.get(src) ?? 0;
-    if (count >= 4) {
+    const hasMeta = await waitForVideoDuration(video);
+    if (!hasMeta || !Number.isFinite(video.duration) || video.duration <= 0) {
+      logWarn("视频时长不可用，跳过 seek 截帧");
       return;
     }
 
-    state.videoFrameInFlight = true;
+    const times = buildVideoSeekTimes(video.duration);
+    if (times.length === 0) {
+      return;
+    }
+
+    const savedTime = video.currentTime;
+    const savedPaused = video.paused;
+    const savedMuted = video.muted;
+    const savedRate = video.playbackRate;
+
+    video.muted = true;
+    video.pause();
+
+    let uploadedCount = 0;
     try {
-      const blob = await captureVideoFrameBlob(video);
-      if (!(blob instanceof Blob)) {
-        return;
+      logInfo("视频 seek 截帧开始", {
+        duration: video.duration,
+        frames: times.length,
+      });
+      for (let i = 0; i < times.length; i += 1) {
+        if (state.videoSeekAbort) {
+          break;
+        }
+        const t = times[i];
+        try {
+          await seekVideoTo(video, t);
+        } catch {
+          logWarn("视频 seek 跳过", { t });
+          continue;
+        }
+        await new Promise((r) => {
+          requestAnimationFrame(() => r());
+        });
+        const blob = await captureVideoFrameBlob(video);
+        if (!(blob instanceof Blob)) {
+          continue;
+        }
+        const ok = await submitAppendListingImage(
+          config,
+          blob,
+          `video-t${Math.round(t)}s.jpg`,
+        );
+        if (ok) {
+          uploadedCount += 1;
+        }
       }
-      const uploaded = await submitAppendListingImage(
-        config,
-        blob,
-        `video-frame-${count + 1}.jpg`,
-      );
-      if (uploaded) {
-        state.videoFrameCountBySrc.set(src, count + 1);
+      if (!state.videoSeekAbort) {
+        state.videoSeekDoneKey = jobKey;
       }
+      logInfo("视频 seek 截帧结束", { uploadedCount, aborted: state.videoSeekAbort });
     } finally {
-      state.videoFrameInFlight = false;
+      video.currentTime = savedTime;
+      video.playbackRate = savedRate;
+      video.muted = savedMuted;
+      if (savedPaused) {
+        video.pause();
+      } else {
+        video.play().catch(() => {});
+      }
     }
   };
 
-  const ensureVideoFrameTimer = (config) => {
-    const hasVideo = Boolean(
-      (state.carouselObserveRoot ?? findMediaRoot())?.querySelector(
-        'video[mediatype="video"], video',
-      ),
-    );
-    if (!hasVideo || state.videoFrameTimer) {
+  const maybeStartVideoSeekCapture = (config) => {
+    if (!state.detailIngestReady || state.videoSeekRunning) {
       return;
     }
-    void captureCurrentVideoFrame(config);
-    state.videoFrameTimer = window.setInterval(() => {
-      void captureCurrentVideoFrame(config);
-    }, 5000);
+    const root = state.carouselObserveRoot ?? findMediaRoot();
+    if (!root?.querySelector?.('video[mediatype="video"], video')) {
+      return;
+    }
+    const video = pickVideoForFrame(root);
+    if (!video) {
+      return;
+    }
+    const vSrc = video.currentSrc || video.src || "";
+    const jobKey = `${getStableSourceUrl()}|${vSrc}`;
+    if (state.videoSeekDoneKey === jobKey) {
+      return;
+    }
+
+    state.videoSeekRunning = true;
+    state.videoSeekAbort = false;
+    void (async () => {
+      try {
+        await runVideoSeekCapture(config, video, jobKey);
+      } finally {
+        state.videoSeekRunning = false;
+        state.videoSeekAbort = false;
+      }
+    })();
   };
 
   const processCarouselUploadQueue = async (config) => {
@@ -1183,7 +1295,7 @@
     for (const imgUrl of imgUrls) {
       enqueueCarouselImage(config, imgUrl);
     }
-    ensureVideoFrameTimer(config);
+    maybeStartVideoSeekCapture(config);
   };
 
   const ensureCarouselObserver = (config) => {
@@ -1215,7 +1327,7 @@
     }
     if (state.carouselObserver && state.carouselObserveRoot === root) {
       scheduleCarouselBurst(config);
-      ensureVideoFrameTimer(config);
+      maybeStartVideoSeekCapture(config);
       return;
     }
     state.carouselObserveRoot = root;
@@ -1228,7 +1340,7 @@
       childList: true,
     });
     scheduleCarouselBurst(config);
-    ensureVideoFrameTimer(config);
+    maybeStartVideoSeekCapture(config);
   };
 
   const setCopyButtonStatus = (text, disabled) => {
