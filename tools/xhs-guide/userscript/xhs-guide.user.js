@@ -83,7 +83,7 @@
     },
     highlight: {
       borderColor: "#ff2442",
-      overlayShadow: "0 0 0 9999px rgba(0, 0, 0, 0.2)",
+      overlayShadow: "none",
       hintPrefix: "湾区租房相关",
     },
     detailCopy: {
@@ -1465,6 +1465,31 @@
     return succeeded;
   };
 
+  const showCopySuccessToast = () => {
+    document.getElementById("xhs-guide-copy-success-toast")?.remove();
+
+    const toast = document.createElement("div");
+    toast.id = "xhs-guide-copy-success-toast";
+    toast.textContent = "✓ 复制成功";
+    toast.style.position = "fixed";
+    toast.style.right = "20px";
+    toast.style.bottom = "76px";
+    toast.style.zIndex = "2147483647";
+    toast.style.background = "#16a34a";
+    toast.style.color = "#ffffff";
+    toast.style.fontSize = "14px";
+    toast.style.fontWeight = "700";
+    toast.style.padding = "10px 14px";
+    toast.style.borderRadius = "10px";
+    toast.style.pointerEvents = "none";
+    toast.style.boxShadow = "none";
+    document.body.append(toast);
+
+    window.setTimeout(() => {
+      toast.remove();
+    }, 1600);
+  };
+
   const handleCopyButtonClick = async (config) => {
     if (!state.detailContentElement) {
       setCopyButtonStatus(config.detailCopy.missingText, true);
@@ -1486,6 +1511,7 @@
     try {
       await copyPlainText(plainText);
       setCopyButtonStatus(config.detailCopy.copiedText, false);
+      showCopySuccessToast();
       logInfo("正文复制成功", { chars: plainText.length });
       state.detailIngestReady = await submitIngestAfterCopy(config, plainText);
     } catch (error) {
