@@ -1,7 +1,7 @@
-import { put } from "@vercel/blob";
-import { randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
 
-import { appendXhsListingImageUrl } from "@/lib/db/queries";
+import { put } from "@vercel/blob";
+import { appendXhsListingImageUrl } from "@/lib/db/xhs-queries";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -42,8 +42,7 @@ export async function POST(request: Request) {
   }
 
   const sourceUrlRaw = formData.get("sourceUrl");
-  const sourceUrl =
-    typeof sourceUrlRaw === "string" ? sourceUrlRaw.trim() : "";
+  const sourceUrl = typeof sourceUrlRaw === "string" ? sourceUrlRaw.trim() : "";
   if (!sourceUrl) {
     return jsonWithCors({ ok: false, error: "sourceUrl is required" }, 400);
   }
@@ -62,10 +61,7 @@ export async function POST(request: Request) {
   }
 
   if (file.size > MAX_BYTES) {
-    return jsonWithCors(
-      { ok: false, error: "File too large (max 25MB)" },
-      400
-    );
+    return jsonWithCors({ ok: false, error: "File too large (max 25MB)" }, 400);
   }
 
   const buffer = Buffer.from(await file.arrayBuffer());
