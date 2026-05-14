@@ -26,7 +26,7 @@
 ## 数据库（服务端）
 
 1. 在 Neon 执行一次 `db/create_xhs_rental_listing.sql`。
-2. Next 部署需配置 `POSTGRES_URL`（与现有应用一致）。
+2. Next 部署需配置 `POSTGRES_URL`（与现有应用共用同一个 Neon 数据库）。
 3. API 路径：`POST /api/xhs/rental-ingest`，无 `Authorization` 头。
 
 ## 使用方式

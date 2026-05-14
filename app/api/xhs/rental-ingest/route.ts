@@ -1,14 +1,23 @@
-import { createXhsRentalListing } from "@/lib/db/queries";
+import { createXhsRentalListing } from "@/lib/db/xhs-queries";
 
-const RENT_RE = /(?:租金|房租|rent|price|价格|月租)[^\n$¥￥\d]{0,12}([$¥￥]?\s?\d[\d,]*(?:\.\d+)?\s?(?:刀|美金|usd|\/月|per month|monthly|month|mo)?)/i;
-const DEPOSIT_RE = /(?:押金|deposit)[^\n$¥￥\d]{0,12}([$¥￥]?\s?\d[\d,]*(?:\.\d+)?\s?(?:刀|美金|usd|个月|month|mo)?)/i;
-const BED_BATH_RE = /(\d+(?:\.\d+)?)\s*(?:b|室|bed|br|bedroom)s?\s*(\d+(?:\.\d+)?)?\s*(?:b|卫|bath|ba|bathroom)s?/i;
+const RENT_RE =
+  /(?:租金|房租|rent|price|价格|月租)[^\n$¥￥\d]{0,12}([$¥￥]?\s?\d[\d,]*(?:\.\d+)?\s?(?:刀|美金|usd|\/月|per month|monthly|month|mo)?)/i;
+const DEPOSIT_RE =
+  /(?:押金|deposit)[^\n$¥￥\d]{0,12}([$¥￥]?\s?\d[\d,]*(?:\.\d+)?\s?(?:刀|美金|usd|个月|month|mo)?)/i;
+const BED_BATH_RE =
+  /(\d+(?:\.\d+)?)\s*(?:b|室|bed|br|bedroom)s?\s*(\d+(?:\.\d+)?)?\s*(?:b|卫|bath|ba|bathroom)s?/i;
 const BEDROOM_RE = /(\d+(?:\.\d+)?)\s*(?:b|室|bed|br|bedroom)s?/i;
 const BATHROOM_RE = /(\d+(?:\.\d+)?)\s*(?:卫|bath|ba|bathroom)s?/i;
-const AVAILABLE_RE = /(?:入住|available|avail|起租|可入住|入住时间)[^\n\d]{0,12}((?:\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?)|(?:\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2})|(?:now|asap|immediate|随时))/i;
-const LEASE_END_RE = /(?:lease\s*end|租期到|到期|租期至|end date)[^\n\d]{0,12}((?:\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?)|(?:\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}))/i;
-const CONTACT_RE = /((?:微信|wechat|vx|v信)[:：\s]*[a-zA-Z0-9_-]{3,})|([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})|((?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}))/i;
-const PROPERTY_RE = /(?:公寓|小区|apartment|apt|community|property|楼盘)[:：\s]*([^\n，,。;；]{2,60})/i;
+const AVAILABLE_RE =
+  /(?:入住|available|avail|起租|可入住|入住时间)[^\n\d]{0,12}((?:\d{1,2}[/.-]\d{1,2}(?:[/.-]\d{2,4})?)|(?:\d{4}[/.-]\d{1,2}[/.-]\d{1,2})|(?:now|asap|immediate|随时))/i;
+const LEASE_END_RE =
+  /(?:lease\s*end|租期到|到期|租期至|end date)[^\n\d]{0,12}((?:\d{1,2}[/.-]\d{1,2}(?:[/.-]\d{2,4})?)|(?:\d{4}[/.-]\d{1,2}[/.-]\d{1,2}))/i;
+const CONTACT_RE =
+  /((?:微信|wechat|vx|v信)[:：\s]*[a-zA-Z0-9_-]{3,})|([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})|((?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}))/i;
+const PROPERTY_RE =
+  /(?:公寓|小区|apartment|apt|community|property|楼盘)[:：\s]*([^\n，,。;；]{2,60})/i;
+const LINE_SPLIT_RE = /\n+/;
+const SPACE_RUN_RE = /\s+/g;
 
 const BAY_AREA_LOCATIONS = [
   "San Francisco",
@@ -62,8 +71,8 @@ function matchText(re: RegExp, text: string, group = 1): string | null {
 
 function inferTitle(text: string): string | null {
   const lines = text
-    .split(/\n+/)
-    .map((line) => line.replace(/\s+/g, " ").trim())
+    .split(LINE_SPLIT_RE)
+    .map((line) => line.replace(SPACE_RUN_RE, " ").trim())
     .filter((line) => line.length > 0);
   const title = lines.find((line) => line.length >= 4 && line.length <= 120);
   return title ?? null;
@@ -87,7 +96,11 @@ function inferListingType(text: string): string | null {
   if (lower.includes("求租")) {
     return "wanted";
   }
-  if (lower.includes("出租") || lower.includes("lease") || lower.includes("rent")) {
+  if (
+    lower.includes("出租") ||
+    lower.includes("lease") ||
+    lower.includes("rent")
+  ) {
     return "rent";
   }
   return null;
