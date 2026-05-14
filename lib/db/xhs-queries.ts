@@ -2,10 +2,10 @@ import "server-only";
 
 import { neon } from "@neondatabase/serverless";
 
-const xhsDatabaseUrl = process.env.XHS_POSTGRES_URL ?? process.env.POSTGRES_URL;
+const xhsDatabaseUrl = process.env.POSTGRES_URL;
 
 if (!xhsDatabaseUrl) {
-  throw new Error("XHS_POSTGRES_URL or POSTGRES_URL must be set");
+  throw new Error("POSTGRES_URL must be set");
 }
 
 const sql = neon(xhsDatabaseUrl);
