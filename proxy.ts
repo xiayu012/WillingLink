@@ -17,6 +17,11 @@ export async function proxy(request: NextRequest) {
     return NextResponse.next();
   }
 
+  /** 油猴匿名上报：不做登录重定向，避免 POST 被 307 到 guest 后变成 405 */
+  if (pathname.startsWith("/api/xhs/")) {
+    return NextResponse.next();
+  }
+
   const token = await getToken({
     req: request,
     secret: process.env.AUTH_SECRET,
