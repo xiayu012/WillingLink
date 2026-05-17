@@ -8,11 +8,9 @@ import {
   eq,
   gt,
   gte,
-  ilike,
   inArray,
   isNotNull,
   lt,
-  or,
   type SQL,
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
@@ -791,60 +789,6 @@ export async function getShiftsForExport(): Promise<ShiftExportRow[]> {
     .where(and(isNotNull(shift.audioUrl), isNotNull(shift.signUpAudioUrl)))
     .orderBy(desc(shift.createdAt));
   return rows;
-}
-
-export type ListXhsRentalListingsParams = {
-  limit: number;
-  offset: number;
-  /**
-   * 在 title / rawText / locationText / propertyName 上做 ILIKE %…% 包含匹配；
-   * 输入中的 % 与 _ 会被去掉，避免通配符注入。
-   */
-  search?: string | null;
-};
-
-/** 只读列出 XhsRentalListing 全列，按 createdAt 新到旧 */
-export async function listXhsRentalListings(
-  params: ListXhsRentalListingsParams
-) {
-  const { limit, offset, search } = params;
-  const trimmed = search?.trim();
-  const safeFragment =
-    trimmed && trimmed.length > 0
-      ? trimmed.replaceAll("%", "").replaceAll("_", "")
-      : "";
-  const pattern =
-    safeFragment.length > 0 ? `%${safeFragment.slice(0, 500)}%` : null;
-
-  const textOr =
-    pattern !== null
-      ? or(
-          ilike(xhsRentalListing.title, pattern),
-          ilike(xhsRentalListing.rawText, pattern),
-          ilike(xhsRentalListing.locationText, pattern),
-          ilike(xhsRentalListing.propertyName, pattern)
-        )
-      : null;
-
-  const listBase = db.select().from(xhsRentalListing);
-  const listFiltered = textOr !== null ? listBase.where(textOr) : listBase;
-  const countBase = db
-    .select({ total: count(xhsRentalListing.id) })
-    .from(xhsRentalListing);
-  const countFiltered = textOr !== null ? countBase.where(textOr) : countBase;
-
-  const [rows, countRows] = await Promise.all([
-    listFiltered
-      .orderBy(desc(xhsRentalListing.createdAt))
-      .limit(limit)
-      .offset(offset),
-    countFiltered,
-  ]);
-
-  return {
-    rows,
-    total: countRows[0]?.total ?? 0,
-  };
 }
 
 export type CreateXhsRentalListingInput = {
