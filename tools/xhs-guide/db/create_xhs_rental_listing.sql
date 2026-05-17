@@ -55,5 +55,41 @@ ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "furnished" text;
 ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "contactMethod" text;
 ALTER TABLE "XhsRentalListing" ADD COLUMN IF NOT EXISTS "imageUrls" jsonb DEFAULT '[]'::jsonb;
 
+-- ------------------------------------------------------------
+-- 查询性能（Dify / ILIKE 检索）：pg_trgm + 常用筛选列索引
+-- 与 lib/db/migrations/0009_xhs_rental_listing_search_idx.sql 一致，可整段重复执行
+-- ------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_createdAt_id_idx"
+  ON "XhsRentalListing" ("createdAt" DESC, "id" DESC);
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_title_trgm_idx"
+  ON "XhsRentalListing" USING gin ("title" gin_trgm_ops);
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_rawText_trgm_idx"
+  ON "XhsRentalListing" USING gin ("rawText" gin_trgm_ops);
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_locationText_trgm_idx"
+  ON "XhsRentalListing" USING gin ("locationText" gin_trgm_ops);
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_propertyName_trgm_idx"
+  ON "XhsRentalListing" USING gin ("propertyName" gin_trgm_ops);
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_listingType_idx"
+  ON "XhsRentalListing" ("listingType");
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_bedrooms_idx"
+  ON "XhsRentalListing" ("bedrooms");
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_bathrooms_idx"
+  ON "XhsRentalListing" ("bathrooms");
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_roomType_idx"
+  ON "XhsRentalListing" ("roomType");
+
+CREATE INDEX IF NOT EXISTS "XhsRentalListing_furnished_idx"
+  ON "XhsRentalListing" ("furnished");
+
 -- 历史遗留 summary 列（若存在可删）
 -- ALTER TABLE "XhsRentalListing" DROP COLUMN IF EXISTS "summary";
