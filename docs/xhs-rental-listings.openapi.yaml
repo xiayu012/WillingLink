@@ -5,15 +5,6 @@ info:
     只读查询 Postgres 表 **XhsRentalListing**（小红书租房帖上报数据）。
     生产路径为 `/api/xhs/rental-listings`。若部署环境设置了 `XHS_RENTAL_LISTINGS_READ_SECRET`，
     则须在请求头携带 `Authorization: Bearer <同一密钥>`；未设置时可以不带头。
-
-    **Dify / 自然语言检索建议（省 DB、省 token）**
-    1. 首轮浏览：`compact=true&includeTotal=false&limit=30`（无 `rawText`，仅有 `rawTextSnippet`）。
-    2. 需要正文时再请求：`compact=false&rawTextMax=8000` 或省略二者取全文。
-    3. `q` 按**空格分词**，各词之间为 **AND**（每词须在 title / rawText / locationText / propertyName 之一命中）。
-    4. 追问地理位置时加 `location=…`（只筛 `locationText`，比全文 `q` 更省）。
-    5. 已知结构化条件时用 `listingType`、`bedrooms` 等（**等值**匹配，走 btree 索引）。
-    6. 深翻页用 `cursor`（keyset，避免大 `offset`）；`cursor` 存在时忽略 `offset`。
-    7. 列表与 `COUNT(*)` 并行；若不需要精确总数，设 `includeTotal=false` 省一次计数查询。
   version: 1.0.0
 
 servers:
@@ -29,10 +20,11 @@ paths:
     get:
       tags:
         - XhsRentalListing
-      summary: 查询 / 搜索租房列表（分页、游标、紧凑字段）
+      summary: 查询 / 搜索租房列表（分页）
       description: |
-        默认按 `createdAt` 新到旧（可用 `sort=createdAt_asc` 反转）。
-        数据库侧已建 `pg_trgm` GIN 索引以加速 `ILIKE %…%` 类包含检索（迁移 `0009_xhs_rental_listing_search_idx`）。
+        返回表 **XhsRentalListing** 的全字段行，按 `createdAt` 新到旧排序。
+        可选查询参数 `q` 在 `title`、`rawText`、`locationText`、`propertyName` 上做不区分大小写的包含匹配；
+        参数中的 `%`、`_` 会被去掉（避免 ILIKE 通配符注入）。
       operationId: searchRentalListings
       parameters:
         - name: limit
@@ -45,107 +37,25 @@ paths:
             default: 100
         - name: offset
           in: query
-          description: 跳过条数（无 `cursor` 时生效），默认 0，最大 500000
+          description: 跳过条数，默认 0，最大 500000
           schema:
             type: integer
             minimum: 0
             maximum: 500000
             default: 0
-        - name: cursor
-          in: query
-          description: |
-            上一页响应中的 `nextCursor`（base64url JSON）。存在时按 keyset 继续取下一页，并忽略 `offset`。
-            须与当前 `sort` 与上一响应一致。
-          schema:
-            type: string
-        - name: sort
-          in: query
-          description: 排序
-          schema:
-            type: string
-            enum:
-              - createdAt_desc
-              - createdAt_asc
-            default: createdAt_desc
         - name: q
           in: query
-          description: |
-            空格分词后多词 **AND**；每词在 title / rawText / locationText / propertyName 上 ILIKE 包含匹配。
-            词内 `%`、`_` 会被去掉。最多 8 词，每词最长 100 字符。
+          description: 关键词（可选），多字段 OR 包含匹配
           schema:
             type: string
             maxLength: 500
-        - name: location
-          in: query
-          description: 仅匹配 `locationText`（AND），适合「在旧金山」类追问
-          schema:
-            type: string
-            maxLength: 200
-        - name: listingType
-          in: query
-          description: 等值筛选 `listingType`（大小写敏感）
-          schema:
-            type: string
-        - name: bedrooms
-          in: query
-          description: 等值筛选 `bedrooms`
-          schema:
-            type: string
-        - name: bathrooms
-          in: query
-          description: 等值筛选 `bathrooms`
-          schema:
-            type: string
-        - name: roomType
-          in: query
-          description: 等值筛选 `roomType`
-          schema:
-            type: string
-        - name: furnished
-          in: query
-          description: 等值筛选 `furnished`
-          schema:
-            type: string
-        - name: compact
-          in: query
-          description: 为 true 时不返回 `rawText`，返回 `rawTextSnippet`（由 `snippet` 控制长度）
-          schema:
-            type: boolean
-            default: false
-        - name: snippet
-          in: query
-          description: compact 模式下摘要长度，默认 480，范围 80–2000
-          schema:
-            type: integer
-            minimum: 80
-            maximum: 2000
-            default: 480
-        - name: rawTextMax
-          in: query
-          description: 非 compact 时截断 `rawText` 最大字符数（1–50000）；省略表示不截断
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 50000
-        - name: includeTotal
-          in: query
-          description: 为 false 时跳过 COUNT(*)，响应 `total` 为 null；深翻或大表时推荐
-          schema:
-            type: boolean
-            default: true
       responses:
         "200":
           description: 成功
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RentalListingsResponse"
-        "400":
-          description: 请求不合法（例如 cursor 与 sort 不匹配）
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ApiErrorBody"
+                $ref: "#/components/schemas/RentalListingsPage"
         "401":
           description: 未授权（已配置 `XHS_RENTAL_LISTINGS_READ_SECRET` 但 Bearer 不正确或缺失）
           content:
@@ -172,23 +82,9 @@ components:
       required:
         - error
 
-    ApiErrorBody:
-      type: object
-      properties:
-        code:
-          type: string
-          example: "bad_request:api"
-        message:
-          type: string
-        cause:
-          type: string
-      required:
-        - code
-        - message
-
     XhsRentalListing:
       type: object
-      description: 与数据库表 XhsRentalListing 列一致（非 compact 响应）
+      description: 与数据库表 XhsRentalListing 列一致
       properties:
         id:
           type: string
@@ -201,7 +97,7 @@ components:
           nullable: true
         rawText:
           type: string
-          description: 原始正文（可用 rawTextMax 截断）
+          description: 原始正文
         rent:
           type: string
           nullable: true
@@ -254,112 +150,29 @@ components:
         - rawText
         - createdAt
 
-    XhsRentalListingCompact:
-      type: object
-      description: compact=true 时的行（无 rawText）
-      properties:
-        id:
-          type: string
-          format: uuid
-        sourceUrl:
-          type: string
-        title:
-          type: string
-          nullable: true
-        rent:
-          type: string
-          nullable: true
-        deposit:
-          type: string
-          nullable: true
-        availableFrom:
-          type: string
-          nullable: true
-        leaseEndDate:
-          type: string
-          nullable: true
-        listingType:
-          type: string
-          nullable: true
-        bedrooms:
-          type: string
-          nullable: true
-        bathrooms:
-          type: string
-          nullable: true
-        roomType:
-          type: string
-          nullable: true
-        propertyName:
-          type: string
-          nullable: true
-        locationText:
-          type: string
-          nullable: true
-        furnished:
-          type: string
-          nullable: true
-        contactMethod:
-          type: string
-          nullable: true
-        imageUrls:
-          type: array
-          nullable: true
-          items:
-            type: string
-            format: uri
-        createdAt:
-          type: string
-          format: date-time
-        rawTextSnippet:
-          type: string
-          description: 正文前缀摘要（长度由 snippet 控制）
-      required:
-        - id
-        - sourceUrl
-        - rawTextSnippet
-        - createdAt
-
-    RentalListingsResponse:
+    RentalListingsPage:
       type: object
       properties:
         listings:
           type: array
           items:
-            oneOf:
-              - $ref: "#/components/schemas/XhsRentalListing"
-              - $ref: "#/components/schemas/XhsRentalListingCompact"
+            $ref: "#/components/schemas/XhsRentalListing"
         total:
           type: integer
-          nullable: true
-          description: includeTotal=false 时为 null
+          description: 满足当前筛选条件的总条数
           minimum: 0
-        compact:
-          type: boolean
-        nextCursor:
-          type: string
-          nullable: true
-          description: 下一页游标；无更多时可能为 null
         limit:
           type: integer
         offset:
           type: integer
-          description: 请求中的 offset（使用 cursor 分页时内部可能忽略，但回显原值）
-        sort:
-          type: string
-          enum:
-            - createdAt_desc
-            - createdAt_asc
         hasMore:
           type: boolean
+          description: 是否还有下一页（offset + len(listings) < total）
       required:
         - listings
         - total
-        - compact
-        - nextCursor
         - limit
         - offset
-        - sort
         - hasMore
 
   securitySchemes:

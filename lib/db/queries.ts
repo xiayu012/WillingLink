@@ -14,7 +14,6 @@ import {
   lt,
   or,
   type SQL,
-  sql,
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
@@ -35,7 +34,6 @@ import {
   type User,
   user,
   vote,
-  type XhsRentalListing,
   xhsRentalListing,
 } from "./schema";
 import { generateHashedPassword } from "./utils";
@@ -795,361 +793,57 @@ export async function getShiftsForExport(): Promise<ShiftExportRow[]> {
   return rows;
 }
 
-export type XhsRentalListingSort = "createdAt_desc" | "createdAt_asc";
-
-export type XhsRentalListingCompactRow = {
-  id: string;
-  sourceUrl: string;
-  title: string | null;
-  rent: string | null;
-  deposit: string | null;
-  availableFrom: string | null;
-  leaseEndDate: string | null;
-  listingType: string | null;
-  bedrooms: string | null;
-  bathrooms: string | null;
-  roomType: string | null;
-  propertyName: string | null;
-  locationText: string | null;
-  furnished: string | null;
-  contactMethod: string | null;
-  imageUrls: string[] | null;
-  createdAt: Date;
-  rawTextSnippet: string;
-};
-
-export type XhsRentalListingListRow =
-  | XhsRentalListing
-  | XhsRentalListingCompactRow;
-
 export type ListXhsRentalListingsParams = {
   limit: number;
   offset: number;
-  /** 为 false 时跳过 COUNT(*)，降低数据库负载；hasMore 用「是否满页」推断 */
-  includeTotal: boolean;
-  /** 为 true 时不返回 rawText，仅返回 rawTextSnippet（显著减小 JSON） */
-  compact: boolean;
-  /** compact 时正文摘要长度，默认 480，范围 80–2000 */
-  rawTextSnippetLength: number;
-  /** 非 compact 时截断 rawText 最大字符数；null 表示不截断 */
-  rawTextMaxChars: number | null;
   /**
-   * 空格分词后 **每个词** 须在 title / rawText / locationText / propertyName 之一中命中（AND），
-   * 更贴合自然语言多条件；词内 %、_ 已去掉。
+   * 在 title / rawText / locationText / propertyName 上做 ILIKE %…% 包含匹配；
+   * 输入中的 % 与 _ 会被去掉，避免通配符注入。
    */
-  search: string | null;
-  /** 仅匹配 locationText（AND），适合「在湾区 / SF」类追问 */
-  locationHint: string | null;
-  /** 结构化等值筛选（AND），大小写敏感；传之前尽量与库内取值一致 */
-  listingType: string | null;
-  bedrooms: string | null;
-  bathrooms: string | null;
-  roomType: string | null;
-  furnished: string | null;
-  sort: XhsRentalListingSort;
-  /** 与 sort 一致的 keyset 游标（base64url JSON）；存在时忽略 offset */
-  cursorAfter: string | null;
+  search?: string | null;
 };
 
-export type ListXhsRentalListingsResult = {
-  rows: XhsRentalListingListRow[];
-  total: number | null;
-  compact: boolean;
-  nextCursor: string | null;
-};
-
-type ListingCursorPayload = {
-  cAt: string;
-  id: string;
-  sort: XhsRentalListingSort;
-};
-
-const SEARCH_TOKEN_SPLIT_RE = /\s+/;
-
-function stripIlikeMetacharacters(value: string): string {
-  return value.replaceAll("%", "").replaceAll("_", "");
-}
-
-function parseSearchTokens(search: string | null | undefined): string[] {
-  const trimmed = search?.trim() ?? "";
-  if (trimmed.length === 0) {
-    return [];
-  }
-  const parts = trimmed
-    .split(SEARCH_TOKEN_SPLIT_RE)
-    .filter((p) => p.length > 0);
-  const MAX_TOKENS = 8;
-  const MAX_TOKEN_LEN = 100;
-  const out: string[] = [];
-  for (const p of parts) {
-    if (out.length >= MAX_TOKENS) {
-      break;
-    }
-    const cleaned = stripIlikeMetacharacters(p).slice(0, MAX_TOKEN_LEN);
-    if (cleaned.length > 0) {
-      out.push(cleaned);
-    }
-  }
-  return out;
-}
-
-function encodeListingCursor(
-  createdAt: Date,
-  id: string,
-  sort: XhsRentalListingSort
-): string {
-  const payload: ListingCursorPayload = {
-    cAt: createdAt.toISOString(),
-    id,
-    sort,
-  };
-  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-}
-
-function decodeListingCursor(token: string): ListingCursorPayload | null {
-  try {
-    const raw = Buffer.from(token, "base64url").toString("utf8");
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return null;
-    }
-    const o = parsed as Record<string, unknown>;
-    const cAt = typeof o.cAt === "string" ? o.cAt : null;
-    const id = typeof o.id === "string" ? o.id : null;
-    const sort =
-      o.sort === "createdAt_asc" || o.sort === "createdAt_desc" ? o.sort : null;
-    if (!cAt || !id || !sort) {
-      return null;
-    }
-    return { cAt, id, sort };
-  } catch {
-    return null;
-  }
-}
-
-function buildKeysetCursorSql(
-  createdAt: Date,
-  id: string,
-  sort: XhsRentalListingSort
-): SQL {
-  if (sort === "createdAt_desc") {
-    return sql`(${xhsRentalListing.createdAt}, ${xhsRentalListing.id}) < (${createdAt}::timestamptz, ${id}::uuid)`;
-  }
-  return sql`(${xhsRentalListing.createdAt}, ${xhsRentalListing.id}) > (${createdAt}::timestamptz, ${id}::uuid)`;
-}
-
-/** 只读列出 XhsRentalListing；针对 Dify 多轮筛选做了索引友好查询与可选轻量字段 */
+/** 只读列出 XhsRentalListing 全列，按 createdAt 新到旧 */
 export async function listXhsRentalListings(
   params: ListXhsRentalListingsParams
-): Promise<ListXhsRentalListingsResult> {
-  const tokens = parseSearchTokens(params.search);
-  const locationSanitized = stripIlikeMetacharacters(
-    params.locationHint?.trim() ?? ""
-  ).slice(0, 200);
-  const locationPattern =
-    locationSanitized.length > 0 ? `%${locationSanitized}%` : null;
+) {
+  const { limit, offset, search } = params;
+  const trimmed = search?.trim();
+  const safeFragment =
+    trimmed && trimmed.length > 0
+      ? trimmed.replaceAll("%", "").replaceAll("_", "")
+      : "";
+  const pattern =
+    safeFragment.length > 0 ? `%${safeFragment.slice(0, 500)}%` : null;
 
-  const conditions: SQL[] = [];
+  const textOr =
+    pattern !== null
+      ? or(
+          ilike(xhsRentalListing.title, pattern),
+          ilike(xhsRentalListing.rawText, pattern),
+          ilike(xhsRentalListing.locationText, pattern),
+          ilike(xhsRentalListing.propertyName, pattern)
+        )
+      : null;
 
-  for (const token of tokens) {
-    const pattern = `%${token}%`;
-    const tokenMatch = or(
-      ilike(xhsRentalListing.title, pattern),
-      ilike(xhsRentalListing.rawText, pattern),
-      ilike(xhsRentalListing.locationText, pattern),
-      ilike(xhsRentalListing.propertyName, pattern)
-    );
-    if (tokenMatch) {
-      conditions.push(tokenMatch);
-    }
-  }
+  const listBase = db.select().from(xhsRentalListing);
+  const listFiltered = textOr !== null ? listBase.where(textOr) : listBase;
+  const countBase = db
+    .select({ total: count(xhsRentalListing.id) })
+    .from(xhsRentalListing);
+  const countFiltered = textOr !== null ? countBase.where(textOr) : countBase;
 
-  if (locationPattern !== null) {
-    conditions.push(ilike(xhsRentalListing.locationText, locationPattern));
-  }
-
-  const listingTypeEq = stripIlikeMetacharacters(
-    params.listingType?.trim() ?? ""
-  );
-  if (listingTypeEq.length > 0) {
-    conditions.push(eq(xhsRentalListing.listingType, listingTypeEq));
-  }
-
-  const bedroomsEq = stripIlikeMetacharacters(params.bedrooms?.trim() ?? "");
-  if (bedroomsEq.length > 0) {
-    conditions.push(eq(xhsRentalListing.bedrooms, bedroomsEq));
-  }
-
-  const bathroomsEq = stripIlikeMetacharacters(params.bathrooms?.trim() ?? "");
-  if (bathroomsEq.length > 0) {
-    conditions.push(eq(xhsRentalListing.bathrooms, bathroomsEq));
-  }
-
-  const roomTypeEq = stripIlikeMetacharacters(params.roomType?.trim() ?? "");
-  if (roomTypeEq.length > 0) {
-    conditions.push(eq(xhsRentalListing.roomType, roomTypeEq));
-  }
-
-  const furnishedEq = stripIlikeMetacharacters(params.furnished?.trim() ?? "");
-  if (furnishedEq.length > 0) {
-    conditions.push(eq(xhsRentalListing.furnished, furnishedEq));
-  }
-
-  if (params.cursorAfter) {
-    const decoded = decodeListingCursor(params.cursorAfter);
-    if (!decoded || decoded.sort !== params.sort) {
-      throw new ChatSDKError(
-        "bad_request:api",
-        "Invalid or mismatched cursor for current sort"
-      );
-    }
-    const cDate = new Date(decoded.cAt);
-    if (Number.isNaN(cDate.getTime())) {
-      throw new ChatSDKError("bad_request:api", "Invalid cursor timestamp");
-    }
-    conditions.push(buildKeysetCursorSql(cDate, decoded.id, params.sort));
-  }
-
-  const combinedWhere =
-    conditions.length === 0
-      ? undefined
-      : conditions.length === 1
-        ? conditions[0]
-        : and(...conditions);
-
-  const orderParts =
-    params.sort === "createdAt_asc"
-      ? [asc(xhsRentalListing.createdAt), asc(xhsRentalListing.id)]
-      : [desc(xhsRentalListing.createdAt), desc(xhsRentalListing.id)];
-
-  const offset = params.cursorAfter ? 0 : params.offset;
-
-  const snippetLen = Math.min(
-    2000,
-    Math.max(80, params.rawTextSnippetLength || 480)
-  );
-
-  const compactSelect = {
-    id: xhsRentalListing.id,
-    sourceUrl: xhsRentalListing.sourceUrl,
-    title: xhsRentalListing.title,
-    rent: xhsRentalListing.rent,
-    deposit: xhsRentalListing.deposit,
-    availableFrom: xhsRentalListing.availableFrom,
-    leaseEndDate: xhsRentalListing.leaseEndDate,
-    listingType: xhsRentalListing.listingType,
-    bedrooms: xhsRentalListing.bedrooms,
-    bathrooms: xhsRentalListing.bathrooms,
-    roomType: xhsRentalListing.roomType,
-    propertyName: xhsRentalListing.propertyName,
-    locationText: xhsRentalListing.locationText,
-    furnished: xhsRentalListing.furnished,
-    contactMethod: xhsRentalListing.contactMethod,
-    imageUrls: xhsRentalListing.imageUrls,
-    createdAt: xhsRentalListing.createdAt,
-    rawTextSnippet:
-      sql<string>`left(${xhsRentalListing.rawText}, ${snippetLen})`.as(
-        "rawTextSnippet"
-      ),
-  } as const;
-
-  const truncatedSelect = (cap: number) =>
-    ({
-      id: xhsRentalListing.id,
-      sourceUrl: xhsRentalListing.sourceUrl,
-      title: xhsRentalListing.title,
-      rawText: sql<string>`left(${xhsRentalListing.rawText}, ${cap})`.as(
-        "rawText"
-      ),
-      rent: xhsRentalListing.rent,
-      deposit: xhsRentalListing.deposit,
-      availableFrom: xhsRentalListing.availableFrom,
-      leaseEndDate: xhsRentalListing.leaseEndDate,
-      listingType: xhsRentalListing.listingType,
-      bedrooms: xhsRentalListing.bedrooms,
-      bathrooms: xhsRentalListing.bathrooms,
-      roomType: xhsRentalListing.roomType,
-      propertyName: xhsRentalListing.propertyName,
-      locationText: xhsRentalListing.locationText,
-      furnished: xhsRentalListing.furnished,
-      contactMethod: xhsRentalListing.contactMethod,
-      imageUrls: xhsRentalListing.imageUrls,
-      createdAt: xhsRentalListing.createdAt,
-    }) as const;
-
-  const runListQuery = (): Promise<XhsRentalListingListRow[]> => {
-    if (params.compact) {
-      const base =
-        combinedWhere !== undefined
-          ? db.select(compactSelect).from(xhsRentalListing).where(combinedWhere)
-          : db.select(compactSelect).from(xhsRentalListing);
-      return base
-        .orderBy(...orderParts)
-        .limit(params.limit)
-        .offset(offset);
-    }
-    if (params.rawTextMaxChars !== null && params.rawTextMaxChars > 0) {
-      const cap = Math.min(50_000, params.rawTextMaxChars);
-      const sel = truncatedSelect(cap);
-      const base =
-        combinedWhere !== undefined
-          ? db.select(sel).from(xhsRentalListing).where(combinedWhere)
-          : db.select(sel).from(xhsRentalListing);
-      return base
-        .orderBy(...orderParts)
-        .limit(params.limit)
-        .offset(offset);
-    }
-    const base =
-      combinedWhere !== undefined
-        ? db.select().from(xhsRentalListing).where(combinedWhere)
-        : db.select().from(xhsRentalListing);
-    return base
-      .orderBy(...orderParts)
-      .limit(params.limit)
-      .offset(offset);
-  };
-
-  const listPromise = runListQuery();
-
-  let rows: XhsRentalListingListRow[];
-  let total: number | null = null;
-
-  if (params.includeTotal) {
-    const countBase = db
-      .select({ total: count(xhsRentalListing.id) })
-      .from(xhsRentalListing);
-    const countFiltered =
-      combinedWhere !== undefined ? countBase.where(combinedWhere) : countBase;
-    const [listRows, countRows] = await Promise.all([
-      listPromise,
-      countFiltered,
-    ]);
-    rows = listRows;
-    total = countRows[0]?.total ?? 0;
-  } else {
-    rows = await listPromise;
-  }
-
-  let nextCursor: string | null = null;
-  if (rows.length === params.limit) {
-    const last = rows.at(-1);
-    if (last) {
-      let emitCursor = true;
-      if (total !== null && !params.cursorAfter) {
-        emitCursor = params.offset + rows.length < total;
-      }
-      if (emitCursor) {
-        nextCursor = encodeListingCursor(last.createdAt, last.id, params.sort);
-      }
-    }
-  }
+  const [rows, countRows] = await Promise.all([
+    listFiltered
+      .orderBy(desc(xhsRentalListing.createdAt))
+      .limit(limit)
+      .offset(offset),
+    countFiltered,
+  ]);
 
   return {
     rows,
-    total,
-    compact: params.compact,
-    nextCursor,
+    total: countRows[0]?.total ?? 0,
   };
 }
 
