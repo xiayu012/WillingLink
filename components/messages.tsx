@@ -18,9 +18,7 @@ type MessagesProps = {
   setMessages: UseChatHelpers<ChatMessage>["setMessages"];
   regenerate: UseChatHelpers<ChatMessage>["regenerate"];
   isReadonly: boolean;
-  isArtifactVisible: boolean;
   selectedModelId: string;
-  onSignUpClick?: (shiftId: string) => void;
 };
 
 function PureMessages({
@@ -33,7 +31,6 @@ function PureMessages({
   regenerate,
   isReadonly,
   selectedModelId: _selectedModelId,
-  onSignUpClick,
 }: MessagesProps) {
   const {
     containerRef: messagesContainerRef,
@@ -66,14 +63,6 @@ function PureMessages({
               isReadonly={isReadonly}
               key={message.id}
               message={message}
-              onSignUpClick={
-                onSignUpClick
-                  ? (shiftId) => {
-                      scrollToBottom("smooth");
-                      onSignUpClick(shiftId);
-                    }
-                  : undefined
-              }
               regenerate={regenerate}
               requiresScrollPadding={
                 hasSentMessage && index === messages.length - 1
@@ -118,17 +107,10 @@ function PureMessages({
 }
 
 export const Messages = memo(PureMessages, (prevProps, nextProps) => {
-  if (prevProps.isArtifactVisible && nextProps.isArtifactVisible) {
-    return true;
-  }
-
   if (prevProps.status !== nextProps.status) {
     return false;
   }
   if (prevProps.selectedModelId !== nextProps.selectedModelId) {
-    return false;
-  }
-  if (prevProps.onSignUpClick !== nextProps.onSignUpClick) {
     return false;
   }
   if (prevProps.messages.length !== nextProps.messages.length) {

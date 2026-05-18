@@ -68,8 +68,6 @@ function PureMultimodalInput({
   selectedVisibilityType,
   selectedModelId,
   onModelChange,
-  pendingSignUp: _pendingSignUp,
-  onSignUpNameSubmit: _onSignUpNameSubmit,
 }: {
   chatId: string;
   input: string;
@@ -85,8 +83,6 @@ function PureMultimodalInput({
   selectedVisibilityType: VisibilityType;
   selectedModelId: string;
   onModelChange?: (modelId: string) => void;
-  pendingSignUp?: { shiftId: string } | null;
-  onSignUpNameSubmit?: (shiftId: string, userName: string) => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { width } = useWindowSize();

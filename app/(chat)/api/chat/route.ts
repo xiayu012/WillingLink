@@ -89,12 +89,11 @@ export async function POST(request: Request) {
 
     // Feedback mode: send user message to Telegram only, no DB, no LLM
     if (feedbackMode) {
-      const textParts =
-        message?.parts?.filter(
-          (p: { type?: string; text?: string }) => p.type === "text"
-        ) ?? [];
-      const text = textParts
-        .map((p: { text?: string }) => p.text ?? "")
+      const text = (message?.parts ?? [])
+        .filter(
+          (p): p is { type: "text"; text: string } => p.type === "text"
+        )
+        .map((p) => p.text ?? "")
         .join("\n")
         .trim();
       if (!text) {

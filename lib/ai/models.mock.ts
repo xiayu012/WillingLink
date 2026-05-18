@@ -170,4 +170,3 @@ const createMockTitleModel = (): LanguageModel => {
 export const chatModel = createMockModel();
 export const reasoningModel = createMockReasoningModel();
 export const titleModel = createMockTitleModel();
-export const artifactModel = createMockModel();

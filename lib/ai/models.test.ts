@@ -64,18 +64,3 @@ export const titleModel = new MockLanguageModelV3({
   }),
 });
 
-export const artifactModel = new MockLanguageModelV3({
-  doGenerate: async () => ({
-    finishReason: "stop",
-    usage: mockUsage,
-    content: [{ type: "text", text: "Hello, world!" }],
-    warnings: [],
-  }),
-  doStream: async ({ prompt }) => ({
-    stream: simulateReadableStream({
-      chunkDelayInMs: 50,
-      initialDelayInMs: 100,
-      chunks: getResponseChunksByPrompt(prompt),
-    }),
-  }),
-});
