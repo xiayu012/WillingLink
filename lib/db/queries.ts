@@ -890,3 +890,145 @@ export async function appendXhsListingImageUrl(
     listingFound: true,
   };
 }
+
+export type SearchXhsRentalListingsArgs = {
+  /** 结构化精确筛选（仅在用户明确说时传） */
+  bedrooms?: string | null;
+  bathrooms?: string | null;
+  roomType?: string | null;
+  listingType?: string | null;
+  furnished?: string | null;
+  propertyName?: string | null;
+  locationText?: string | null;
+  /** 数值范围筛选；rent / bathrooms 是 text 字段，用正则取首个数字再比较 */
+  rentMin?: number | null;
+  rentMax?: number | null;
+  bedroomsMin?: number | null;
+  bathroomsMin?: number | null;
+  /** 入住时间范围（ISO 日期字符串），availableFrom 是 text 字段 */
+  availableFromAfter?: string | null;
+  availableFromBefore?: string | null;
+  /**
+   * 自由文本关键词（处理"刁钻"长尾条件，如"宠物友好/靠近地铁/带阳台"）。
+   * 对 rawText/title/locationText/propertyName 四列做 OR 模糊匹配，
+   * 关键词之间 AND（必须全部命中至少一列）。
+   */
+  keywords?: string[] | null;
+};
+
+export type XhsRentalSearchResultRow = {
+  id: string;
+  sourceUrl: string;
+  title: string | null;
+  rawText: string;
+  rent: string | null;
+  deposit: string | null;
+  availableFrom: string | null;
+  leaseEndDate: string | null;
+  listingType: string | null;
+  bedrooms: string | null;
+  bathrooms: string | null;
+  roomType: string | null;
+  propertyName: string | null;
+  locationText: string | null;
+  furnished: string | null;
+  contactMethod: string | null;
+  imageUrls: string[] | null;
+  createdAt: Date;
+};
+
+const RENTAL_RESULT_LIMIT = 20;
+
+export async function searchXhsRentalListings({
+  bedrooms,
+  bathrooms,
+  roomType,
+  listingType,
+  furnished,
+  propertyName,
+  locationText,
+  rentMin,
+  rentMax,
+  bedroomsMin,
+  bathroomsMin,
+  availableFromAfter,
+  availableFromBefore,
+  keywords,
+}: SearchXhsRentalListingsArgs) {
+  try {
+    const cleanKeywords = (keywords ?? [])
+      .map((k) => (typeof k === "string" ? k.trim() : ""))
+      .filter((k) => k.length > 0);
+
+    const rows = await client`
+      SELECT
+        "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+        "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
+        "roomType", "propertyName", "locationText", "furnished", "contactMethod",
+        "imageUrls", "createdAt",
+        COUNT(*) OVER() AS total_count
+      FROM "XhsRentalListing"
+      WHERE
+            (${bedrooms ?? null}::text     IS NULL OR "bedrooms"     ILIKE '%' || ${bedrooms ?? null} || '%')
+        AND (${bathrooms ?? null}::text    IS NULL OR "bathrooms"    ILIKE '%' || ${bathrooms ?? null} || '%')
+        AND (${roomType ?? null}::text     IS NULL OR "roomType"     ILIKE '%' || ${roomType ?? null} || '%')
+        AND (${listingType ?? null}::text  IS NULL OR "listingType"  ILIKE '%' || ${listingType ?? null} || '%')
+        AND (${furnished ?? null}::text    IS NULL OR "furnished"    ILIKE '%' || ${furnished ?? null} || '%')
+        AND (${propertyName ?? null}::text IS NULL OR "propertyName" ILIKE '%' || ${propertyName ?? null} || '%')
+        AND (${locationText ?? null}::text IS NULL OR "locationText" ILIKE '%' || ${locationText ?? null} || '%')
+        AND (${rentMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("rent" from '\\d+'), '')::int, 0)  >= ${rentMin ?? null}::int)
+        AND (${rentMax ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("rent" from '\\d+'), '')::int, 999999) <= ${rentMax ?? null}::int)
+        AND (${bedroomsMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("bedrooms"  from '\\d+'), '')::int, 0) >= ${bedroomsMin ?? null}::int)
+        AND (${bathroomsMin ?? null}::int IS NULL OR COALESCE(NULLIF(substring("bathrooms" from '\\d+'), '')::int, 0) >= ${bathroomsMin ?? null}::int)
+        AND (${availableFromAfter ?? null}::text  IS NULL OR "availableFrom" >= ${availableFromAfter ?? null})
+        AND (${availableFromBefore ?? null}::text IS NULL OR "availableFrom" <= ${availableFromBefore ?? null})
+        AND (
+          ${cleanKeywords.length === 0}::boolean
+          OR (
+            SELECT bool_and(
+              "rawText"      ILIKE '%' || kw || '%'
+              OR COALESCE("title", '')        ILIKE '%' || kw || '%'
+              OR COALESCE("locationText", '') ILIKE '%' || kw || '%'
+              OR COALESCE("propertyName", '') ILIKE '%' || kw || '%'
+            )
+            FROM unnest(${cleanKeywords}::text[]) AS kw
+          )
+        )
+      ORDER BY "createdAt" DESC
+      LIMIT ${RENTAL_RESULT_LIMIT}
+    `;
+
+    const totalCount = rows.length > 0 ? Number(rows[0].total_count) : 0;
+
+    const results: XhsRentalSearchResultRow[] = rows.map((row) => ({
+      id: row.id as string,
+      sourceUrl: row.sourceUrl as string,
+      title: (row.title as string | null) ?? null,
+      rawText: row.rawText as string,
+      rent: (row.rent as string | null) ?? null,
+      deposit: (row.deposit as string | null) ?? null,
+      availableFrom: (row.availableFrom as string | null) ?? null,
+      leaseEndDate: (row.leaseEndDate as string | null) ?? null,
+      listingType: (row.listingType as string | null) ?? null,
+      bedrooms: (row.bedrooms as string | null) ?? null,
+      bathrooms: (row.bathrooms as string | null) ?? null,
+      roomType: (row.roomType as string | null) ?? null,
+      propertyName: (row.propertyName as string | null) ?? null,
+      locationText: (row.locationText as string | null) ?? null,
+      furnished: (row.furnished as string | null) ?? null,
+      contactMethod: (row.contactMethod as string | null) ?? null,
+      imageUrls: Array.isArray(row.imageUrls)
+        ? (row.imageUrls as string[])
+        : null,
+      createdAt: row.createdAt as Date,
+    }));
+
+    return { totalCount, results };
+  } catch (error) {
+    console.error("Failed to search XhsRentalListing:", error);
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to search rental listings"
+    );
+  }
+}
