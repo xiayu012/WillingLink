@@ -18,20 +18,20 @@ type SuggestedActionsProps = {
 
 const suggestedActions = [
   {
-    label: "Search shift",
+    label: "            ",
     response: "Give me a clue.",
   },
   {
-    label: "Post shift",
+    label: "          ",
     response:
       " ",
   },
   {
-    label: "Download labor records of Twin Oaks",
+    label: "                                   ",
     response: "Downloading.",
   },
   {
-    label: "Feedback to WillingLink",
+    label: "                 ",
     response: "Tell something to WillingLink developers.",
   },
 ];
