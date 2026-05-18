@@ -13,7 +13,7 @@ export const Greeting = () => {
         initial={{ opacity: 0, y: 10 }}
         transition={{ delay: 0.5 }}
       >
-        Please scroll down and click the Submit Phone Number button
+        Scroll down and click submit phone number button
       </motion.div>
       <motion.div
         animate={{ opacity: 1, y: 0 }}
