@@ -41,13 +41,8 @@ import {
   PromptInputToolbar,
   PromptInputTools,
 } from "./elements/prompt-input";
-import { SpeechInput } from "./ai-elements/speech-input";
 import { ArrowUpIcon, PaperclipIcon, StopIcon } from "./icons";
 import { PreviewAttachment } from "./preview-attachment";
-import {
-  type VoiceRecordResult,
-  VoiceRecorderOverlay,
-} from "./voice-recorder-overlay";
 import { SuggestedActions } from "./suggested-actions";
 import { Button } from "./ui/button";
 import type { VisibilityType } from "./visibility-selector";
@@ -57,15 +52,6 @@ function setCookie(name: string, value: string) {
   // biome-ignore lint/suspicious/noDocumentCookie: needed for client-side cookie setting
   document.cookie = `${name}=${encodeURIComponent(value)}; path=/; max-age=${maxAge}`;
 }
-
-const POST_SHIFT_RECORDING_HINTS = [
-  "What to do",
-  "Start time",
-  "Where",
-  "Skills needed",
-  "Who is being helped",
-  "How long",
-];
 
 function PureMultimodalInput({
   chatId,
@@ -82,8 +68,8 @@ function PureMultimodalInput({
   selectedVisibilityType,
   selectedModelId,
   onModelChange,
-  pendingSignUp,
-  onSignUpNameSubmit,
+  pendingSignUp: _pendingSignUp,
+  onSignUpNameSubmit: _onSignUpNameSubmit,
 }: {
   chatId: string;
   input: string;
@@ -102,7 +88,6 @@ function PureMultimodalInput({
   pendingSignUp?: { shiftId: string } | null;
   onSignUpNameSubmit?: (shiftId: string, userName: string) => void;
 }) {
-  const effectivePendingSignUp = pendingSignUp ?? null;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { width } = useWindowSize();
 
@@ -122,11 +107,7 @@ function PureMultimodalInput({
   useEffect(() => {
     if (!hasAutoFocused.current && width) {
       const timer = setTimeout(() => {
-        if (sessionStorage.getItem("skipInputAutoFocus")) {
-          sessionStorage.removeItem("skipInputAutoFocus");
-        } else {
-          textareaRef.current?.focus();
-        }
+        textareaRef.current?.focus();
         hasAutoFocused.current = true;
       }, 100);
       return () => clearTimeout(timer);
@@ -165,70 +146,7 @@ function PureMultimodalInput({
   };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const attachmentsRef = useRef(attachments);
-  attachmentsRef.current = attachments;
-
   const [uploadQueue, setUploadQueue] = useState<string[]>([]);
-  const [showPostShiftRecorder, setShowPostShiftRecorder] = useState(false);
-  const [voiceStartTrigger, setVoiceStartTrigger] = useState(0);
-
-  const handleVoiceAction = useCallback((action: "post") => {
-    if (action === "post") {
-      setShowPostShiftRecorder(true);
-      setVoiceStartTrigger((t) => t + 1);
-    }
-  }, []);
-
-  const handleVoiceResult = useCallback(
-    (data: VoiceRecordResult) => {
-      setShowPostShiftRecorder(false);
-
-      const transcriptText = (data.transcript || "").trim();
-      const textContent =
-        (transcriptText || "（语音消息）") +
-        `\n[AUDIO_META: url=${data.audioUrl} duration=${data.durationMs} mime=${data.mimeType} size=${data.sizeBytes}]`;
-
-      window.history.pushState({}, "", `/chat/${chatId}`);
-
-      sendMessage({
-        role: "user",
-        parts: [
-          ...attachmentsRef.current.map((attachment) => ({
-            type: "file" as const,
-            url: attachment.url,
-            name: attachment.name,
-            mediaType: attachment.contentType,
-          })),
-          { type: "text", text: textContent },
-        ],
-      });
-
-      setAttachments([]);
-      setLocalStorageInput("");
-      resetHeight();
-      setInput("");
-
-      if (width && width > 768) {
-        textareaRef.current?.focus();
-      }
-    },
-    [
-      chatId,
-      sendMessage,
-      setAttachments,
-      setLocalStorageInput,
-      resetHeight,
-      setInput,
-      width,
-    ],
-  );
-
-  const handleTranscriptionChange = useCallback(
-    (text: string) => {
-      setInput((prev) => (prev ? `${prev} ${text}` : text));
-    },
-    [setInput],
-  );
 
   const submitForm = useCallback(() => {
     window.history.pushState({}, "", `/chat/${chatId}`);
@@ -242,7 +160,10 @@ function PureMultimodalInput({
           name: attachment.name,
           mediaType: attachment.contentType,
         })),
-        { type: "text", text: input },
+        {
+          type: "text",
+          text: input,
+        },
       ],
     });
 
@@ -385,9 +306,8 @@ function PureMultimodalInput({
         uploadQueue.length === 0 && (
           <SuggestedActions
             chatId={chatId}
-            onVoiceAction={handleVoiceAction}
             selectedVisibilityType={selectedVisibilityType}
-            setMessages={setMessages}
+            sendMessage={sendMessage}
           />
         )}
 
@@ -406,35 +326,11 @@ function PureMultimodalInput({
           event.preventDefault();
           if (status !== "ready") {
             toast.error("Please wait for the model to finish its response!");
-            return;
+          } else {
+            submitForm();
           }
-          if (
-            effectivePendingSignUp &&
-            input.trim() &&
-            typeof onSignUpNameSubmit === "function"
-          ) {
-            onSignUpNameSubmit(effectivePendingSignUp.shiftId, input.trim());
-            setAttachments([]);
-            setLocalStorageInput("");
-            setInput("");
-            resetHeight();
-            if (width && width > 768) {
-              textareaRef.current?.focus();
-            }
-            return;
-          }
-          submitForm();
         }}
       >
-        {showPostShiftRecorder && (
-          <VoiceRecorderOverlay
-            onResult={handleVoiceResult}
-            recordingHints={POST_SHIFT_RECORDING_HINTS}
-            recordingTitle="Speak to the community. Try to include:"
-            startTrigger={voiceStartTrigger}
-            uploadingText="Uploading voice..."
-          />
-        )}
         {(attachments.length > 0 || uploadQueue.length > 0) && (
           <div
             className="flex flex-row items-end gap-2 overflow-x-scroll"
@@ -489,18 +385,10 @@ function PureMultimodalInput({
               selectedModelId={selectedModelId}
               status={status}
             />
-            <SpeechInput
-              className="h-8"
-              disabled={status !== "ready"}
-              lang="en-US"
-              onTranscriptionChange={handleTranscriptionChange}
+            <ModelSelectorCompact
+              onModelChange={onModelChange}
+              selectedModelId={selectedModelId}
             />
-            <div data-dev-only="model-selector" style={{ display: "none" }}>
-              <ModelSelectorCompact
-                onModelChange={onModelChange}
-                selectedModelId={selectedModelId}
-              />
-            </div>
           </PromptInputTools>
 
           {status === "submitted" ? (
@@ -537,15 +425,6 @@ export const MultimodalInput = memo(
       return false;
     }
     if (prevProps.selectedModelId !== nextProps.selectedModelId) {
-      return false;
-    }
-    if (prevProps.messages.length !== nextProps.messages.length) {
-      return false;
-    }
-    if (prevProps.pendingSignUp !== nextProps.pendingSignUp) {
-      return false;
-    }
-    if (prevProps.onSignUpNameSubmit !== nextProps.onSignUpNameSubmit) {
       return false;
     }
 
