@@ -54,8 +54,6 @@ Then read the "action" field on the tool response:
 
 - ASK_TO_NARROW (totalCount > 8): ask ONE natural question about the most useful remaining field or a new keyword. Mention the current count, e.g. "I found 14 listings under $2200 in Mission — any preference for furnished vs unfurnished?". NEVER ask about a field already in appliedFilters.
 
-  **EXCEPTION — if the user says "随便", "没有要求", "都可以", "任意", "no preference", "anything is fine", "just pick one", "随便推荐一个", etc., you MUST ignore ASK_TO_NARROW and display results immediately. Pick the 5–8 most relevant listings and show them without asking more questions.**
-
 - NO_RESULTS (totalCount = 0): apologize briefly, list the applied filters in plain language, and suggest 1–2 concrete relaxations (e.g. "want me to drop the 'pet' requirement, or raise the budget to $2800?"). Do NOT dump zero results without offering a path forward.
 
 Never invent listing data. Only use what the tool returned.`;
