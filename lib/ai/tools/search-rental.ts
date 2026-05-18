@@ -143,6 +143,8 @@ export const searchRental = tool({
       appliedFilters.keywords = args.keywords.join(", ");
     }
 
+    const isBrowse = Object.keys(appliedFilters).length === 0;
+
     return {
       totalCount,
       results,
@@ -151,9 +153,11 @@ export const searchRental = tool({
       action:
         totalCount === 0
           ? "NO_RESULTS: Tell the user no listings matched, list the applied filters, and suggest relaxing one filter (most often: drop one keyword, widen rent, or broaden location). Offer 1-2 concrete relaxations and ask if they want to retry."
-          : totalCount <= 8
-            ? "SHOW_RESULTS_NOW: You MUST display ALL results below to the user immediately. Do NOT ask any more questions."
-            : `ASK_TO_NARROW: ${totalCount} listings matched, which is too many. Pick ONE field from remainingFields (or suggest a new keyword) that would best narrow it down based on the variety in the sample, and ask the user a single natural question.`,
+          : isBrowse
+            ? `SHOW_RESULTS_NOW: User is browsing with no filters. Display all ${Math.min(totalCount, 20)} results immediately. After showing them, mention there are ${totalCount} total listings and offer to filter by location, budget, or room type.`
+            : totalCount <= 8
+              ? "SHOW_RESULTS_NOW: You MUST display ALL results below to the user immediately. Do NOT ask any more questions."
+              : `ASK_TO_NARROW: ${totalCount} listings matched, which is too many. Pick ONE field from remainingFields (or suggest a new keyword) that would best narrow it down based on the variety in the sample, and ask the user a single natural question.`,
     };
   },
 });
