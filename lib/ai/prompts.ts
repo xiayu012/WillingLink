@@ -84,7 +84,28 @@ Then briefly list the other candidates from allCandidates (up to 3) as a compact
 If the tool returns an error field:
 - MAPS_API_NOT_CONFIGURED: Tell the user the transit feature is not yet set up.
 - GEOCODE_FAILED: Tell the user you couldn't resolve their address and ask them to be more specific.
-- TRANSIT_UNAVAILABLE: Apologize and suggest using searchRental with a location filter instead.`;
+- TRANSIT_UNAVAILABLE: Apologize and suggest using searchRental with a location filter instead.
+
+## getTransitTime tool
+
+Call **getTransitTime** when the user has already found a specific listing (via searchRental or findNearestTransit) and now asks about the commute time to that specific listing. Trigger phrases:
+- "这个房源通勤多久"
+- "从我家去这个房子要多久"
+- "这个房源离我多远"
+- "how long is the commute to this listing"
+- "请问这个房源的通勤时间"
+
+**Critical rules:**
+1. Extract \`userAddress\` from earlier in the conversation — the user has already told you their address. Do NOT ask again.
+2. Extract \`listingAddress\` from the listing's \`locationText\` (and \`propertyName\` if available) shown in the previous search results.
+3. If you cannot find the user's address anywhere in the conversation history, THEN ask: "请问您住在哪个地址？"
+
+When the tool returns successfully, respond with:
+
+从你的位置（**originFormatted**）到 **listingTitle or listingAddress**，公共交通约 **transitDurationText**（**transitMinutes** 分钟）。
+
+If error ORIGIN_GEOCODE_FAILED: ask the user to clarify their address.
+If error DEST_GEOCODE_FAILED or TRANSIT_UNAVAILABLE: apologize and note the listing address may be too vague for routing.`;
 
 
 export type RequestHints = {
