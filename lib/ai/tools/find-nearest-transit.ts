@@ -8,7 +8,6 @@ import {
 
 const GOOGLE_MAPS_KEY = process.env.GOOGLE_MAPS_API_KEY ?? "";
 
-const MAX_GEOCODE_ON_THE_FLY = 20;
 const MAX_TRANSIT_CANDIDATES = 10;
 
 type GeoPoint = { lat: number; lng: number; formattedAddress: string };
@@ -40,9 +39,64 @@ type RankedListing = {
   transit: TransitResult;
 };
 
+// Top-level regex declarations (must stay at module scope to avoid re-creation)
+const RE_SANFRANSHI = /三藩市/g;
+const RE_JIUJIUSHAN = /旧金山/g;
+const RE_WANQU = /湾区/g;
+const RE_AOKELAND = /奥克兰/g;
+const RE_BOLI = /伯克利/g;
+const RE_SHENGHEXI = /圣何塞/g;
+const RE_PALOALTO = /帕罗奥图/g;
+const RE_SHANJINGCHENG = /山景城/g;
+const RE_SANGNIYWEIER = /桑尼维尔/g;
+const RE_SHENGKELALA = /圣克拉拉/g;
+const RE_FULEIMENGDE = /弗里蒙特/g;
+const RE_DAILI = /戴利城/g;
+const RE_NANBEI = /南湾/g;
+const RE_DONGWAN = /东湾/g;
+const RE_BEIBEI = /北湾/g;
+const RE_JIAOKOUPHRASE = /和(.+?)交口/g;
+const RE_JIAOKOU = /交口/g;
+const RE_CHINESE_COMMA = /，/g;
+const RE_MULTI_SPACE = /\s{2,}/g;
+
+/**
+ * Normalize a Chinese-language address into a form that Google Maps geocoding understands.
+ * Replaces common Chinese Bay Area city names and intersection phrases with English equivalents.
+ */
+function normalizeAddress(raw: string): string {
+  return raw
+    .replace(RE_SANFRANSHI, "San Francisco")
+    .replace(RE_JIUJIUSHAN, "San Francisco")
+    .replace(RE_WANQU, "Bay Area, CA")
+    .replace(RE_AOKELAND, "Oakland")
+    .replace(RE_BOLI, "Berkeley")
+    .replace(RE_SHENGHEXI, "San Jose")
+    .replace(RE_PALOALTO, "Palo Alto")
+    .replace(RE_SHANJINGCHENG, "Mountain View")
+    .replace(RE_SANGNIYWEIER, "Sunnyvale")
+    .replace(RE_SHENGKELALA, "Santa Clara")
+    .replace(RE_FULEIMENGDE, "Fremont")
+    .replace(RE_DAILI, "Daly City")
+    .replace(RE_NANBEI, "South Bay, CA")
+    .replace(RE_DONGWAN, "East Bay, CA")
+    .replace(RE_BEIBEI, "North Bay, CA")
+    .replace(RE_JIAOKOUPHRASE, "and $1")
+    .replace(RE_JIAOKOU, "")
+    .replace(RE_CHINESE_COMMA, ", ")
+    .replace(RE_MULTI_SPACE, " ")
+    .trim();
+}
+
 async function geocodeAddress(address: string): Promise<GeoPoint | null> {
   if (!GOOGLE_MAPS_KEY) return null;
-  const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_MAPS_KEY}`;
+  const normalized = normalizeAddress(address);
+  const url =
+    `https://maps.googleapis.com/maps/api/geocode/json` +
+    `?address=${encodeURIComponent(normalized)}` +
+    `&region=us` +
+    `&components=country:US` +
+    `&key=${GOOGLE_MAPS_KEY}`;
   try {
     const res = await fetch(url);
     if (!res.ok) return null;
@@ -116,7 +170,7 @@ export const findNearestTransit = tool({
     userAddress: z
       .string()
       .describe(
-        "The user's full address or location, e.g. '123 Main St, Mountain View, CA' or 'Downtown San Francisco' or '旧金山市中心'."
+        "The user's full address or location, e.g. '123 Main St, Mountain View, CA' or '三藩市 10th Ave' or '旧金山市中心'."
       ),
   }),
   execute: async ({ userAddress }) => {
@@ -144,10 +198,11 @@ export const findNearestTransit = tool({
       };
     }
 
-    // Geocode listings that don't have coordinates yet (up to the limit)
-    const needsGeocode = listings
-      .filter((l) => (l.lat === null || l.lng === null) && l.locationText)
-      .slice(0, MAX_GEOCODE_ON_THE_FLY);
+    // Geocode every listing that is missing coordinates (no artificial cap —
+    // Promise.all runs them in parallel and results are cached to DB for future requests)
+    const needsGeocode = listings.filter(
+      (l) => (l.lat === null || l.lng === null) && l.locationText
+    );
 
     const freshGeoResults = await Promise.all(
       needsGeocode.map((l) =>
@@ -158,20 +213,16 @@ export const findNearestTransit = tool({
       )
     );
 
-    // Persist fresh geocodes back to DB (fire-and-forget; errors are swallowed inside updateListingGeocode)
+    // Persist fresh geocodes back to DB
     await Promise.all(
       freshGeoResults
-        .filter(
-          (r): r is { id: string; geo: GeoPoint } => r.geo !== null
-        )
+        .filter((r): r is { id: string; geo: GeoPoint } => r.geo !== null)
         .map((r) => updateListingGeocode(r.id, r.geo.lat, r.geo.lng))
     );
 
     const freshGeoMap = new Map(
       freshGeoResults
-        .filter(
-          (r): r is { id: string; geo: GeoPoint } => r.geo !== null
-        )
+        .filter((r): r is { id: string; geo: GeoPoint } => r.geo !== null)
         .map((r) => [r.id, r.geo])
     );
 
@@ -215,8 +266,13 @@ export const findNearestTransit = tool({
 
     const ranked: RankedListing[] = transitResults
       .filter(
-        (r): r is { listing: ListingWithCoords; distanceKm: number; transit: TransitResult } =>
-          r.transit !== null
+        (
+          r
+        ): r is {
+          listing: ListingWithCoords;
+          distanceKm: number;
+          transit: TransitResult;
+        } => r.transit !== null
       )
       .sort((a, b) => a.transit.minutes - b.transit.minutes);
 
