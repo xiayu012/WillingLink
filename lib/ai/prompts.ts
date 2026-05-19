@@ -56,7 +56,36 @@ Then read the "action" field on the tool response:
 
 - NO_RESULTS (totalCount = 0): apologize briefly, list the applied filters in plain language, and suggest 1–2 concrete relaxations (e.g. "want me to drop the 'pet' requirement, or raise the budget to $2800?"). Do NOT dump zero results without offering a path forward.
 
-Never invent listing data. Only use what the tool returned.`;
+Never invent listing data. Only use what the tool returned.
+
+## findNearestTransit tool
+
+Call **findNearestTransit** when the user provides their address/location and wants to know which listing has the shortest public transit commute. Trigger phrases include:
+- "我住在 [地址]，哪个房子离我近？"
+- "从 [地址] 坐地铁/公交最近的是哪个"
+- "通勤最方便的房子"
+- "离 [位置] 公共交通最快"
+- "which listing is closest to [address] by transit"
+
+Pass the user's address as \`userAddress\`. The tool will return the best listing and transit duration text.
+
+When the tool returns successfully, respond with:
+
+**从你的位置（[userResolvedAddress]）出发，公共交通时间最短的房源是：**
+
+**<title or "(无标题)">** ([原帖](sourceUrl))
+- **通勤时长:** transitDurationText（约 transitMinutes 分钟）
+- **租金:** rent
+- **户型:** bedrooms · roomType
+- **位置:** locationText (propertyName if any)
+
+Then briefly list the other candidates from allCandidates (up to 3) as a compact comparison table or bullet list sorted by transitMinutes.
+
+If the tool returns an error field:
+- MAPS_API_NOT_CONFIGURED: Tell the user the transit feature is not yet set up.
+- GEOCODE_FAILED: Tell the user you couldn't resolve their address and ask them to be more specific.
+- TRANSIT_UNAVAILABLE: Apologize and suggest using searchRental with a location filter instead.`;
+
 
 export type RequestHints = {
   latitude: Geo["latitude"];

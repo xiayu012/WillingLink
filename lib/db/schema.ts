@@ -1,6 +1,7 @@
 import type { InferSelectModel } from "drizzle-orm";
 import {
   boolean,
+  doublePrecision,
   foreignKey,
   json,
   pgTable,
@@ -105,6 +106,9 @@ export const xhsRentalListing = pgTable("XhsRentalListing", {
   /** 上传到 Blob 后的公开 URL 列表，与 sourceUrl 同一帖 */
   imageUrls: json("imageUrls").$type<string[] | null>(),
   createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+  lat: doublePrecision("lat"),
+  lng: doublePrecision("lng"),
+  geocodedAt: timestamp("geocodedAt", { withTimezone: true }),
 });
 
 export type XhsRentalListing = InferSelectModel<typeof xhsRentalListing>;

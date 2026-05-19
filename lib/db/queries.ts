@@ -713,3 +713,69 @@ export async function searchXhsRentalListings({
     );
   }
 }
+
+export type ListingForTransit = {
+  id: string;
+  locationText: string | null;
+  propertyName: string | null;
+  title: string | null;
+  rent: string | null;
+  roomType: string | null;
+  bedrooms: string | null;
+  sourceUrl: string;
+  lat: number | null;
+  lng: number | null;
+};
+
+/** 获取所有有地址或已经编码的房源，用于通勤时间计算 */
+export async function getListingsForTransitSearch(): Promise<
+  ListingForTransit[]
+> {
+  try {
+    const rows = await client`
+      SELECT
+        "id", "locationText", "propertyName", "title",
+        "rent", "roomType", "bedrooms", "sourceUrl",
+        "lat", "lng"
+      FROM "XhsRentalListing"
+      WHERE "locationText" IS NOT NULL
+         OR ("lat" IS NOT NULL AND "lng" IS NOT NULL)
+      ORDER BY "createdAt" DESC
+      LIMIT 100
+    `;
+    return rows.map((r) => ({
+      id: r.id as string,
+      locationText: (r.locationText as string | null) ?? null,
+      propertyName: (r.propertyName as string | null) ?? null,
+      title: (r.title as string | null) ?? null,
+      rent: (r.rent as string | null) ?? null,
+      roomType: (r.roomType as string | null) ?? null,
+      bedrooms: (r.bedrooms as string | null) ?? null,
+      sourceUrl: r.sourceUrl as string,
+      lat: r.lat !== null && r.lat !== undefined ? Number(r.lat) : null,
+      lng: r.lng !== null && r.lng !== undefined ? Number(r.lng) : null,
+    }));
+  } catch (error) {
+    console.error("Failed to get listings for transit search:", error);
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to get listings for transit search"
+    );
+  }
+}
+
+/** 将地理编码结果缓存回数据库 */
+export async function updateListingGeocode(
+  id: string,
+  lat: number,
+  lng: number
+): Promise<void> {
+  try {
+    await db
+      .update(xhsRentalListing)
+      .set({ lat, lng, geocodedAt: new Date() })
+      .where(eq(xhsRentalListing.id, id));
+  } catch (error) {
+    console.error("Failed to update listing geocode:", error);
+  }
+}
