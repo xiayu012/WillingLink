@@ -741,7 +741,6 @@ export async function getListingsForTransitSearch(): Promise<
       WHERE "locationText" IS NOT NULL
          OR ("lat" IS NOT NULL AND "lng" IS NOT NULL)
       ORDER BY "createdAt" DESC
-      LIMIT 100
     `;
     return rows.map((r) => ({
       id: r.id as string,
