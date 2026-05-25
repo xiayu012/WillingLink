@@ -77,27 +77,3 @@ export async function rerankDocuments(
     .map((d: RerankDataItem) => d.index ?? 0);
 }
 
-/**
- * 生成房源帖子的嵌入文本（拼接关键字段，让向量信息更丰富）。
- */
-export function buildListingEmbedText(listing: {
-  title?: string | null;
-  rawText: string;
-  locationText?: string | null;
-  rent?: string | null;
-  roomType?: string | null;
-  bedrooms?: string | null;
-  furnished?: string | null;
-  listingType?: string | null;
-}): string {
-  const parts: string[] = [];
-  if (listing.title) parts.push(listing.title);
-  if (listing.locationText) parts.push(`地点: ${listing.locationText}`);
-  if (listing.rent) parts.push(`租金: ${listing.rent}`);
-  if (listing.roomType) parts.push(`户型: ${listing.roomType}`);
-  if (listing.bedrooms) parts.push(`卧室: ${listing.bedrooms}`);
-  if (listing.furnished) parts.push(`家具: ${listing.furnished}`);
-  if (listing.listingType) parts.push(`类型: ${listing.listingType}`);
-  parts.push(listing.rawText);
-  return parts.join("\n");
-}

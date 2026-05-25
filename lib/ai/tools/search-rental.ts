@@ -1,14 +1,13 @@
 import { tool } from "ai";
 import { z } from "zod";
 import {
-  buildListingEmbedText,
   embedText,
   rerankDocuments,
 } from "@/lib/ai/embeddings";
 import { vectorSearchXhsRentalListings } from "@/lib/db/queries";
 
 const VECTOR_CANDIDATES = 20;
-const RERANK_TOP_K = 8;
+const RERANK_TOP_K = 2;
 
 export const searchRental = tool({
   description:
@@ -45,8 +44,8 @@ export const searchRental = tool({
       };
     }
 
-    // 3. Voyage rerank — reorder candidates by relevance, keep top 8
-    const rerankTexts = candidates.map((c) => buildListingEmbedText(c));
+    // 3. Voyage rerank — reorder candidates by relevance, keep top 2
+    const rerankTexts = candidates.map((c) => c.rawText);
     const rankedIndices = await rerankDocuments(query, rerankTexts, RERANK_TOP_K);
 
     const results = rankedIndices.map((i) => candidates[i]);

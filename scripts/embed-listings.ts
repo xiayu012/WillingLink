@@ -27,28 +27,8 @@ const voyage = new VoyageAIClient({ apiKey: process.env.VOYAGE_API_KEY! });
 
 type RawRow = {
   id: string;
-  title: string | null;
   rawText: string;
-  locationText: string | null;
-  rent: string | null;
-  roomType: string | null;
-  bedrooms: string | null;
-  furnished: string | null;
-  listingType: string | null;
 };
-
-function buildEmbedText(row: RawRow): string {
-  const parts: string[] = [];
-  if (row.title) parts.push(row.title);
-  if (row.locationText) parts.push(`地点: ${row.locationText}`);
-  if (row.rent) parts.push(`租金: ${row.rent}`);
-  if (row.roomType) parts.push(`户型: ${row.roomType}`);
-  if (row.bedrooms) parts.push(`卧室: ${row.bedrooms}`);
-  if (row.furnished) parts.push(`家具: ${row.furnished}`);
-  if (row.listingType) parts.push(`类型: ${row.listingType}`);
-  parts.push(row.rawText);
-  return parts.join("\n");
-}
 
 async function runMigration(): Promise<void> {
   console.log("⏳ Ensuring pgvector extension and embedding column exist...");
@@ -70,7 +50,7 @@ async function main(): Promise<void> {
   await runMigration();
 
   const rows = await db<RawRow[]>`
-    SELECT id, title, "rawText", "locationText", rent, "roomType", bedrooms, furnished, "listingType"
+    SELECT id, "rawText"
     FROM "XhsRentalListing"
     WHERE embedding IS NULL
     ORDER BY "createdAt" DESC
@@ -87,7 +67,7 @@ async function main(): Promise<void> {
 
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const batch = rows.slice(i, i + BATCH_SIZE);
-    const texts = batch.map(buildEmbedText);
+    const texts = batch.map((row) => row.rawText);
 
     const res = await voyage.embed({
       input: texts,

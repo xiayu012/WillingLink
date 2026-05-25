@@ -18,7 +18,7 @@ How to build the \`query\` argument:
 
 After the tool returns, read the "action" field:
 
-- SHOW_RESULTS_NOW: Immediately display ALL results. Use this Markdown format for EACH listing — every field on its OWN line, "---" separator between listings:
+- SHOW_RESULTS_NOW: Display the results (at most 2). The tool already reranked them by relevance — show only the top 1–2. Use this Markdown format for EACH listing — every field on its OWN line, "---" separator between listings:
 
   **<title or "(无标题)">** ([原帖](sourceUrl))
   - **租金:** rent
