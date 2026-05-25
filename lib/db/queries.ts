@@ -778,3 +778,70 @@ export async function updateListingGeocode(
     console.error("Failed to update listing geocode:", error);
   }
 }
+
+/**
+ * 向量相似度搜索：用查询向量做 pgvector cosine 近邻搜索，
+ * 返回最多 candidateLimit 条候选（供后续 rerank 使用）。
+ * 跳过 embedding 为 NULL 的行。
+ */
+export async function vectorSearchXhsRentalListings(
+  queryEmbedding: number[],
+  candidateLimit = 20
+): Promise<XhsRentalSearchResultRow[]> {
+  try {
+    const vectorLiteral = `[${queryEmbedding.join(",")}]`;
+    const rows = await client`
+      SELECT
+        "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+        "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
+        "roomType", "propertyName", "locationText", "furnished", "contactMethod",
+        "imageUrls", "createdAt"
+      FROM "XhsRentalListing"
+      WHERE embedding IS NOT NULL
+      ORDER BY embedding <=> ${vectorLiteral}::vector
+      LIMIT ${candidateLimit}
+    `;
+
+    return rows.map((row) => ({
+      id: row.id as string,
+      sourceUrl: row.sourceUrl as string,
+      title: (row.title as string | null) ?? null,
+      rawText: row.rawText as string,
+      rent: (row.rent as string | null) ?? null,
+      deposit: (row.deposit as string | null) ?? null,
+      availableFrom: (row.availableFrom as string | null) ?? null,
+      leaseEndDate: (row.leaseEndDate as string | null) ?? null,
+      listingType: (row.listingType as string | null) ?? null,
+      bedrooms: (row.bedrooms as string | null) ?? null,
+      bathrooms: (row.bathrooms as string | null) ?? null,
+      roomType: (row.roomType as string | null) ?? null,
+      propertyName: (row.propertyName as string | null) ?? null,
+      locationText: (row.locationText as string | null) ?? null,
+      furnished: (row.furnished as string | null) ?? null,
+      contactMethod: (row.contactMethod as string | null) ?? null,
+      imageUrls: Array.isArray(row.imageUrls)
+        ? (row.imageUrls as string[])
+        : null,
+      createdAt: row.createdAt as Date,
+    }));
+  } catch (error) {
+    console.error("Failed to vector search XhsRentalListing:", error);
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to vector search rental listings"
+    );
+  }
+}
+
+/** 将单条房源的向量写回数据库（新帖入库后调用） */
+export async function updateListingEmbedding(
+  id: string,
+  embedding: number[]
+): Promise<void> {
+  const vectorLiteral = `[${embedding.join(",")}]`;
+  await client`
+    UPDATE "XhsRentalListing"
+    SET embedding = ${vectorLiteral}::vector
+    WHERE id = ${id}::uuid
+  `;
+}
