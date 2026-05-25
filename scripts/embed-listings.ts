@@ -53,6 +53,7 @@ async function main(): Promise<void> {
     SELECT id, "rawText"
     FROM "XhsRentalListing"
     WHERE embedding IS NULL
+      AND trim("rawText") <> ''
     ORDER BY "createdAt" DESC
   `;
 
@@ -66,7 +67,9 @@ async function main(): Promise<void> {
   let done = 0;
 
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const batch = rows.slice(i, i + BATCH_SIZE);
+    const batch = rows.slice(i, i + BATCH_SIZE).filter((row) => row.rawText.trim().length > 0);
+    if (batch.length === 0) continue;
+
     const texts = batch.map((row) => row.rawText);
 
     const res = await voyage.embed({

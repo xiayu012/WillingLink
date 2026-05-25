@@ -7,7 +7,7 @@ import {
 import { vectorSearchXhsRentalListings } from "@/lib/db/queries";
 
 const VECTOR_CANDIDATES = 20;
-const RERANK_TOP_K = 2;
+const RERANK_TOP_K = 1;
 
 export const searchRental = tool({
   description:
@@ -44,7 +44,7 @@ export const searchRental = tool({
       };
     }
 
-    // 3. Voyage rerank — reorder candidates by relevance, keep top 2
+    // 3. Voyage rerank — reorder candidates by relevance, keep top 1
     const rerankTexts = candidates.map((c) => c.rawText);
     const rankedIndices = await rerankDocuments(query, rerankTexts, RERANK_TOP_K);
 
