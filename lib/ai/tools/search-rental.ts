@@ -25,6 +25,16 @@ export const searchRental = tool({
           "Include all context from the conversation: location, budget, room type, special requirements, etc. " +
           "Example: '圣何塞两室一厅，预算2500以下，宠物友好，靠近Caltrain'"
       ),
+    sortBy: z
+      .enum(["relevance", "newest"])
+      .optional()
+      .default("relevance")
+      .describe(
+        "How to order the result pool. " +
+          "Use 'newest' when the user asks for the most recently posted/created listings " +
+          "('最近发布的', '最新的', '新帖', 'newest', 'recently posted', etc.). " +
+          "Defaults to 'relevance' (reranked by semantic match)."
+      ),
     excludeIds: z
       .array(z.string())
       .optional()
@@ -33,7 +43,7 @@ export const searchRental = tool({
           "Pass these only when the user has exhausted the current pool and wants completely fresh results."
       ),
   }),
-  execute: async ({ query, excludeIds }) => {
+  execute: async ({ query, sortBy = "relevance", excludeIds }) => {
     // 1. Embed the user query
     const queryVec = await embedText(query, "query");
 
@@ -52,10 +62,18 @@ export const searchRental = tool({
       };
     }
 
-    // 3. Voyage rerank — reorder candidates, keep top POOL_SIZE
-    const rerankTexts = candidates.map((c) => c.rawText);
-    const rankedIndices = await rerankDocuments(query, rerankTexts, POOL_SIZE);
-    const pool = rankedIndices.map((i) => candidates[i]);
+    // 3. Build pool: rerank by relevance OR sort by createdAt
+    let pool;
+    if (sortBy === "newest") {
+      pool = candidates
+        .slice()
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        .slice(0, POOL_SIZE);
+    } else {
+      const rerankTexts = candidates.map((c) => c.rawText);
+      const rankedIndices = await rerankDocuments(query, rerankTexts, POOL_SIZE);
+      pool = rankedIndices.map((i) => candidates[i]);
+    }
 
     return {
       pool,
