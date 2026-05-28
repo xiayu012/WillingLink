@@ -786,21 +786,36 @@ export async function updateListingGeocode(
  */
 export async function vectorSearchXhsRentalListings(
   queryEmbedding: number[],
-  candidateLimit = 20
+  candidateLimit = 20,
+  excludeIds: string[] = []
 ): Promise<XhsRentalSearchResultRow[]> {
   try {
     const vectorLiteral = `[${queryEmbedding.join(",")}]`;
-    const rows = await client`
-      SELECT
-        "id", "sourceUrl", "title", "rawText", "rent", "deposit",
-        "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
-        "roomType", "propertyName", "locationText", "furnished", "contactMethod",
-        "imageUrls", "createdAt"
-      FROM "XhsRentalListing"
-      WHERE embedding IS NOT NULL
-      ORDER BY embedding <=> ${vectorLiteral}::vector
-      LIMIT ${candidateLimit}
-    `;
+    const rows =
+      excludeIds.length > 0
+        ? await client`
+            SELECT
+              "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+              "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
+              "roomType", "propertyName", "locationText", "furnished", "contactMethod",
+              "imageUrls", "createdAt"
+            FROM "XhsRentalListing"
+            WHERE embedding IS NOT NULL
+              AND "id" != ALL(${excludeIds}::uuid[])
+            ORDER BY embedding <=> ${vectorLiteral}::vector
+            LIMIT ${candidateLimit}
+          `
+        : await client`
+            SELECT
+              "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+              "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
+              "roomType", "propertyName", "locationText", "furnished", "contactMethod",
+              "imageUrls", "createdAt"
+            FROM "XhsRentalListing"
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> ${vectorLiteral}::vector
+            LIMIT ${candidateLimit}
+          `;
 
     return rows.map((row) => ({
       id: row.id as string,
