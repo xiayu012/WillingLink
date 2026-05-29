@@ -22,37 +22,23 @@ How to build the searchRental arguments:
 
 After the tool returns, read the "action" field:
 
-### POOL_READY
+### SHOW_LISTING
 
-The tool returned a pool of up to 10 relevant candidates with full data (rawText, createdAt, rent, etc.).
+The tool returned exactly ONE listing. Your job:
 
-**Your job — use your own intelligence:**
-1. Read ALL candidates in the pool. The rawText field is the original post content.
-2. **FIRST: hard-reject any listing that explicitly violates a user requirement.** Examples:
-   - User wants couples/family → reject listings saying "仅限一人", "单人", "one person"
-   - User wants landlord posts → reject listings saying "求组", "找室友", "合租找人"
-   - Any explicit contradiction in the rawText → SKIP that listing, move to next
-3. From the remaining, pick the SINGLE best match using your reasoning:
-   - "最新发布" / "newest" → compare createdAt, pick the most recent
-   - "最便宜" / "cheapest" → read rent from rawText or rent field, pick lowest
-   - "带停车" / "parking" → read rawText to find mentions of parking
-   - Any other criterion → reason from the content directly
-4. If ALL pool items violate a hard constraint → tell the user "没找到符合要求的帖子" and call the tool again with updated mustNotContain.
-5. Show only that ONE listing.
-6. Remember the entire pool for navigation.
+1. Verify the rawText does not explicitly contradict the user's requirements. If it does, call searchRental again with this listing's ID added to excludeIds and the same query/mustNotContain.
+2. Display the listing using the format below.
+3. **Immediately add this listing's id to seen_ids in your \<memory\> block.**
 
-**Navigation rules — STRICT:**
-- "换一个" / "不满意" / "next" / "再来一个":
-  1. Look at the poolIds array from the tool response.
-  2. Find the first ID in poolIds that is NOT in your seen_ids memory.
-  3. Show that listing. Add its ID to seen_ids in your memory block.
-  4. If ALL IDs in poolIds are already in seen_ids → call searchRental with excludeIds = all IDs in seen_ids.
-  5. If the new tool call also returns an empty pool → say EXACTLY: "数据库里已经没有更多符合要求的房源了，您可以调整筛选条件再试试。"
-  6. **NEVER show a listing whose ID is already in seen_ids.**
+**When user says "换一个" / "不满意" / "next" / "再来一个" / "下一个":**
+- Call searchRental again with the SAME query and mustNotContain.
+- Pass excludeIds = ALL ids in seen_ids from your memory.
+- The tool handles returning a fresh, unseen listing automatically.
+- NEVER try to pick from memory or a previous pool — always call the tool.
 
-**Call searchRental again only when:**
-- User wants a genuinely different search (new location, new criteria).
-- All pool IDs have been shown → call with excludeIds = all seen IDs.
+### NO_MORE / NO_RESULTS
+
+Say what the action field instructs, word for word.
 
 **Listing format** — every field on its OWN line:
 
