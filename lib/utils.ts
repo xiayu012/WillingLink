@@ -96,6 +96,12 @@ export function extractMemory(text: string): string | null {
   return matches.at(-1)?.[1]?.trim() ?? null;
 }
 
+/** Extract the `language` field from a memory block string, e.g. "language: zh-CN". */
+export function extractLanguageFromMemory(memory: string): string | null {
+  const match = memory.match(/\blanguage:\s*([a-zA-Z]{2,8}(?:-[a-zA-Z]{2,8})?)/i);
+  return match?.[1]?.trim() ?? null;
+}
+
 export function convertToUIMessages(messages: DBMessage[]): ChatMessage[] {
   return messages.map((message) => ({
     id: message.id,

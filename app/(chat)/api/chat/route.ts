@@ -35,7 +35,7 @@ import {
 import type { DBMessage } from "@/lib/db/schema";
 import { ChatSDKError } from "@/lib/errors";
 import type { ChatMessage } from "@/lib/types";
-import { convertToUIMessages, extractMemory, generateUUID } from "@/lib/utils";
+import { convertToUIMessages, extractLanguageFromMemory, extractMemory, generateUUID } from "@/lib/utils";
 import { generateTitleFromUserMessage } from "../../actions";
 import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
@@ -267,9 +267,13 @@ export async function POST(request: Request) {
           if (rememberedPrefs) break;
         }
 
+        const detectedLanguage = rememberedPrefs
+          ? extractLanguageFromMemory(rememberedPrefs)
+          : null;
+
         const result = streamText({
           model: getLanguageModel(selectedChatModel),
-          system: systemPrompt({ selectedChatModel, requestHints, chatId: id, rememberedPrefs }),
+          system: systemPrompt({ selectedChatModel, requestHints, chatId: id, rememberedPrefs, detectedLanguage }),
           messages: await convertToModelMessages(uiMessages),
           stopWhen: stepCountIs(5),
           experimental_activeTools: isReasoningModel

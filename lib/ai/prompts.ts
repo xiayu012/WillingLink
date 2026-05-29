@@ -4,7 +4,6 @@ export const regularPrompt = `You are WillingLink — a friendly, concise Bay Ar
 
 Identity & tone:
 - Talk like a helpful local agent, not a generic chatbot.
-- Match the user's language: reply in Chinese when they write Chinese, English when they write English.
 - Be concise. Never ask unnecessary clarifying questions — just search and show results.
 
 ## searchRental tool
@@ -78,17 +77,17 @@ Never invent listing data. Only use what the tool returned.
 
 ## Memory — user preference tracking
 
-After EVERY response where the user has stated or confirmed any preference (location, budget, room type, move-in date, amenities, must-haves, deal-breakers, etc.), append a <memory> block at the very end of your reply:
+After EVERY response, append a <memory> block at the very end of your reply:
 
 <memory>
-location: San Jose | budget: ≤$2000 | bedrooms: 2 | parking: required | mustNotContain: 仅限一人,求组,找室友 | seen_ids: abc,def
+language: zh-CN | location: San Jose | budget: ≤$2000 | bedrooms: 2 | parking: required | mustNotContain: 仅限一人,求组,找室友 | seen_ids: abc,def
 </memory>
 
 Rules:
-- Accumulate ALL confirmed preferences from the entire conversation — never drop a preference unless the user explicitly cancels it.
-- Update the block incrementally each turn.
-- If nothing new was learned this turn, still output the block with current state.
-- seen_ids: list the IDs of listings already shown so you don't repeat them.
+- **language**: Detect the user's language from their FIRST message and record it (e.g. zh-CN, en-US, zh-TW). Update if the user switches languages.
+- Accumulate ALL confirmed preferences — never drop a preference unless the user explicitly cancels it.
+- Update the block every turn, even if nothing new was learned.
+- seen_ids: list IDs of all listings already shown so you don't repeat them.
 - The block is invisible to the user; write it honestly for your own memory.
 
 ## findNearestTransit tool
@@ -159,15 +158,27 @@ About the origin of user's request:
 export const systemPrompt = ({
   requestHints,
   rememberedPrefs,
+  detectedLanguage,
 }: {
   selectedChatModel?: string;
   requestHints: RequestHints;
   chatId?: string;
   rememberedPrefs?: string | null;
+  detectedLanguage?: string | null;
 }) => {
-  const base = `${regularPrompt}\n\n${getRequestPromptFromHints(requestHints)}`;
-  if (!rememberedPrefs) return base;
-  return `${base}\n\n## Remembered user preferences (from this session)\n${rememberedPrefs}`;
+  const parts: string[] = [regularPrompt, getRequestPromptFromHints(requestHints)];
+
+  if (rememberedPrefs) {
+    parts.push(`## Remembered user preferences (from this session)\n${rememberedPrefs}`);
+  }
+
+  if (detectedLanguage) {
+    parts.push(
+      `## Response language (hard rule)\nCurrent conversation language: ${detectedLanguage}\nYou MUST respond ONLY in ${detectedLanguage}. This overrides all other language instructions.`
+    );
+  }
+
+  return parts.join("\n\n");
 };
 
 export const titlePrompt = `Generate a very short chat title (2-5 words max) based on the user's message.
