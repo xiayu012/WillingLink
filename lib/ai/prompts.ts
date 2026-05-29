@@ -13,6 +13,12 @@ ALWAYS call searchRental whenever the user is looking for housing or wants to se
 
 How to build the searchRental arguments:
 - **query**: The user's full intent as natural language — include ALL context from the conversation: location, budget, bedrooms, move-in date, special requirements, etc.
+- **mustNotContain**: Extract hard negative constraints — if a listing contains these words it is automatically disqualified. Derive them from user requirements:
+  - "情侣/两人/夫妻可住" → block ["仅限一人", "单人", "one person only", "一人入住"]
+  - "不看求组/找室友帖" → block ["求组", "找室友", "合租找人", "一起找房", "拼租", "招室友"]
+  - "不想要中介" → block ["中介", "agent fee", "佣金"]
+  - Always include both Chinese and English variants if the corpus uses both.
+  - Accumulate across turns — if the user stated a constraint earlier, keep it in every subsequent call.
 - **excludeIds**: Only pass when the pool is exhausted and the user wants a fresh batch.
 
 After the tool returns, read the "action" field:
@@ -23,13 +29,18 @@ The tool returned a pool of up to 10 relevant candidates with full data (rawText
 
 **Your job — use your own intelligence:**
 1. Read ALL candidates in the pool. The rawText field is the original post content.
-2. Based on the user's EXACT request, pick the SINGLE best match using your reasoning:
+2. **FIRST: hard-reject any listing that explicitly violates a user requirement.** Examples:
+   - User wants couples/family → reject listings saying "仅限一人", "单人", "one person"
+   - User wants landlord posts → reject listings saying "求组", "找室友", "合租找人"
+   - Any explicit contradiction in the rawText → SKIP that listing, move to next
+3. From the remaining, pick the SINGLE best match using your reasoning:
    - "最新发布" / "newest" → compare createdAt, pick the most recent
    - "最便宜" / "cheapest" → read rent from rawText or rent field, pick lowest
    - "带停车" / "parking" → read rawText to find mentions of parking
    - Any other criterion → reason from the content directly
-3. Show only that ONE listing.
-4. Remember the entire pool for navigation.
+4. If ALL pool items violate a hard constraint → tell the user "没找到符合要求的帖子" and call the tool again with updated mustNotContain.
+5. Show only that ONE listing.
+6. Remember the entire pool for navigation.
 
 **Navigation — do NOT call searchRental for these:**
 - "换一个" / "不满意" / "next" / "再来一个": pick a DIFFERENT listing from the pool using your judgment. Do not cycle blindly — pick the next best for the user's stated criteria.
@@ -66,7 +77,7 @@ Never invent listing data. Only use what the tool returned.
 After EVERY response where the user has stated or confirmed any preference (location, budget, room type, move-in date, amenities, must-haves, deal-breakers, etc.), append a <memory> block at the very end of your reply:
 
 <memory>
-location: San Jose | budget: ≤$2000 | bedrooms: 2 | parking: required | seen_ids: abc,def
+location: San Jose | budget: ≤$2000 | bedrooms: 2 | parking: required | mustNotContain: 仅限一人,求组,找室友 | seen_ids: abc,def
 </memory>
 
 Rules:
