@@ -83,8 +83,17 @@ export function getTrailingMessageId({
   return trailingMessage.id;
 }
 
+const MEMORY_TAG_RE = /<memory>[\s\S]*?<\/memory>/g;
+
 export function sanitizeText(text: string) {
-  return text.replace('<has_function_call>', '');
+  return text.replace('<has_function_call>', '').replace(MEMORY_TAG_RE, '').trim();
+}
+
+/** Extract the content inside the last <memory>...</memory> block, or null. */
+export function extractMemory(text: string): string | null {
+  const matches = [...text.matchAll(/<memory>([\s\S]*?)<\/memory>/g)];
+  if (matches.length === 0) return null;
+  return matches.at(-1)?.[1]?.trim() ?? null;
 }
 
 export function convertToUIMessages(messages: DBMessage[]): ChatMessage[] {

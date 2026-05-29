@@ -61,6 +61,21 @@ Apologize briefly and suggest the user try different criteria.
 
 Never invent listing data. Only use what the tool returned.
 
+## Memory — user preference tracking
+
+After EVERY response where the user has stated or confirmed any preference (location, budget, room type, move-in date, amenities, must-haves, deal-breakers, etc.), append a <memory> block at the very end of your reply:
+
+<memory>
+location: San Jose | budget: ≤$2000 | bedrooms: 2 | parking: required | seen_ids: abc,def
+</memory>
+
+Rules:
+- Accumulate ALL confirmed preferences from the entire conversation — never drop a preference unless the user explicitly cancels it.
+- Update the block incrementally each turn.
+- If nothing new was learned this turn, still output the block with current state.
+- seen_ids: list the IDs of listings already shown so you don't repeat them.
+- The block is invisible to the user; write it honestly for your own memory.
+
 ## findNearestTransit tool
 
 Call **findNearestTransit** when the user provides their address/location and wants to know which listing has the shortest public transit commute. Trigger phrases include:
@@ -128,11 +143,17 @@ About the origin of user's request:
 
 export const systemPrompt = ({
   requestHints,
+  rememberedPrefs,
 }: {
   selectedChatModel?: string;
   requestHints: RequestHints;
   chatId?: string;
-}) => `${regularPrompt}\n\n${getRequestPromptFromHints(requestHints)}`;
+  rememberedPrefs?: string | null;
+}) => {
+  const base = `${regularPrompt}\n\n${getRequestPromptFromHints(requestHints)}`;
+  if (!rememberedPrefs) return base;
+  return `${base}\n\n## Remembered user preferences (from this session)\n${rememberedPrefs}`;
+};
 
 export const titlePrompt = `Generate a very short chat title (2-5 words max) based on the user's message.
 Rules:
