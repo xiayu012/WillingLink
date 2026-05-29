@@ -79,17 +79,22 @@ export const searchRental = tool({
     const actualPoolSize = Math.min(POOL_SIZE, candidates.length);
     const rankedIndices = await rerankDocuments(query, rerankTexts, actualPoolSize);
     const pool = rankedIndices.map((i) => candidates[i]);
+    const poolIds = pool.map((p) => p.id);
 
     return {
       pool,
+      poolIds,
       filteredOut: rawCandidates.length - candidates.length,
       action:
-        "POOL_READY: You have a pool of listings that passed all hard constraints. " +
-        "Read ALL rawTexts carefully. " +
-        "Pick the SINGLE best match for the user's full request. " +
-        "STRICT RULE: if a listing still explicitly contradicts a user requirement (e.g. says '仅限一人' when user wants couples), SKIP it and pick the next. " +
-        "For '换一个'/'next'/'不满意': pick a different one from the pool without calling this tool. " +
-        "Pool exhausted → call tool again with excludeIds = all seen IDs.",
+        `POOL_READY: Pool contains ${pool.length} listing(s). IDs in order: [${poolIds.join(", ")}]. ` +
+        "INSTRUCTIONS:\n" +
+        "1. Show the FIRST listing that has NOT been shown yet (check seen_ids in memory).\n" +
+        "2. Add its ID to seen_ids in your <memory> block immediately.\n" +
+        "3. Hard-reject any listing that explicitly contradicts user requirements (re-read rawText).\n" +
+        "4. When user says '换一个'/'next'/'不满意': show the next unshown ID in poolIds. DO NOT call this tool again — pick from the pool.\n" +
+        `5. When ALL ${pool.length} IDs in this pool have been shown (all in seen_ids): call this tool again with excludeIds = seen_ids list. DO NOT show a repeated listing.\n` +
+        "6. If this tool returns an empty pool (pool.length === 0) or pool has no new IDs: " +
+        "say EXACTLY: '数据库里已经没有更多符合要求的房源了，您可以调整筛选条件再试试。' DO NOT repeat a listing.",
     };
   },
 });
