@@ -1,7 +1,10 @@
 import { put } from "@vercel/blob";
 import { randomUUID } from "crypto";
 
-import { appendXhsListingImageUrl } from "@/lib/db/queries";
+import {
+  appendXhsListingImageById,
+  appendXhsListingImageUrl,
+} from "@/lib/db/queries";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -41,11 +44,17 @@ export async function POST(request: Request) {
     return jsonWithCors({ ok: false, error: "Invalid form data" }, 400);
   }
 
+  const listingIdRaw = formData.get("listingId");
+  const listingId =
+    typeof listingIdRaw === "string" ? listingIdRaw.trim() : "";
   const sourceUrlRaw = formData.get("sourceUrl");
   const sourceUrl =
     typeof sourceUrlRaw === "string" ? sourceUrlRaw.trim() : "";
-  if (!sourceUrl) {
-    return jsonWithCors({ ok: false, error: "sourceUrl is required" }, 400);
+  if (!listingId && !sourceUrl) {
+    return jsonWithCors(
+      { ok: false, error: "listingId or sourceUrl is required" },
+      400
+    );
   }
 
   const file = formData.get("file");
@@ -80,7 +89,9 @@ export async function POST(request: Request) {
     return jsonWithCors({ ok: false, error: "Upload failed" }, 500);
   }
 
-  const result = await appendXhsListingImageUrl(sourceUrl, blobUrl);
+  const result = listingId
+    ? await appendXhsListingImageById(listingId, blobUrl)
+    : await appendXhsListingImageUrl(sourceUrl, blobUrl);
   if (!result.listingFound) {
     return jsonWithCors(
       {

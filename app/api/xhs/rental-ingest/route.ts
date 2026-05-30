@@ -1,3 +1,5 @@
+import { randomUUID } from "crypto";
+
 import { createXhsRentalListing } from "@/lib/db/queries";
 
 const RENT_RE = /(?:租金|房租|rent|price|价格|月租)[^\n$¥￥\d]{0,12}([$¥￥]?\s?\d[\d,]*(?:\.\d+)?\s?(?:刀|美金|usd|\/月|per month|monthly|month|mo)?)/i;
@@ -162,16 +164,16 @@ export async function POST(request: Request) {
     return jsonWithCors({ ok: false, error: "Invalid JSON" }, 400);
   }
 
-  const sourceUrlRaw =
-    optString(payload.sourceUrl) ?? optString(payload.pageUrl) ?? "";
   const rawText = optString(payload.rawText) ?? "";
 
-  if (!sourceUrlRaw || !rawText) {
-    return jsonWithCors(
-      { ok: false, error: "sourceUrl (or pageUrl) and rawText are required" },
-      400
-    );
+  if (!rawText) {
+    return jsonWithCors({ ok: false, error: "rawText is required" }, 400);
   }
+
+  const sourceUrlRaw =
+    optString(payload.sourceUrl) ??
+    optString(payload.pageUrl) ??
+    `pending:${randomUUID()}`;
 
   const parsed = parseListingFields(rawText);
   const row = await createXhsRentalListing({

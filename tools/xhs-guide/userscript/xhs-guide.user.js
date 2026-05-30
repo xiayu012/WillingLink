@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.5.5
+// @version      0.5.6
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -101,6 +101,7 @@
       missingText: "未找到正文",
       hintText: "点击右下角按钮复制正文",
       carouselArrowHint: "手动点右侧箭头翻页，每张主图会上传到后端",
+      shareHint: "点击分享按钮复制真实链接",
       pollIntervalMs: 1500,
     },
     /** 复制成功后 POST 到 Next /api/xhs/rental-ingest。请用 https 根地址，避免 http→https 重定向触发 CORS 预检失败 */
@@ -142,6 +143,10 @@
     videoSeekDoneKey: "",
     videoSeekAbort: false,
     detailIngestReady: false,
+    listingId: null,
+    shareUrlDone: false,
+    shareElement: null,
+    shareClickHandler: null,
   };
 
   const VIDEO_SEEK_STEP_SEC = 5;
@@ -322,10 +327,8 @@
     return "jpg";
   };
 
-  const getStableSourceUrl = () => {
-    const { origin, pathname } = window.location;
-    return `${origin}${pathname}`;
-  };
+  const isMediaCaptureReady = () =>
+    Boolean(state.listingId && state.shareUrlDone);
 
   const isUrlMatched = (appConfig) => window.location.href.includes(appConfig.urlPattern);
   const isDetailPage = (config) => {
@@ -801,7 +804,7 @@
     }
 
     const arrow = document.querySelector(".arrow-controller.right");
-    if (arrow instanceof HTMLElement) {
+    if (arrow instanceof HTMLElement && isMediaCaptureReady()) {
       appendRectHighlight(
         root,
         config,
@@ -809,6 +812,132 @@
         config.detailCopy.carouselArrowHint,
       );
     }
+
+    if (!state.shareUrlDone && state.listingId) {
+      const share = document.querySelector(".share-wrapper");
+      if (share instanceof HTMLElement) {
+        appendRectHighlight(
+          root,
+          config,
+          share,
+          config.detailCopy.shareHint,
+        );
+      }
+    }
+  };
+
+  const extractXhsUrlFromText = (text) => {
+    if (!text) {
+      return null;
+    }
+    const urls = text.match(/https?:\/\/[^\s"'<>]+/g) || [];
+    for (const raw of urls) {
+      const cleaned = raw.replace(/[)\]}>.,;！。，]+$/, "");
+      try {
+        const host = new URL(cleaned).hostname.toLowerCase();
+        if (
+          host.includes("xiaohongshu.com") ||
+          host.includes("xhslink.com") ||
+          host.includes("xhs.cn")
+        ) {
+          return cleaned;
+        }
+      } catch {
+        /* ignore invalid url */
+      }
+    }
+    return null;
+  };
+
+  const readClipboardText = async () => {
+    if (navigator.clipboard?.readText) {
+      return navigator.clipboard.readText();
+    }
+    return "";
+  };
+
+  const submitUpdateSourceUrl = async (config, listingId, sourceUrl) => {
+    const baseUrl = config.ingest.baseUrl?.trim();
+    if (!baseUrl) {
+      return false;
+    }
+    const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/update-source-url`;
+    const body = JSON.stringify({ listingId, sourceUrl });
+    try {
+      const { status, responseText } = await gmHttpPost(url, {
+        "Content-Type": "application/json",
+      }, body);
+      const data = JSON.parse(responseText || "{}");
+      if (status >= 200 && status < 300 && data?.ok) {
+        logInfo("真实链接已写入", { sourceUrl: data.sourceUrl });
+        return true;
+      }
+      logWarn("写入真实链接失败", { status, data });
+    } catch (e) {
+      logWarn("写入真实链接异常", e instanceof Error ? e.message : String(e));
+    }
+    return false;
+  };
+
+  const teardownShareCapture = () => {
+    if (state.shareElement && state.shareClickHandler) {
+      state.shareElement.removeEventListener(
+        "click",
+        state.shareClickHandler,
+        true,
+      );
+    }
+    state.shareElement = null;
+    state.shareClickHandler = null;
+  };
+
+  const ensureShareClickListener = (config) => {
+    if (state.shareUrlDone || !state.listingId) {
+      teardownShareCapture();
+      return;
+    }
+    const share = document.querySelector(".share-wrapper");
+    if (!(share instanceof HTMLElement)) {
+      return;
+    }
+    if (state.shareElement === share && state.shareClickHandler) {
+      return;
+    }
+    teardownShareCapture();
+    state.shareClickHandler = () => {
+      window.setTimeout(async () => {
+        if (state.shareUrlDone || !state.listingId) {
+          return;
+        }
+        try {
+          const clip = await readClipboardText();
+          const sourceUrl = extractXhsUrlFromText(clip);
+          if (!sourceUrl) {
+            logWarn("剪贴板中未找到小红书链接", { clip: clip?.slice(0, 120) });
+            return;
+          }
+          const ok = await submitUpdateSourceUrl(
+            config,
+            state.listingId,
+            sourceUrl,
+          );
+          if (!ok) {
+            return;
+          }
+          state.shareUrlDone = true;
+          teardownShareCapture();
+          renderDetailHighlight(config);
+          ensureCarouselObserver(config);
+        } catch (e) {
+          logWarn(
+            "读取分享链接失败",
+            e instanceof Error ? e.message : String(e),
+          );
+        }
+      }, 300);
+    };
+    share.addEventListener("click", state.shareClickHandler, true);
+    state.shareElement = share;
   };
 
   const findCarouselRootFromArrow = (arrow) => {
@@ -936,13 +1065,18 @@
     if (!config.ingest?.enable) {
       return;
     }
+    if (!state.listingId) {
+      return false;
+    }
     const baseUrl = config.ingest.baseUrl?.trim();
     if (!baseUrl) {
       return;
     }
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/append-listing-image`;
     const fd = new FormData();
-    fd.append("sourceUrl", getStableSourceUrl());
+    if (state.listingId) {
+      fd.append("listingId", state.listingId);
+    }
     fd.append("file", imageBlob, filename);
 
     try {
@@ -961,7 +1095,7 @@
         return true;
       }
       if (status === 409 && data?.code === "LISTING_NOT_FOUND") {
-        logWarn("先点复制正文入库，再翻页上传图片", { sourceUrl: getStableSourceUrl() });
+        logWarn("先复制正文并点击分享获取链接，再上传图片");
         return false;
       }
       logWarn("轮播图上传失败", { status, data });
@@ -1179,7 +1313,7 @@
   };
 
   const maybeStartVideoSeekCapture = (config) => {
-    if (!state.detailIngestReady || state.videoSeekRunning) {
+    if (!isMediaCaptureReady() || state.videoSeekRunning) {
       return;
     }
     const root = state.carouselObserveRoot ?? findMediaRoot();
@@ -1191,7 +1325,7 @@
       return;
     }
     const vSrc = video.currentSrc || video.src || "";
-    const jobKey = `${getStableSourceUrl()}|${vSrc}`;
+    const jobKey = `${state.listingId}|${vSrc}`;
     if (state.videoSeekDoneKey === jobKey) {
       return;
     }
@@ -1287,7 +1421,7 @@
       ensureCarouselObserver(config);
       return;
     }
-    if (!state.detailIngestReady) {
+    if (!isMediaCaptureReady()) {
       return;
     }
 
@@ -1379,15 +1513,14 @@
 
   const submitIngestAfterCopy = async (config, plainText) => {
     if (!config.ingest?.enable) {
-      return false;
+      return null;
     }
     const baseUrl = config.ingest.baseUrl?.trim();
     if (!baseUrl) {
-      return false;
+      return null;
     }
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/rental-ingest`;
     const payload = {
-      sourceUrl: getStableSourceUrl(),
       rawText: plainText,
       ...gatherOptionalListingFieldsForIngest(),
     };
@@ -1403,9 +1536,9 @@
       } catch {
         data = {};
       }
-      if (status >= 200 && status < 300 && data?.ok) {
+      if (status >= 200 && status < 300 && data?.ok && data?.id) {
         logInfo("已写入远程数据库", { id: data.id, channel: "GM" });
-        return true;
+        return data.id;
       }
       logWarn("写入数据库失败", { status, data });
     } catch (firstError) {
@@ -1413,7 +1546,7 @@
         firstError instanceof Error ? firstError.message : String(firstError);
       if (msg !== "NO_GM_HTTP") {
         logWarn("写入数据库（GM）异常", msg);
-        return false;
+        return null;
       }
       logWarn(
         "未检测到 GM.xmlHttpRequest / GM_xmlhttpRequest，改用 fetch（会走页面 CORS，易 PreflightDisallowedRedirect）。请确认脚本元数据含 @grant GM.xmlHttpRequest 并已保存、刷新页面。",
@@ -1427,9 +1560,9 @@
           body,
         });
         const data = await response.json().catch(() => ({}));
-        if (response.ok && data?.ok) {
+        if (response.ok && data?.ok && data?.id) {
           logInfo("已写入远程数据库", { id: data.id, channel: "fetch" });
-          return true;
+          return data.id;
         }
         logWarn("写入数据库失败", { status: response.status, data });
       } catch (error) {
@@ -1439,7 +1572,7 @@
         );
       }
     }
-    return false;
+    return null;
   };
 
   const copyPlainText = async (plainText) => {
@@ -1513,7 +1646,14 @@
       setCopyButtonStatus(config.detailCopy.copiedText, false);
       showCopySuccessToast();
       logInfo("正文复制成功", { chars: plainText.length });
-      state.detailIngestReady = await submitIngestAfterCopy(config, plainText);
+      const listingId = await submitIngestAfterCopy(config, plainText);
+      if (listingId) {
+        state.listingId = listingId;
+        state.shareUrlDone = false;
+        state.detailIngestReady = true;
+        renderDetailHighlight(config);
+        ensureShareClickListener(config);
+      }
     } catch (error) {
       setCopyButtonStatus(config.detailCopy.copyFailText, false);
       logWarn("正文复制失败", error instanceof Error ? error.message : String(error));
@@ -1614,7 +1754,10 @@
     ensureDetailCopyButton(config);
     state.detailContentElement = findDetailContentElement(config);
     renderDetailHighlight(config);
-    ensureCarouselObserver(config);
+    ensureShareClickListener(config);
+    if (isMediaCaptureReady()) {
+      ensureCarouselObserver(config);
+    }
 
     if (state.detailContentElement && getPlainText(state.detailContentElement)) {
       setCopyButtonStatus(config.detailCopy.buttonText, false);
@@ -1705,6 +1848,9 @@
     state.detailContentElement = null;
     state.mode = "idle";
     state.detailIngestReady = false;
+    state.listingId = null;
+    state.shareUrlDone = false;
+    teardownShareCapture();
     teardownCarouselCapture();
     state.uploadedCarouselSrcs.clear();
     removeDetailCopyButton();
