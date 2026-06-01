@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.5.6
+// @version      0.6.5
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
 // @match        https://xiaohongshu.com/*
 // @run-at       document-idle
 // @grant        GM_setClipboard
+// @grant        clipboardRead
 // @grant        GM.xmlHttpRequest
 // @grant        GM_xmlhttpRequest
 // @connect      *
@@ -19,6 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
+  const SCRIPT_VERSION = "0.6.5";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
 
@@ -84,6 +86,8 @@
     highlight: {
       borderColor: "#ff2442",
       overlayShadow: "none",
+      /** 仅信息流标题高亮：单层半透明灰 mask，不随标题数量叠加 */
+      titleMaskColor: "rgba(0, 0, 0, 0.35)",
       hintPrefix: "湾区租房相关",
     },
     detailCopy: {
@@ -116,6 +120,8 @@
     judgeCache: new Map(),
     inFlightText: new Set(),
     matchedById: new Map(),
+    dismissedTitleKeys: new Set(),
+    titleClickHandler: null,
     llmReviewedInRound: 0,
     lastLlmCallAt: 0,
     loopTimer: 0,
@@ -145,13 +151,19 @@
     detailIngestReady: false,
     listingId: null,
     shareUrlDone: false,
-    shareElement: null,
-    shareClickHandler: null,
+    shareDocClickHandler: null,
+    shareCopyHandler: null,
+    bodyCopied: false,
+    shareUpdateInFlight: false,
+    pageClipboardBridgeInjected: false,
+    pageClipboardMessageHandler: null,
   };
 
   const VIDEO_SEEK_STEP_SEC = 5;
   const VIDEO_SEEK_MAX_FRAMES = 120;
   const VIDEO_SEEK_TIMEOUT_MS = 3500;
+  /** 在用户点击手势内短间隔连读剪贴板（ms） */
+  const SHARE_CLIPBOARD_BURST_MS = [0, 80, 200, 400, 800, 1500, 2500];
 
   const logInfo = (message, extra) => {
     if (extra === undefined) {
@@ -391,6 +403,10 @@
     state.detailCopyButton = null;
   };
 
+  const removeSyncShareButton = () => {
+    document.getElementById("xhs-guide-sync-share-button")?.remove();
+  };
+
   const isElementVisible = (element) => {
     const rect = element.getBoundingClientRect();
     const inViewport =
@@ -399,6 +415,70 @@
       rect.top <= window.innerHeight - VIEWPORT_MARGIN &&
       rect.left <= window.innerWidth - VIEWPORT_MARGIN;
     return inViewport && rect.width > 0 && rect.height > 0;
+  };
+
+  const getCandidatePostRoot = (element) => {
+    if (!(element instanceof Element)) {
+      return null;
+    }
+    const link = element.closest(
+      'a[href*="/explore/"], a[href*="/discovery/item/"]',
+    );
+    if (link instanceof Element) {
+      const card =
+        link.closest("section") ??
+        link.closest('[class*="note"]') ??
+        link.closest('[class*="feed"]') ??
+        link.closest('[class*="card"]');
+      if (card instanceof Element) {
+        return card;
+      }
+      return link;
+    }
+    let node = element;
+    for (let i = 0; i < 12 && node.parentElement; i += 1) {
+      node = node.parentElement;
+      const rect = node.getBoundingClientRect();
+      if (rect.height >= 120 && rect.width >= 140) {
+        return node;
+      }
+    }
+    return element;
+  };
+
+  const getTitleDismissKey = (candidate) => {
+    const postRoot =
+      candidate.postRoot ?? getCandidatePostRoot(candidate.element);
+    if (postRoot instanceof Element) {
+      const link =
+        postRoot.querySelector(
+          'a[href*="/explore/"], a[href*="/discovery/item/"]',
+        ) ??
+        postRoot.closest('a[href*="/explore/"], a[href*="/discovery/item/"]');
+      if (link instanceof HTMLAnchorElement && link.href) {
+        try {
+          const u = new URL(link.href);
+          return `post:${u.origin}${u.pathname}`;
+        } catch {
+          /* ignore invalid url */
+        }
+      }
+    }
+    return `title:${normalizeTitle(candidate.text).toLowerCase()}`;
+  };
+
+  const getCandidateHighlightRect = (candidate) => {
+    const base = candidate.element.getBoundingClientRect();
+    if (base.width <= 0 || base.height <= 0) {
+      return null;
+    }
+    const padding = 5;
+    return {
+      top: Math.max(VIEWPORT_MARGIN, base.top - padding),
+      left: Math.max(VIEWPORT_MARGIN, base.left - padding),
+      width: Math.max(0, base.width + padding * 2),
+      height: Math.max(0, base.height + padding * 2),
+    };
   };
 
   const collectVisibleTitleCandidates = (config) => {
@@ -435,6 +515,7 @@
           id,
           text,
           element,
+          postRoot: getCandidatePostRoot(element),
           sourceSelector: selector,
           rect: element.getBoundingClientRect(),
         });
@@ -711,33 +792,85 @@
     root.replaceChildren();
 
     const list = candidates.slice(0, MAX_HIGHLIGHT_COUNT);
+    if (list.length === 0) {
+      return;
+    }
+
+    const holes = [];
     for (const candidate of list) {
-      const rect = candidate.element.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) {
+      const rect = getCandidateHighlightRect(candidate);
+      if (rect) {
+        holes.push(rect);
+      }
+    }
+    if (holes.length === 0) {
+      return;
+    }
+
+    const svgNS = "http://www.w3.org/2000/svg";
+    const maskId = `xhs-guide-title-mask-${Date.now()}`;
+    const svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("width", "100%");
+    svg.setAttribute("height", "100%");
+    svg.style.position = "fixed";
+    svg.style.top = "0";
+    svg.style.left = "0";
+    svg.style.width = "100vw";
+    svg.style.height = "100vh";
+    svg.style.pointerEvents = "none";
+
+    const defs = document.createElementNS(svgNS, "defs");
+    const maskEl = document.createElementNS(svgNS, "mask");
+    maskEl.setAttribute("id", maskId);
+
+    const maskBg = document.createElementNS(svgNS, "rect");
+    maskBg.setAttribute("width", "100%");
+    maskBg.setAttribute("height", "100%");
+    maskBg.setAttribute("fill", "white");
+    maskEl.append(maskBg);
+
+    for (const rect of holes) {
+      const hole = document.createElementNS(svgNS, "rect");
+      hole.setAttribute("x", String(rect.left));
+      hole.setAttribute("y", String(rect.top));
+      hole.setAttribute("width", String(rect.width));
+      hole.setAttribute("height", String(rect.height));
+      hole.setAttribute("rx", "10");
+      hole.setAttribute("fill", "black");
+      maskEl.append(hole);
+    }
+
+    defs.append(maskEl);
+    const overlay = document.createElementNS(svgNS, "rect");
+    overlay.setAttribute("width", "100%");
+    overlay.setAttribute("height", "100%");
+    overlay.setAttribute("fill", config.highlight.titleMaskColor);
+    overlay.setAttribute("mask", `url(#${maskId})`);
+    svg.append(defs, overlay);
+    root.append(svg);
+
+    for (const candidate of list) {
+      const rect = getCandidateHighlightRect(candidate);
+      if (!rect) {
         continue;
       }
 
-      const padding = 5;
-      const top = Math.max(VIEWPORT_MARGIN, rect.top - padding);
-      const left = Math.max(VIEWPORT_MARGIN, rect.left - padding);
-      const width = Math.max(0, rect.width + padding * 2);
-      const height = Math.max(0, rect.height + padding * 2);
-
       const box = document.createElement("div");
       box.style.position = "fixed";
-      box.style.top = `${top}px`;
-      box.style.left = `${left}px`;
-      box.style.width = `${width}px`;
-      box.style.height = `${height}px`;
+      box.style.top = `${rect.top}px`;
+      box.style.left = `${rect.left}px`;
+      box.style.width = `${rect.width}px`;
+      box.style.height = `${rect.height}px`;
       box.style.border = `3px solid ${config.highlight.borderColor}`;
       box.style.borderRadius = "10px";
       box.style.pointerEvents = "none";
-      box.style.boxShadow = config.highlight.overlayShadow;
+      box.style.boxShadow = "none";
+      box.style.background = "transparent";
 
       const bubble = document.createElement("div");
       bubble.style.position = "fixed";
-      bubble.style.top = `${Math.max(VIEWPORT_MARGIN, top - 34)}px`;
-      bubble.style.left = `${left}px`;
+      bubble.style.top = `${Math.max(VIEWPORT_MARGIN, rect.top - 34)}px`;
+      bubble.style.left = `${rect.left}px`;
       bubble.style.background = config.highlight.borderColor;
       bubble.style.color = "#ffffff";
       bubble.style.fontSize = "12px";
@@ -751,11 +884,101 @@
     }
   };
 
+  const resolveHighlightRect = (element) => {
+    if (!(element instanceof Element)) {
+      return null;
+    }
+    const candidates = [element];
+    if (element.matches(".share-wrapper")) {
+      const icon = element.querySelector(".share-icon-container");
+      if (icon instanceof Element) {
+        candidates.unshift(icon);
+      }
+    }
+    for (const candidate of candidates) {
+      const rect = candidate.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        return { element: candidate, rect };
+      }
+    }
+    return null;
+  };
+
+  const isShareIconUse = (useEl) => {
+    if (!(useEl instanceof Element)) {
+      return false;
+    }
+    const href =
+      useEl.getAttribute("href") ??
+      useEl.getAttributeNS("http://www.w3.org/1999/xlink", "href") ??
+      "";
+    return href.includes("share_new") || href.includes("link_c");
+  };
+
+  /** 页面上可能有多个隐藏的 .share-wrapper，需选可见且尺寸有效的 */
+  const findDetailShareElement = () => {
+    const tryElements = (elements) => {
+      for (const element of elements) {
+        if (!(element instanceof HTMLElement)) {
+          continue;
+        }
+        const resolved = resolveHighlightRect(element);
+        if (resolved && isElementVisible(resolved.element)) {
+          return resolved.element;
+        }
+      }
+      return null;
+    };
+
+    const wrappers = [...document.querySelectorAll(".share-wrapper")];
+    wrappers.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return rb.width * rb.height - ra.width * ra.height;
+    });
+    const fromWrapper = tryElements(wrappers);
+    if (fromWrapper) {
+      return fromWrapper;
+    }
+
+    const icons = [...document.querySelectorAll(".share-icon-container")];
+    const fromIcon = tryElements(icons);
+    if (fromIcon) {
+      return fromIcon;
+    }
+
+    for (const use of document.querySelectorAll("use")) {
+      if (!isShareIconUse(use)) {
+        continue;
+      }
+      const container =
+        use.closest(".share-icon-container") ??
+        use.closest(".share-wrapper") ??
+        use.closest("svg")?.parentElement;
+      if (container instanceof HTMLElement) {
+        const resolved = resolveHighlightRect(container);
+        if (resolved && isElementVisible(resolved.element)) {
+          return resolved.element;
+        }
+      }
+    }
+    return null;
+  };
+
+  const findDetailShareClickTarget = (highlightElement) => {
+    if (!(highlightElement instanceof HTMLElement)) {
+      return null;
+    }
+    const wrapper = highlightElement.closest(".share-wrapper");
+    return wrapper instanceof HTMLElement ? wrapper : highlightElement;
+  };
+
   const appendRectHighlight = (root, config, element, bubbleText) => {
-    const rect = element.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) {
+    const resolved = resolveHighlightRect(element);
+    if (!resolved) {
       return;
     }
+    const { rect } = resolved;
 
     const padding = 6;
     const top = Math.max(VIEWPORT_MARGIN, rect.top - padding);
@@ -813,8 +1036,8 @@
       );
     }
 
-    if (!state.shareUrlDone && state.listingId) {
-      const share = document.querySelector(".share-wrapper");
+    if (!state.shareUrlDone && (state.listingId || state.bodyCopied)) {
+      const share = findDetailShareElement();
       if (share instanceof HTMLElement) {
         appendRectHighlight(
           root,
@@ -849,11 +1072,126 @@
     return null;
   };
 
+  const readClipboardTextSyncViaPaste = () => {
+    const helper = document.createElement("textarea");
+    helper.style.position = "fixed";
+    helper.style.left = "-9999px";
+    helper.style.top = "0";
+    helper.setAttribute("readonly", "readonly");
+    document.body.append(helper);
+    helper.focus();
+    let text = "";
+    try {
+      if (document.execCommand("paste")) {
+        text = helper.value;
+      }
+    } catch {
+      /* ignore paste failure */
+    }
+    helper.remove();
+    return text;
+  };
+
   const readClipboardText = async () => {
+    const pasted = readClipboardTextSyncViaPaste();
+    if (pasted) {
+      return pasted;
+    }
     if (navigator.clipboard?.readText) {
-      return navigator.clipboard.readText();
+      try {
+        return await navigator.clipboard.readText();
+      } catch {
+        return "";
+      }
     }
     return "";
+  };
+
+  const injectPageClipboardBridge = () => {
+    if (state.pageClipboardBridgeInjected) {
+      return;
+    }
+    const script = document.createElement("script");
+    script.textContent = `(function(){if(window.__xhsGuideClipboardBridge)return;window.__xhsGuideClipboardBridge=true;const notify=function(t,r){window.postMessage({source:"xhs-guide-clipboard-bridge",text:String(t),reason:r},"*");};if(navigator.clipboard&&navigator.clipboard.writeText){const orig=navigator.clipboard.writeText.bind(navigator.clipboard);navigator.clipboard.writeText=function(text){notify(text,"writeText");return orig(text);};}document.addEventListener("copy",function(e){if(e.clipboardData){const t=e.clipboardData.getData("text/plain");if(t){notify(t,"clipboardData");return;}}const sel=window.getSelection&&window.getSelection();const text=sel&&sel.toString?sel.toString():"";if(text){notify(text,"selection");}},true);})();`;
+    (document.head || document.documentElement).appendChild(script);
+    script.remove();
+    state.pageClipboardBridgeInjected = true;
+    logInfo("页面剪贴板桥接已注入", { version: SCRIPT_VERSION });
+  };
+
+  const handleCapturedClipboardText = async (config, text, reason) => {
+    if (state.shareUrlDone || !state.listingId || state.shareUpdateInFlight) {
+      return;
+    }
+    const sourceUrl = extractXhsUrlFromText(text);
+    if (!sourceUrl) {
+      logInfo("剪贴板桥接：暂未解析到小红书链接", {
+        reason,
+        listingId: state.listingId,
+        preview: text.slice(0, 80),
+      });
+      return;
+    }
+    logInfo("剪贴板桥接：捕获分享链接", {
+      reason,
+      listingId: state.listingId,
+      sourceUrl: sourceUrl.slice(0, 100),
+    });
+    state.shareUpdateInFlight = true;
+    try {
+      const ok = await submitUpdateSourceUrl(
+        config,
+        state.listingId,
+        sourceUrl,
+      );
+      if (!ok) {
+        return;
+      }
+      markShareUrlDone(config);
+    } finally {
+      state.shareUpdateInFlight = false;
+    }
+  };
+
+  const ensurePageClipboardBridgeListener = (config) => {
+    injectPageClipboardBridge();
+    if (state.pageClipboardMessageHandler) {
+      return;
+    }
+    state.pageClipboardMessageHandler = (event) => {
+      if (event.source !== window) {
+        return;
+      }
+      const data = event.data;
+      if (!data || data.source !== "xhs-guide-clipboard-bridge") {
+        return;
+      }
+      if (typeof data.text !== "string") {
+        return;
+      }
+      void handleCapturedClipboardText(
+        config,
+        data.text,
+        data.reason || "bridge",
+      );
+    };
+    window.addEventListener("message", state.pageClipboardMessageHandler);
+    logInfo("页面剪贴板桥接监听已挂载", { version: SCRIPT_VERSION });
+  };
+
+  const teardownPageClipboardBridge = () => {
+    if (state.pageClipboardMessageHandler) {
+      window.removeEventListener("message", state.pageClipboardMessageHandler);
+    }
+    state.pageClipboardMessageHandler = null;
+  };
+
+  const markShareUrlDone = (config) => {
+    state.shareUrlDone = true;
+    teardownShareCapture();
+    removeSyncShareButton();
+    renderDetailHighlight(config);
+    ensureCarouselObserver(config);
   };
 
   const submitUpdateSourceUrl = async (config, listingId, sourceUrl) => {
@@ -872,23 +1210,107 @@
         logInfo("真实链接已写入", { sourceUrl: data.sourceUrl });
         return true;
       }
-      logWarn("写入真实链接失败", { status, data });
+      logWarn("写入真实链接失败", { status, data, listingId });
     } catch (e) {
       logWarn("写入真实链接异常", e instanceof Error ? e.message : String(e));
     }
     return false;
   };
 
-  const teardownShareCapture = () => {
-    if (state.shareElement && state.shareClickHandler) {
-      state.shareElement.removeEventListener(
-        "click",
-        state.shareClickHandler,
-        true,
-      );
+  const tryAutoUpdateSourceUrl = async (config, reason) => {
+    if (state.shareUrlDone || !state.listingId) {
+      return false;
     }
-    state.shareElement = null;
-    state.shareClickHandler = null;
+
+    let sourceUrl = null;
+    let clipPreview = "";
+    try {
+      const clip = await readClipboardText();
+      clipPreview = clip?.slice(0, 80) ?? "";
+      sourceUrl = extractXhsUrlFromText(clip);
+      if (sourceUrl) {
+        logInfo("从剪贴板解析到分享链接", {
+          reason,
+          listingId: state.listingId,
+          sourceUrl: sourceUrl.slice(0, 100),
+        });
+      }
+    } catch (e) {
+      logWarn("剪贴板读取失败", {
+        reason,
+        listingId: state.listingId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+
+    if (!sourceUrl) {
+      logInfo("剪贴板中暂未找到小红书分享链接", {
+        reason,
+        listingId: state.listingId,
+        clipPreview,
+      });
+      return false;
+    }
+
+    if (state.shareUpdateInFlight) {
+      return false;
+    }
+    state.shareUpdateInFlight = true;
+    try {
+      const ok = await submitUpdateSourceUrl(
+        config,
+        state.listingId,
+        sourceUrl,
+      );
+      if (!ok) {
+        return false;
+      }
+      markShareUrlDone(config);
+      return true;
+    } finally {
+      state.shareUpdateInFlight = false;
+    }
+  };
+
+  const burstTryAutoUpdateSourceUrl = async (config, reason) => {
+    if (state.shareUrlDone || !state.listingId) {
+      return;
+    }
+    logInfo("开始捕获分享链接", {
+      reason,
+      listingId: state.listingId,
+      burstMs: SHARE_CLIPBOARD_BURST_MS,
+    });
+    let elapsed = 0;
+    for (let i = 0; i < SHARE_CLIPBOARD_BURST_MS.length; i += 1) {
+      if (state.shareUrlDone) {
+        return;
+      }
+      const targetMs = SHARE_CLIPBOARD_BURST_MS[i];
+      if (targetMs > elapsed) {
+        await sleep(targetMs - elapsed);
+        elapsed = targetMs;
+      }
+      const ok = await tryAutoUpdateSourceUrl(
+        config,
+        `${reason}@${targetMs}ms`,
+      );
+      if (ok) {
+        return;
+      }
+    }
+  };
+
+  const teardownShareCapture = () => {
+    if (state.shareDocClickHandler) {
+      document.removeEventListener("click", state.shareDocClickHandler, true);
+    }
+    if (state.shareCopyHandler) {
+      document.removeEventListener("copy", state.shareCopyHandler, true);
+    }
+    state.shareDocClickHandler = null;
+    state.shareCopyHandler = null;
+    teardownPageClipboardBridge();
   };
 
   const ensureShareClickListener = (config) => {
@@ -896,48 +1318,65 @@
       teardownShareCapture();
       return;
     }
-    const share = document.querySelector(".share-wrapper");
-    if (!(share instanceof HTMLElement)) {
+    ensurePageClipboardBridgeListener(config);
+    if (state.shareDocClickHandler) {
       return;
     }
-    if (state.shareElement === share && state.shareClickHandler) {
-      return;
-    }
-    teardownShareCapture();
-    state.shareClickHandler = () => {
-      window.setTimeout(async () => {
-        if (state.shareUrlDone || !state.listingId) {
-          return;
-        }
-        try {
-          const clip = await readClipboardText();
-          const sourceUrl = extractXhsUrlFromText(clip);
-          if (!sourceUrl) {
-            logWarn("剪贴板中未找到小红书链接", { clip: clip?.slice(0, 120) });
-            return;
-          }
-          const ok = await submitUpdateSourceUrl(
-            config,
-            state.listingId,
-            sourceUrl,
-          );
-          if (!ok) {
-            return;
-          }
-          state.shareUrlDone = true;
-          teardownShareCapture();
-          renderDetailHighlight(config);
-          ensureCarouselObserver(config);
-        } catch (e) {
-          logWarn(
-            "读取分享链接失败",
-            e instanceof Error ? e.message : String(e),
-          );
-        }
-      }, 300);
+
+    state.shareDocClickHandler = () => {
+      if (state.shareUrlDone || !state.listingId) {
+        return;
+      }
+      void burstTryAutoUpdateSourceUrl(config, "user-click");
     };
-    share.addEventListener("click", state.shareClickHandler, true);
-    state.shareElement = share;
+    document.addEventListener("click", state.shareDocClickHandler, true);
+
+    state.shareCopyHandler = () => {
+      if (state.shareUrlDone || !state.listingId) {
+        return;
+      }
+      void burstTryAutoUpdateSourceUrl(config, "copy-event");
+    };
+    document.addEventListener("copy", state.shareCopyHandler, true);
+
+    logInfo("分享链接监听已挂载", {
+      version: SCRIPT_VERSION,
+      listingId: state.listingId,
+    });
+  };
+
+  const ensureSyncShareButton = (config) => {
+    if (state.shareUrlDone || !state.listingId) {
+      removeSyncShareButton();
+      return;
+    }
+    if (document.getElementById("xhs-guide-sync-share-button")) {
+      return;
+    }
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.id = "xhs-guide-sync-share-button";
+    button.textContent = "同步分享链接";
+    button.style.position = "fixed";
+    button.style.right = "20px";
+    button.style.bottom = "120px";
+    button.style.zIndex = "2147483647";
+    button.style.pointerEvents = "auto";
+    button.style.border = "none";
+    button.style.borderRadius = "10px";
+    button.style.padding = "8px 12px";
+    button.style.fontSize = "13px";
+    button.style.fontWeight = "600";
+    button.style.background = "#2563eb";
+    button.style.color = "#ffffff";
+    button.style.boxShadow = "0 6px 18px rgba(0, 0, 0, 0.25)";
+    button.style.cursor = "pointer";
+    button.addEventListener("click", () => {
+      void burstTryAutoUpdateSourceUrl(config, "manual-sync-button");
+    });
+    document.body.append(button);
+    logInfo("同步分享链接按钮已显示", { listingId: state.listingId });
   };
 
   const findCarouselRootFromArrow = (arrow) => {
@@ -1645,15 +2084,24 @@
       await copyPlainText(plainText);
       setCopyButtonStatus(config.detailCopy.copiedText, false);
       showCopySuccessToast();
-      logInfo("正文复制成功", { chars: plainText.length });
+      logInfo("正文复制成功", {
+        version: SCRIPT_VERSION,
+        chars: plainText.length,
+      });
+      state.bodyCopied = true;
       const listingId = await submitIngestAfterCopy(config, plainText);
       if (listingId) {
         state.listingId = listingId;
         state.shareUrlDone = false;
         state.detailIngestReady = true;
-        renderDetailHighlight(config);
-        ensureShareClickListener(config);
+        logInfo("listingId 已就绪", {
+          version: SCRIPT_VERSION,
+          listingId,
+        });
       }
+      renderDetailHighlight(config);
+      ensureShareClickListener(config);
+      ensureSyncShareButton(config);
     } catch (error) {
       setCopyButtonStatus(config.detailCopy.copyFailText, false);
       logWarn("正文复制失败", error instanceof Error ? error.message : String(error));
@@ -1694,14 +2142,75 @@
     state.detailCopyButton = button;
   };
 
+  const isClickOnCandidate = (candidate, event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return false;
+    }
+    const postRoot =
+      candidate.postRoot ?? getCandidatePostRoot(candidate.element);
+    if (!(postRoot instanceof Element)) {
+      return false;
+    }
+    return postRoot.contains(target) || postRoot === target;
+  };
+
+  const dismissTitleCandidate = (config, candidate) => {
+    const dismissKey = getTitleDismissKey(candidate);
+    state.dismissedTitleKeys.add(dismissKey);
+    state.matchedById.delete(candidate.id);
+    const liveMatches = Array.from(state.matchedById.values()).filter(
+      (item) =>
+        document.body.contains(item.element) &&
+        !state.dismissedTitleKeys.has(getTitleDismissKey(item)),
+    );
+    renderHighlightItems(liveMatches, config);
+  };
+
+  const handleTitleClickDismiss = (config, event) => {
+    if (state.mode !== "title") {
+      return;
+    }
+    for (const candidate of state.matchedById.values()) {
+      const dismissKey = getTitleDismissKey(candidate);
+      if (state.dismissedTitleKeys.has(dismissKey)) {
+        continue;
+      }
+      if (!isClickOnCandidate(candidate, event)) {
+        continue;
+      }
+      dismissTitleCandidate(config, candidate);
+      return;
+    }
+  };
+
+  const setupTitleClickDismiss = (config) => {
+    if (state.titleClickHandler) {
+      return;
+    }
+    state.titleClickHandler = (event) => {
+      handleTitleClickDismiss(config, event);
+    };
+    document.addEventListener("pointerdown", state.titleClickHandler, true);
+  };
+
+  const teardownTitleClickDismiss = () => {
+    if (state.titleClickHandler) {
+      document.removeEventListener("pointerdown", state.titleClickHandler, true);
+      state.titleClickHandler = null;
+    }
+  };
+
   const scheduleRender = (config) => {
     if (state.rafId) {
       cancelAnimationFrame(state.rafId);
     }
     state.rafId = requestAnimationFrame(() => {
       state.rafId = 0;
-      const liveMatches = Array.from(state.matchedById.values()).filter((item) =>
-        document.body.contains(item.element),
+      const liveMatches = Array.from(state.matchedById.values()).filter(
+        (item) =>
+          document.body.contains(item.element) &&
+          !state.dismissedTitleKeys.has(getTitleDismissKey(item)),
       );
       renderHighlightItems(liveMatches, config);
     });
@@ -1715,6 +2224,9 @@
 
     for (const candidate of candidates) {
       const cacheKey = normalizeTitle(candidate.text).toLowerCase();
+      if (state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
+        continue;
+      }
       const cached = state.judgeCache.get(cacheKey);
       if (cached) {
         if (cached.isBayAreaRentingRelated) {
@@ -1740,6 +2252,9 @@
 
     state.matchedById.clear();
     for (const candidate of relatedInRound) {
+      if (state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
+        continue;
+      }
       state.matchedById.set(candidate.id, candidate);
     }
     scheduleRender(config);
@@ -1755,6 +2270,7 @@
     state.detailContentElement = findDetailContentElement(config);
     renderDetailHighlight(config);
     ensureShareClickListener(config);
+    ensureSyncShareButton(config);
     if (isMediaCaptureReady()) {
       ensureCarouselObserver(config);
     }
@@ -1845,20 +2361,25 @@
     state.observer?.disconnect();
     state.observer = null;
     state.matchedById.clear();
+    teardownTitleClickDismiss();
     state.detailContentElement = null;
     state.mode = "idle";
     state.detailIngestReady = false;
+    state.bodyCopied = false;
     state.listingId = null;
     state.shareUrlDone = false;
     teardownShareCapture();
+    state.pageClipboardBridgeInjected = false;
     teardownCarouselCapture();
     state.uploadedCarouselSrcs.clear();
     removeDetailCopyButton();
+    removeSyncShareButton();
     clearOverlay();
   };
 
   const bootTitleMode = (config) => {
     ensureOverlayRoot();
+    setupTitleClickDismiss(config);
     setupObservers(config);
     void analyzeRound(config);
     state.loopTimer = window.setInterval(() => {
@@ -1873,12 +2394,13 @@
 
   const bootDetailCopyMode = (config) => {
     ensureOverlayRoot();
+    injectPageClipboardBridge();
     setupDetailModeObservers(config);
     refreshDetailMode(config);
     state.detailTimer = window.setInterval(() => {
       refreshDetailMode(config);
     }, config.detailCopy.pollIntervalMs);
-    logInfo("详情页复制引导已启动");
+    logInfo("详情页复制引导已启动", { version: SCRIPT_VERSION });
     state.mode = "detail";
   };
 
