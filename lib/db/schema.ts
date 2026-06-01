@@ -227,6 +227,8 @@ export const xhsRentalListing = pgTable("XhsRentalListing", {
   contactMethod: text("contactMethod"),
   /** 上传到 Blob 后的公开 URL 列表，与 sourceUrl 同一帖 */
   imageUrls: json("imageUrls").$type<string[] | null>(),
+  /** 论坛帖时间：优先更新于，无则发布于 */
+  postedAt: timestamp("postedAt", { withTimezone: true }),
   createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
 });
 

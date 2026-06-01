@@ -77,6 +77,109 @@ function truncate(text: string, max = MAX_RAW_TEXT): string {
   return text.slice(0, max);
 }
 
+/** 解析论坛 .post_time：优先「更新于」，无则回退「发布于」 */
+function parseForumDateTimeLabel(raw: string): Date | null {
+  const cleaned = raw
+    .replace(/\u00a0/g, " ")
+    .replace(/,/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const matched = cleaned.match(
+    /^(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})\s*(am|pm)$/i
+  );
+  if (!matched) {
+    return null;
+  }
+
+  const year = Number(matched[1]);
+  const month = Number(matched[2]);
+  const day = Number(matched[3]);
+  let hour = Number(matched[4]);
+  const minute = Number(matched[5]);
+  const ampm = matched[6].toLowerCase();
+
+  if (ampm === "pm" && hour < 12) {
+    hour += 12;
+  }
+  if (ampm === "am" && hour === 12) {
+    hour = 0;
+  }
+
+  const isoDate = `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  const isoTime = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
+
+  for (const offset of ["-08:00", "-07:00"]) {
+    const candidate = new Date(`${isoDate}T${isoTime}${offset}`);
+    if (Number.isNaN(candidate.getTime())) {
+      continue;
+    }
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Los_Angeles",
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    }).formatToParts(candidate);
+
+    const read = (type: string) =>
+      Number(parts.find((part) => part.type === type)?.value ?? "0");
+    const readMeridiem = () =>
+      parts.find((part) => part.type === "dayPeriod")?.value?.toLowerCase() ??
+      "";
+
+    const laYear = read("year");
+    const laMonth = read("month");
+    const laDay = read("day");
+    let laHour = read("hour");
+    const laMinute = read("minute");
+    const laMeridiem = readMeridiem();
+
+    if (laMeridiem === "pm" && laHour < 12) {
+      laHour += 12;
+    }
+    if (laMeridiem === "am" && laHour === 12) {
+      laHour = 0;
+    }
+
+    if (
+      laYear === year &&
+      laMonth === month &&
+      laDay === day &&
+      laHour === hour &&
+      laMinute === minute
+    ) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function parsePostTimeBlock(postTimeText: string): Date | null {
+  const normalized = postTimeText.replace(/\u00a0/g, " ");
+
+  const updatedMatch = normalized.match(
+    /更新于:\s*(\d{4}\/\d{1,2}\/\d{1,2}[,\s]+\d{1,2}:\d{2}\s*(?:am|pm))/i
+  );
+  if (updatedMatch?.[1]) {
+    const parsed = parseForumDateTimeLabel(updatedMatch[1]);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  const publishedMatch = normalized.match(
+    /发布于:\s*(\d{4}\/\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}\s*(?:am|pm))/i
+  );
+  if (publishedMatch?.[1]) {
+    return parseForumDateTimeLabel(publishedMatch[1]);
+  }
+
+  return null;
+}
+
 function fingerprintFromParts(parts: Array<string | null | undefined>): string {
   const base = parts
     .map((part) => (part ? normalizeText(part) : ""))
@@ -468,6 +571,7 @@ async function scrapeThreadContent(url: string): Promise<{
   title: string;
   rawText: string;
   imageUrls: string[];
+  postedAt: Date | null;
 }> {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
@@ -506,10 +610,14 @@ async function scrapeThreadContent(url: string): Promise<{
       new Set([...thumbImageUrls, ...detailImageUrls])
     ).slice(0, 16);
 
+    const postTimeText =
+      document.querySelector(".post_time")?.textContent?.trim() ?? "";
+
     return {
       title,
       rawText,
       imageUrls,
+      postTimeText,
     };
   });
 
@@ -520,6 +628,7 @@ async function scrapeThreadContent(url: string): Promise<{
     title: payload.title,
     rawText: payload.rawText.trim(),
     imageUrls: payload.imageUrls,
+    postedAt: parsePostTimeBlock(payload.postTimeText ?? ""),
   };
 }
 
@@ -534,6 +643,11 @@ async function main() {
   });
 
   try {
+    await sql`
+      alter table "XhsRentalListing"
+      add column if not exists "postedAt" timestamptz
+    `;
+
     console.log("[scrape] 正在抓取列表页链接...");
     const threads = await scrapeThreadLinks(MAX_PAGES);
     console.log(`[scrape] 找到候选帖子 ${threads.length} 条`);
@@ -589,11 +703,13 @@ async function main() {
       let title = candidate.title;
       let rawText = "";
       let imageUrls: string[] = [];
+      let postedAt: Date | null = null;
       try {
         const content = await scrapeThreadContent(candidate.url);
         title = content.title || candidate.title;
         rawText = content.rawText;
         imageUrls = content.imageUrls;
+        postedAt = content.postedAt;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.log(`[scrape] skip(抓取失败): url=${candidate.url} error=${message}`);
@@ -681,6 +797,7 @@ async function main() {
           "furnished",
           "contactMethod",
           "imageUrls",
+          "postedAt",
           "createdAt"
         ) values (
           ${candidate.url},
@@ -699,6 +816,7 @@ async function main() {
           ${normalizedStructured.furnished},
           ${normalizedStructured.contactMethod},
           ${JSON.stringify(uniqueUploaded)}::jsonb,
+          ${postedAt ? postedAt.toISOString() : null},
           ${new Date().toISOString()}
         )
         returning "id"

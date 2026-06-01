@@ -807,6 +807,7 @@ export type CreateXhsRentalListingInput = {
   locationText?: string | null;
   furnished?: string | null;
   contactMethod?: string | null;
+  postedAt?: Date | null;
 };
 
 export async function updateXhsListingSourceUrl(
@@ -889,6 +890,7 @@ export async function createXhsRentalListing(
       locationText: input.locationText ?? null,
       furnished: input.furnished ?? null,
       contactMethod: input.contactMethod ?? null,
+      postedAt: input.postedAt ?? null,
       createdAt: new Date(),
     })
     .returning({ id: xhsRentalListing.id });
