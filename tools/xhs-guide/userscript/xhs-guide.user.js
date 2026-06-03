@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.6.5
+// @version      0.6.9
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.6.5";
+  const SCRIPT_VERSION = "0.6.9";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
 
@@ -101,6 +101,7 @@
       ],
       buttonText: "复制正文",
       copiedText: "已复制",
+      pendingShareText: "先完成分享同步",
       copyFailText: "复制失败",
       missingText: "未找到正文",
       hintText: "点击右下角按钮复制正文",
@@ -1072,31 +1073,23 @@
     return null;
   };
 
-  const readClipboardTextSyncViaPaste = () => {
-    const helper = document.createElement("textarea");
-    helper.style.position = "fixed";
-    helper.style.left = "-9999px";
-    helper.style.top = "0";
-    helper.setAttribute("readonly", "readonly");
-    document.body.append(helper);
-    helper.focus();
-    let text = "";
-    try {
-      if (document.execCommand("paste")) {
-        text = helper.value;
-      }
-    } catch {
-      /* ignore paste failure */
+  const isPersistedShareUrlResponse = (data, listingId) => {
+    if (!data || data.ok !== true) {
+      return false;
     }
-    helper.remove();
-    return text;
+    if (typeof data.id !== "string" || data.id !== listingId) {
+      return false;
+    }
+    if (typeof data.sourceUrl !== "string" || data.sourceUrl.startsWith("pending:")) {
+      return false;
+    }
+    return extractXhsUrlFromText(data.sourceUrl) !== null;
   };
 
+  const shortListingId = (listingId) =>
+    typeof listingId === "string" ? listingId.slice(0, 8) : "";
+
   const readClipboardText = async () => {
-    const pasted = readClipboardTextSyncViaPaste();
-    if (pasted) {
-      return pasted;
-    }
     if (navigator.clipboard?.readText) {
       try {
         return await navigator.clipboard.readText();
@@ -1105,6 +1098,14 @@
       }
     }
     return "";
+  };
+
+  const getClipboardTextFromCopyEvent = (event) => {
+    if (!(event instanceof ClipboardEvent)) {
+      return "";
+    }
+    const direct = event.clipboardData?.getData("text/plain") ?? "";
+    return typeof direct === "string" ? direct.trim() : "";
   };
 
   const injectPageClipboardBridge = () => {
@@ -1147,7 +1148,7 @@
       if (!ok) {
         return;
       }
-      markShareUrlDone(config);
+      markShareUrlDone(config, sourceUrl);
     } finally {
       state.shareUpdateInFlight = false;
     }
@@ -1186,8 +1187,9 @@
     state.pageClipboardMessageHandler = null;
   };
 
-  const markShareUrlDone = (config) => {
+  const markShareUrlDone = (config, sourceUrl) => {
     state.shareUrlDone = true;
+    showShareUrlSuccessToast(state.listingId, sourceUrl);
     teardownShareCapture();
     removeSyncShareButton();
     renderDetailHighlight(config);
@@ -1206,11 +1208,25 @@
         "Content-Type": "application/json",
       }, body);
       const data = JSON.parse(responseText || "{}");
-      if (status >= 200 && status < 300 && data?.ok) {
-        logInfo("真实链接已写入", { sourceUrl: data.sourceUrl });
+      if (
+        status >= 200 &&
+        status < 300 &&
+        isPersistedShareUrlResponse(data, listingId)
+      ) {
+        logInfo("真实链接已写入", {
+          listingId: data.id,
+          listingIdShort: shortListingId(data.id),
+          sourceUrl: data.sourceUrl,
+          hint: "请在数据库按 id 查此行，不要用 sourceUrl 里的 pending:... 当作行 id",
+        });
         return true;
       }
-      logWarn("写入真实链接失败", { status, data, listingId });
+      logWarn("写入真实链接失败：响应未通过校验", {
+        status,
+        data,
+        listingId,
+        requestedSourceUrl: sourceUrl,
+      });
     } catch (e) {
       logWarn("写入真实链接异常", e instanceof Error ? e.message : String(e));
     }
@@ -1265,7 +1281,7 @@
       if (!ok) {
         return false;
       }
-      markShareUrlDone(config);
+      markShareUrlDone(config, sourceUrl);
       return true;
     } finally {
       state.shareUpdateInFlight = false;
@@ -1331,9 +1347,17 @@
     };
     document.addEventListener("click", state.shareDocClickHandler, true);
 
-    state.shareCopyHandler = () => {
+    state.shareCopyHandler = (event) => {
       if (state.shareUrlDone || !state.listingId) {
         return;
+      }
+      const directText = getClipboardTextFromCopyEvent(event);
+      if (directText) {
+        void handleCapturedClipboardText(
+          config,
+          directText,
+          "copy-event-clipboardData",
+        );
       }
       void burstTryAutoUpdateSourceUrl(config, "copy-event");
     };
@@ -1537,7 +1561,14 @@
         logWarn("先复制正文并点击分享获取链接，再上传图片");
         return false;
       }
-      logWarn("轮播图上传失败", { status, data });
+      logWarn("轮播图上传失败", {
+        status,
+        data,
+        responseText,
+        listingId: state.listingId,
+        blobType: imageBlob.type,
+        blobSize: imageBlob.size,
+      });
       return false;
     } catch (firstError) {
       const msg =
@@ -1976,7 +2007,13 @@
         data = {};
       }
       if (status >= 200 && status < 300 && data?.ok && data?.id) {
-        logInfo("已写入远程数据库", { id: data.id, channel: "GM" });
+        logInfo("已写入远程数据库", {
+          id: data.id,
+          idShort: shortListingId(data.id),
+          sourceUrlPending: data.sourceUrl,
+          channel: "GM",
+          hint: "分享成功后 sourceUrl 才会变成 https 链接",
+        });
         return data.id;
       }
       logWarn("写入数据库失败", { status, data });
@@ -2000,7 +2037,13 @@
         });
         const data = await response.json().catch(() => ({}));
         if (response.ok && data?.ok && data?.id) {
-          logInfo("已写入远程数据库", { id: data.id, channel: "fetch" });
+          logInfo("已写入远程数据库", {
+            id: data.id,
+            idShort: shortListingId(data.id),
+            sourceUrlPending: data.sourceUrl,
+            channel: "fetch",
+            hint: "分享成功后 sourceUrl 才会变成 https 链接",
+          });
           return data.id;
         }
         logWarn("写入数据库失败", { status: response.status, data });
@@ -2062,6 +2105,61 @@
     }, 1600);
   };
 
+  const showShareUrlSuccessToast = (listingId, sourceUrl) => {
+    document.getElementById("xhs-guide-share-success-toast")?.remove();
+
+    const toast = document.createElement("div");
+    toast.id = "xhs-guide-share-success-toast";
+    toast.textContent = `✓ 分享链接已写入 id=${shortListingId(listingId)}`;
+    toast.title =
+      typeof sourceUrl === "string"
+        ? sourceUrl
+        : "分享链接已写入数据库";
+    toast.style.position = "fixed";
+    toast.style.right = "20px";
+    toast.style.bottom = "132px";
+    toast.style.zIndex = "2147483647";
+    toast.style.background = "#2563eb";
+    toast.style.color = "#ffffff";
+    toast.style.fontSize = "13px";
+    toast.style.fontWeight = "700";
+    toast.style.padding = "10px 14px";
+    toast.style.borderRadius = "10px";
+    toast.style.pointerEvents = "none";
+    toast.style.boxShadow = "none";
+    toast.style.maxWidth = "320px";
+    document.body.append(toast);
+
+    window.setTimeout(() => {
+      toast.remove();
+    }, 2600);
+  };
+
+  const showPendingShareToast = (listingId) => {
+    document.getElementById("xhs-guide-pending-share-toast")?.remove();
+
+    const toast = document.createElement("div");
+    toast.id = "xhs-guide-pending-share-toast";
+    toast.textContent = `⚠ 先完成分享同步 id=${shortListingId(listingId)}`;
+    toast.style.position = "fixed";
+    toast.style.right = "20px";
+    toast.style.bottom = "132px";
+    toast.style.zIndex = "2147483647";
+    toast.style.background = "#f59e0b";
+    toast.style.color = "#111827";
+    toast.style.fontSize = "13px";
+    toast.style.fontWeight = "700";
+    toast.style.padding = "10px 14px";
+    toast.style.borderRadius = "10px";
+    toast.style.pointerEvents = "none";
+    toast.style.boxShadow = "none";
+    document.body.append(toast);
+
+    window.setTimeout(() => {
+      toast.remove();
+    }, 2400);
+  };
+
   const handleCopyButtonClick = async (config) => {
     if (!state.detailContentElement) {
       setCopyButtonStatus(config.detailCopy.missingText, true);
@@ -2089,19 +2187,33 @@
         chars: plainText.length,
       });
       state.bodyCopied = true;
-      const listingId = await submitIngestAfterCopy(config, plainText);
-      if (listingId) {
-        state.listingId = listingId;
-        state.shareUrlDone = false;
-        state.detailIngestReady = true;
-        logInfo("listingId 已就绪", {
-          version: SCRIPT_VERSION,
-          listingId,
+      if (state.listingId && !state.shareUrlDone) {
+        setCopyButtonStatus(config.detailCopy.pendingShareText, true);
+        showPendingShareToast(state.listingId);
+        logWarn("上次复制的记录尚未写入分享链接，已阻止新建记录", {
+          previousListingId: state.listingId,
+          previousListingIdShort: shortListingId(state.listingId),
         });
+        renderDetailHighlight(config);
+        ensureShareClickListener(config);
+        ensureSyncShareButton(config);
+      } else {
+        const listingId = await submitIngestAfterCopy(config, plainText);
+        if (listingId) {
+          state.listingId = listingId;
+          state.shareUrlDone = false;
+          state.detailIngestReady = true;
+          logInfo("listingId 已就绪", {
+            version: SCRIPT_VERSION,
+            listingId,
+            listingIdShort: shortListingId(listingId),
+            hint: "数据库请按 id 查此行；sourceUrl 列里的 pending:uuid 只是占位，不是行 id",
+          });
+        }
+        renderDetailHighlight(config);
+        ensureShareClickListener(config);
+        ensureSyncShareButton(config);
       }
-      renderDetailHighlight(config);
-      ensureShareClickListener(config);
-      ensureSyncShareButton(config);
     } catch (error) {
       setCopyButtonStatus(config.detailCopy.copyFailText, false);
       logWarn("正文复制失败", error instanceof Error ? error.message : String(error));

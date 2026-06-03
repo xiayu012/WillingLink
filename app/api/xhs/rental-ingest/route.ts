@@ -198,5 +198,5 @@ export async function POST(request: Request) {
     return jsonWithCors({ ok: false, error: "Failed to save" }, 500);
   }
 
-  return jsonWithCors({ ok: true, id: row.id });
+  return jsonWithCors({ ok: true, id: row.id, sourceUrl: sourceUrlRaw });
 }

@@ -66,5 +66,16 @@ export async function POST(request: Request) {
     return jsonWithCors({ ok: false, error: "Listing not found" }, 404);
   }
 
+  if (
+    !row.sourceUrl ||
+    row.sourceUrl.startsWith("pending:") ||
+    !isValidXhsShareUrl(row.sourceUrl)
+  ) {
+    return jsonWithCors(
+      { ok: false, error: "Update did not persist a valid share URL" },
+      500
+    );
+  }
+
   return jsonWithCors({ ok: true, id: row.id, sourceUrl: row.sourceUrl });
 }

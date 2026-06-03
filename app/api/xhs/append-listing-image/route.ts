@@ -32,6 +32,10 @@ function jsonWithCors(body: unknown, status = 200) {
   return Response.json(body, { status, headers: corsHeaders });
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export function OPTIONS() {
   return new Response(null, { status: 204, headers: corsHeaders });
 }
@@ -85,13 +89,34 @@ export async function POST(request: Request) {
   try {
     const data = await put(path, buffer, { access: "public" });
     blobUrl = data.url;
-  } catch {
-    return jsonWithCors({ ok: false, error: "Upload failed" }, 500);
+  } catch (error) {
+    return jsonWithCors(
+      {
+        ok: false,
+        error: "Upload failed",
+        stage: "blob-put",
+        detail: errorMessage(error),
+      },
+      500
+    );
   }
 
-  const result = listingId
-    ? await appendXhsListingImageById(listingId, blobUrl)
-    : await appendXhsListingImageUrl(sourceUrl, blobUrl);
+  let result;
+  try {
+    result = listingId
+      ? await appendXhsListingImageById(listingId, blobUrl)
+      : await appendXhsListingImageUrl(sourceUrl, blobUrl);
+  } catch (error) {
+    return jsonWithCors(
+      {
+        ok: false,
+        error: "Failed to append image URL",
+        stage: "db-append-image",
+        detail: errorMessage(error),
+      },
+      500
+    );
+  }
   if (!result.listingFound) {
     return jsonWithCors(
       {
