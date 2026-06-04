@@ -1,8 +1,8 @@
 import type { InferSelectModel } from "drizzle-orm";
 import {
   boolean,
+  doublePrecision,
   foreignKey,
-  integer,
   json,
   pgTable,
   primaryKey,
@@ -34,20 +34,6 @@ export const chat = pgTable("Chat", {
 
 export type Chat = InferSelectModel<typeof chat>;
 
-// DEPRECATED: The following schema is deprecated and will be removed in the future.
-// Read the migration guide at https://chat-sdk.dev/docs/migration-guides/message-parts
-export const messageDeprecated = pgTable("Message", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  chatId: uuid("chatId")
-    .notNull()
-    .references(() => chat.id),
-  role: varchar("role").notNull(),
-  content: json("content").notNull(),
-  createdAt: timestamp("createdAt").notNull(),
-});
-
-export type MessageDeprecated = InferSelectModel<typeof messageDeprecated>;
-
 export const message = pgTable("Message_v2", {
   id: uuid("id").primaryKey().notNull().defaultRandom(),
   chatId: uuid("chatId")
@@ -60,28 +46,6 @@ export const message = pgTable("Message_v2", {
 });
 
 export type DBMessage = InferSelectModel<typeof message>;
-
-// DEPRECATED: The following schema is deprecated and will be removed in the future.
-// Read the migration guide at https://chat-sdk.dev/docs/migration-guides/message-parts
-export const voteDeprecated = pgTable(
-  "Vote",
-  {
-    chatId: uuid("chatId")
-      .notNull()
-      .references(() => chat.id),
-    messageId: uuid("messageId")
-      .notNull()
-      .references(() => messageDeprecated.id),
-    isUpvoted: boolean("isUpvoted").notNull(),
-  },
-  (table) => {
-    return {
-      pk: primaryKey({ columns: [table.chatId, table.messageId] }),
-    };
-  }
-);
-
-export type VoteDeprecated = InferSelectModel<typeof voteDeprecated>;
 
 export const vote = pgTable(
   "Vote_v2",
@@ -103,55 +67,6 @@ export const vote = pgTable(
 
 export type Vote = InferSelectModel<typeof vote>;
 
-export const document = pgTable(
-  "Document",
-  {
-    id: uuid("id").notNull().defaultRandom(),
-    createdAt: timestamp("createdAt").notNull(),
-    title: text("title").notNull(),
-    content: text("content"),
-    kind: varchar("text", { enum: ["text", "code", "image", "sheet"] })
-      .notNull()
-      .default("text"),
-    userId: uuid("userId")
-      .notNull()
-      .references(() => user.id),
-  },
-  (table) => {
-    return {
-      pk: primaryKey({ columns: [table.id, table.createdAt] }),
-    };
-  }
-);
-
-export type Document = InferSelectModel<typeof document>;
-
-export const suggestion = pgTable(
-  "Suggestion",
-  {
-    id: uuid("id").notNull().defaultRandom(),
-    documentId: uuid("documentId").notNull(),
-    documentCreatedAt: timestamp("documentCreatedAt").notNull(),
-    originalText: text("originalText").notNull(),
-    suggestedText: text("suggestedText").notNull(),
-    description: text("description"),
-    isResolved: boolean("isResolved").notNull().default(false),
-    userId: uuid("userId")
-      .notNull()
-      .references(() => user.id),
-    createdAt: timestamp("createdAt").notNull(),
-  },
-  (table) => ({
-    pk: primaryKey({ columns: [table.id] }),
-    documentRef: foreignKey({
-      columns: [table.documentId, table.documentCreatedAt],
-      foreignColumns: [document.id, document.createdAt],
-    }),
-  })
-);
-
-export type Suggestion = InferSelectModel<typeof suggestion>;
-
 export const stream = pgTable(
   "Stream",
   {
@@ -169,43 +84,6 @@ export const stream = pgTable(
 );
 
 export type Stream = InferSelectModel<typeof stream>;
-
-export const shift = pgTable("Shift", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  whattodo: text("whattodo"),
-  startTime: timestamp("startTime", { withTimezone: true }),
-  location: text("location"),
-  skillsNeeded: text("skillsNeeded"),
-  whoIsBeingHelped: text("whoIsBeingHelped"),
-  laborCredits: text("laborCredits"),
-  rawMessage: text("rawMessage").notNull(),
-  audioUrl: text("audioUrl"),
-  audioDurationMs: integer("audioDurationMs"),
-  audioMimeType: text("audioMimeType"),
-  audioSizeBytes: integer("audioSizeBytes"),
-  createdAt: timestamp("createdAt").notNull(),
-  signUpUserName: text("signUpUserName"),
-  signUpAudioUrl: text("signUpAudioUrl"),
-  signUpAudioDurationMs: integer("signUpAudioDurationMs"),
-  signUpAudioMimeType: text("signUpAudioMimeType"),
-  signUpAudioSizeBytes: integer("signUpAudioSizeBytes"),
-  signUpCreatedAt: timestamp("signUpCreatedAt", { withTimezone: true }),
-});
-
-export type Shift = InferSelectModel<typeof shift>;
-
-export const searchAudio = pgTable("SearchAudio", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  chatId: text("chatId").notNull(),
-  audioUrl: text("audioUrl").notNull(),
-  audioDurationMs: integer("audioDurationMs"),
-  audioMimeType: text("audioMimeType"),
-  audioSizeBytes: integer("audioSizeBytes"),
-  transcript: text("transcript"),
-  createdAt: timestamp("createdAt").notNull(),
-});
-
-export type SearchAudio = InferSelectModel<typeof searchAudio>;
 
 /** 小红书租房帖（复制按钮上报 + 可选结构化字段） */
 export const xhsRentalListing = pgTable("XhsRentalListing", {
@@ -227,9 +105,11 @@ export const xhsRentalListing = pgTable("XhsRentalListing", {
   contactMethod: text("contactMethod"),
   /** 上传到 Blob 后的公开 URL 列表，与 sourceUrl 同一帖 */
   imageUrls: json("imageUrls").$type<string[] | null>(),
-  /** 论坛帖时间：优先更新于，无则发布于 */
   postedAt: timestamp("postedAt", { withTimezone: true }),
   createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+  lat: doublePrecision("lat"),
+  lng: doublePrecision("lng"),
+  geocodedAt: timestamp("geocodedAt", { withTimezone: true }),
 });
 
 export type XhsRentalListing = InferSelectModel<typeof xhsRentalListing>;
