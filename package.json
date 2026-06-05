@@ -15,7 +15,8 @@
     "db:pull": "drizzle-kit pull",
     "db:check": "drizzle-kit check",
     "db:up": "drizzle-kit up",
-    "test": "export PLAYWRIGHT=True && pnpm exec playwright test"
+    "test": "export PLAYWRIGHT=True && pnpm exec playwright test",
+    "xhs:clean-rented": "tsx scripts/clean-xhs-rented-listings.ts"
   },
   "dependencies": {
     "@ai-sdk/gateway": "2.0.0-beta.85",

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.6.9
+// @version      0.8.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,9 +20,11 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.6.9";
+  const SCRIPT_VERSION = "0.8.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
+  /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
+  const TITLE_HIGHLIGHT_MAX_HEIGHT = 80;
 
   const DEFAULT_CONFIG = {
     app: {
@@ -32,8 +34,11 @@
     },
     titleScan: {
       selectorCandidates: [
-        'a[href*="/explore/"] [class*="title"]',
+        'a[href*="/explore/"] .title span',
+        'a[href*="/explore/"] footer .title span',
+        "section footer .title span",
         "section .title span",
+        'a[href*="/explore/"] h3 span',
         'a[href*="/explore/"] h3',
       ],
       minTitleLength: 4,
@@ -157,7 +162,9 @@
     bodyCopied: false,
     shareUpdateInFlight: false,
     pageClipboardBridgeInjected: false,
-    pageClipboardMessageHandler: null,
+    pageNetworkBridgeInjected: false,
+    pageShareBridgeMessageHandler: null,
+    lastShareCaptureKey: null,
   };
 
   const VIDEO_SEEK_STEP_SEC = 5;
@@ -468,8 +475,83 @@
     return `title:${normalizeTitle(candidate.text).toLowerCase()}`;
   };
 
+  const textMatchesTitleCandidate = (elementText, expectedText) => {
+    const normalizedElement = normalizeTitle(elementText);
+    const normalizedExpected = normalizeTitle(expectedText);
+    if (!normalizedElement || !normalizedExpected) {
+      return false;
+    }
+    if (normalizedElement === normalizedExpected) {
+      return true;
+    }
+    const prefixLen = Math.min(16, normalizedElement.length, normalizedExpected.length);
+    if (prefixLen < 4) {
+      return false;
+    }
+    const prefix = normalizedExpected.slice(0, prefixLen);
+    return (
+      normalizedElement.startsWith(prefix) ||
+      normalizedExpected.startsWith(normalizedElement.slice(0, prefixLen))
+    );
+  };
+
+  const refineTitleHighlightElement = (element, expectedText) => {
+    if (!(element instanceof HTMLElement)) {
+      return element;
+    }
+
+    const selfRect = element.getBoundingClientRect();
+    if (
+      selfRect.height > 0 &&
+      selfRect.height <= TITLE_HIGHLIGHT_MAX_HEIGHT &&
+      selfRect.width > 0
+    ) {
+      return element;
+    }
+
+    const scopedRoot =
+      element.closest(
+        'a[href*="/explore/"], section, [class*="note"], [class*="feed"]',
+      ) ?? element;
+
+    let best = null;
+    let bestArea = Number.POSITIVE_INFINITY;
+    for (const node of scopedRoot.querySelectorAll(
+      "span, p, h3, h4, em, strong, [class*='title']",
+    )) {
+      if (!(node instanceof HTMLElement)) {
+        continue;
+      }
+      if (!isElementVisible(node)) {
+        continue;
+      }
+      const nodeText = node.innerText || node.textContent || "";
+      if (!textMatchesTitleCandidate(nodeText, expectedText)) {
+        continue;
+      }
+      const rect = node.getBoundingClientRect();
+      if (rect.height <= 0 || rect.width <= 0) {
+        continue;
+      }
+      if (rect.height > TITLE_HIGHLIGHT_MAX_HEIGHT) {
+        continue;
+      }
+      const area = rect.width * rect.height;
+      if (area < bestArea) {
+        bestArea = area;
+        best = node;
+      }
+    }
+
+    return best instanceof HTMLElement ? best : element;
+  };
+
   const getCandidateHighlightRect = (candidate) => {
-    const base = candidate.element.getBoundingClientRect();
+    const highlightElement = refineTitleHighlightElement(
+      candidate.element,
+      candidate.text,
+    );
+    const base = highlightElement.getBoundingClientRect();
     if (base.width <= 0 || base.height <= 0) {
       return null;
     }
@@ -507,7 +589,8 @@
           continue;
         }
 
-        const id = makeCandidateId(text, element);
+        const highlightElement = refineTitleHighlightElement(element, text);
+        const id = makeCandidateId(text, highlightElement);
         if (dedup.has(id)) {
           continue;
         }
@@ -515,10 +598,10 @@
         candidates.push({
           id,
           text,
-          element,
+          element: highlightElement,
           postRoot: getCandidatePostRoot(element),
           sourceSelector: selector,
-          rect: element.getBoundingClientRect(),
+          rect: highlightElement.getBoundingClientRect(),
         });
       }
     }
@@ -1050,27 +1133,78 @@
     }
   };
 
-  const extractXhsUrlFromText = (text) => {
-    if (!text) {
-      return null;
+  const scoreShareUrl = (url) => {
+    let score = 0;
+    if (url.includes("/discovery/item/")) {
+      score += 20;
     }
-    const urls = text.match(/https?:\/\/[^\s"'<>]+/g) || [];
+    if (url.includes("xsec_token=")) {
+      score += 10;
+    }
+    if (url.includes("source=webshare") || url.includes("xhsshare=pc_web")) {
+      score += 8;
+    }
+    if (url.includes("/explore/")) {
+      score += 2;
+    }
+    return score;
+  };
+
+  const pickBestShareUrl = (urls) => {
+    let best = null;
+    let bestScore = -1;
     for (const raw of urls) {
       const cleaned = raw.replace(/[)\]}>.,;！。，]+$/, "");
       try {
         const host = new URL(cleaned).hostname.toLowerCase();
         if (
-          host.includes("xiaohongshu.com") ||
-          host.includes("xhslink.com") ||
-          host.includes("xhs.cn")
+          !host.includes("xiaohongshu.com") &&
+          !host.includes("xhslink.com") &&
+          !host.includes("xhs.cn")
         ) {
-          return cleaned;
+          continue;
+        }
+        const score = scoreShareUrl(cleaned);
+        if (score > bestScore) {
+          bestScore = score;
+          best = cleaned;
         }
       } catch {
         /* ignore invalid url */
       }
     }
-    return null;
+    return best;
+  };
+
+  const extractXhsUrlFromText = (text) => {
+    if (!text) {
+      return null;
+    }
+    const urls = text.match(/https?:\/\/[^\s"'<>\\]+/g) || [];
+    return pickBestShareUrl(urls);
+  };
+
+  const isStrongShareUrl = (url) => {
+    if (!url) {
+      return false;
+    }
+    try {
+      const parsed = new URL(url);
+      const host = parsed.hostname.toLowerCase();
+      if (
+        !host.includes("xiaohongshu.com") &&
+        !host.includes("xhslink.com") &&
+        !host.includes("xhs.cn")
+      ) {
+        return false;
+      }
+      if (parsed.pathname.includes("/discovery/item/")) {
+        return true;
+      }
+      return parsed.search.includes("xsec_token=");
+    } catch {
+      return false;
+    }
   };
 
   const isPersistedShareUrlResponse = (data, listingId) => {
@@ -1120,23 +1254,105 @@
     logInfo("页面剪贴板桥接已注入", { version: SCRIPT_VERSION });
   };
 
-  const handleCapturedClipboardText = async (config, text, reason) => {
+  const injectPageNetworkBridge = () => {
+    if (state.pageNetworkBridgeInjected) {
+      return;
+    }
+    const script = document.createElement("script");
+    script.textContent = [
+      "(function(){",
+      "if(window.__xhsGuideNetworkBridge){return;}",
+      "window.__xhsGuideNetworkBridge=true;",
+      'var SRC="xhs-guide-network-bridge";',
+      'var HOST_RE=/xiaohongshu\\.com|xhslink\\.com|xhs\\.cn/i;',
+      'var URL_RE=/https?:\\/\\/[^\\s"\'<>\\\\]+/g;',
+      "var lastKey=\"\";",
+      "var notify=function(text,reason,reqUrl){",
+      "if(!text){return;}",
+      "var s=String(text);",
+      "if(!HOST_RE.test(s)&&!URL_RE.test(s)){return;}",
+      "var key=reason+\"|\"+s.slice(0,240);",
+      "if(key===lastKey){return;}",
+      "lastKey=key;",
+      'window.postMessage({source:SRC,text:s,reason:reason||"network",reqUrl:reqUrl?String(reqUrl):""},"*");',
+      "};",
+      "var payloadToString=function(payload){",
+      "if(payload==null){return\"\";}",
+      'if(typeof payload==="string"){return payload;}',
+      "try{",
+      "if(typeof URLSearchParams!==\"undefined\"&&payload instanceof URLSearchParams){return payload.toString();}",
+      "if(typeof FormData!==\"undefined\"&&payload instanceof FormData){var parts=[];payload.forEach(function(v,k){parts.push(k+\"=\"+v);});return parts.join(\"&\");}",
+      "}catch(e){}",
+      "try{",
+      "if(payload instanceof ArrayBuffer){return new TextDecoder(\"utf-8\").decode(payload);}",
+      "if(ArrayBuffer.isView(payload)){return new TextDecoder(\"utf-8\").decode(payload);}",
+      "}catch(e){}",
+      'try{return String(payload);}catch(e){return"";}',
+      "};",
+      "var scanPayload=function(payload,reqUrl,reason){",
+      "var text=payloadToString(payload);",
+      "if(text){notify(text,reason,reqUrl);}",
+      "if(typeof Blob!==\"undefined\"&&payload instanceof Blob){",
+      "payload.text().then(function(t){notify(t,reason,reqUrl);}).catch(function(){});",
+      "}",
+      "};",
+      "var origFetch=window.fetch;",
+      'if(typeof origFetch==="function"){',
+      "window.fetch=function(input,init){",
+      "init=init||{};",
+      'var reqUrl=typeof input==="string"?input:(input&&input.url)||"";',
+      'try{scanPayload(init.body,reqUrl,"fetch-req");}catch(e){}',
+      "return origFetch.apply(this,arguments).then(function(res){",
+      'try{var clone=res.clone();clone.text().then(function(t){notify(t,"fetch-res",reqUrl);}).catch(function(){});}catch(e){}',
+      "return res;",
+      "});",
+      "};",
+      "}",
+      "var XHR=XMLHttpRequest.prototype;",
+      "var origOpen=XHR.open;",
+      "var origSend=XHR.send;",
+      "XHR.open=function(method,url){",
+      "this.__xhsGuideReqUrl=url;",
+      "return origOpen.apply(this,arguments);",
+      "};",
+      "XHR.send=function(body){",
+      'var reqUrl=this.__xhsGuideReqUrl||"";',
+      'try{scanPayload(body,reqUrl,"xhr-req");}catch(e){}',
+      'this.addEventListener("load",function(){',
+      'try{notify(this.responseText||"","xhr-res",reqUrl);}catch(e){}',
+      "});",
+      "return origSend.apply(this,arguments);",
+      "};",
+      "})();",
+    ].join("");
+    (document.head || document.documentElement).appendChild(script);
+    script.remove();
+    state.pageNetworkBridgeInjected = true;
+    logInfo("页面网络拦截桥接已注入", { version: SCRIPT_VERSION });
+  };
+
+  const handleCapturedShareText = async (config, text, reason) => {
     if (state.shareUrlDone || !state.listingId || state.shareUpdateInFlight) {
       return;
     }
     const sourceUrl = extractXhsUrlFromText(text);
-    if (!sourceUrl) {
-      logInfo("剪贴板桥接：暂未解析到小红书链接", {
+    if (!sourceUrl || !isStrongShareUrl(sourceUrl)) {
+      logInfo("分享捕获：暂未解析到有效分享链接", {
         reason,
         listingId: state.listingId,
-        preview: text.slice(0, 80),
+        preview: text.slice(0, 120),
       });
       return;
     }
-    logInfo("剪贴板桥接：捕获分享链接", {
+    const captureKey = `${state.listingId}|${sourceUrl}`;
+    if (state.lastShareCaptureKey === captureKey) {
+      return;
+    }
+    state.lastShareCaptureKey = captureKey;
+    logInfo("分享捕获：解析到分享链接", {
       reason,
       listingId: state.listingId,
-      sourceUrl: sourceUrl.slice(0, 100),
+      sourceUrl: sourceUrl.slice(0, 120),
     });
     state.shareUpdateInFlight = true;
     try {
@@ -1146,6 +1362,7 @@
         sourceUrl,
       );
       if (!ok) {
+        state.lastShareCaptureKey = null;
         return;
       }
       markShareUrlDone(config, sourceUrl);
@@ -1154,37 +1371,46 @@
     }
   };
 
-  const ensurePageClipboardBridgeListener = (config) => {
+  const ensurePageShareBridgeListeners = (config) => {
     injectPageClipboardBridge();
-    if (state.pageClipboardMessageHandler) {
+    injectPageNetworkBridge();
+    if (state.pageShareBridgeMessageHandler) {
       return;
     }
-    state.pageClipboardMessageHandler = (event) => {
+    state.pageShareBridgeMessageHandler = (event) => {
       if (event.source !== window) {
         return;
       }
       const data = event.data;
-      if (!data || data.source !== "xhs-guide-clipboard-bridge") {
+      if (!data || typeof data.text !== "string") {
         return;
       }
-      if (typeof data.text !== "string") {
+      if (data.source === "xhs-guide-clipboard-bridge") {
+        void handleCapturedShareText(
+          config,
+          data.text,
+          data.reason || "clipboard-bridge",
+        );
         return;
       }
-      void handleCapturedClipboardText(
-        config,
-        data.text,
-        data.reason || "bridge",
-      );
+      if (data.source === "xhs-guide-network-bridge") {
+        void handleCapturedShareText(
+          config,
+          data.text,
+          data.reason || "network-bridge",
+        );
+      }
     };
-    window.addEventListener("message", state.pageClipboardMessageHandler);
-    logInfo("页面剪贴板桥接监听已挂载", { version: SCRIPT_VERSION });
+    window.addEventListener("message", state.pageShareBridgeMessageHandler);
+    logInfo("分享桥接监听已挂载（剪贴板+网络）", { version: SCRIPT_VERSION });
   };
 
-  const teardownPageClipboardBridge = () => {
-    if (state.pageClipboardMessageHandler) {
-      window.removeEventListener("message", state.pageClipboardMessageHandler);
+  const teardownPageShareBridges = () => {
+    if (state.pageShareBridgeMessageHandler) {
+      window.removeEventListener("message", state.pageShareBridgeMessageHandler);
     }
-    state.pageClipboardMessageHandler = null;
+    state.pageShareBridgeMessageHandler = null;
+    state.lastShareCaptureKey = null;
   };
 
   const markShareUrlDone = (config, sourceUrl) => {
@@ -1244,6 +1470,9 @@
       const clip = await readClipboardText();
       clipPreview = clip?.slice(0, 80) ?? "";
       sourceUrl = extractXhsUrlFromText(clip);
+      if (sourceUrl && !isStrongShareUrl(sourceUrl)) {
+        sourceUrl = null;
+      }
       if (sourceUrl) {
         logInfo("从剪贴板解析到分享链接", {
           reason,
@@ -1326,7 +1555,7 @@
     }
     state.shareDocClickHandler = null;
     state.shareCopyHandler = null;
-    teardownPageClipboardBridge();
+    teardownPageShareBridges();
   };
 
   const ensureShareClickListener = (config) => {
@@ -1334,7 +1563,7 @@
       teardownShareCapture();
       return;
     }
-    ensurePageClipboardBridgeListener(config);
+    ensurePageShareBridgeListeners(config);
     if (state.shareDocClickHandler) {
       return;
     }
@@ -1353,7 +1582,7 @@
       }
       const directText = getClipboardTextFromCopyEvent(event);
       if (directText) {
-        void handleCapturedClipboardText(
+        void handleCapturedShareText(
           config,
           directText,
           "copy-event-clipboardData",
@@ -2482,6 +2711,8 @@
     state.shareUrlDone = false;
     teardownShareCapture();
     state.pageClipboardBridgeInjected = false;
+    state.pageNetworkBridgeInjected = false;
+    state.lastShareCaptureKey = null;
     teardownCarouselCapture();
     state.uploadedCarouselSrcs.clear();
     removeDetailCopyButton();
@@ -2507,6 +2738,7 @@
   const bootDetailCopyMode = (config) => {
     ensureOverlayRoot();
     injectPageClipboardBridge();
+    injectPageNetworkBridge();
     setupDetailModeObservers(config);
     refreshDetailMode(config);
     state.detailTimer = window.setInterval(() => {
