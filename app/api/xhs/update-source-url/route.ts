@@ -1,4 +1,8 @@
-import { updateXhsListingSourceUrl } from "@/lib/db/queries";
+import {
+  resolveXhsRecordKind,
+  type XhsRecordKind,
+  updateXhsRecordSourceUrl,
+} from "@/lib/db/queries";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -46,6 +50,11 @@ export async function POST(request: Request) {
 
   const listingId = optString(payload.listingId) ?? "";
   const sourceUrl = optString(payload.sourceUrl) ?? "";
+  const listingKindRaw = optString(payload.listingKind);
+  const listingKind: XhsRecordKind | null =
+    listingKindRaw === "wanted" || listingKindRaw === "listing"
+      ? listingKindRaw
+      : null;
 
   if (!listingId || !sourceUrl) {
     return jsonWithCors(
@@ -61,7 +70,11 @@ export async function POST(request: Request) {
     );
   }
 
-  const row = await updateXhsListingSourceUrl(listingId, sourceUrl);
+  const row = await updateXhsRecordSourceUrl(
+    listingId,
+    sourceUrl,
+    listingKind
+  );
   if (!row) {
     return jsonWithCors({ ok: false, error: "Listing not found" }, 404);
   }
@@ -77,5 +90,12 @@ export async function POST(request: Request) {
     );
   }
 
-  return jsonWithCors({ ok: true, id: row.id, sourceUrl: row.sourceUrl });
+  const resolvedKind =
+    (await resolveXhsRecordKind(row.id)) ?? listingKind ?? "listing";
+  return jsonWithCors({
+    ok: true,
+    id: row.id,
+    sourceUrl: row.sourceUrl,
+    listingKind: resolvedKind,
+  });
 }

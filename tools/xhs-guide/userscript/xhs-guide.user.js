@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.0
+// @version      0.7.1
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.0";
+  const SCRIPT_VERSION = "0.7.1";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -156,6 +156,7 @@
     videoSeekAbort: false,
     detailIngestReady: false,
     listingId: null,
+    listingKind: null,
     shareUrlDone: false,
     shareDocClickHandler: null,
     shareCopyHandler: null,
@@ -1283,7 +1284,11 @@
       return false;
     }
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/update-source-url`;
-    const body = JSON.stringify({ listingId, sourceUrl });
+    const body = JSON.stringify({
+      listingId,
+      sourceUrl,
+      listingKind: state.listingKind,
+    });
     try {
       const { status, responseText } = await gmHttpPost(url, {
         "Content-Type": "application/json",
@@ -1620,6 +1625,9 @@
     const fd = new FormData();
     if (state.listingId) {
       fd.append("listingId", state.listingId);
+    }
+    if (state.listingKind) {
+      fd.append("listingKind", state.listingKind);
     }
     fd.append("file", imageBlob, filename);
 
@@ -2062,6 +2070,22 @@
     return out;
   };
 
+  const parseIngestResult = (data) => {
+    if (!data?.ok || !data?.id) {
+      return null;
+    }
+    const listingKind =
+      data.listingKind === "wanted" || data.listingKind === "listing"
+        ? data.listingKind
+        : "listing";
+    return {
+      id: data.id,
+      listingKind,
+      classification: data.classification ?? null,
+      sourceUrl: data.sourceUrl ?? null,
+    };
+  };
+
   const submitIngestAfterCopy = async (config, plainText) => {
     if (!config.ingest?.enable) {
       return null;
@@ -2087,15 +2111,22 @@
       } catch {
         data = {};
       }
-      if (status >= 200 && status < 300 && data?.ok && data?.id) {
+      const ingestResult = parseIngestResult(data);
+      if (status >= 200 && status < 300 && ingestResult) {
         logInfo("已写入远程数据库", {
-          id: data.id,
-          idShort: shortListingId(data.id),
-          sourceUrlPending: data.sourceUrl,
+          id: ingestResult.id,
+          idShort: shortListingId(ingestResult.id),
+          listingKind: ingestResult.listingKind,
+          table:
+            ingestResult.listingKind === "wanted"
+              ? "XhsRentalWanted"
+              : "XhsRentalListing",
+          classification: ingestResult.classification,
+          sourceUrlPending: ingestResult.sourceUrl,
           channel: "GM",
           hint: "分享成功后 sourceUrl 才会变成 https 链接",
         });
-        return data.id;
+        return ingestResult;
       }
       logWarn("写入数据库失败", { status, data });
     } catch (firstError) {
@@ -2117,15 +2148,22 @@
           body,
         });
         const data = await response.json().catch(() => ({}));
-        if (response.ok && data?.ok && data?.id) {
+        const ingestResult = parseIngestResult(data);
+        if (response.ok && ingestResult) {
           logInfo("已写入远程数据库", {
-            id: data.id,
-            idShort: shortListingId(data.id),
-            sourceUrlPending: data.sourceUrl,
+            id: ingestResult.id,
+            idShort: shortListingId(ingestResult.id),
+            listingKind: ingestResult.listingKind,
+            table:
+              ingestResult.listingKind === "wanted"
+                ? "XhsRentalWanted"
+                : "XhsRentalListing",
+            classification: ingestResult.classification,
+            sourceUrlPending: ingestResult.sourceUrl,
             channel: "fetch",
             hint: "分享成功后 sourceUrl 才会变成 https 链接",
           });
-          return data.id;
+          return ingestResult;
         }
         logWarn("写入数据库失败", { status: response.status, data });
       } catch (error) {
@@ -2279,15 +2317,21 @@
         ensureShareClickListener(config);
         ensureSyncShareButton(config);
       } else {
-        const listingId = await submitIngestAfterCopy(config, plainText);
-        if (listingId) {
-          state.listingId = listingId;
+        const ingestResult = await submitIngestAfterCopy(config, plainText);
+        if (ingestResult) {
+          state.listingId = ingestResult.id;
+          state.listingKind = ingestResult.listingKind;
           state.shareUrlDone = false;
           state.detailIngestReady = true;
           logInfo("listingId 已就绪", {
             version: SCRIPT_VERSION,
-            listingId,
-            listingIdShort: shortListingId(listingId),
+            listingId: ingestResult.id,
+            listingIdShort: shortListingId(ingestResult.id),
+            listingKind: ingestResult.listingKind,
+            table:
+              ingestResult.listingKind === "wanted"
+                ? "XhsRentalWanted"
+                : "XhsRentalListing",
             hint: "数据库请按 id 查此行；sourceUrl 列里的 pending:uuid 只是占位，不是行 id",
           });
         }

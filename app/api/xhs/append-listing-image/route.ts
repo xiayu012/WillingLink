@@ -2,8 +2,9 @@ import { put } from "@vercel/blob";
 import { randomUUID } from "crypto";
 
 import {
-  appendXhsListingImageById,
   appendXhsListingImageUrl,
+  appendXhsRecordImageById,
+  type XhsRecordKind,
 } from "@/lib/db/queries";
 
 const corsHeaders = {
@@ -51,6 +52,13 @@ export async function POST(request: Request) {
   const listingIdRaw = formData.get("listingId");
   const listingId =
     typeof listingIdRaw === "string" ? listingIdRaw.trim() : "";
+  const listingKindRaw = formData.get("listingKind");
+  const listingKindValue =
+    typeof listingKindRaw === "string" ? listingKindRaw.trim() : "";
+  const listingKind: XhsRecordKind | null =
+    listingKindValue === "wanted" || listingKindValue === "listing"
+      ? listingKindValue
+      : null;
   const sourceUrlRaw = formData.get("sourceUrl");
   const sourceUrl =
     typeof sourceUrlRaw === "string" ? sourceUrlRaw.trim() : "";
@@ -104,7 +112,7 @@ export async function POST(request: Request) {
   let result;
   try {
     result = listingId
-      ? await appendXhsListingImageById(listingId, blobUrl)
+      ? await appendXhsRecordImageById(listingId, blobUrl, listingKind)
       : await appendXhsListingImageUrl(sourceUrl, blobUrl);
   } catch (error) {
     return jsonWithCors(
