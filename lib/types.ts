@@ -1,7 +1,7 @@
 import type { InferUITool, UIMessage } from "ai";
 import { z } from "zod";
 import type { getWeather } from "./ai/tools/get-weather";
-import type { searchRental } from "./ai/tools/search-rental";
+import type { createSearchRentalTool } from "./ai/tools/search-rental";
 
 export type DataPart = { type: "append-message"; message: string };
 
@@ -12,7 +12,7 @@ export const messageMetadataSchema = z.object({
 export type MessageMetadata = z.infer<typeof messageMetadataSchema>;
 
 type weatherTool = InferUITool<typeof getWeather>;
-type searchRentalTool = InferUITool<typeof searchRental>;
+type searchRentalTool = InferUITool<ReturnType<typeof createSearchRentalTool>>;
 
 export type ChatTools = {
   getWeather: weatherTool;

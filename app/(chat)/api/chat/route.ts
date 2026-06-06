@@ -18,7 +18,7 @@ import { type RequestHints, systemPrompt } from "@/lib/ai/prompts";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { findNearestTransit } from "@/lib/ai/tools/find-nearest-transit";
 import { getTransitTime } from "@/lib/ai/tools/get-transit-time";
-import { searchRental } from "@/lib/ai/tools/search-rental";
+import { createSearchRentalTool } from "@/lib/ai/tools/search-rental";
 import { getWeather } from "@/lib/ai/tools/get-weather";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
@@ -271,7 +271,7 @@ export async function POST(request: Request) {
             : undefined,
           tools: {
             getWeather,
-            searchRental,
+            searchRental: createSearchRentalTool(id),
             findNearestTransit,
             getTransitTime,
           },
