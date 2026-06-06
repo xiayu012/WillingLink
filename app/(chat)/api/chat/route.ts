@@ -35,7 +35,12 @@ import {
 import type { DBMessage } from "@/lib/db/schema";
 import { ChatSDKError } from "@/lib/errors";
 import type { ChatMessage } from "@/lib/types";
-import { convertToUIMessages, generateUUID } from "@/lib/utils";
+import {
+  convertToUIMessages,
+  extractLanguageFromMemory,
+  extractMemory,
+  generateUUID,
+} from "@/lib/utils";
 import { generateTitleFromUserMessage } from "../../actions";
 import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
@@ -251,9 +256,37 @@ export async function POST(request: Request) {
           selectedChatModel.includes("reasoning") ||
           selectedChatModel.includes("thinking");
 
+        let rememberedPrefs: string | null = null;
+        for (let i = uiMessages.length - 1; i >= 0; i--) {
+          const msg = uiMessages[i];
+          if (msg.role !== "assistant") continue;
+          for (const part of msg.parts ?? []) {
+            if (part.type === "text") {
+              const found = extractMemory(
+                (part as { type: "text"; text: string }).text ?? ""
+              );
+              if (found) {
+                rememberedPrefs = found;
+                break;
+              }
+            }
+          }
+          if (rememberedPrefs) break;
+        }
+
+        const detectedLanguage = rememberedPrefs
+          ? extractLanguageFromMemory(rememberedPrefs)
+          : null;
+
         const result = streamText({
           model: getLanguageModel(selectedChatModel),
-          system: systemPrompt({ selectedChatModel, requestHints, chatId: id }),
+          system: systemPrompt({
+            selectedChatModel,
+            requestHints,
+            chatId: id,
+            rememberedPrefs,
+            detectedLanguage,
+          }),
           messages: await convertToModelMessages(uiMessages),
           stopWhen: stepCountIs(5),
           experimental_activeTools: isReasoningModel
