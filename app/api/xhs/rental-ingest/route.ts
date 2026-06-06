@@ -5,6 +5,7 @@ import {
   createXhsRentalListing,
   createXhsRentalWanted,
 } from "@/lib/db/queries";
+import { classifyPost } from "@/lib/xhs/classify-post";
 import { parseListingFields, parseWantedFields } from "@/lib/xhs/parse-rental-text";
 
 const corsHeaders = {
@@ -48,9 +49,28 @@ export async function POST(request: Request) {
     optString(payload.pageUrl) ??
     `pending:${randomUUID()}`;
 
+  const category = await classifyPost(rawText);
+
+  if (category === "other") {
+    const phantomId = `phantom:${randomUUID()}`;
+    return jsonWithCors({
+      ok: true,
+      id: phantomId,
+      sourceUrl: sourceUrlRaw,
+      listingKind: "other",
+      classification: {
+        intent: "other",
+        confidence: 1,
+        reason: "经验/科普帖，不入库",
+        source: "rule",
+      },
+    });
+  }
+
   const classification = await classifyRentalPostIntent(rawText);
   const isSeeker =
-    classification.intent === "seeker" && classification.confidence >= 0.55;
+    category === "wanted" ||
+    (classification.intent === "seeker" && classification.confidence >= 0.55);
 
   if (isSeeker) {
     const parsed = parseWantedFields(rawText);
@@ -71,7 +91,7 @@ export async function POST(request: Request) {
       pets: optString(payload.pets) ?? parsed.pets,
       occupation: optString(payload.occupation) ?? parsed.occupation,
       householdSize: optString(payload.householdSize) ?? parsed.householdSize,
-      gender: optString(payload.gender),
+      gender: optString(payload.gender) ?? parsed.gender,
       requirements: optString(payload.requirements) ?? parsed.requirements,
       contactMethod: optString(payload.contactMethod) ?? parsed.contactMethod,
       aiConfidence: String(classification.confidence),

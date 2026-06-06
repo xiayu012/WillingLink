@@ -1165,6 +1165,9 @@
     if (typeof data.sourceUrl !== "string" || data.sourceUrl.startsWith("pending:")) {
       return false;
     }
+    if (state.listingKind === "other" || listingId.startsWith("phantom:")) {
+      return true;
+    }
     return extractXhsUrlFromText(data.sourceUrl) !== null;
   };
 
@@ -1302,6 +1305,7 @@
         logInfo("真实链接已写入", {
           listingId: data.id,
           listingIdShort: shortListingId(data.id),
+          listingKind: state.listingKind,
           sourceUrl: data.sourceUrl,
           hint: "请在数据库按 id 查此行，不要用 sourceUrl 里的 pending:... 当作行 id",
         });
@@ -2075,7 +2079,9 @@
       return null;
     }
     const listingKind =
-      data.listingKind === "wanted" || data.listingKind === "listing"
+      data.listingKind === "wanted" ||
+      data.listingKind === "listing" ||
+      data.listingKind === "other"
         ? data.listingKind
         : "listing";
     return {
@@ -2120,11 +2126,16 @@
           table:
             ingestResult.listingKind === "wanted"
               ? "XhsRentalWanted"
-              : "XhsRentalListing",
+              : ingestResult.listingKind === "other"
+                ? "(未入库)"
+                : "XhsRentalListing",
           classification: ingestResult.classification,
           sourceUrlPending: ingestResult.sourceUrl,
           channel: "GM",
-          hint: "分享成功后 sourceUrl 才会变成 https 链接",
+          hint:
+            ingestResult.listingKind === "other"
+              ? "经验/科普帖，未写入数据库（伪装成功）"
+              : "分享成功后 sourceUrl 才会变成 https 链接",
         });
         return ingestResult;
       }
@@ -2157,11 +2168,16 @@
             table:
               ingestResult.listingKind === "wanted"
                 ? "XhsRentalWanted"
-                : "XhsRentalListing",
+                : ingestResult.listingKind === "other"
+                  ? "(未入库)"
+                  : "XhsRentalListing",
             classification: ingestResult.classification,
             sourceUrlPending: ingestResult.sourceUrl,
             channel: "fetch",
-            hint: "分享成功后 sourceUrl 才会变成 https 链接",
+            hint:
+              ingestResult.listingKind === "other"
+                ? "经验/科普帖，未写入数据库（伪装成功）"
+                : "分享成功后 sourceUrl 才会变成 https 链接",
           });
           return ingestResult;
         }
@@ -2331,8 +2347,13 @@
             table:
               ingestResult.listingKind === "wanted"
                 ? "XhsRentalWanted"
-                : "XhsRentalListing",
-            hint: "数据库请按 id 查此行；sourceUrl 列里的 pending:uuid 只是占位，不是行 id",
+                : ingestResult.listingKind === "other"
+                  ? "(未入库)"
+                  : "XhsRentalListing",
+            hint:
+              ingestResult.listingKind === "other"
+                ? "经验/科普帖，未写入数据库（伪装成功）"
+                : "数据库请按 id 查此行；sourceUrl 列里的 pending:uuid 只是占位，不是行 id",
           });
         }
         renderDetailHighlight(config);

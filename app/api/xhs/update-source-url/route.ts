@@ -51,8 +51,10 @@ export async function POST(request: Request) {
   const listingId = optString(payload.listingId) ?? "";
   const sourceUrl = optString(payload.sourceUrl) ?? "";
   const listingKindRaw = optString(payload.listingKind);
-  const listingKind: XhsRecordKind | null =
-    listingKindRaw === "wanted" || listingKindRaw === "listing"
+  const listingKind: XhsRecordKind | "other" | null =
+    listingKindRaw === "wanted" ||
+    listingKindRaw === "listing" ||
+    listingKindRaw === "other"
       ? listingKindRaw
       : null;
 
@@ -70,10 +72,19 @@ export async function POST(request: Request) {
     );
   }
 
+  if (listingKind === "other" || listingId.startsWith("phantom:")) {
+    return jsonWithCors({
+      ok: true,
+      id: listingId,
+      sourceUrl,
+      listingKind: "other",
+    });
+  }
+
   const row = await updateXhsRecordSourceUrl(
     listingId,
     sourceUrl,
-    listingKind
+    listingKind === "wanted" || listingKind === "listing" ? listingKind : null
   );
   if (!row) {
     return jsonWithCors({ ok: false, error: "Listing not found" }, 404);
