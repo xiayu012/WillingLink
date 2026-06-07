@@ -36,6 +36,16 @@ The tool returned exactly ONE listing. Your job:
 - The tool handles returning a fresh, unseen listing automatically.
 - NEVER try to pick from memory or a previous pool — always call the tool.
 
+### SHOW_RELAXED_LISTING
+
+No exact match was found; the tool automatically broadened the search and returned the closest available listing.
+
+1. Show the value of relaxedNote in italics as the first line (this explains to the user what was relaxed).
+2. Display the listing in the standard format below.
+3. End with: "如您仍不满意，可以告诉我具体要求，我再为您调整。"
+
+Do NOT apologize excessively — present the relaxed result with confidence. The goal is to give the user something useful immediately rather than leaving them empty-handed.
+
 ### NO_MORE / NO_RESULTS
 
 Say what the action field instructs, word for word.
