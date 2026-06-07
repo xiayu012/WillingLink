@@ -1,5 +1,6 @@
-import { tool } from "ai";
+import { generateText, tool } from "ai";
 import { z } from "zod";
+import { gateway } from "@ai-sdk/gateway";
 import { embedText, rerankDocuments } from "@/lib/ai/embeddings";
 import {
   searchXhsRentalListings,
@@ -48,14 +49,49 @@ function detectCity(query: string): { en: string; zh: string } | null {
   return null;
 }
 
-/** Primary semantic search: vector first, ILIKE fallback. */
+/**
+ * LLM-powered geographic query expansion.
+ *
+ * Asks a cheap model to rewrite the user's query into a richer semantic string
+ * that includes neighboring cities, Bay Area sub-regions, and landmark proximity
+ * so the subsequent vector search has far better geographic coverage.
+ *
+ * - Costs ~80 tokens per call (fast, cheap, no extra APIs or DB fields)
+ * - Falls back to original query on any failure
+ */
+async function geoExpandQuery(query: string): Promise<string> {
+  try {
+    const { text } = await generateText({
+      model: gateway.languageModel("anthropic/claude-haiku-4.5"),
+      system:
+        "You are a Bay Area rental geography expert. " +
+        "Given a rental search query, rewrite it into a single rich English search string " +
+        "that expands geographic terms with neighboring cities, sub-regions, highways, and famous landmarks nearby. " +
+        "Rules:\n" +
+        "- Include the original city PLUS its immediate neighbors (e.g. Sunnyvale → add Mountain View, Santa Clara, Cupertino, South Bay)\n" +
+        "- Replace Chinese city names with English (e.g. 圣何塞→San Jose, 旧金山→San Francisco)\n" +
+        "- If the query mentions a school/company, add the city/neighborhood it's in (e.g. Stanford→Palo Alto, Apple→Cupertino, Google→Mountain View)\n" +
+        "- Keep the non-geographic parts of the query (bedrooms, budget, requirements) unchanged\n" +
+        "- Return ONLY the rewritten query string, no explanation, no quotes",
+      prompt: query,
+      maxOutputTokens: 120,
+    });
+    return text.trim() || query;
+  } catch {
+    return query;
+  }
+}
+
+/** Primary semantic search: geo-expand → vector search, with ILIKE fallback. */
 async function primarySearch(
   query: string,
   excludeIds: string[]
 ): Promise<XhsRentalSearchResultRow[]> {
   if (process.env.VOYAGE_API_KEY) {
     try {
-      const vec = await embedText(query, "query");
+      // Geo-expand before embedding so the vector captures neighboring areas
+      const expandedQuery = await geoExpandQuery(query);
+      const vec = await embedText(expandedQuery, "query");
       const rows = await vectorSearchXhsRentalListings(vec, VECTOR_CANDIDATES, excludeIds);
       if (rows.length > 0) return rows;
     } catch (err) {
