@@ -15,7 +15,7 @@ import {
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
-import type { ArtifactKind } from "@/components/artifact";
+type ArtifactKind = string; // artifact component removed
 import type { VisibilityType } from "@/components/visibility-selector";
 import { ChatSDKError } from "../errors";
 import { generateUUID } from "../utils";
@@ -344,7 +344,7 @@ export async function saveDocument({
       .values({
         id,
         title,
-        kind,
+        kind: kind as "text" | "code" | "image" | "sheet",
         content,
         userId,
         createdAt: new Date(),
@@ -696,6 +696,7 @@ export async function saveShift({
   rawMessage: string;
   embedding?: number[];
   audioUrl?: string | null;
+  audioDurationMs?: number | null;
   audioMimeType?: string | null;
   audioSizeBytes?: number | null;
 }) {
@@ -703,7 +704,7 @@ export async function saveShift({
     await db.insert(shift).values({
       id,
       whattodo,
-      startTime: startTime ?? null,
+      startTime: typeof startTime === "string" ? new Date(startTime) : (startTime ?? null),
       location,
       skillsNeeded,
       whoIsBeingHelped,
@@ -1130,4 +1131,290 @@ export async function appendXhsListingImageUrl(
     duplicated: false,
     listingFound: true,
   };
+}
+
+// --- Rental search (AI chat tool) ---
+
+export type SearchXhsRentalListingsArgs = {
+  /** ??????????????????????????? */
+  bedrooms?: string | null;
+  bathrooms?: string | null;
+  roomType?: string | null;
+  listingType?: string | null;
+  furnished?: string | null;
+  propertyName?: string | null;
+  locationText?: string | null;
+  /** ???????????rent / bathrooms ??text ????????????????????? */
+  rentMin?: number | null;
+  rentMax?: number | null;
+  bedroomsMin?: number | null;
+  bathroomsMin?: number | null;
+  /** ???????????SO ???????????vailableFrom ??text ??? */
+  availableFromAfter?: string | null;
+  availableFromBefore?: string | null;
+  /**
+   * ???????????????"???"?????????"??????/??????/?????????   * ??rawText/title/locationText/propertyName ?????OR ????????   * ????????AND????????????????????   */
+  keywords?: string[] | null;
+};
+
+export type XhsRentalSearchResultRow = {
+  id: string;
+  sourceUrl: string;
+  title: string | null;
+  rawText: string;
+  rent: string | null;
+  deposit: string | null;
+  availableFrom: string | null;
+  leaseEndDate: string | null;
+  listingType: string | null;
+  bedrooms: string | null;
+  bathrooms: string | null;
+  roomType: string | null;
+  propertyName: string | null;
+  locationText: string | null;
+  furnished: string | null;
+  contactMethod: string | null;
+  imageUrls: string[] | null;
+  createdAt: Date;
+};
+
+const RENTAL_RESULT_LIMIT = 20;
+
+/** pgvector ????????? embedding ????????*/
+export async function vectorSearchXhsRentalListings(
+  queryEmbedding: number[],
+  candidateLimit = 20,
+  excludeIds: string[] = []
+): Promise<XhsRentalSearchResultRow[]> {
+  try {
+    const vectorLiteral = `[${queryEmbedding.join(",")}]`;
+    const rows =
+      excludeIds.length > 0
+        ? await client`
+            SELECT
+              "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+              "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
+              "roomType", "propertyName", "locationText", "furnished", "contactMethod",
+              "imageUrls", "createdAt"
+            FROM "XhsRentalListing"
+            WHERE embedding IS NOT NULL
+              AND "id" != ALL(${excludeIds}::uuid[])
+            ORDER BY embedding <=> ${vectorLiteral}::vector
+            LIMIT ${candidateLimit}
+          `
+        : await client`
+            SELECT
+              "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+              "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
+              "roomType", "propertyName", "locationText", "furnished", "contactMethod",
+              "imageUrls", "createdAt"
+            FROM "XhsRentalListing"
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> ${vectorLiteral}::vector
+            LIMIT ${candidateLimit}
+          `;
+
+    return rows.map((row) => ({
+      id: row.id as string,
+      sourceUrl: row.sourceUrl as string,
+      title: (row.title as string | null) ?? null,
+      rawText: row.rawText as string,
+      rent: (row.rent as string | null) ?? null,
+      deposit: (row.deposit as string | null) ?? null,
+      availableFrom: (row.availableFrom as string | null) ?? null,
+      leaseEndDate: (row.leaseEndDate as string | null) ?? null,
+      listingType: (row.listingType as string | null) ?? null,
+      bedrooms: (row.bedrooms as string | null) ?? null,
+      bathrooms: (row.bathrooms as string | null) ?? null,
+      roomType: (row.roomType as string | null) ?? null,
+      propertyName: (row.propertyName as string | null) ?? null,
+      locationText: (row.locationText as string | null) ?? null,
+      furnished: (row.furnished as string | null) ?? null,
+      contactMethod: (row.contactMethod as string | null) ?? null,
+      imageUrls: Array.isArray(row.imageUrls)
+        ? (row.imageUrls as string[])
+        : null,
+      createdAt: row.createdAt as Date,
+    }));
+  } catch (error) {
+    console.error("Failed to vector search XhsRentalListing:", error);
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to vector search rental listings"
+    );
+  }
+}
+
+/** ????????????????????????????????? */
+export async function updateListingEmbedding(
+  id: string,
+  embedding: number[]
+): Promise<void> {
+  const vectorLiteral = `[${embedding.join(",")}]`;
+  await client`
+    UPDATE "XhsRentalListing"
+    SET embedding = ${vectorLiteral}::vector
+    WHERE id = ${id}::uuid
+  `;
+}
+
+export async function searchXhsRentalListings({
+  bedrooms,
+  bathrooms,
+  roomType,
+  listingType,
+  furnished,
+  propertyName,
+  locationText,
+  rentMin,
+  rentMax,
+  bedroomsMin,
+  bathroomsMin,
+  availableFromAfter,
+  availableFromBefore,
+  keywords,
+}: SearchXhsRentalListingsArgs) {
+  try {
+    const cleanKeywords = (keywords ?? [])
+      .map((k) => (typeof k === "string" ? k.trim() : ""))
+      .filter((k) => k.length > 0);
+
+    const rows = await client`
+      SELECT
+        "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+        "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
+        "roomType", "propertyName", "locationText", "furnished", "contactMethod",
+        "imageUrls", "createdAt",
+        COUNT(*) OVER() AS total_count
+      FROM "XhsRentalListing"
+      WHERE
+            (${bedrooms ?? null}::text     IS NULL OR "bedrooms"     ILIKE '%' || ${bedrooms ?? null} || '%')
+        AND (${bathrooms ?? null}::text    IS NULL OR "bathrooms"    ILIKE '%' || ${bathrooms ?? null} || '%')
+        AND (${roomType ?? null}::text     IS NULL OR "roomType"     ILIKE '%' || ${roomType ?? null} || '%')
+        AND (${listingType ?? null}::text  IS NULL OR "listingType"  ILIKE '%' || ${listingType ?? null} || '%')
+        AND (${furnished ?? null}::text    IS NULL OR "furnished"    ILIKE '%' || ${furnished ?? null} || '%')
+        AND (${propertyName ?? null}::text IS NULL OR "propertyName" ILIKE '%' || ${propertyName ?? null} || '%')
+        AND (${locationText ?? null}::text IS NULL OR "locationText" ILIKE '%' || ${locationText ?? null} || '%')
+        AND (${rentMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("rent" from '\\d+'), '')::int, 0)  >= ${rentMin ?? null}::int)
+        AND (${rentMax ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("rent" from '\\d+'), '')::int, 999999) <= ${rentMax ?? null}::int)
+        AND (${bedroomsMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("bedrooms"  from '\\d+'), '')::int, 0) >= ${bedroomsMin ?? null}::int)
+        AND (${bathroomsMin ?? null}::int IS NULL OR COALESCE(NULLIF(substring("bathrooms" from '\\d+'), '')::int, 0) >= ${bathroomsMin ?? null}::int)
+        AND (${availableFromAfter ?? null}::text  IS NULL OR "availableFrom" >= ${availableFromAfter ?? null})
+        AND (${availableFromBefore ?? null}::text IS NULL OR "availableFrom" <= ${availableFromBefore ?? null})
+        AND (
+          ${cleanKeywords.length === 0}::boolean
+          OR (
+            SELECT bool_and(
+              "rawText"      ILIKE '%' || kw || '%'
+              OR COALESCE("title", '')        ILIKE '%' || kw || '%'
+              OR COALESCE("locationText", '') ILIKE '%' || kw || '%'
+              OR COALESCE("propertyName", '') ILIKE '%' || kw || '%'
+            )
+            FROM unnest(${cleanKeywords}::text[]) AS kw
+          )
+        )
+      ORDER BY "createdAt" DESC
+      LIMIT ${RENTAL_RESULT_LIMIT}
+    `;
+
+    const totalCount = rows.length > 0 ? Number(rows[0].total_count) : 0;
+
+    const results: XhsRentalSearchResultRow[] = rows.map((row) => ({
+      id: row.id as string,
+      sourceUrl: row.sourceUrl as string,
+      title: (row.title as string | null) ?? null,
+      rawText: row.rawText as string,
+      rent: (row.rent as string | null) ?? null,
+      deposit: (row.deposit as string | null) ?? null,
+      availableFrom: (row.availableFrom as string | null) ?? null,
+      leaseEndDate: (row.leaseEndDate as string | null) ?? null,
+      listingType: (row.listingType as string | null) ?? null,
+      bedrooms: (row.bedrooms as string | null) ?? null,
+      bathrooms: (row.bathrooms as string | null) ?? null,
+      roomType: (row.roomType as string | null) ?? null,
+      propertyName: (row.propertyName as string | null) ?? null,
+      locationText: (row.locationText as string | null) ?? null,
+      furnished: (row.furnished as string | null) ?? null,
+      contactMethod: (row.contactMethod as string | null) ?? null,
+      imageUrls: Array.isArray(row.imageUrls)
+        ? (row.imageUrls as string[])
+        : null,
+      createdAt: row.createdAt as Date,
+    }));
+
+    return { totalCount, results };
+  } catch (error) {
+    console.error("Failed to search XhsRentalListing:", error);
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to search rental listings"
+    );
+  }
+}
+
+export type ListingForTransit = {
+  id: string;
+  locationText: string | null;
+  propertyName: string | null;
+  title: string | null;
+  rent: string | null;
+  roomType: string | null;
+  bedrooms: string | null;
+  sourceUrl: string;
+  lat: number | null;
+  lng: number | null;
+};
+
+/** ????????????????????????????????????? */
+export async function getListingsForTransitSearch(): Promise<
+  ListingForTransit[]
+> {
+  try {
+    const rows = await client`
+      SELECT
+        "id", "locationText", "propertyName", "title",
+        "rent", "roomType", "bedrooms", "sourceUrl",
+        "lat", "lng"
+      FROM "XhsRentalListing"
+      WHERE "locationText" IS NOT NULL
+         OR ("lat" IS NOT NULL AND "lng" IS NOT NULL)
+      ORDER BY "createdAt" DESC
+    `;
+    return rows.map((r) => ({
+      id: r.id as string,
+      locationText: (r.locationText as string | null) ?? null,
+      propertyName: (r.propertyName as string | null) ?? null,
+      title: (r.title as string | null) ?? null,
+      rent: (r.rent as string | null) ?? null,
+      roomType: (r.roomType as string | null) ?? null,
+      bedrooms: (r.bedrooms as string | null) ?? null,
+      sourceUrl: r.sourceUrl as string,
+      lat: r.lat !== null && r.lat !== undefined ? Number(r.lat) : null,
+      lng: r.lng !== null && r.lng !== undefined ? Number(r.lng) : null,
+    }));
+  } catch (error) {
+    console.error("Failed to get listings for transit search:", error);
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to get listings for transit search"
+    );
+  }
+}
+
+/** ????????????????????*/
+export async function updateListingGeocode(
+  id: string,
+  lat: number,
+  lng: number
+): Promise<void> {
+  try {
+    // lat/lng may not exist in current Drizzle schema; use raw SQL to stay forward-compatible
+    await client`
+      UPDATE "XhsRentalListing"
+      SET lat = ${lat}, lng = ${lng}
+      WHERE id = ${id}::uuid
+    `;
+  } catch (error) {
+    console.error("Failed to update listing geocode:", error);
+  }
 }
