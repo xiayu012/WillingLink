@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.1
+// @version      0.7.5
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.1";
+  const SCRIPT_VERSION = "0.7.5";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -130,6 +130,8 @@
     titleClickHandler: null,
     llmReviewedInRound: 0,
     lastLlmCallAt: 0,
+    analyzeInFlight: false,
+    analyzeScheduled: false,
     loopTimer: 0,
     detailTimer: 0,
     rafId: 0,
@@ -158,6 +160,8 @@
     listingId: null,
     listingKind: null,
     shareUrlDone: false,
+    /** API 返回前用户已点分享时缓存的链接，API 完成后立即提交 */
+    pendingShareUrl: null,
     shareDocClickHandler: null,
     shareCopyHandler: null,
     bodyCopied: false,
@@ -1110,7 +1114,7 @@
     }
 
     const arrow = document.querySelector(".arrow-controller.right");
-    if (arrow instanceof HTMLElement && isMediaCaptureReady()) {
+    if (arrow instanceof HTMLElement) {
       appendRectHighlight(
         root,
         config,
@@ -1206,7 +1210,7 @@
   };
 
   const handleCapturedClipboardText = async (config, text, reason) => {
-    if (state.shareUrlDone || !state.listingId || state.shareUpdateInFlight) {
+    if (state.shareUrlDone || state.shareUpdateInFlight) {
       return;
     }
     const sourceUrl = extractXhsUrlFromText(text);
@@ -1216,6 +1220,12 @@
         listingId: state.listingId,
         preview: text.slice(0, 80),
       });
+      return;
+    }
+    // listingId 还未从 API 返回时，先缓存，等入库完成后立即提交
+    if (!state.listingId) {
+      state.pendingShareUrl = sourceUrl;
+      logInfo("分享链接已缓冲（入库进行中）", { reason, sourceUrl: sourceUrl.slice(0, 100) });
       return;
     }
     logInfo("剪贴板桥接：捕获分享链接", {
@@ -1324,7 +1334,7 @@
   };
 
   const tryAutoUpdateSourceUrl = async (config, reason) => {
-    if (state.shareUrlDone || !state.listingId) {
+    if (state.shareUrlDone) {
       return false;
     }
 
@@ -1355,6 +1365,13 @@
         listingId: state.listingId,
         clipPreview,
       });
+      return false;
+    }
+
+    // listingId 还未就绪时缓存，等入库后再提交
+    if (!state.listingId) {
+      state.pendingShareUrl = sourceUrl;
+      logInfo("分享链接已缓冲（入库进行中）", { reason, sourceUrl: sourceUrl.slice(0, 100) });
       return false;
     }
 
@@ -1474,7 +1491,7 @@
     button.textContent = "同步分享链接";
     button.style.position = "fixed";
     button.style.right = "20px";
-    button.style.bottom = "120px";
+    button.style.bottom = "200px";
     button.style.zIndex = "2147483647";
     button.style.pointerEvents = "auto";
     button.style.border = "none";
@@ -2223,7 +2240,7 @@
     toast.textContent = "✓ 复制成功";
     toast.style.position = "fixed";
     toast.style.right = "20px";
-    toast.style.bottom = "76px";
+    toast.style.bottom = "150px";
     toast.style.zIndex = "2147483647";
     toast.style.background = "#16a34a";
     toast.style.color = "#ffffff";
@@ -2252,7 +2269,7 @@
         : "分享链接已写入数据库";
     toast.style.position = "fixed";
     toast.style.right = "20px";
-    toast.style.bottom = "132px";
+    toast.style.bottom = "220px";
     toast.style.zIndex = "2147483647";
     toast.style.background = "#2563eb";
     toast.style.color = "#ffffff";
@@ -2278,7 +2295,7 @@
     toast.textContent = `⚠ 先完成分享同步 id=${shortListingId(listingId)}`;
     toast.style.position = "fixed";
     toast.style.right = "20px";
-    toast.style.bottom = "132px";
+    toast.style.bottom = "220px";
     toast.style.zIndex = "2147483647";
     toast.style.background = "#f59e0b";
     toast.style.color = "#111827";
@@ -2322,6 +2339,7 @@
         chars: plainText.length,
       });
       state.bodyCopied = true;
+      removeDetailCopyButton();
       if (state.listingId && !state.shareUrlDone) {
         setCopyButtonStatus(config.detailCopy.pendingShareText, true);
         showPendingShareToast(state.listingId);
@@ -2333,6 +2351,12 @@
         ensureShareClickListener(config);
         ensureSyncShareButton(config);
       } else {
+        // 立即挂载监听，用户无需等待 API 返回再点分享
+        state.pendingShareUrl = null;
+        renderDetailHighlight(config);
+        ensureShareClickListener(config);
+        ensureSyncShareButton(config);
+
         const ingestResult = await submitIngestAfterCopy(config, plainText);
         if (ingestResult) {
           state.listingId = ingestResult.id;
@@ -2355,10 +2379,14 @@
                 ? "经验/科普帖，未写入数据库（伪装成功）"
                 : "数据库请按 id 查此行；sourceUrl 列里的 pending:uuid 只是占位，不是行 id",
           });
+          // 如果 API 返回前用户已完成分享复制，立即提交缓存的链接
+          const buffered = state.pendingShareUrl;
+          if (buffered && !state.shareUrlDone) {
+            state.pendingShareUrl = null;
+            logInfo("提交缓冲的分享链接", { sourceUrl: buffered.slice(0, 100) });
+            void handleCapturedClipboardText(config, buffered, "buffered");
+          }
         }
-        renderDetailHighlight(config);
-        ensureShareClickListener(config);
-        ensureSyncShareButton(config);
       }
     } catch (error) {
       setCopyButtonStatus(config.detailCopy.copyFailText, false);
@@ -2371,7 +2399,7 @@
   };
 
   const ensureDetailCopyButton = (config) => {
-    if (state.detailCopyButton?.parentNode) {
+    if (state.bodyCopied || state.detailCopyButton?.parentNode) {
       return;
     }
 
@@ -2385,13 +2413,13 @@
     button.style.zIndex = "2147483647";
     button.style.pointerEvents = "auto";
     button.style.border = "none";
-    button.style.borderRadius = "10px";
-    button.style.padding = "10px 14px";
-    button.style.fontSize = "14px";
+    button.style.borderRadius = "30px";
+    button.style.padding = "30px 42px";
+    button.style.fontSize = "42px";
     button.style.fontWeight = "600";
     button.style.background = "#ff2442";
     button.style.color = "#ffffff";
-    button.style.boxShadow = "0 6px 18px rgba(0, 0, 0, 0.25)";
+    button.style.boxShadow = "0 18px 54px rgba(0, 0, 0, 0.25)";
     button.style.cursor = "pointer";
     button.addEventListener("click", () => {
       void handleCopyButtonClick(config);
@@ -2475,52 +2503,86 @@
   };
 
   const analyzeRound = async (config) => {
-    state.llmReviewedInRound = 0;
+    // 串行化：若上一轮尚未结束，标记"需要再跑一次"，直接返回
+    if (state.analyzeInFlight) {
+      state.analyzeScheduled = true;
+      return;
+    }
+    state.analyzeInFlight = true;
+    state.analyzeScheduled = false;
 
-    const candidates = collectVisibleTitleCandidates(config);
-    const relatedInRound = [];
+    try {
+      state.llmReviewedInRound = 0;
 
-    for (const candidate of candidates) {
-      const cacheKey = normalizeTitle(candidate.text).toLowerCase();
-      if (state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
-        continue;
-      }
-      const cached = state.judgeCache.get(cacheKey);
-      if (cached) {
-        if (cached.isBayAreaRentingRelated) {
-          candidate.judgement = cached;
-          relatedInRound.push(candidate);
+      const candidates = collectVisibleTitleCandidates(config);
+      const relatedInRound = [];
+      const needLlm = [];
+
+      // 第一遍：收集缓存命中的，立即渲染；未缓存的放入 needLlm
+      for (const candidate of candidates) {
+        const cacheKey = normalizeTitle(candidate.text).toLowerCase();
+        if (state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
+          continue;
         }
-        continue;
+        const cached = state.judgeCache.get(cacheKey);
+        if (cached) {
+          if (cached.isBayAreaRentingRelated) {
+            candidate.judgement = cached;
+            relatedInRound.push(candidate);
+          }
+          continue;
+        }
+        if (!state.inFlightText.has(cacheKey)) {
+          needLlm.push(candidate);
+        }
       }
 
-      if (state.inFlightText.has(cacheKey)) {
-        continue;
+      // 立即渲染缓存命中项，不等 LLM
+      state.matchedById.clear();
+      for (const candidate of relatedInRound) {
+        if (!state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
+          state.matchedById.set(candidate.id, candidate);
+        }
       }
-      state.inFlightText.add(cacheKey);
-      const result = await runTitleJudgementPipeline(candidate, config);
-      state.judgeCache.set(cacheKey, result);
-      state.inFlightText.delete(cacheKey);
+      if (relatedInRound.length > 0) {
+        scheduleRender(config);
+      }
 
-      if (result.isBayAreaRentingRelated) {
-        candidate.judgement = result;
-        relatedInRound.push(candidate);
+      // 第二遍：LLM 判断未缓存项
+      for (const candidate of needLlm) {
+        const cacheKey = normalizeTitle(candidate.text).toLowerCase();
+        if (state.inFlightText.has(cacheKey)) {
+          continue;
+        }
+        state.inFlightText.add(cacheKey);
+        const result = await runTitleJudgementPipeline(candidate, config);
+        state.judgeCache.set(cacheKey, result);
+        state.inFlightText.delete(cacheKey);
+
+        if (result.isBayAreaRentingRelated) {
+          candidate.judgement = result;
+          relatedInRound.push(candidate);
+          if (!state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
+            state.matchedById.set(candidate.id, candidate);
+            scheduleRender(config);
+          }
+        }
+      }
+
+      scheduleRender(config);
+      logInfo("本轮完成", {
+        scanned: candidates.length,
+        highlighted: relatedInRound.length,
+        llmReviewed: state.llmReviewedInRound,
+      });
+    } finally {
+      state.analyzeInFlight = false;
+      // 如果期间有新的触发请求，立即再跑一轮
+      if (state.analyzeScheduled) {
+        state.analyzeScheduled = false;
+        void analyzeRound(config);
       }
     }
-
-    state.matchedById.clear();
-    for (const candidate of relatedInRound) {
-      if (state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
-        continue;
-      }
-      state.matchedById.set(candidate.id, candidate);
-    }
-    scheduleRender(config);
-    logInfo("本轮完成", {
-      scanned: candidates.length,
-      highlighted: relatedInRound.length,
-      llmReviewed: state.llmReviewedInRound,
-    });
   };
 
   const refreshDetailMode = (config) => {
