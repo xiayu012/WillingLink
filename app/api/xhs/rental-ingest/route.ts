@@ -3,6 +3,7 @@ import { randomUUID } from "crypto";
 import { classifyRentalPostIntent } from "@/lib/ai/classify-rental-post";
 import {
   createXhsRentalListing,
+  createXhsRentalOther,
   createXhsRentalWanted,
 } from "@/lib/db/queries";
 import { classifyPost } from "@/lib/xhs/classify-post";
@@ -49,28 +50,42 @@ export async function POST(request: Request) {
     optString(payload.pageUrl) ??
     `pending:${randomUUID()}`;
 
-  const category = await classifyPost(rawText);
+  // Step 1: 先判断是否为非交易帖（经验/科普）
+  const broadCategory = await classifyPost(rawText);
 
-  if (category === "other") {
-    const phantomId = `phantom:${randomUUID()}`;
+  if (broadCategory === "other") {
+    // 真实写入 XhsRentalOther 表
+    const inferredTitle = rawText.split(/[\n。！？!?]/)[0]?.slice(0, 80) ?? null;
+    const row = await createXhsRentalOther({
+      sourceUrl: sourceUrlRaw,
+      rawText,
+      title: optString(payload.title) ?? inferredTitle,
+      aiReason: "经验/科普/非交易帖，由规则分类器识别",
+    });
+
+    if (!row) {
+      return jsonWithCors({ ok: false, error: "Failed to save other post" }, 500);
+    }
+
     return jsonWithCors({
       ok: true,
-      id: phantomId,
+      id: row.id,
       sourceUrl: sourceUrlRaw,
       listingKind: "other",
       classification: {
         intent: "other",
         confidence: 1,
-        reason: "经验/科普帖，不入库",
+        reason: "经验/科普帖",
         source: "rule",
       },
     });
   }
 
+  // Step 2: 对所有租房帖，使用 AI 全文阅读来区分招租 vs 求租
+  // 不依赖关键词分类结果，避免误判
   const classification = await classifyRentalPostIntent(rawText);
   const isSeeker =
-    category === "wanted" ||
-    (classification.intent === "seeker" && classification.confidence >= 0.55);
+    classification.intent === "seeker" && classification.confidence >= 0.55;
 
   if (isSeeker) {
     const parsed = parseWantedFields(rawText);

@@ -1,4 +1,4 @@
-import "server-only";
+﻿import "server-only";
 
 import {
   and,
@@ -33,6 +33,7 @@ import {
   user,
   vote,
   xhsRentalListing,
+  xhsRentalOther,
   xhsRentalWanted,
 } from "./schema";
 import { generateHashedPassword } from "./utils";
@@ -812,7 +813,7 @@ export type CreateXhsRentalListingInput = {
   postedAt?: Date | null;
 };
 
-export type XhsRecordKind = "listing" | "wanted";
+export type XhsRecordKind = "listing" | "wanted" | "other";
 
 export async function resolveXhsRecordKind(
   recordId: string
@@ -833,6 +834,15 @@ export async function resolveXhsRecordKind(
     .limit(1);
   if (wantedRows[0]) {
     return "wanted";
+  }
+
+  const otherRows = await db
+    .select({ id: xhsRentalOther.id })
+    .from(xhsRentalOther)
+    .where(eq(xhsRentalOther.id, recordId))
+    .limit(1);
+  if (otherRows[0]) {
+    return "other";
   }
 
   return null;
@@ -862,6 +872,18 @@ export async function updateXhsWantedSourceUrl(
   return row ?? null;
 }
 
+export async function updateXhsOtherSourceUrl(
+  otherId: string,
+  sourceUrl: string
+) {
+  const [row] = await db
+    .update(xhsRentalOther)
+    .set({ sourceUrl })
+    .where(eq(xhsRentalOther.id, otherId))
+    .returning({ id: xhsRentalOther.id, sourceUrl: xhsRentalOther.sourceUrl });
+  return row ?? null;
+}
+
 export async function updateXhsRecordSourceUrl(
   recordId: string,
   sourceUrl: string,
@@ -870,6 +892,9 @@ export async function updateXhsRecordSourceUrl(
   const resolvedKind = kind ?? (await resolveXhsRecordKind(recordId));
   if (resolvedKind === "wanted") {
     return updateXhsWantedSourceUrl(recordId, sourceUrl);
+  }
+  if (resolvedKind === "other") {
+    return updateXhsOtherSourceUrl(recordId, sourceUrl);
   }
   if (resolvedKind === "listing") {
     return updateXhsListingSourceUrl(recordId, sourceUrl);
@@ -971,6 +996,38 @@ export async function appendXhsWantedImageById(
   };
 }
 
+export async function appendXhsOtherImageById(
+  otherId: string,
+  blobPublicUrl: string
+): Promise<AppendXhsListingImageResult> {
+  const rows = await db
+    .select()
+    .from(xhsRentalOther)
+    .where(eq(xhsRentalOther.id, otherId))
+    .limit(1);
+
+  const existing = rows[0];
+  if (!existing) {
+    return { id: null, imageUrlsLength: 0, duplicated: false, listingFound: false };
+  }
+
+  const list: string[] = Array.isArray(existing.imageUrls)
+    ? [...existing.imageUrls]
+    : [];
+
+  if (list.includes(blobPublicUrl)) {
+    return { id: existing.id, imageUrlsLength: list.length, duplicated: true, listingFound: true };
+  }
+
+  list.push(blobPublicUrl);
+  await db
+    .update(xhsRentalOther)
+    .set({ imageUrls: list })
+    .where(eq(xhsRentalOther.id, existing.id));
+
+  return { id: existing.id, imageUrlsLength: list.length, duplicated: false, listingFound: true };
+}
+
 export async function appendXhsRecordImageById(
   recordId: string,
   blobPublicUrl: string,
@@ -979,6 +1036,9 @@ export async function appendXhsRecordImageById(
   const resolvedKind = kind ?? (await resolveXhsRecordKind(recordId));
   if (resolvedKind === "wanted") {
     return appendXhsWantedImageById(recordId, blobPublicUrl);
+  }
+  if (resolvedKind === "other") {
+    return appendXhsOtherImageById(recordId, blobPublicUrl);
   }
   if (resolvedKind === "listing") {
     return appendXhsListingImageById(recordId, blobPublicUrl);
@@ -989,6 +1049,29 @@ export async function appendXhsRecordImageById(
     duplicated: false,
     listingFound: false,
   };
+}
+
+export type CreateXhsRentalOtherInput = {
+  sourceUrl: string;
+  rawText: string;
+  title?: string | null;
+  aiReason?: string | null;
+  postedAt?: Date | null;
+};
+
+export async function createXhsRentalOther(input: CreateXhsRentalOtherInput) {
+  const [row] = await db
+    .insert(xhsRentalOther)
+    .values({
+      sourceUrl: input.sourceUrl,
+      rawText: input.rawText,
+      title: input.title ?? null,
+      aiReason: input.aiReason ?? null,
+      postedAt: input.postedAt ?? null,
+      createdAt: new Date(),
+    })
+    .returning({ id: xhsRentalOther.id });
+  return row ?? null;
 }
 
 export type CreateXhsRentalWantedInput = {

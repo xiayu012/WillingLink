@@ -265,3 +265,17 @@ export const xhsRentalWanted = pgTable("XhsRentalWanted", {
 });
 
 export type XhsRentalWanted = InferSelectModel<typeof xhsRentalWanted>;
+
+/** 小红书经验/科普/其他非交易帖 */
+export const xhsRentalOther = pgTable("XhsRentalOther", {
+  id: uuid("id").primaryKey().notNull().defaultRandom(),
+  sourceUrl: text("sourceUrl").notNull(),
+  rawText: text("rawText").notNull(),
+  title: text("title"),
+  aiReason: text("aiReason"),
+  imageUrls: json("imageUrls").$type<string[] | null>(),
+  postedAt: timestamp("postedAt", { withTimezone: true }),
+  createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+});
+
+export type XhsRentalOther = InferSelectModel<typeof xhsRentalOther>;
