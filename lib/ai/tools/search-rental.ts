@@ -2,6 +2,7 @@ import { generateText, tool } from "ai";
 import { z } from "zod";
 import { gateway } from "@ai-sdk/gateway";
 import { embedText, rerankDocuments } from "@/lib/ai/embeddings";
+import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
 import {
   searchXhsRentalListings,
   vectorSearchXhsRentalListings,
@@ -9,29 +10,6 @@ import {
 } from "@/lib/db/queries";
 
 const VECTOR_CANDIDATES = 50;
-
-// ── Per-chat shown-listing tracker (server-side) ──────────────────────────────
-// The LLM never needs to pass excludeIds; this map handles deduplication
-// automatically across every turn, including "换一个" and relaxed results.
-
-const shownListingsPerChat = new Map<string, Set<string>>();
-
-function getShownIds(chatId: string): string[] {
-  return [...(shownListingsPerChat.get(chatId) ?? [])];
-}
-
-function markShown(chatId: string, id: string): void {
-  if (!shownListingsPerChat.has(chatId)) {
-    shownListingsPerChat.set(chatId, new Set());
-  }
-  // biome-ignore lint/style/noNonNullAssertion: just set above
-  shownListingsPerChat.get(chatId)!.add(id);
-  // Prevent unbounded growth in long-running servers
-  if (shownListingsPerChat.size > 500) {
-    const firstKey = shownListingsPerChat.keys().next().value;
-    if (firstKey) shownListingsPerChat.delete(firstKey);
-  }
-}
 
 // ── City patterns (Chinese ↔ English) ─────────────────────────────────────────
 
@@ -262,7 +240,7 @@ export function createSearchRentalTool(chatId: string) {
     }),
     execute: async ({ query, mustNotContain }) => {
       try {
-        const excludeIds = getShownIds(chatId);
+        const excludeIds = await getSeenListingIds(chatId);
         const blockTerms = (mustNotContain ?? [])
           .map((t) => t.trim().toLowerCase())
           .filter((t) => t.length > 0);
@@ -277,7 +255,7 @@ export function createSearchRentalTool(chatId: string) {
           return { listing: null, relaxedNote: null, action: msg };
         }
 
-        markShown(chatId, result.listing.id);
+        await markListingAsSeen(chatId, result.listing.id);
 
         if (result.relaxedNote) {
           return {
