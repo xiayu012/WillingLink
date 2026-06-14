@@ -116,6 +116,7 @@
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "@types/react-syntax-highlighter": "^15.5.13",
+    "baseline-browser-mapping": "^2.10.37",
     "drizzle-kit": "^0.25.0",
     "postcss": "^8",
     "serwist": "^9.5.0",
