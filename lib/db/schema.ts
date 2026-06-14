@@ -230,6 +230,12 @@ export const xhsRentalListing = pgTable("XhsRentalListing", {
   /** 论坛帖时间：优先更新于，无则发布于 */
   postedAt: timestamp("postedAt", { withTimezone: true }),
   createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+  /**
+   * 从 rent 文本解析的月租金（美元整数）。
+   * 100–15000 范围外视为无效数据，设为 NULL。
+   * 供 SQL 数值过滤用，避免 ILIKE 正则的精度问题。
+   */
+  rentNumeric: integer("rentNumeric"),
 });
 
 export type XhsRentalListing = InferSelectModel<typeof xhsRentalListing>;

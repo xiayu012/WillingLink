@@ -1133,6 +1133,15 @@ export async function createXhsRentalWanted(input: CreateXhsRentalWantedInput) {
   return row ?? null;
 }
 
+/** Parse monthly rent text to integer (100–15000 USD). Returns null if unparseable. */
+function parseRentNumeric(rent: string | null | undefined): number | null {
+  if (!rent) return null;
+  const m = rent.match(/\d+/);
+  if (!m) return null;
+  const n = parseInt(m[0], 10);
+  return n >= 100 && n <= 15_000 ? n : null;
+}
+
 export async function createXhsRentalListing(
   input: CreateXhsRentalListingInput
 ) {
@@ -1143,6 +1152,7 @@ export async function createXhsRentalListing(
       rawText: input.rawText,
       title: input.title ?? null,
       rent: input.rent ?? null,
+      rentNumeric: parseRentNumeric(input.rent),
       deposit: input.deposit ?? null,
       availableFrom: input.availableFrom ?? null,
       leaseEndDate: input.leaseEndDate ?? null,
@@ -1246,6 +1256,7 @@ export type XhsRentalSearchResultRow = {
   title: string | null;
   rawText: string;
   rent: string | null;
+  rentNumeric: number | null;
   deposit: string | null;
   availableFrom: string | null;
   leaseEndDate: string | null;
@@ -1275,7 +1286,7 @@ export async function vectorSearchXhsRentalListings(
       excludeIds.length > 0
         ? await client`
             SELECT
-              "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+              "id", "sourceUrl", "title", "rawText", "rent", "rentNumeric", "deposit",
               "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
               "roomType", "propertyName", "locationText", "furnished", "contactMethod",
               "imageUrls", "createdAt"
@@ -1287,7 +1298,7 @@ export async function vectorSearchXhsRentalListings(
           `
         : await client`
             SELECT
-              "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+              "id", "sourceUrl", "title", "rawText", "rent", "rentNumeric", "deposit",
               "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
               "roomType", "propertyName", "locationText", "furnished", "contactMethod",
               "imageUrls", "createdAt"
@@ -1303,6 +1314,7 @@ export async function vectorSearchXhsRentalListings(
       title: (row.title as string | null) ?? null,
       rawText: row.rawText as string,
       rent: (row.rent as string | null) ?? null,
+      rentNumeric: (row.rentNumeric as number | null) ?? null,
       deposit: (row.deposit as string | null) ?? null,
       availableFrom: (row.availableFrom as string | null) ?? null,
       leaseEndDate: (row.leaseEndDate as string | null) ?? null,
@@ -1364,7 +1376,7 @@ export async function searchXhsRentalListings({
 
     const rows = await client`
       SELECT
-        "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+        "id", "sourceUrl", "title", "rawText", "rent", "rentNumeric", "deposit",
         "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
         "roomType", "propertyName", "locationText", "furnished", "contactMethod",
         "imageUrls", "createdAt",
@@ -1378,10 +1390,10 @@ export async function searchXhsRentalListings({
         AND (${furnished ?? null}::text    IS NULL OR "furnished"    ILIKE '%' || ${furnished ?? null} || '%')
         AND (${propertyName ?? null}::text IS NULL OR "propertyName" ILIKE '%' || ${propertyName ?? null} || '%')
         AND (${locationText ?? null}::text IS NULL OR "locationText" ILIKE '%' || ${locationText ?? null} || '%')
-        AND (${rentMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("rent" from '\\d+'), '')::int, 0)  >= ${rentMin ?? null}::int)
-        AND (${rentMax ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("rent" from '\\d+'), '')::int, 999999) <= ${rentMax ?? null}::int)
-        AND (${bedroomsMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("bedrooms"  from '\\d+'), '')::int, 0) >= ${bedroomsMin ?? null}::int)
-        AND (${bathroomsMin ?? null}::int IS NULL OR COALESCE(NULLIF(substring("bathrooms" from '\\d+'), '')::int, 0) >= ${bathroomsMin ?? null}::int)
+        AND (${rentMin ?? null}::int  IS NULL OR "rentNumeric" >= ${rentMin ?? null}::int)
+        AND (${rentMax ?? null}::int  IS NULL OR "rentNumeric" <= ${rentMax ?? null}::int)
+        AND (${bedroomsMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("bedrooms"  from '\d+'), '')::int, 0) >= ${bedroomsMin ?? null}::int)
+        AND (${bathroomsMin ?? null}::int IS NULL OR COALESCE(NULLIF(substring("bathrooms" from '\d+'), '')::int, 0) >= ${bathroomsMin ?? null}::int)
         AND (${availableFromAfter ?? null}::text  IS NULL OR "availableFrom" >= ${availableFromAfter ?? null})
         AND (${availableFromBefore ?? null}::text IS NULL OR "availableFrom" <= ${availableFromBefore ?? null})
         AND (
@@ -1408,6 +1420,7 @@ export async function searchXhsRentalListings({
       title: (row.title as string | null) ?? null,
       rawText: row.rawText as string,
       rent: (row.rent as string | null) ?? null,
+      rentNumeric: (row.rentNumeric as number | null) ?? null,
       deposit: (row.deposit as string | null) ?? null,
       availableFrom: (row.availableFrom as string | null) ?? null,
       leaseEndDate: (row.leaseEndDate as string | null) ?? null,
