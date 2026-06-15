@@ -1,13 +1,14 @@
 import { randomUUID } from "crypto";
 
 import { classifyRentalPostIntent } from "@/lib/ai/classify-rental-post";
+import { extractListingFields } from "@/lib/ai/extract-listing-fields";
 import {
   createXhsRentalListing,
   createXhsRentalOther,
   createXhsRentalWanted,
 } from "@/lib/db/queries";
 import { classifyPost } from "@/lib/xhs/classify-post";
-import { parseListingFields, parseWantedFields } from "@/lib/xhs/parse-rental-text";
+import { parseWantedFields } from "@/lib/xhs/parse-rental-text";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -131,7 +132,8 @@ export async function POST(request: Request) {
     });
   }
 
-  const parsed = parseListingFields(rawText);
+  // LLM extracts all fields (falls back to regex on failure)
+  const parsed = await extractListingFields(rawText);
   const row = await createXhsRentalListing({
     sourceUrl: sourceUrlRaw,
     rawText,
@@ -148,6 +150,13 @@ export async function POST(request: Request) {
     locationText: optString(payload.locationText) ?? parsed.locationText,
     furnished: optString(payload.furnished) ?? parsed.furnished,
     contactMethod: optString(payload.contactMethod) ?? parsed.contactMethod,
+    // New LLM-only fields
+    bedroomsNum: parsed.bedroomsNum ?? null,
+    city: parsed.city ?? null,
+    petFriendly: parsed.petFriendly ?? null,
+    couplesOk: parsed.couplesOk ?? null,
+    utilitiesIncluded: parsed.utilitiesIncluded ?? null,
+    parkingIncluded: parsed.parkingIncluded ?? null,
   });
 
   if (!row) {

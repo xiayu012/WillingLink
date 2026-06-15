@@ -39,56 +39,76 @@ const SCHEMA_DESCRIPTION = `
 Table: "XhsRentalListing" (case-sensitive, always double-quote it)
 
 Columns and types:
-  id             uuid          PRIMARY KEY
-  sourceUrl      text          Original post URL (xiaohongshu / WeChat etc.)
-  title          text NULL     Post headline; often null or short description
-  rawText        text          Full post text in Chinese/English — use ILIKE for free-text search
-  rent           text NULL     Monthly rent as free text, e.g. "880", "1704刀", "$1000/月", "面议"
-  rentNumeric    integer NULL  Parsed monthly rent in USD (100–15000 range). NULL = unparseable.
-                               USE THIS COLUMN for numeric rent filtering and sorting.
-  deposit        text NULL     Deposit description, e.g. "一个月押金", "$1250"
-  bedrooms       text NULL     Bedroom count/description, e.g. "1", "2", "三房", "两房"
-  bathrooms      text NULL     Bathroom count, e.g. "1", "2"
-  roomType       text NULL     Room type, e.g. "整套", "独立卧室", "主卧", "次卧", "套间"
-  listingType    text NULL     Listing type, e.g. "整租", "合租", "sublet"
-  furnished      text NULL     Furnishing, e.g. "全屋家具", "部分家具", "unfurnished"
-  locationText   text NULL     Free-text address/area, e.g. "Fremont 94539", "旧金山近金门公园"
-  propertyName   text NULL     Apartment complex name if mentioned
-  availableFrom  text NULL     Move-in date (free text)
-  leaseEndDate   text NULL     Lease end date (free text)
-  contactMethod  text NULL     How to contact, e.g. WeChat ID, phone
-  imageUrls      json NULL     Array of image URLs
-  postedAt       timestamptz   When the post was published (use for recency queries)
-  createdAt      timestamptz   When the record was inserted
+  id                uuid          PRIMARY KEY
+  sourceUrl         text          Original post URL (xiaohongshu / WeChat etc.)
+  title             text NULL     Post headline; often null or short description
+  rawText           text          Full post text in Chinese/English — use ILIKE for free-text search
+  rent              text NULL     Monthly rent as free text, e.g. "880", "1704刀", "$1000/月", "面议"
+  rentNumeric       integer NULL  Parsed monthly rent in USD (100–15000 range). NULL = unparseable.
+                                  USE THIS COLUMN for numeric rent filtering and sorting.
+  deposit           text NULL     Deposit description, e.g. "一个月押金", "$1250"
+  bedrooms          text NULL     Bedroom count/description free text, e.g. "1", "两房"
+  bedroomsNum       integer NULL  Bedrooms as integer (studio=0). USE THIS for numeric bedroom filter.
+  bathrooms         text NULL     Bathroom count, e.g. "1", "2"
+  roomType          text NULL     Room type, e.g. "整套", "独立卧室", "主卧", "次卧", "套间"
+  listingType       text NULL     Listing type, e.g. "整租", "合租", "sublet"
+  furnished         text NULL     Furnishing, e.g. "全屋家具", "部分家具", "unfurnished"
+  locationText      text NULL     Free-text address/area, e.g. "Fremont 94539", "旧金山近金门公园"
+  city              text NULL     Standardized English city, e.g. "San Jose", "San Francisco", "Fremont"
+                                  USE THIS for city-level filtering and grouping.
+  propertyName      text NULL     Apartment complex name if mentioned
+  availableFrom     text NULL     Move-in date (free text)
+  leaseEndDate      text NULL     Lease end date (free text)
+  contactMethod     text NULL     How to contact, e.g. WeChat ID, phone
+  petFriendly       boolean NULL  true=pets allowed, false=no pets, NULL=not mentioned
+  couplesOk         boolean NULL  true=couples welcome, false=single only, NULL=not mentioned
+  utilitiesIncluded boolean NULL  true=water/elec included in rent, NULL=not mentioned
+  parkingIncluded   boolean NULL  true=parking available/included, NULL=not mentioned
+  imageUrls         json NULL     Array of image URLs
+  postedAt          timestamptz   When the post was published (use for recency queries)
+  createdAt         timestamptz   When the record was inserted
 
 Key query patterns:
-  -- Count by city/area
-  SELECT "locationText", COUNT(*) AS cnt FROM "XhsRentalListing"
-  GROUP BY "locationText" ORDER BY cnt DESC LIMIT 20
+  -- Count by city (use structured city column, not ILIKE on locationText)
+  SELECT city, COUNT(*) AS cnt FROM "XhsRentalListing"
+  WHERE city IS NOT NULL
+  GROUP BY city ORDER BY cnt DESC LIMIT 20
 
   -- Numeric rent filter (use rentNumeric, not rent)
-  SELECT id, title, "rentNumeric", "locationText"
+  SELECT id, title, "rentNumeric", city, "locationText"
   FROM "XhsRentalListing"
   WHERE "rentNumeric" IS NOT NULL AND "rentNumeric" <= 1500
   ORDER BY "rentNumeric" ASC LIMIT 20
 
+  -- Bedroom filter (use bedroomsNum, not bedrooms text)
+  SELECT id, title, "bedroomsNum", "rentNumeric", city
+  FROM "XhsRentalListing"
+  WHERE "bedroomsNum" = 2 AND "rentNumeric" < 2500
+  ORDER BY "rentNumeric" ASC LIMIT 20
+
+  -- Pet-friendly listings
+  SELECT id, title, city, "rentNumeric"
+  FROM "XhsRentalListing"
+  WHERE "petFriendly" = true
+  ORDER BY "rentNumeric" ASC LIMIT 20
+
+  -- Utilities included
+  SELECT id, title, city, "rentNumeric"
+  FROM "XhsRentalListing"
+  WHERE "utilitiesIncluded" = true AND city = 'San Jose'
+  LIMIT 20
+
   -- Cheapest listing
-  SELECT id, title, rent, "rentNumeric", "locationText"
+  SELECT id, title, rent, "rentNumeric", city, "locationText"
   FROM "XhsRentalListing"
   WHERE "rentNumeric" IS NOT NULL
   ORDER BY "rentNumeric" ASC LIMIT 5
 
   -- Posted this week
-  SELECT id, title, "locationText", "postedAt"
+  SELECT id, title, city, "postedAt"
   FROM "XhsRentalListing"
   WHERE "postedAt" > NOW() - INTERVAL '7 days'
   ORDER BY "postedAt" DESC LIMIT 20
-
-  -- Full-text search (Chinese or English)
-  SELECT id, title, "locationText"
-  FROM "XhsRentalListing"
-  WHERE "rawText" ILIKE '%宠物%' OR "rawText" ILIKE '%pet%'
-  LIMIT 20
 
   -- Count total listings
   SELECT COUNT(*) FROM "XhsRentalListing"

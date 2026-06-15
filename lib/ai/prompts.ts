@@ -53,11 +53,15 @@ Say what the action field instructs.
   **<title or "(???)">** ([??](sourceUrl))
   - **??:** rent
   - **??:** deposit
-  - **??:** bedrooms ? / bathrooms ? ∑ roomType
+  - **??:** bedrooms ? / bathrooms ? ù roomType
   - **??:** locationText (propertyName if any)
   - **??:** availableFrom ? leaseEndDate
-  - **??/??:** furnished ∑ listingType
+  - **??/??:** furnished ù listingType
   - **??:** contactMethod
+  - **??:** Show only non-null boolean fields as emoji badges on one line:
+    ?? ???? (petFriendly=true) ù ???? ????? (petFriendly=false)
+    ?? ???? (couplesOk=true) ù ?? ???? (utilitiesIncluded=true) ù ?? ??? (parkingIncluded=true)
+    Skip this line entirely if all four are null.
   - **??:** first 80 chars of rawText, then "..."
   - If imageUrls is non-empty: ![](imageUrls[0])
 
@@ -89,11 +93,12 @@ Rules:
 
 Call queryListings whenever you need to explore the database directly before searching, or when the user asks a statistical or structural question. Examples:
 
-- "?????????????" ? run: SELECT "locationText", COUNT(*) AS cnt FROM "XhsRentalListing" GROUP BY "locationText" ORDER BY cnt DESC LIMIT 20
-- "??? $1500 ??????" ? run: SELECT id, title, rent FROM "XhsRentalListing" WHERE rent ILIKE '%1500%' LIMIT 10
-- "???????" ? run: SELECT id, title, "locationText", "postedAt" FROM "XhsRentalListing" WHERE "postedAt" > NOW() - INTERVAL '7 days' ORDER BY "postedAt" DESC LIMIT 20
-- "??????????" ? run: SELECT COUNT(*) FROM "XhsRentalListing" WHERE "rawText" ILIKE '%pet%' OR "rawText" ILIKE '%??%'
-- "???????" ? run: SELECT COUNT(*) FROM "XhsRentalListing"
+- "?????????????" ? run: SELECT city, COUNT(*) AS cnt FROM "XhsRentalListing" WHERE city IS NOT NULL GROUP BY city ORDER BY cnt DESC LIMIT 20
+- "???? $1500 ???" ? run: SELECT id, title, "rentNumeric", city FROM "XhsRentalListing" WHERE "rentNumeric" IS NOT NULL AND "rentNumeric" <= 1500 ORDER BY "rentNumeric" ASC LIMIT 20
+- "?????" ? run: SELECT id, title, "bedroomsNum", "rentNumeric", city FROM "XhsRentalListing" WHERE "bedroomsNum" = 2 ORDER BY "rentNumeric" ASC LIMIT 20
+- "???????" ? run: SELECT id, title, city, "rentNumeric" FROM "XhsRentalListing" WHERE "petFriendly" = true ORDER BY "rentNumeric" ASC LIMIT 20
+- "??????" ? run: SELECT id, title, city, "postedAt" FROM "XhsRentalListing" WHERE "postedAt" > NOW() - INTERVAL '7 days' ORDER BY "postedAt" DESC LIMIT 20
+- "????????" ? run: SELECT COUNT(*) FROM "XhsRentalListing"
 
 Two-step search pattern (preferred for complex or informed searches):
 1. Call queryListings to survey the data ? discover what cities have supply, typical rent ranges, available roomTypes.
@@ -119,7 +124,7 @@ When the tool returns successfully, respond with:
 **<title or "(???)">** ([??](sourceUrl))
 - **????:** transitDurationText?? transitMinutes ???
 - **??:** rent
-- **??:** bedrooms ∑ roomType
+- **??:** bedrooms ù roomType
 - **??:** locationText (propertyName if any)
 
 Then briefly list the other candidates from allCandidates (up to 3) as a compact comparison table or bullet list sorted by transitMinutes.

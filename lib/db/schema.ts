@@ -236,6 +236,20 @@ export const xhsRentalListing = pgTable("XhsRentalListing", {
    * 供 SQL 数值过滤用，避免 ILIKE 正则的精度问题。
    */
   rentNumeric: integer("rentNumeric"),
+
+  // ── LLM 提取的结构化字段（入库时自动填写）──────────────────────────────
+  /** 卧室数整数，studio=0。比 bedrooms 文本更适合数值过滤 */
+  bedroomsNum: integer("bedroomsNum"),
+  /** 标准化英文城市名，如 "San Jose"、"San Francisco" */
+  city: text("city"),
+  /** 是否允许宠物入住（true/false/null=未提及） */
+  petFriendly: boolean("petFriendly"),
+  /** 是否允许情侣/两人入住（true/false/null=未提及） */
+  couplesOk: boolean("couplesOk"),
+  /** 水电是否包含在租金内（true/false/null=未提及） */
+  utilitiesIncluded: boolean("utilitiesIncluded"),
+  /** 是否有停车位（true/false/null=未提及） */
+  parkingIncluded: boolean("parkingIncluded"),
 });
 
 export type XhsRentalListing = InferSelectModel<typeof xhsRentalListing>;

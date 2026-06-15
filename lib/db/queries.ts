@@ -811,6 +811,13 @@ export type CreateXhsRentalListingInput = {
   furnished?: string | null;
   contactMethod?: string | null;
   postedAt?: Date | null;
+  // LLM-extracted structured fields
+  bedroomsNum?: number | null;
+  city?: string | null;
+  petFriendly?: boolean | null;
+  couplesOk?: boolean | null;
+  utilitiesIncluded?: boolean | null;
+  parkingIncluded?: boolean | null;
 };
 
 export type XhsRecordKind = "listing" | "wanted" | "other";
@@ -1166,6 +1173,12 @@ export async function createXhsRentalListing(
       contactMethod: input.contactMethod ?? null,
       postedAt: input.postedAt ?? null,
       createdAt: new Date(),
+      bedroomsNum: input.bedroomsNum ?? null,
+      city: input.city ?? null,
+      petFriendly: input.petFriendly ?? null,
+      couplesOk: input.couplesOk ?? null,
+      utilitiesIncluded: input.utilitiesIncluded ?? null,
+      parkingIncluded: input.parkingIncluded ?? null,
     })
     .returning({ id: xhsRentalListing.id });
   return row ?? null;
@@ -1270,6 +1283,13 @@ export type XhsRentalSearchResultRow = {
   contactMethod: string | null;
   imageUrls: string[] | null;
   createdAt: Date;
+  // LLM-extracted structured fields
+  bedroomsNum: number | null;
+  city: string | null;
+  petFriendly: boolean | null;
+  couplesOk: boolean | null;
+  utilitiesIncluded: boolean | null;
+  parkingIncluded: boolean | null;
 };
 
 const RENTAL_RESULT_LIMIT = 20;
@@ -1289,7 +1309,8 @@ export async function vectorSearchXhsRentalListings(
               "id", "sourceUrl", "title", "rawText", "rent", "rentNumeric", "deposit",
               "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
               "roomType", "propertyName", "locationText", "furnished", "contactMethod",
-              "imageUrls", "createdAt"
+              "imageUrls", "createdAt",
+              "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded"
             FROM "XhsRentalListing"
             WHERE embedding IS NOT NULL
               AND "id" != ALL(${excludeIds}::uuid[])
@@ -1301,7 +1322,8 @@ export async function vectorSearchXhsRentalListings(
               "id", "sourceUrl", "title", "rawText", "rent", "rentNumeric", "deposit",
               "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
               "roomType", "propertyName", "locationText", "furnished", "contactMethod",
-              "imageUrls", "createdAt"
+              "imageUrls", "createdAt",
+              "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded"
             FROM "XhsRentalListing"
             WHERE embedding IS NOT NULL
             ORDER BY embedding <=> ${vectorLiteral}::vector
@@ -1330,6 +1352,12 @@ export async function vectorSearchXhsRentalListings(
         ? (row.imageUrls as string[])
         : null,
       createdAt: row.createdAt as Date,
+      bedroomsNum: (row.bedroomsNum as number | null) ?? null,
+      city: (row.city as string | null) ?? null,
+      petFriendly: (row.petFriendly as boolean | null) ?? null,
+      couplesOk: (row.couplesOk as boolean | null) ?? null,
+      utilitiesIncluded: (row.utilitiesIncluded as boolean | null) ?? null,
+      parkingIncluded: (row.parkingIncluded as boolean | null) ?? null,
     }));
   } catch (error) {
     console.error("Failed to vector search XhsRentalListing:", error);
@@ -1380,6 +1408,7 @@ export async function searchXhsRentalListings({
         "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
         "roomType", "propertyName", "locationText", "furnished", "contactMethod",
         "imageUrls", "createdAt",
+        "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded",
         COUNT(*) OVER() AS total_count
       FROM "XhsRentalListing"
       WHERE
@@ -1436,6 +1465,12 @@ export async function searchXhsRentalListings({
         ? (row.imageUrls as string[])
         : null,
       createdAt: row.createdAt as Date,
+      bedroomsNum: (row.bedroomsNum as number | null) ?? null,
+      city: (row.city as string | null) ?? null,
+      petFriendly: (row.petFriendly as boolean | null) ?? null,
+      couplesOk: (row.couplesOk as boolean | null) ?? null,
+      utilitiesIncluded: (row.utilitiesIncluded as boolean | null) ?? null,
+      parkingIncluded: (row.parkingIncluded as boolean | null) ?? null,
     }));
 
     return { totalCount, results };
