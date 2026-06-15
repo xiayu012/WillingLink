@@ -17,10 +17,12 @@ if (process.env.POSTGRES_URL?.startsWith('"')) {
 
 import postgres from "postgres";
 import { generateObject } from "ai";
-import { gateway } from "@ai-sdk/gateway";
+import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 
 const client = postgres(process.env.POSTGRES_URL!);
+
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
 const extractSchema = z.object({
   bedroomsNum: z.number().int().nullable(),
@@ -33,7 +35,7 @@ const extractSchema = z.object({
 
 async function extractFields(rawText: string) {
   const { object } = await generateObject({
-    model: gateway.languageModel("anthropic/claude-haiku-4.5"),
+    model: openai("gpt-4o-mini"),
     schema: extractSchema,
     system: `You are a data extractor for US Bay Area rental listings (Chinese/English).
 Extract only these 6 fields. Return null for anything you cannot confidently determine.
