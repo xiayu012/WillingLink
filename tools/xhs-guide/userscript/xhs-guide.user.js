@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.5
+// @version      0.7.6
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.5";
+  const SCRIPT_VERSION = "0.7.6";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -45,41 +45,49 @@
       maxTitlesPerRound: 20,
     },
     judgement: {
-      enableLlmReview: false,
+      enableLlmReview: true,
       llmTimeoutMs: 12000,
-      maxLlmReviewsPerRound: 4,
-      llmMinIntervalMs: 700,
+      maxLlmReviewsPerRound: 10,
+      llmMinIntervalMs: 300,
       minConfidenceToHighlight: 0.6,
       rule: {
-        cityKeywords: [
-          "湾区",
-          "Bay Area",
-          "San Francisco",
-          "San Jose",
-          "Oakland",
-          "Palo Alto",
-          "Fremont",
-          "Santa Clara",
-          "Mountain View",
-          "Sunnyvale",
-          "伯克利",
-          "旧金山",
-          "硅谷",
+        /**
+         * 强命中列表：同时命中城市词 + 租房词即可跳过 LLM（节省开销）。
+         * 这里追求完整覆盖，漏掉的交给 LLM 判断。
+         */
+        bayAreaWords: [
+          "湾区", "Bay Area", "bay area",
+          "San Francisco", "SF", "旧金山",
+          "San Jose", "SJ", "South Bay", "南湾",
+          "Oakland", "East Bay", "东湾",
+          "Fremont", "Milpitas", "Cupertino",
+          "Santa Clara", "Mountain View", "Sunnyvale",
+          "Palo Alto", "Los Altos", "Menlo Park",
+          "Redwood City", "Foster City", "San Mateo",
+          "Daly City", "San Bruno",
+          "Berkeley", "伯克利",
+          "Hayward", "Alameda", "Campbell",
+          "Saratoga", "Los Gatos",
+          "Stanford", "斯坦福", "硅谷", "North Bay", "北湾",
+          "SJSU", "UCSF", "SCU",
         ],
-        rentKeywords: [
-          "租房",
-          "转租",
-          "求租",
-          "出租",
-          "找室友",
-          "合租",
-          "lease",
-          "sublease",
-          "roommate",
-          "rent",
-          "studio",
-          "1b1b",
-          "2b2b",
+        rentalWords: [
+          "租", "房", "室友", "招租", "出租", "转租", "求租",
+          "短租", "合租", "一房", "两房", "主卧", "次卧",
+          "1b", "2b", "1bd", "2bd", "studio",
+          "lease", "sublease", "roommate", "rent",
+          "apartment", "condo", "公寓",
+          "找房", "寻房", "搬家", "入住", "押金", "月租",
+          "独卫", "独立", "furnished",
+        ],
+        /**
+         * 强排除词：含以下词且无湾区信号，直接拒绝（减少 LLM 浪费）
+         * 只放绝对不可能是湾区租房的强信号词。
+         */
+        mainlandOnlyWords: [
+          "北京", "上海", "广州", "深圳", "成都", "杭州",
+          "武汉", "西安", "南京", "苏州", "重庆", "天津",
+          "长沙", "郑州", "厦门", "青岛", "大连",
         ],
       },
       llm: {
@@ -650,26 +658,47 @@
   };
 
   const ruleScreenStage = (input, config) => {
-    const normalizedLower = input.titleText.toLowerCase();
-    const cityHit = config.judgement.rule.cityKeywords.find((word) =>
-      normalizedLower.includes(word.toLowerCase()),
-    );
-    const rentHit = config.judgement.rule.rentKeywords.find((word) =>
-      normalizedLower.includes(word.toLowerCase()),
-    );
+    const lower = input.titleText.toLowerCase();
+    const rule = config.judgement.rule;
 
-    const passed = Boolean(cityHit && rentHit);
-    const confidence = passed ? 0.62 : 0.1;
+    const bayHit = rule.bayAreaWords.find((w) => lower.includes(w.toLowerCase()));
+    const rentHit = rule.rentalWords.find((w) => lower.includes(w.toLowerCase()));
 
+    // 强命中：城市词 + 租房词同时出现 → 直接判为相关，跳过 LLM
+    if (bayHit && rentHit) {
+      return {
+        stageName: "ruleScreenStage",
+        passed: true,
+        skipLlm: true,
+        confidence: 0.85,
+        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})`,
+      };
+    }
+
+    // 排除：含大陆城市词且没有任何湾区/租房信号 → 直接拒绝，不耗 LLM
+    if (!bayHit && !rentHit) {
+      const mainlandHit = rule.mainlandOnlyWords.find((w) => lower.includes(w.toLowerCase()));
+      if (mainlandHit) {
+        return {
+          stageName: "ruleScreenStage",
+          passed: false,
+          skipLlm: true,
+          confidence: 0.05,
+          reason: `大陆城市词(${mainlandHit})且无湾区/租房信号，排除`,
+        };
+      }
+    }
+
+    // 其他一切：交给 LLM 判断
+    const anySignal = bayHit ?? rentHit ?? null;
     return {
       stageName: "ruleScreenStage",
-      passed,
-      confidence,
-      reason: passed
-        ? `规则命中: 城市词(${cityHit}) + 租房词(${rentHit})`
-        : "规则未同时命中城市词和租房词",
-      cityHit: cityHit || "",
-      rentHit: rentHit || "",
+      passed: true,
+      skipLlm: false,
+      confidence: anySignal ? 0.45 : 0.25,
+      reason: anySignal
+        ? `弱信号(${anySignal})，送 LLM 复核`
+        : "无明确关键词，送 LLM 判断",
     };
   };
 
@@ -787,7 +816,9 @@
     }
 
     const systemPrompt =
-      "你是帖子分类器。仅判断标题是否与美国湾区租房相关。输出 JSON: {\"related\": boolean, \"confidence\": 0-1, \"reason\": string}";
+      "你是小红书帖子分类器，专门识别美国湾区（Bay Area / 硅谷 / 旧金山 / 南湾 / 东湾等）租房相关帖子。" +
+      "包括：出租/转租/短租/招租/求租/找房/找室友/roommate/sublease 等。" +
+      "判断标题是否属于此类。输出 JSON: {\"related\": boolean, \"confidence\": 0-1, \"reason\": string}";
     const userPrompt = `标题: ${input.titleText}`;
 
     const payload = {
@@ -841,15 +872,18 @@
 
     const ruleResult = ruleScreenStage(input, config);
     stageTrace.push(ruleResult);
-    if (!ruleResult.passed) {
+
+    // 强规则拒绝（仅大陆词命中）或强规则通过（城市+租房双命中跳过 LLM）
+    if (ruleResult.skipLlm) {
       return {
-        isBayAreaRentingRelated: false,
+        isBayAreaRentingRelated: ruleResult.passed && ruleResult.confidence >= config.judgement.minConfidenceToHighlight,
         confidence: ruleResult.confidence,
         reason: ruleResult.reason,
         stageTrace,
       };
     }
 
+    // 其余全部交给 LLM；LLM 失败时降级为规则结果
     let llmResult;
     try {
       llmResult = await llmReviewStage(input, config);
@@ -857,7 +891,7 @@
       llmResult = {
         stageName: "llmReviewStage",
         skipped: true,
-        passed: true,
+        passed: ruleResult.passed,
         confidence: ruleResult.confidence,
         reason: `LLM 失败，降级规则结果: ${error instanceof Error ? error.message : String(error)}`,
       };
