@@ -175,23 +175,7 @@ function inferLeaseDuration(text: string): string | null {
   return m[0].trim().slice(0, 40);
 }
 
-export type ParsedListingFields = {
-  title: string | null;
-  rent: string | null;
-  deposit: string | null;
-  availableFrom: string | null;
-  leaseEndDate: string | null;
-  listingType: string | null;
-  bedrooms: string | null;
-  bathrooms: string | null;
-  roomType: string | null;
-  propertyName: string | null;
-  locationText: string | null;
-  furnished: string | null;
-  contactMethod: string | null;
-};
-
-export function parseListingFields(rawText: string): ParsedListingFields {
+export function parseListingFields(rawText: string) {
   const { bedrooms, bathrooms } = extractBedroomsBathrooms(rawText);
   return {
     title: inferTitle(rawText),
