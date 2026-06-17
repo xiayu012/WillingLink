@@ -1,13 +1,14 @@
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 
 import { classifyRentalPostIntent } from "@/lib/ai/classify-rental-post";
+import { extractListingFields } from "@/lib/ai/extract-listing-fields";
 import {
   createXhsRentalListing,
   createXhsRentalOther,
   createXhsRentalWanted,
 } from "@/lib/db/queries";
 import { classifyPost } from "@/lib/xhs/classify-post";
-import { parseListingFields, parseWantedFields } from "@/lib/xhs/parse-rental-text";
+import { parseWantedFields } from "@/lib/xhs/parse-rental-text";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -31,6 +32,11 @@ function optString(v: unknown): string | null {
   return t.length > 0 ? t : null;
 }
 
+/** SHA-256 of rawText, used for content-based deduplication */
+function computeContentHash(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
 export async function POST(request: Request) {
   let payload: Record<string, unknown>;
   try {
@@ -50,28 +56,29 @@ export async function POST(request: Request) {
     optString(payload.pageUrl) ??
     `pending:${randomUUID()}`;
 
+  // Content hash for deduplication (covers both real URL and pending:uuid cases)
+  const contentHash = computeContentHash(rawText);
+
   // Step 1: 先判断是否为非交易帖（经验/科普）
   const broadCategory = await classifyPost(rawText);
 
   if (broadCategory === "other") {
-    // 真实写入 XhsRentalOther 表
     const inferredTitle = rawText.split(/[\n。！？!?]/)[0]?.slice(0, 80) ?? null;
     const row = await createXhsRentalOther({
       sourceUrl: sourceUrlRaw,
       rawText,
       title: optString(payload.title) ?? inferredTitle,
       aiReason: "经验/科普/非交易帖，由规则分类器识别",
+      contentHash,
     });
 
-    if (!row) {
-      return jsonWithCors({ ok: false, error: "Failed to save other post" }, 500);
-    }
-
+    // row is null when ON CONFLICT fired (duplicate) — still return ok:true
     return jsonWithCors({
       ok: true,
-      id: row.id,
+      id: row?.id ?? null,
       sourceUrl: sourceUrlRaw,
       listingKind: "other",
+      duplicate: row === null,
       classification: {
         intent: "other",
         confidence: 1,
@@ -81,8 +88,7 @@ export async function POST(request: Request) {
     });
   }
 
-  // Step 2: 对所有租房帖，使用 AI 全文阅读来区分招租 vs 求租
-  // 不依赖关键词分类结果，避免误判
+  // Step 2: 区分招租 vs 求租
   const classification = await classifyRentalPostIntent(rawText);
   const isSeeker =
     classification.intent === "seeker" && classification.confidence >= 0.55;
@@ -111,17 +117,15 @@ export async function POST(request: Request) {
       contactMethod: optString(payload.contactMethod) ?? parsed.contactMethod,
       aiConfidence: String(classification.confidence),
       aiReason: classification.reason,
+      contentHash,
     });
-
-    if (!row) {
-      return jsonWithCors({ ok: false, error: "Failed to save wanted post" }, 500);
-    }
 
     return jsonWithCors({
       ok: true,
-      id: row.id,
+      id: row?.id ?? null,
       sourceUrl: sourceUrlRaw,
       listingKind: "wanted",
+      duplicate: row === null,
       classification: {
         intent: classification.intent,
         confidence: classification.confidence,
@@ -131,7 +135,8 @@ export async function POST(request: Request) {
     });
   }
 
-  const parsed = parseListingFields(rawText);
+  // Step 3: 招租帖 — LLM 提取结构化字段
+  const parsed = await extractListingFields(rawText);
   const row = await createXhsRentalListing({
     sourceUrl: sourceUrlRaw,
     rawText,
@@ -148,17 +153,21 @@ export async function POST(request: Request) {
     locationText: optString(payload.locationText) ?? parsed.locationText,
     furnished: optString(payload.furnished) ?? parsed.furnished,
     contactMethod: optString(payload.contactMethod) ?? parsed.contactMethod,
+    bedroomsNum: parsed.bedroomsNum ?? null,
+    city: parsed.city ?? null,
+    petFriendly: parsed.petFriendly ?? null,
+    couplesOk: parsed.couplesOk ?? null,
+    utilitiesIncluded: parsed.utilitiesIncluded ?? null,
+    parkingIncluded: parsed.parkingIncluded ?? null,
+    contentHash,
   });
-
-  if (!row) {
-    return jsonWithCors({ ok: false, error: "Failed to save" }, 500);
-  }
 
   return jsonWithCors({
     ok: true,
-    id: row.id,
+    id: row?.id ?? null,
     sourceUrl: sourceUrlRaw,
     listingKind: "listing",
+    duplicate: row === null,
     classification: {
       intent: classification.intent,
       confidence: classification.confidence,

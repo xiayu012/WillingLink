@@ -230,6 +230,27 @@ export const xhsRentalListing = pgTable("XhsRentalListing", {
   /** 论坛帖时间：优先更新于，无则发布于 */
   postedAt: timestamp("postedAt", { withTimezone: true }),
   createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+  // ── 数值过滤列（正则解析）────────────────────────────────────────────────
+  /** 月租金（美元整数，100-15000 范围），供 SQL 数值过滤 */
+  rentNumeric: integer("rentNumeric"),
+  // ── LLM 提取的结构化字段（入库时自动填写）────────────────────────────────
+  /** 卧室数整数，studio=0 */
+  bedroomsNum: integer("bedroomsNum"),
+  /** 标准化英文城市名，如 "San Jose"、"San Francisco" */
+  city: text("city"),
+  /** 是否允许宠物（true/false/null=未提及） */
+  petFriendly: boolean("petFriendly"),
+  /** 是否允许情侣入住 */
+  couplesOk: boolean("couplesOk"),
+  /** 水电是否包含在租金内 */
+  utilitiesIncluded: boolean("utilitiesIncluded"),
+  /** 是否有停车位 */
+  parkingIncluded: boolean("parkingIncluded"),
+  /**
+   * SHA-256 of rawText (hex). Content-based deduplication for pending:uuid URLs.
+   * Partial UNIQUE index at DB level (WHERE contentHash IS NOT NULL).
+   */
+  contentHash: text("contentHash"),
 });
 
 export type XhsRentalListing = InferSelectModel<typeof xhsRentalListing>;
@@ -262,6 +283,7 @@ export const xhsRentalWanted = pgTable("XhsRentalWanted", {
   aiReason: text("aiReason"),
   postedAt: timestamp("postedAt", { withTimezone: true }),
   createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+  contentHash: text("contentHash"),
 });
 
 export type XhsRentalWanted = InferSelectModel<typeof xhsRentalWanted>;
@@ -276,6 +298,7 @@ export const xhsRentalOther = pgTable("XhsRentalOther", {
   imageUrls: json("imageUrls").$type<string[] | null>(),
   postedAt: timestamp("postedAt", { withTimezone: true }),
   createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+  contentHash: text("contentHash"),
 });
 
 export type XhsRentalOther = InferSelectModel<typeof xhsRentalOther>;

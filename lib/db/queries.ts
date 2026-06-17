@@ -811,6 +811,14 @@ export type CreateXhsRentalListingInput = {
   furnished?: string | null;
   contactMethod?: string | null;
   postedAt?: Date | null;
+  // LLM-extracted structured fields
+  bedroomsNum?: number | null;
+  city?: string | null;
+  petFriendly?: boolean | null;
+  couplesOk?: boolean | null;
+  utilitiesIncluded?: boolean | null;
+  parkingIncluded?: boolean | null;
+  contentHash?: string | null;
 };
 
 export type XhsRecordKind = "listing" | "wanted" | "other";
@@ -1057,6 +1065,7 @@ export type CreateXhsRentalOtherInput = {
   title?: string | null;
   aiReason?: string | null;
   postedAt?: Date | null;
+  contentHash?: string | null;
 };
 
 export async function createXhsRentalOther(input: CreateXhsRentalOtherInput) {
@@ -1069,7 +1078,9 @@ export async function createXhsRentalOther(input: CreateXhsRentalOtherInput) {
       aiReason: input.aiReason ?? null,
       postedAt: input.postedAt ?? null,
       createdAt: new Date(),
+      contentHash: input.contentHash ?? null,
     })
+    .onConflictDoNothing()
     .returning({ id: xhsRentalOther.id });
   return row ?? null;
 }
@@ -1098,6 +1109,7 @@ export type CreateXhsRentalWantedInput = {
   aiConfidence?: string | null;
   aiReason?: string | null;
   postedAt?: Date | null;
+  contentHash?: string | null;
 };
 
 export async function createXhsRentalWanted(input: CreateXhsRentalWantedInput) {
@@ -1128,9 +1140,20 @@ export async function createXhsRentalWanted(input: CreateXhsRentalWantedInput) {
       aiReason: input.aiReason ?? null,
       postedAt: input.postedAt ?? null,
       createdAt: new Date(),
+      contentHash: input.contentHash ?? null,
     })
+    .onConflictDoNothing()
     .returning({ id: xhsRentalWanted.id });
   return row ?? null;
+}
+
+/** Parse rent text to a numeric USD monthly value (100–15,000), or null */
+function parseRentNumeric(rent: string | null | undefined): number | null {
+  if (!rent) return null;
+  const m = rent.replace(/,/g, "").match(/\d+/);
+  if (!m) return null;
+  const n = parseInt(m[0], 10);
+  return n >= 100 && n <= 15_000 ? n : null;
 }
 
 export async function createXhsRentalListing(
@@ -1143,6 +1166,7 @@ export async function createXhsRentalListing(
       rawText: input.rawText,
       title: input.title ?? null,
       rent: input.rent ?? null,
+      rentNumeric: parseRentNumeric(input.rent),
       deposit: input.deposit ?? null,
       availableFrom: input.availableFrom ?? null,
       leaseEndDate: input.leaseEndDate ?? null,
@@ -1156,7 +1180,15 @@ export async function createXhsRentalListing(
       contactMethod: input.contactMethod ?? null,
       postedAt: input.postedAt ?? null,
       createdAt: new Date(),
+      bedroomsNum: input.bedroomsNum ?? null,
+      city: input.city ?? null,
+      petFriendly: input.petFriendly ?? null,
+      couplesOk: input.couplesOk ?? null,
+      utilitiesIncluded: input.utilitiesIncluded ?? null,
+      parkingIncluded: input.parkingIncluded ?? null,
+      contentHash: input.contentHash ?? null,
     })
+    .onConflictDoNothing()
     .returning({ id: xhsRentalListing.id });
   return row ?? null;
 }
