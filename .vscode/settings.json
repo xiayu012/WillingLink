@@ -25,11 +25,30 @@
     "editor.defaultFormatter": "biomejs.biome"
   },
   "typescript.tsdk": "node_modules/typescript/lib",
+  "typescript.disableAutomaticTypeAcquisition": true,
+  "javascript.validate.enable": false,
+  "biome.lsp.enabled": false,
+  "git.autofetch": false,
+  "yaml.schemaStore.enable": false,
+  "yaml.validate": false,
+  "files.watcherExclude": {
+    "**/.next/**": true,
+    "**/node_modules/**": true,
+    "**/.git/**": true,
+    "**/.turbo/**": true,
+    "**/twa/gradle/**": true,
+    "**/twa/build/**": true
+  },
+  "search.exclude": {
+    "**/.next": true,
+    "**/node_modules": true,
+    "**/tools/xhs-guide/userscript": true
+  },
   "editor.formatOnSave": true,
-  "editor.formatOnPaste": true,
+  "editor.formatOnPaste": false,
   "emmet.showExpandedAbbreviation": "never",
   "editor.codeActionsOnSave": {
-    "source.fixAll.biome": "explicit",
+    "source.fixAll.biome": "never",
     "source.organizeImports.biome": "explicit"
   }
 }

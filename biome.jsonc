@@ -6,7 +6,8 @@
       "**/*",
       "!components/ui",
       "!lib/utils.ts",
-      "!hooks/use-mobile.ts"
+      "!hooks/use-mobile.ts",
+      "!tools/xhs-guide/userscript/**"
     ]
   },
   "linter": {

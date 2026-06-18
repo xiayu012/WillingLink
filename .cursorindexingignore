@@ -1,0 +1,7 @@
+node_modules/
+.next/
+.turbo/
+tools/xhs-guide/userscript/
+twa/gradle/
+twa/build/
+pnpm-lock.yaml
