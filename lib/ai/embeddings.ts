@@ -1,14 +1,40 @@
-import { VoyageAIClient } from "voyageai";
-
 type EmbedDataItem = { index?: number; embedding?: number[] };
-type RerankDataItem = { index?: number; relevanceScore?: number };
+type RerankDataItem = { index?: number; relevance_score?: number };
 
-// biome-ignore lint: required env var
-const voyage = new VoyageAIClient({ apiKey: process.env.VOYAGE_API_KEY! });
+const VOYAGE_API_BASE_URL = "https://api.voyageai.com/v1";
 
 const EMBED_MODEL = "voyage-3" as const;
 const RERANK_MODEL = "rerank-2-lite" as const;
 const EMBED_DIMS = 1024;
+
+function getVoyageApiKey(): string {
+  const apiKey = process.env.VOYAGE_API_KEY;
+  if (!apiKey) {
+    throw new Error("VOYAGE_API_KEY is not configured");
+  }
+  return apiKey;
+}
+
+async function postVoyage<TResponse>(
+  path: "/embeddings" | "/rerank",
+  body: Record<string, unknown>
+): Promise<TResponse> {
+  const res = await fetch(`${VOYAGE_API_BASE_URL}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${getVoyageApiKey()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const message = await res.text();
+    throw new Error(`Voyage API ${path} failed: ${res.status} ${message}`);
+  }
+
+  return (await res.json()) as TResponse;
+}
 
 /**
  * 将单条文本转成 1024 维向量。
@@ -20,10 +46,10 @@ export async function embedText(
   text: string,
   inputType: "document" | "query" = "query"
 ): Promise<number[]> {
-  const res = await voyage.embed({
+  const res = await postVoyage<{ data?: EmbedDataItem[] }>("/embeddings", {
     input: [text],
     model: EMBED_MODEL,
-    inputType,
+    input_type: inputType,
   });
   const item = res.data?.[0];
   const vec = item?.embedding;
@@ -42,10 +68,10 @@ export async function embedBatch(
   inputType: "document" | "query" = "document"
 ): Promise<number[][]> {
   if (texts.length === 0) return [];
-  const res = await voyage.embed({
+  const res = await postVoyage<{ data?: EmbedDataItem[] }>("/embeddings", {
     input: texts,
     model: EMBED_MODEL,
-    inputType,
+    input_type: inputType,
   });
   return (res.data ?? [])
     .slice()
@@ -64,16 +90,19 @@ export async function rerankDocuments(
 ): Promise<number[]> {
   if (documents.length === 0) return [];
   const actualTopK = Math.min(topK, documents.length);
-  const res = await voyage.rerank({
+  const res = await postVoyage<{ data?: RerankDataItem[] }>("/rerank", {
     query,
     documents,
     model: RERANK_MODEL,
-    topK: actualTopK,
-    returnDocuments: false,
+    top_k: actualTopK,
+    return_documents: false,
   });
   return (res.data ?? [])
     .slice()
-    .sort((a: RerankDataItem, b: RerankDataItem) => (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0))
+    .sort(
+      (a: RerankDataItem, b: RerankDataItem) =>
+        (b.relevance_score ?? 0) - (a.relevance_score ?? 0)
+    )
     .map((d: RerankDataItem) => d.index ?? 0);
 }
 
