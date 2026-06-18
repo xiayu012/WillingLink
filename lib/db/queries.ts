@@ -818,7 +818,6 @@ export type CreateXhsRentalListingInput = {
   couplesOk?: boolean | null;
   utilitiesIncluded?: boolean | null;
   parkingIncluded?: boolean | null;
-  contentHash?: string | null;
 };
 
 export type XhsRecordKind = "listing" | "wanted" | "other";
@@ -1065,7 +1064,6 @@ export type CreateXhsRentalOtherInput = {
   title?: string | null;
   aiReason?: string | null;
   postedAt?: Date | null;
-  contentHash?: string | null;
 };
 
 export async function createXhsRentalOther(input: CreateXhsRentalOtherInput) {
@@ -1078,9 +1076,7 @@ export async function createXhsRentalOther(input: CreateXhsRentalOtherInput) {
       aiReason: input.aiReason ?? null,
       postedAt: input.postedAt ?? null,
       createdAt: new Date(),
-      contentHash: input.contentHash ?? null,
     })
-    .onConflictDoNothing()
     .returning({ id: xhsRentalOther.id });
   return row ?? null;
 }
@@ -1109,7 +1105,6 @@ export type CreateXhsRentalWantedInput = {
   aiConfidence?: string | null;
   aiReason?: string | null;
   postedAt?: Date | null;
-  contentHash?: string | null;
 };
 
 export async function createXhsRentalWanted(input: CreateXhsRentalWantedInput) {
@@ -1140,17 +1135,15 @@ export async function createXhsRentalWanted(input: CreateXhsRentalWantedInput) {
       aiReason: input.aiReason ?? null,
       postedAt: input.postedAt ?? null,
       createdAt: new Date(),
-      contentHash: input.contentHash ?? null,
     })
-    .onConflictDoNothing()
     .returning({ id: xhsRentalWanted.id });
   return row ?? null;
 }
 
-/** Parse rent text to a numeric USD monthly value (100–15,000), or null */
+/** Parse monthly rent text to integer (100–15000 USD). Returns null if unparseable. */
 function parseRentNumeric(rent: string | null | undefined): number | null {
   if (!rent) return null;
-  const m = rent.replace(/,/g, "").match(/\d+/);
+  const m = rent.match(/\d+/);
   if (!m) return null;
   const n = parseInt(m[0], 10);
   return n >= 100 && n <= 15_000 ? n : null;
@@ -1186,9 +1179,7 @@ export async function createXhsRentalListing(
       couplesOk: input.couplesOk ?? null,
       utilitiesIncluded: input.utilitiesIncluded ?? null,
       parkingIncluded: input.parkingIncluded ?? null,
-      contentHash: input.contentHash ?? null,
     })
-    .onConflictDoNothing()
     .returning({ id: xhsRentalListing.id });
   return row ?? null;
 }
@@ -1251,7 +1242,6 @@ export async function appendXhsListingImageUrl(
 // --- Rental search (AI chat tool) ---
 
 export type SearchXhsRentalListingsArgs = {
-  /** ??????????????????????????? */
   bedrooms?: string | null;
   bathrooms?: string | null;
   roomType?: string | null;
@@ -1259,17 +1249,22 @@ export type SearchXhsRentalListingsArgs = {
   furnished?: string | null;
   propertyName?: string | null;
   locationText?: string | null;
-  /** ???????????rent / bathrooms ??text ????????????????????? */
   rentMin?: number | null;
   rentMax?: number | null;
   bedroomsMin?: number | null;
   bathroomsMin?: number | null;
-  /** ???????????SO ???????????vailableFrom ??text ??? */
   availableFromAfter?: string | null;
   availableFromBefore?: string | null;
   /**
-   * ???????????????"???"?????????"??????/??????/?????????   * ??rawText/title/locationText/propertyName ?????OR ????????   * ????????AND????????????????????   */
+   * Free-text keywords — ALL must appear in rawText, title, locationText, or propertyName.
+   * Useful for city names, room types, amenities.
+   */
   keywords?: string[] | null;
+  /**
+   * Override the default RENTAL_RESULT_LIMIT (20).
+   * Use a higher value for last-resort searches where a wider pool improves reranking quality.
+   */
+  limit?: number | null;
 };
 
 export type XhsRentalSearchResultRow = {
@@ -1278,6 +1273,7 @@ export type XhsRentalSearchResultRow = {
   title: string | null;
   rawText: string;
   rent: string | null;
+  rentNumeric: number | null;
   deposit: string | null;
   availableFrom: string | null;
   leaseEndDate: string | null;
@@ -1291,6 +1287,13 @@ export type XhsRentalSearchResultRow = {
   contactMethod: string | null;
   imageUrls: string[] | null;
   createdAt: Date;
+  // LLM-extracted structured fields
+  bedroomsNum: number | null;
+  city: string | null;
+  petFriendly: boolean | null;
+  couplesOk: boolean | null;
+  utilitiesIncluded: boolean | null;
+  parkingIncluded: boolean | null;
 };
 
 const RENTAL_RESULT_LIMIT = 20;
@@ -1307,10 +1310,11 @@ export async function vectorSearchXhsRentalListings(
       excludeIds.length > 0
         ? await client`
             SELECT
-              "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+              "id", "sourceUrl", "title", "rawText", "rent", "rentNumeric", "deposit",
               "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
               "roomType", "propertyName", "locationText", "furnished", "contactMethod",
-              "imageUrls", "createdAt"
+              "imageUrls", "createdAt",
+              "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded"
             FROM "XhsRentalListing"
             WHERE embedding IS NOT NULL
               AND "id" != ALL(${excludeIds}::uuid[])
@@ -1319,10 +1323,11 @@ export async function vectorSearchXhsRentalListings(
           `
         : await client`
             SELECT
-              "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+              "id", "sourceUrl", "title", "rawText", "rent", "rentNumeric", "deposit",
               "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
               "roomType", "propertyName", "locationText", "furnished", "contactMethod",
-              "imageUrls", "createdAt"
+              "imageUrls", "createdAt",
+              "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded"
             FROM "XhsRentalListing"
             WHERE embedding IS NOT NULL
             ORDER BY embedding <=> ${vectorLiteral}::vector
@@ -1335,6 +1340,7 @@ export async function vectorSearchXhsRentalListings(
       title: (row.title as string | null) ?? null,
       rawText: row.rawText as string,
       rent: (row.rent as string | null) ?? null,
+      rentNumeric: (row.rentNumeric as number | null) ?? null,
       deposit: (row.deposit as string | null) ?? null,
       availableFrom: (row.availableFrom as string | null) ?? null,
       leaseEndDate: (row.leaseEndDate as string | null) ?? null,
@@ -1350,6 +1356,12 @@ export async function vectorSearchXhsRentalListings(
         ? (row.imageUrls as string[])
         : null,
       createdAt: row.createdAt as Date,
+      bedroomsNum: (row.bedroomsNum as number | null) ?? null,
+      city: (row.city as string | null) ?? null,
+      petFriendly: (row.petFriendly as boolean | null) ?? null,
+      couplesOk: (row.couplesOk as boolean | null) ?? null,
+      utilitiesIncluded: (row.utilitiesIncluded as boolean | null) ?? null,
+      parkingIncluded: (row.parkingIncluded as boolean | null) ?? null,
     }));
   } catch (error) {
     console.error("Failed to vector search XhsRentalListing:", error);
@@ -1388,6 +1400,7 @@ export async function searchXhsRentalListings({
   availableFromAfter,
   availableFromBefore,
   keywords,
+  limit,
 }: SearchXhsRentalListingsArgs) {
   try {
     const cleanKeywords = (keywords ?? [])
@@ -1396,10 +1409,11 @@ export async function searchXhsRentalListings({
 
     const rows = await client`
       SELECT
-        "id", "sourceUrl", "title", "rawText", "rent", "deposit",
+        "id", "sourceUrl", "title", "rawText", "rent", "rentNumeric", "deposit",
         "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
         "roomType", "propertyName", "locationText", "furnished", "contactMethod",
         "imageUrls", "createdAt",
+        "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded",
         COUNT(*) OVER() AS total_count
       FROM "XhsRentalListing"
       WHERE
@@ -1410,10 +1424,10 @@ export async function searchXhsRentalListings({
         AND (${furnished ?? null}::text    IS NULL OR "furnished"    ILIKE '%' || ${furnished ?? null} || '%')
         AND (${propertyName ?? null}::text IS NULL OR "propertyName" ILIKE '%' || ${propertyName ?? null} || '%')
         AND (${locationText ?? null}::text IS NULL OR "locationText" ILIKE '%' || ${locationText ?? null} || '%')
-        AND (${rentMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("rent" from '\\d+'), '')::int, 0)  >= ${rentMin ?? null}::int)
-        AND (${rentMax ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("rent" from '\\d+'), '')::int, 999999) <= ${rentMax ?? null}::int)
-        AND (${bedroomsMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("bedrooms"  from '\\d+'), '')::int, 0) >= ${bedroomsMin ?? null}::int)
-        AND (${bathroomsMin ?? null}::int IS NULL OR COALESCE(NULLIF(substring("bathrooms" from '\\d+'), '')::int, 0) >= ${bathroomsMin ?? null}::int)
+        AND (${rentMin ?? null}::int  IS NULL OR "rentNumeric" >= ${rentMin ?? null}::int)
+        AND (${rentMax ?? null}::int  IS NULL OR "rentNumeric" <= ${rentMax ?? null}::int)
+        AND (${bedroomsMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("bedrooms"  from '\d+'), '')::int, 0) >= ${bedroomsMin ?? null}::int)
+        AND (${bathroomsMin ?? null}::int IS NULL OR COALESCE(NULLIF(substring("bathrooms" from '\d+'), '')::int, 0) >= ${bathroomsMin ?? null}::int)
         AND (${availableFromAfter ?? null}::text  IS NULL OR "availableFrom" >= ${availableFromAfter ?? null})
         AND (${availableFromBefore ?? null}::text IS NULL OR "availableFrom" <= ${availableFromBefore ?? null})
         AND (
@@ -1429,7 +1443,7 @@ export async function searchXhsRentalListings({
           )
         )
       ORDER BY "createdAt" DESC
-      LIMIT ${RENTAL_RESULT_LIMIT}
+      LIMIT ${limit ?? RENTAL_RESULT_LIMIT}
     `;
 
     const totalCount = rows.length > 0 ? Number(rows[0].total_count) : 0;
@@ -1440,6 +1454,7 @@ export async function searchXhsRentalListings({
       title: (row.title as string | null) ?? null,
       rawText: row.rawText as string,
       rent: (row.rent as string | null) ?? null,
+      rentNumeric: (row.rentNumeric as number | null) ?? null,
       deposit: (row.deposit as string | null) ?? null,
       availableFrom: (row.availableFrom as string | null) ?? null,
       leaseEndDate: (row.leaseEndDate as string | null) ?? null,
@@ -1455,6 +1470,12 @@ export async function searchXhsRentalListings({
         ? (row.imageUrls as string[])
         : null,
       createdAt: row.createdAt as Date,
+      bedroomsNum: (row.bedroomsNum as number | null) ?? null,
+      city: (row.city as string | null) ?? null,
+      petFriendly: (row.petFriendly as boolean | null) ?? null,
+      couplesOk: (row.couplesOk as boolean | null) ?? null,
+      utilitiesIncluded: (row.utilitiesIncluded as boolean | null) ?? null,
+      parkingIncluded: (row.parkingIncluded as boolean | null) ?? null,
     }));
 
     return { totalCount, results };
