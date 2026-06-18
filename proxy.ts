@@ -22,6 +22,11 @@ export async function proxy(request: NextRequest) {
     return NextResponse.next();
   }
 
+  /** GPT Actions：由 Bearer API key 鉴权，不需要 session cookie */
+  if (pathname.startsWith("/api/gpt/")) {
+    return NextResponse.next();
+  }
+
   const token = await getToken({
     req: request,
     secret: process.env.AUTH_SECRET,
