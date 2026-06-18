@@ -1,11 +1,11 @@
 openapi: "3.1.0"
 info:
-  title: WillingLink Rental Search API
+  title: WillingLink Rental GPT Actions API
   description: >
-    Bay Area rental listing search and data API for the WillingLink Custom GPT.
-    Exposes three endpoints: search listings by natural language + filters,
-    get database statistics, and retrieve full listing details.
-  version: "1.0.0"
+    Actions API for the WillingLink Custom GPT. It mirrors the in-app AI chat
+    rental assistant: database stats, read-only SQL exploration, semantic rental
+    search with progressive relaxation, listing details, and public transit tools.
+  version: "2.0.0"
 
 servers:
   - url: https://willinglink.vercel.app
@@ -20,11 +20,8 @@ paths:
       operationId: getStats
       summary: Get database overview statistics
       description: >
-        Returns a summary of all rental listings in the database: total count,
-        breakdown by city, rent distribution (min/max/median/p25/p75),
-        bedroom distribution, and counts of pet-friendly / couples-ok /
-        utilities-included / parking-included listings.
-        Call this first to understand what data is available before searching.
+        Use this when the user asks about inventory, cities, rent ranges, bedroom
+        distribution, or before a complex search to understand what data exists.
       responses:
         "200":
           description: Database statistics
@@ -37,16 +34,39 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /api/gpt/query:
+    post:
+      operationId: queryListings
+      summary: Run a read-only SQL SELECT query against XhsRentalListing
+      description: >
+        Read-only SELECT on "XhsRentalListing". Use rentNumeric, bedroomsNum,
+        city. On SQL error, fix using returned hint and retry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Query results or structured SQL error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /api/gpt/search:
     post:
       operationId: searchListings
-      summary: Search rental listings by natural language and optional filters
+      summary: Search rental listings by natural language and structured filters
       description: >
-        Performs semantic vector search using the natural language query,
-        then applies structured filters on the result set.
-        Returns up to `limit` matching listings (default 5, max 10).
-        Each listing includes a rawTextExcerpt (first 300 chars) for context.
-        Use getListing to retrieve the full post text and contact information.
+        Search listings by natural language and filters. Supports mustNotContain
+        and excludeIds. Returns action (SHOW_LISTING, SHOW_RELAXED_LISTING,
+        NO_MORE, NO_RESULTS). Follow action exactly.
       requestBody:
         required: true
         content:
@@ -55,7 +75,7 @@ paths:
               $ref: "#/components/schemas/SearchRequest"
       responses:
         "200":
-          description: Search results
+          description: Search results plus action protocol
           content:
             application/json:
               schema:
@@ -72,10 +92,9 @@ paths:
       operationId: getListing
       summary: Get full details of a single listing by ID
       description: >
-        Returns the complete listing record including the full rawText (original
-        post content in Chinese/English) and the contactMethod field.
-        Use this after searchListings when the user wants more details or is
-        ready to contact the landlord.
+        Use this after searchListings when the user asks for details,
+        contact info, the full post, original link, images, or is interested in
+        a specific listing.
       parameters:
         - name: id
           in: path
@@ -100,14 +119,98 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /api/gpt/find-nearest-transit:
+    post:
+      operationId: findNearestTransit
+      summary: Find the listing with the shortest public transit commute
+      description: >
+        Use this when the user gives their address or area and asks which
+        listing is closest, fastest by transit, or most convenient for commuting.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FindNearestTransitRequest"
+      responses:
+        "200":
+          description: Best listing and transit candidates, or a structured maps error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FindNearestTransitResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/gpt/transit-time:
+    post:
+      operationId: getTransitTime
+      summary: Calculate public transit time to a specific listing
+      description: >
+        Use this after a listing has been shown and the user asks how long the
+        commute is to that listing. Reuse the user's address from context if it
+        was already provided.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransitTimeRequest"
+      responses:
+        "200":
+          description: Transit duration result or structured maps error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransitTimeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
 components:
   securitySchemes:
     BearerAuth:
       type: http
       scheme: bearer
-      description: Static API key — set in Custom GPT Actions authentication as Bearer token
+      description: Static API key. Configure Custom GPT authentication as Bearer token.
 
   schemas:
+    QueryRequest:
+      type: object
+      required:
+        - sqlQuery
+      properties:
+        sqlQuery:
+          type: string
+          description: >
+            PostgreSQL SELECT query against "XhsRentalListing". Must start with
+            SELECT and include LIMIT when returning rows. Example:
+            SELECT city, COUNT(*) AS cnt FROM "XhsRentalListing" WHERE city IS NOT NULL GROUP BY city ORDER BY cnt DESC LIMIT 20
+
+    QueryResponse:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        rowCount:
+          type: integer
+        error:
+          type: string
+        attemptedQuery:
+          type: string
+        hint:
+          type: string
+
     SearchRequest:
       type: object
       required:
@@ -116,74 +219,94 @@ components:
         query:
           type: string
           description: >
-            Natural language search intent. Include all relevant context:
-            location, budget, room type, special requirements, move-in date, etc.
-            Examples: "2BR in Sunnyvale under $2500 with parking",
-            "pet-friendly studio near downtown San Jose",
-            "圣何塞两室一厅宠物可租"
-          example: "2 bedroom in Sunnyvale under $2500 pet friendly"
+            Full natural-language search intent. Include all context from the
+            conversation: location, budget, bedrooms, move-in date, special
+            requirements, hard negatives, commute target, etc.
+          example: "2 bedroom in Sunnyvale under $2500 pet friendly with parking"
         city:
           type: string
           nullable: true
-          description: >
-            Exact English city name to filter by. Must match the standardized
-            city values in the database. Known cities include:
-            San Jose, San Francisco, Oakland, Berkeley, Mountain View,
-            Sunnyvale, Santa Clara, Fremont, Palo Alto, Daly City,
-            Cupertino, San Mateo, Redwood City, Newark, Milpitas.
-          example: "Sunnyvale"
+          description: Exact standardized English city name, e.g. San Jose, Sunnyvale, Fremont.
         rentMin:
           type: integer
           nullable: true
-          description: Minimum monthly rent in USD (inclusive)
-          example: 1500
+          description: Minimum monthly rent in USD.
         rentMax:
           type: integer
           nullable: true
-          description: Maximum monthly rent in USD (inclusive)
-          example: 2500
+          description: Maximum monthly rent in USD.
         bedroomsNum:
           type: integer
           nullable: true
-          description: Exact number of bedrooms. Use 0 for studio.
-          example: 2
+          description: Exact bedroom count. Studio is 0.
         petFriendly:
           type: boolean
           nullable: true
-          description: >
-            true = only listings explicitly allowing pets.
-            false = only listings explicitly not allowing pets.
-            null (omit) = no filter (includes unknown).
+          description: true for pet-friendly listings. Omit if user did not mention pets.
         couplesOk:
           type: boolean
           nullable: true
-          description: >
-            true = only listings allowing couples/two people.
-            null (omit) = no filter.
+          description: true when the user is a couple or two people moving in.
         utilitiesIncluded:
           type: boolean
           nullable: true
-          description: >
-            true = only listings where water/electricity is included in rent.
-            null (omit) = no filter.
+          description: true when user requires utilities included.
         parkingIncluded:
           type: boolean
           nullable: true
-          description: >
-            true = only listings with parking available.
-            null (omit) = no filter.
+          description: true when user requires parking.
         furnished:
           type: string
           nullable: true
           enum: [furnished, unfurnished, partial]
-          description: Furnishing status filter
+        mustNotContain:
+          type: array
+          nullable: true
+          description: >
+            Hard negative terms. Listings containing any term in title/rawText/location/property
+            are disqualified. Keep this across turns. Include Chinese and English variants.
+          items:
+            type: string
+          example: ["限一人", "one person only", "中介费", "broker fee"]
+        excludeIds:
+          type: array
+          nullable: true
+          description: >
+            Listing ids already shown in this conversation. Use when user says
+            换一个 / next / 不满意 / 还有吗.
+          items:
+            type: string
+            format: uuid
         limit:
           type: integer
           nullable: true
           minimum: 1
           maximum: 10
           default: 5
-          description: Number of results to return (default 5, max 10)
+
+    SearchResponse:
+      type: object
+      properties:
+        listings:
+          type: array
+          items:
+            $ref: "#/components/schemas/ListingSummary"
+        count:
+          type: integer
+        totalBeforeFilter:
+          type: integer
+        totalAfterFilter:
+          type: integer
+        action:
+          type: string
+          enum: [SHOW_LISTING, SHOW_RELAXED_LISTING, NO_MORE, NO_RESULTS, SEARCH_FAILED]
+          description: Follow this action protocol exactly in the GPT response.
+        relaxedNote:
+          type: string
+          nullable: true
+        message:
+          type: string
+          nullable: true
 
     ListingSummary:
       type: object
@@ -191,43 +314,35 @@ components:
         id:
           type: string
           format: uuid
-          description: Use this to call getListing for full details
         sourceUrl:
           type: string
-          description: Original Xiaohongshu post URL
         title:
           type: string
           nullable: true
         rent:
           type: string
           nullable: true
-          description: Rent as written in the post, e.g. "$1800/mo", "1800刀"
         rentNumeric:
           type: integer
           nullable: true
-          description: Parsed monthly rent in USD
         deposit:
           type: string
           nullable: true
         city:
           type: string
           nullable: true
-          description: Standardized English city name
         locationText:
           type: string
           nullable: true
-          description: Full address/area as written
         propertyName:
           type: string
           nullable: true
         bedrooms:
           type: string
           nullable: true
-          description: Bedrooms as written
         bedroomsNum:
           type: integer
           nullable: true
-          description: Bedrooms as integer (studio=0)
         bathrooms:
           type: string
           nullable: true
@@ -271,24 +386,6 @@ components:
           format: date-time
         rawTextExcerpt:
           type: string
-          description: First 300 characters of the original post text
-
-    SearchResponse:
-      type: object
-      properties:
-        listings:
-          type: array
-          items:
-            $ref: "#/components/schemas/ListingSummary"
-        count:
-          type: integer
-          description: Number of listings returned
-        totalBeforeFilter:
-          type: integer
-          description: Number of vector search candidates before applying filters
-        totalAfterFilter:
-          type: integer
-          description: Number of results after applying all filters
 
     FullListing:
       allOf:
@@ -297,18 +394,140 @@ components:
           properties:
             rawText:
               type: string
-              description: Full original post text in Chinese/English
             postedAt:
               type: string
               format: date-time
               nullable: true
+
+    FindNearestTransitRequest:
+      type: object
+      required:
+        - userAddress
+      properties:
+        userAddress:
+          type: string
+          description: User's address or area, e.g. "123 Main St, Mountain View" or "三藩市 10th Ave".
+
+    TransitTimeRequest:
+      type: object
+      required:
+        - userAddress
+        - listingAddress
+      properties:
+        userAddress:
+          type: string
+        listingAddress:
+          type: string
+          description: Listing locationText/propertyName from prior search results.
+        listingTitle:
+          type: string
+          nullable: true
+
+    TransitCandidate:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          nullable: true
+        locationText:
+          type: string
+          nullable: true
+        propertyName:
+          type: string
+          nullable: true
+        rent:
+          type: string
+          nullable: true
+        roomType:
+          type: string
+          nullable: true
+        bedrooms:
+          type: string
+          nullable: true
+        sourceUrl:
+          type: string
+        transitMinutes:
+          type: integer
+        transitDurationText:
+          type: string
+        distanceKm:
+          type: number
+
+    FindNearestTransitResponse:
+      type: object
+      properties:
+        userResolvedAddress:
+          type: string
+        bestListing:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            title:
+              type: string
+              nullable: true
+            locationText:
+              type: string
+              nullable: true
+            propertyName:
+              type: string
+              nullable: true
+            rent:
+              type: string
+              nullable: true
+            roomType:
+              type: string
+              nullable: true
+            bedrooms:
+              type: string
+              nullable: true
+            sourceUrl:
+              type: string
+        transitMinutes:
+          type: integer
+        transitDurationText:
+          type: string
+        allCandidates:
+          type: array
+          items:
+            $ref: "#/components/schemas/TransitCandidate"
+        error:
+          type: string
+          description: Error code when maps lookup fails
+        message:
+          type: string
+          description: Human-readable error message
+
+    TransitTimeResponse:
+      type: object
+      properties:
+        originFormatted:
+          type: string
+        destinationFormatted:
+          type: string
+        listingTitle:
+          type: string
+          nullable: true
+        transitMinutes:
+          type: integer
+        transitDurationText:
+          type: string
+        error:
+          type: string
+          description: Error code when maps lookup fails
+        message:
+          type: string
+          description: Human-readable error message
 
     StatsResponse:
       type: object
       properties:
         totalListings:
           type: integer
-          description: Total number of listings in the database
         byCity:
           type: array
           items:
@@ -318,7 +537,6 @@ components:
                 type: string
               count:
                 type: integer
-          description: Listings count per city, sorted by count descending
         rentStats:
           type: object
           properties:
@@ -339,7 +557,6 @@ components:
               nullable: true
             currency:
               type: string
-              example: "USD/month"
         byBedroomsNum:
           type: array
           items:
@@ -349,12 +566,10 @@ components:
                 type: integer
               label:
                 type: string
-                example: "2BR"
               count:
                 type: integer
         features:
           type: object
-          description: Count of listings with each boolean feature explicitly set to true
           properties:
             petFriendly:
               type: integer
@@ -375,7 +590,6 @@ components:
             properties:
               error:
                 type: string
-                example: "Unauthorized"
     BadRequest:
       description: Invalid request parameters
       content:
@@ -394,7 +608,6 @@ components:
             properties:
               error:
                 type: string
-                example: "Listing not found"
     ServiceUnavailable:
       description: API key environment variable not configured
       content:
