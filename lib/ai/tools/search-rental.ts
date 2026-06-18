@@ -1,3 +1,22 @@
+/**
+ * searchRental tool — semantic + keyword search over XhsRentalListing.
+ *
+ * Search cascade (stops at first hit, always respects excludeIds):
+ *
+ *   S0  Vector search with LIGHT geo-expansion, block filter applied
+ *   S1  Same vector candidates, block filter dropped
+ *   S2  Vector search with ORIGINAL (unexpanded) query, block filter applied
+ *   S3  ILIKE keyword fallback on city/location, block filter dropped
+ *   S4  Full-text rawText keyword scan (all terms from query), excludeIds applied
+ *   null → truly exhausted
+ *
+ * Key design decisions:
+ * - geo-expansion is kept LIGHT (≤3 neighbors) to avoid homogenising query vectors
+ * - pickBest uses topK=3 + random-weighted selection to add variety
+ * - S4 uses actual text keywords extracted from the query, NOT a fixed 20-row dump
+ * - excludeIds is server-managed via Redis/in-memory; LLM never touches it
+ */
+
 import { generateText, tool } from "ai";
 import { z } from "zod";
 import { gateway } from "@ai-sdk/gateway";
@@ -13,61 +32,136 @@ const VECTOR_CANDIDATES = 50;
 
 // ── City patterns (Chinese ↔ English) ─────────────────────────────────────────
 
-const CITY_PATTERNS: Array<{ re: RegExp; en: string; zh: string }> = [
-  { re: /圣何塞|San\s*Jose/i,             en: "San Jose",      zh: "圣何塞" },
-  { re: /旧金山|三藩市|San\s*Francisco/i,  en: "San Francisco", zh: "旧金山" },
-  { re: /伯克利|Berkeley/i,               en: "Berkeley",      zh: "伯克利" },
-  { re: /奥克兰|Oakland/i,                en: "Oakland",       zh: "奥克兰" },
-  { re: /帕罗奥图|帕洛阿尔托|Palo\s*Alto/i, en: "Palo Alto",   zh: "帕洛阿尔托" },
-  { re: /山景城|Mountain\s*View/i,        en: "Mountain View", zh: "山景城" },
-  { re: /桑尼维尔|Sunnyvale/i,            en: "Sunnyvale",     zh: "桑尼维尔" },
-  { re: /弗里蒙特|Fremont/i,              en: "Fremont",       zh: "弗里蒙特" },
-  { re: /圣克拉拉|Santa\s*Clara/i,        en: "Santa Clara",   zh: "圣克拉拉" },
-  { re: /戴利城|Daly\s*City/i,            en: "Daly City",     zh: "戴利城" },
-  { re: /库比蒂诺|Cupertino/i,            en: "Cupertino",     zh: "库比蒂诺" },
-  { re: /圣马特奥|San\s*Mateo/i,          en: "San Mateo",     zh: "圣马特奥" },
-  { re: /红木城|Redwood\s*City/i,         en: "Redwood City",  zh: "红木城" },
-  { re: /圣克鲁斯|Santa\s*Cruz/i,         en: "Santa Cruz",    zh: "圣克鲁斯" },
+const CITY_PATTERNS: Array<{ re: RegExp; en: string; zh: string; neighbors: string[] }> = [
+  {
+    re: /圣何塞|San\s*Jose/i,
+    en: "San Jose", zh: "圣何塞",
+    neighbors: ["Santa Clara", "Milpitas", "Sunnyvale"],
+  },
+  {
+    re: /旧金山|三藩市|San\s*Francisco/i,
+    en: "San Francisco", zh: "旧金山",
+    neighbors: ["Daly City", "South San Francisco", "Oakland"],
+  },
+  {
+    re: /伯克利|Berkeley/i,
+    en: "Berkeley", zh: "伯克利",
+    neighbors: ["Oakland", "Albany", "Emeryville"],
+  },
+  {
+    re: /奥克兰|Oakland/i,
+    en: "Oakland", zh: "奥克兰",
+    neighbors: ["Berkeley", "Emeryville", "San Leandro"],
+  },
+  {
+    re: /帕罗奥图|帕洛阿尔托|Palo\s*Alto/i,
+    en: "Palo Alto", zh: "帕洛阿尔托",
+    neighbors: ["Menlo Park", "Mountain View", "Los Altos"],
+  },
+  {
+    re: /山景城|Mountain\s*View/i,
+    en: "Mountain View", zh: "山景城",
+    neighbors: ["Sunnyvale", "Palo Alto", "Los Altos"],
+  },
+  {
+    re: /桑尼维尔|Sunnyvale/i,
+    en: "Sunnyvale", zh: "桑尼维尔",
+    neighbors: ["Santa Clara", "Mountain View", "Cupertino"],
+  },
+  {
+    re: /弗里蒙特|Fremont/i,
+    en: "Fremont", zh: "弗里蒙特",
+    neighbors: ["Newark", "Union City", "Milpitas"],
+  },
+  {
+    re: /圣克拉拉|Santa\s*Clara/i,
+    en: "Santa Clara", zh: "圣克拉拉",
+    neighbors: ["Sunnyvale", "San Jose", "Cupertino"],
+  },
+  {
+    re: /戴利城|Daly\s*City/i,
+    en: "Daly City", zh: "戴利城",
+    neighbors: ["San Francisco", "South San Francisco", "Colma"],
+  },
+  {
+    re: /库比蒂诺|Cupertino/i,
+    en: "Cupertino", zh: "库比蒂诺",
+    neighbors: ["Sunnyvale", "Santa Clara", "Saratoga"],
+  },
+  {
+    re: /圣马特奥|San\s*Mateo/i,
+    en: "San Mateo", zh: "圣马特奥",
+    neighbors: ["Foster City", "Burlingame", "Redwood City"],
+  },
+  {
+    re: /红木城|Redwood\s*City/i,
+    en: "Redwood City", zh: "红木城",
+    neighbors: ["San Carlos", "Menlo Park", "San Mateo"],
+  },
+  {
+    re: /圣克鲁斯|Santa\s*Cruz/i,
+    en: "Santa Cruz", zh: "圣克鲁斯",
+    neighbors: ["Capitola", "Scotts Valley", "Aptos"],
+  },
 ];
 
-function detectCity(query: string): { en: string; zh: string } | null {
+function detectCity(query: string): (typeof CITY_PATTERNS)[0] | null {
   for (const p of CITY_PATTERNS) {
-    if (p.re.test(query)) return { en: p.en, zh: p.zh };
+    if (p.re.test(query)) return p;
   }
   return null;
 }
 
-// ── LLM geo-expansion ─────────────────────────────────────────────────────────
-// Rewrites the query to include neighboring cities / landmarks before embedding.
-// Costs ~80 tokens; falls back to original on any failure.
+// ── Light geo-expansion ────────────────────────────────────────────────────────
+// Unlike the old LLM-based expansion that ballooned queries and homogenised
+// all embeddings, this is purely deterministic: we append ≤3 nearest neighbors
+// from a local lookup table.  The original query text is preserved verbatim.
+//
+// This keeps query vectors distinct while still helping when a user says
+// "Sunnyvale" and a matching listing only mentions "Mountain View".
 
-async function geoExpandQuery(query: string): Promise<string> {
-  try {
-    const { text } = await generateText({
-      model: gateway.languageModel("anthropic/claude-haiku-4.5"),
-      system:
-        "You are a Bay Area rental geography expert. " +
-        "Rewrite the given rental search query into a single rich English search string. " +
-        "Rules:\n" +
-        "- Expand geographic terms: include the original place PLUS immediate neighbors " +
-        "(Sunnyvale → add Mountain View, Santa Clara, Cupertino; " +
-        "San Jose → add Santa Clara, Milpitas, Campbell, Sunnyvale; " +
-        "Palo Alto → add Menlo Park, Mountain View, Stanford area)\n" +
-        "- Replace Chinese city names with English (圣何塞→San Jose, 旧金山→San Francisco, etc.)\n" +
-        "- If a school/company is mentioned, add its city " +
-        "(Stanford→Palo Alto, Apple→Cupertino, Google→Mountain View, Meta→Menlo Park)\n" +
-        "- Preserve non-geographic parts (bedrooms, budget, requirements) unchanged\n" +
-        "- Return ONLY the rewritten query, no explanation, no quotes",
-      prompt: query,
-      maxOutputTokens: 120,
-    });
-    return text.trim() || query;
-  } catch {
-    return query;
-  }
+function lightGeoExpand(query: string): string {
+  const city = detectCity(query);
+  if (!city) return query;
+  // Replace Chinese city name with English so Voyage embeds it correctly
+  const withEn = query.replace(city.re, city.en);
+  // Append up to 3 neighbors as additional context
+  const neighborStr = city.neighbors.slice(0, 3).join(" ");
+  return `${withEn} ${neighborStr}`;
 }
 
-// ── Vector search with geo-expanded query ─────────────────────────────────────
+// ── Extract plain keywords from a query ───────────────────────────────────────
+// Used for S4: pull out English/Chinese words that are likely meaningful
+// (location names, room types, budget keywords).
+
+function extractKeywords(query: string): string[] {
+  const city = detectCity(query);
+  const words: string[] = [];
+
+  if (city) {
+    words.push(city.en);
+    // Also push the Chinese form if present
+    if (city.zh && query.includes(city.zh)) words.push(city.zh);
+  }
+
+  // Common Chinese rental keywords to scan for
+  const chKeywords = [
+    "主卧", "次卧", "studio", "整租", "合租", "转租", "sublease",
+    "宠物", "pet", "情侣", "couples", "水电", "utilities",
+    "停车", "parking", "家具", "furnished",
+  ];
+  for (const kw of chKeywords) {
+    if (query.toLowerCase().includes(kw.toLowerCase())) words.push(kw);
+  }
+
+  // Pull out numbers that might be bedrooms (1BR, 2室, etc.)
+  const bedroomMatch = query.match(/(\d)\s*(?:br|bed|室|卧|房)/i);
+  if (bedroomMatch) words.push(bedroomMatch[0]);
+
+  return [...new Set(words)].filter((w) => w.length > 0);
+}
+
+// ── Vector search ──────────────────────────────────────────────────────────────
 
 async function vectorSearch(
   query: string,
@@ -75,47 +169,15 @@ async function vectorSearch(
 ): Promise<XhsRentalSearchResultRow[]> {
   if (!process.env.VOYAGE_API_KEY) return [];
   try {
-    const expandedQuery = await geoExpandQuery(query);
-    const vec = await embedText(expandedQuery, "query");
+    const vec = await embedText(query, "query");
     return await vectorSearchXhsRentalListings(vec, VECTOR_CANDIDATES, excludeIds);
   } catch (err) {
-    console.error("Vector search failed:", err);
+    console.error("[searchRental] Vector search failed:", err);
     return [];
   }
 }
 
-// ── ILIKE keyword fallback ────────────────────────────────────────────────────
-
-async function keywordSearch(
-  query: string,
-  excludeIds: string[]
-): Promise<XhsRentalSearchResultRow[]> {
-  const city = detectCity(query);
-  const { results } = await searchXhsRentalListings({
-    locationText: city?.en ?? query.trim().slice(0, 80),
-  });
-  return results.filter((r) => !excludeIds.includes(r.id));
-}
-
-// ── Rerank / pick best ────────────────────────────────────────────────────────
-
-async function pickBest(
-  query: string,
-  candidates: XhsRentalSearchResultRow[]
-): Promise<XhsRentalSearchResultRow> {
-  if (process.env.VOYAGE_API_KEY && candidates.length > 1) {
-    try {
-      const texts = candidates.map((c) => c.rawText);
-      const [bestIdx] = await rerankDocuments(query, texts, 1);
-      return candidates[bestIdx] ?? candidates[0];
-    } catch {
-      // ignore rerank failure
-    }
-  }
-  return candidates[0];
-}
-
-// ── Block-term filter ─────────────────────────────────────────────────────────
+// ── Block-term filter ──────────────────────────────────────────────────────────
 
 function applyBlockFilter(
   rows: XhsRentalSearchResultRow[],
@@ -127,76 +189,127 @@ function applyBlockFilter(
   );
 }
 
+// ── Pick best with diversity ───────────────────────────────────────────────────
+// Uses Voyage reranker with topK=3, then randomly picks from the top-3
+// weighted by rank (rank 1 = 3 chances, rank 2 = 2 chances, rank 3 = 1 chance).
+// This adds meaningful variety while still biasing toward the best match.
+
+async function pickBest(
+  query: string,
+  candidates: XhsRentalSearchResultRow[]
+): Promise<XhsRentalSearchResultRow> {
+  if (candidates.length === 1) return candidates[0];
+
+  if (process.env.VOYAGE_API_KEY && candidates.length > 1) {
+    try {
+      const texts = candidates.map((c) => c.rawText);
+      const topK = Math.min(3, candidates.length);
+      const topIndices = await rerankDocuments(query, texts, topK);
+
+      if (topIndices.length > 0) {
+        // Weighted random: weights [3,2,1] for ranks [0,1,2]
+        const weights = topIndices.map((_, i) => topK - i);
+        const totalWeight = weights.reduce((a, b) => a + b, 0);
+        let rnd = Math.random() * totalWeight;
+        for (let i = 0; i < topIndices.length; i++) {
+          rnd -= weights[i];
+          if (rnd <= 0) {
+            return candidates[topIndices[i]] ?? candidates[0];
+          }
+        }
+        return candidates[topIndices[0]] ?? candidates[0];
+      }
+    } catch {
+      // reranker failure → fall through to candidates[0]
+    }
+  }
+
+  // No reranker: random pick from first 3 to still get some variety
+  const pool = candidates.slice(0, Math.min(3, candidates.length));
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 // ── Unified search cascade ────────────────────────────────────────────────────
 //
-// Called on EVERY tool invocation, whether it is a first search or a "换一个".
-// Always respects excludeIds so the same listing is never shown twice per chat.
-//
-// Strategy waterfall (stops at first hit):
-//   S0  Strict  — vector+geo-expand, block filter applied, excludeIds applied
-//   S1  No-block — same vector results, block filter dropped (relax hard constraint)
-//   S2  ILIKE fallback — keyword search, no block filter, excludeIds applied
-//   S3  City-broad — city-level search with geo-expand, no block filter, excludeIds applied
-//   S4  Latest DB — fetch all latest listings, pick best by rerank, excludeIds applied
-//   null → truly exhausted
+// Every level explicitly passes excludeIds to avoid returning seen listings.
+// The cascade stops as soon as any level returns at least one candidate.
 
 async function findNextListing(
   query: string,
   excludeIds: string[],
   blockTerms: string[]
 ): Promise<{ listing: XhsRentalSearchResultRow; relaxedNote: string | null } | null> {
-  // ── S0: strict vector search + block filter ──────────────────────────────
-  const vectorCandidates = await vectorSearch(query, excludeIds);
+  const expanded = lightGeoExpand(query);
+
+  // ── S0: vector on geo-expanded query, with block filter ───────────────────
+  const vectorCandidates = await vectorSearch(expanded, excludeIds);
   const strictCandidates = applyBlockFilter(vectorCandidates, blockTerms);
 
   if (strictCandidates.length > 0) {
     return { listing: await pickBest(query, strictCandidates), relaxedNote: null };
   }
 
-  // ── S1: same vector results, drop block filter ───────────────────────────
-  // (Re-use vectorCandidates — no extra search needed)
+  // ── S1: same vector candidates, drop block filter ─────────────────────────
   if (blockTerms.length > 0 && vectorCandidates.length > 0) {
     return {
       listing: await pickBest(query, vectorCandidates),
       relaxedNote:
-        '找不到完全符合要求的房源，已放宽硬性排除条件（如"仅限一人"等限制），为您找到以下最相近的房源',
+        "找不到完全符合要求的房源，已放宽部分限制条件，为您找到以下最相近的房源",
     };
   }
 
-  // ── S2: ILIKE keyword fallback (vector unavailable or empty) ────────────
-  const keywordCandidates = await keywordSearch(query, excludeIds);
-  const keywordStrict = applyBlockFilter(keywordCandidates, blockTerms);
-  if (keywordStrict.length > 0) {
-    return { listing: await pickBest(query, keywordStrict), relaxedNote: null };
-  }
-  if (keywordCandidates.length > 0) {
-    return {
-      listing: await pickBest(query, keywordCandidates),
-      relaxedNote: "已放宽部分限制条件，为您找到以下最相近的房源",
-    };
-  }
-
-  // ── S3: city-level broadened search ─────────────────────────────────────
-  const city = detectCity(query);
-  if (city) {
-    const broadQuery = `${city.en} rental apartment Bay Area`;
-    const broadCandidates = await vectorSearch(broadQuery, excludeIds);
-    if (broadCandidates.length > 0) {
+  // ── S2: vector on ORIGINAL (unexpanded) query, drop block filter ──────────
+  // Re-embed with the raw query to catch listings not containing neighbor names.
+  if (expanded !== query) {
+    const rawVec = await vectorSearch(query, excludeIds);
+    const rawStrict = applyBlockFilter(rawVec, blockTerms);
+    if (rawStrict.length > 0) {
+      return { listing: await pickBest(query, rawStrict), relaxedNote: null };
+    }
+    if (rawVec.length > 0) {
       return {
-        listing: await pickBest(query, broadCandidates),
-        relaxedNote: `找不到完全符合要求的房源，已扩大到${city.zh}周边地区搜索，为您找到以下房源`,
+        listing: await pickBest(query, rawVec),
+        relaxedNote: "已放宽部分限制条件，为您找到以下最相近的房源",
       };
     }
   }
 
-  // ── S4: any listing not yet shown, ranked by semantic similarity ─────────
-  const { results: allLatest } = await searchXhsRentalListings({});
-  const remaining = allLatest.filter((r) => !excludeIds.includes(r.id));
+  // ── S3: ILIKE keyword fallback on city / location ─────────────────────────
+  const city = detectCity(query);
+  if (city) {
+    const { results: cityResults } = await searchXhsRentalListings({
+      locationText: city.en,
+    });
+    const cityFiltered = cityResults.filter((r) => !excludeIds.includes(r.id));
+    if (cityFiltered.length > 0) {
+      return {
+        listing: await pickBest(query, cityFiltered),
+        relaxedNote: `暂无完全匹配的房源，已在${city.zh}范围内为您找到以下房源`,
+      };
+    }
+  }
+
+  // ── S4: full-text keyword scan on extracted terms ─────────────────────────
+  // Use meaningful keywords from the query rather than fetching a fixed 20-row dump.
+  const keywords = extractKeywords(query);
+  if (keywords.length > 0) {
+    const { results: kwResults } = await searchXhsRentalListings({ keywords });
+    const kwFiltered = kwResults.filter((r) => !excludeIds.includes(r.id));
+    if (kwFiltered.length > 0) {
+      return {
+        listing: await pickBest(query, kwFiltered),
+        relaxedNote: "找不到完全匹配的房源，已扩大搜索范围，为您找到以下最相近的房源",
+      };
+    }
+  }
+
+  // ── S5: last resort — any unseen listing, ordered by recency ─────────────
+  const { results: allRecent } = await searchXhsRentalListings({});
+  const remaining = allRecent.filter((r) => !excludeIds.includes(r.id));
   if (remaining.length > 0) {
     return {
       listing: await pickBest(query, remaining),
-      relaxedNote:
-        "湾区内暂无完全匹配的房源，已从最近发布的所有房源中为您挑选最接近的",
+      relaxedNote: "湾区内暂无完全匹配的房源，已从最近发布的所有房源中为您挑选最接近的",
     };
   }
 
@@ -215,7 +328,7 @@ export function createSearchRentalTool(chatId: string) {
     description:
       "Semantic search over the XhsRentalListing database. " +
       "Call this for ANY housing/rental request — first searches AND every '换一个'/'next'/'不满意'. " +
-      "Returns ONE listing the user has not yet seen. " +
+      "Returns ONE listing the user has not yet seen this session. " +
       "If no exact match exists, the tool automatically relaxes criteria and returns the closest available listing. " +
       "Never skip calling this tool; the server handles deduplication automatically.",
     inputSchema: z.object({
@@ -278,7 +391,7 @@ export function createSearchRentalTool(chatId: string) {
             "the server automatically excludes already-shown listings.",
         };
       } catch (error) {
-        console.error("searchRental tool failed:", error);
+        console.error("[searchRental] tool failed:", error);
         return {
           listing: null,
           relaxedNote: null,
