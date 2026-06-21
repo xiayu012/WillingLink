@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.6
+// @version      0.7.7
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.6";
+  const SCRIPT_VERSION = "0.7.7";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -119,6 +119,7 @@
       missingText: "未找到正文",
       hintText: "点击右下角按钮复制正文",
       carouselArrowHint: "手动点右侧箭头翻页，每张主图会上传到后端",
+      carouselDoneCloseHint: "轮播图已到最后一张，点击左上角关闭",
       shareHint: "点击分享按钮复制真实链接",
       pollIntervalMs: 1500,
     },
@@ -1148,7 +1149,17 @@
     }
 
     const arrow = document.querySelector(".arrow-controller.right");
-    if (arrow instanceof HTMLElement) {
+    if (arrow instanceof HTMLElement && arrow.classList.contains("forbidden")) {
+      const closeButton = document.querySelector(".close.close-mask-dark");
+      if (closeButton instanceof HTMLElement) {
+        appendRectHighlight(
+          root,
+          config,
+          closeButton,
+          config.detailCopy.carouselDoneCloseHint,
+        );
+      }
+    } else if (arrow instanceof HTMLElement) {
       appendRectHighlight(
         root,
         config,
