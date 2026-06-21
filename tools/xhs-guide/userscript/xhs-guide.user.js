@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.7
+// @version      0.7.9
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.7";
+  const SCRIPT_VERSION = "0.7.9";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -120,6 +120,7 @@
       hintText: "点击右下角按钮复制正文",
       carouselArrowHint: "手动点右侧箭头翻页，每张主图会上传到后端",
       carouselDoneCloseHint: "轮播图已到最后一张，点击左上角关闭",
+      carouselSingleCloseHint: "单图帖无需翻页，点击左上角关闭",
       shareHint: "点击分享按钮复制真实链接",
       pollIntervalMs: 1500,
     },
@@ -978,6 +979,9 @@
       }
 
       const box = document.createElement("div");
+      box.className = "xhs-guide-highlight-box";
+      box.dataset.xhsGuideKind = "feed-title";
+      box.dataset.xhsGuideText = candidate.text;
       box.style.position = "fixed";
       box.style.top = `${rect.top}px`;
       box.style.left = `${rect.left}px`;
@@ -990,6 +994,8 @@
       box.style.background = "transparent";
 
       const bubble = document.createElement("div");
+      bubble.className = "xhs-guide-highlight-bubble";
+      bubble.dataset.xhsGuideKind = "feed-title";
       bubble.style.position = "fixed";
       bubble.style.top = `${Math.max(VIEWPORT_MARGIN, rect.top - 34)}px`;
       bubble.style.left = `${rect.left}px`;
@@ -1000,7 +1006,9 @@
       bubble.style.padding = "4px 8px";
       bubble.style.borderRadius = "6px";
       bubble.style.pointerEvents = "none";
-      bubble.textContent = `${config.highlight.hintPrefix} (${Math.round(candidate.judgement.confidence * 100)}%)`;
+      const bubbleText = `${config.highlight.hintPrefix} (${Math.round(candidate.judgement.confidence * 100)}%)`;
+      bubble.dataset.xhsGuideText = bubbleText;
+      bubble.textContent = bubbleText;
 
       root.append(box, bubble);
     }
@@ -1109,6 +1117,9 @@
     const height = Math.max(0, rect.height + padding * 2);
 
     const box = document.createElement("div");
+    box.className = "xhs-guide-highlight-box";
+    box.dataset.xhsGuideKind = "detail";
+    box.dataset.xhsGuideText = bubbleText;
     box.style.position = "fixed";
     box.style.top = `${top}px`;
     box.style.left = `${left}px`;
@@ -1120,6 +1131,9 @@
     box.style.boxShadow = config.highlight.overlayShadow;
 
     const bubble = document.createElement("div");
+    bubble.className = "xhs-guide-highlight-bubble";
+    bubble.dataset.xhsGuideKind = "detail";
+    bubble.dataset.xhsGuideText = bubbleText;
     bubble.style.position = "fixed";
     bubble.style.top = `${Math.max(VIEWPORT_MARGIN, top - 34)}px`;
     bubble.style.left = `${left}px`;
@@ -1133,6 +1147,20 @@
     bubble.textContent = bubbleText;
 
     root.append(box, bubble);
+  };
+
+  const findDetailCloseButton = () => {
+    const closeButton = document.querySelector(".close.close-mask-dark");
+    return closeButton instanceof HTMLElement ? closeButton : null;
+  };
+
+  const appendCloseHighlight = (root, config, hintText) => {
+    const closeButton = findDetailCloseButton();
+    if (!closeButton) {
+      return false;
+    }
+    appendRectHighlight(root, config, closeButton, hintText);
+    return true;
   };
 
   const renderDetailHighlight = (config) => {
@@ -1150,15 +1178,7 @@
 
     const arrow = document.querySelector(".arrow-controller.right");
     if (arrow instanceof HTMLElement && arrow.classList.contains("forbidden")) {
-      const closeButton = document.querySelector(".close.close-mask-dark");
-      if (closeButton instanceof HTMLElement) {
-        appendRectHighlight(
-          root,
-          config,
-          closeButton,
-          config.detailCopy.carouselDoneCloseHint,
-        );
-      }
+      appendCloseHighlight(root, config, config.detailCopy.carouselDoneCloseHint);
     } else if (arrow instanceof HTMLElement) {
       appendRectHighlight(
         root,
@@ -1166,6 +1186,9 @@
         arrow,
         config.detailCopy.carouselArrowHint,
       );
+    } else if (state.shareUrlDone) {
+      // 单图帖没有右箭头，分享完成后直接引导关闭
+      appendCloseHighlight(root, config, config.detailCopy.carouselSingleCloseHint);
     }
 
     if (!state.shareUrlDone && (state.listingId || state.bodyCopied)) {
