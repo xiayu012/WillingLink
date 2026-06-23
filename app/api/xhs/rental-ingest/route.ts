@@ -1,32 +1,13 @@
 import { randomUUID } from "crypto";
-import { after } from "next/server";
 
 import { classifyRentalPostIntent } from "@/lib/ai/classify-rental-post";
-import { embedText } from "@/lib/ai/embeddings";
-import { extractListingFields } from "@/lib/ai/extract-listing-fields";
 import {
   createXhsRentalListing,
   createXhsRentalOther,
   createXhsRentalWanted,
-  updateListingEmbedding,
 } from "@/lib/db/queries";
 import { classifyPost } from "@/lib/xhs/classify-post";
-import { parseWantedFields } from "@/lib/xhs/parse-rental-text";
-
-/**
- * Generate and persist a vector embedding for a newly created listing.
- * Runs in a background task so it never blocks the ingest response.
- * Silently skips if VOYAGE_API_KEY is not configured.
- */
-async function embedListingAsync(id: string, rawText: string): Promise<void> {
-  if (!process.env.VOYAGE_API_KEY) return;
-  try {
-    const vec = await embedText(rawText, "document");
-    await updateListingEmbedding(id, vec);
-  } catch (err) {
-    console.error(`[embed-listing] Failed to embed listing ${id}:`, err);
-  }
-}
+import { parseListingFields, parseWantedFields } from "@/lib/xhs/parse-rental-text";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -150,8 +131,7 @@ export async function POST(request: Request) {
     });
   }
 
-  // LLM extracts all fields (falls back to regex on failure)
-  const parsed = await extractListingFields(rawText);
+  const parsed = parseListingFields(rawText);
   const row = await createXhsRentalListing({
     sourceUrl: sourceUrlRaw,
     rawText,
@@ -168,22 +148,11 @@ export async function POST(request: Request) {
     locationText: optString(payload.locationText) ?? parsed.locationText,
     furnished: optString(payload.furnished) ?? parsed.furnished,
     contactMethod: optString(payload.contactMethod) ?? parsed.contactMethod,
-    // New LLM-only fields
-    bedroomsNum: parsed.bedroomsNum ?? null,
-    city: parsed.city ?? null,
-    petFriendly: parsed.petFriendly ?? null,
-    couplesOk: parsed.couplesOk ?? null,
-    utilitiesIncluded: parsed.utilitiesIncluded ?? null,
-    parkingIncluded: parsed.parkingIncluded ?? null,
   });
 
   if (!row) {
     return jsonWithCors({ ok: false, error: "Failed to save" }, 500);
   }
-
-  // Generate embedding asynchronously after the response is sent.
-  // This ensures every new listing immediately becomes searchable via vector search.
-  after(embedListingAsync(row.id, rawText));
 
   return jsonWithCors({
     ok: true,

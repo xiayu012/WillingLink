@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.8.0
+// @version      0.7.7
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.8.0";
+  const SCRIPT_VERSION = "0.7.7";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -47,13 +47,13 @@
     judgement: {
       enableLlmReview: true,
       llmTimeoutMs: 12000,
-      maxLlmReviewsPerRound: 15,
+      maxLlmReviewsPerRound: 10,
       llmMinIntervalMs: 300,
-      minConfidenceToHighlight: 0.65,
+      minConfidenceToHighlight: 0.6,
       rule: {
         /**
-         * 规则层只做「预筛」：决定要不要送 LLM，从不单独决定高亮。
-         * 高亮必须 LLM 明确确认，避免其他地名误命中。
+         * 强命中列表：同时命中城市词 + 租房词即可跳过 LLM（节省开销）。
+         * 这里追求完整覆盖，漏掉的交给 LLM 判断。
          */
         bayAreaWords: [
           "湾区", "Bay Area", "bay area",
@@ -71,25 +71,23 @@
           "Stanford", "斯坦福", "硅谷", "North Bay", "北湾",
           "SJSU", "UCSF", "SCU",
         ],
-        /** 强租房意图：无湾区词也可送 LLM（由 LLM 判地理） */
-        strongRentalWords: [
-          "出租", "转租", "求租", "招租", "短租", "合租",
-          "找室友", "求室友", "寻室友", "roommate", "sublease",
-          "for rent", "lease transfer", "找房", "寻租", "寻房",
-          "1b1b", "2b2b", "1bd", "2bd", "studio",
-          "主卧", "次卧", "独卫", "一房一厅", "两房",
+        rentalWords: [
+          "租", "房", "室友", "招租", "出租", "转租", "求租",
+          "短租", "合租", "一房", "两房", "主卧", "次卧",
+          "1b", "2b", "1bd", "2bd", "studio",
+          "lease", "sublease", "roommate", "rent",
+          "apartment", "condo", "公寓",
+          "找房", "寻房", "搬家", "入住", "押金", "月租",
+          "独卫", "独立", "furnished",
         ],
-        /** 弱租房词：太泛，必须同时有湾区词才送 LLM */
-        weakRentalWords: [
-          "租房", "月租", "押金", "入住", "搬家",
-          "apartment", "condo", "公寓", "rent", "lease",
-          "furnished", "独立",
-        ],
-        /** 明显非湾区的大陆城市：无湾区词时 cheap reject，不堆全美/全球排除表 */
+        /**
+         * 强排除词：含以下词且无湾区信号，直接拒绝（减少 LLM 浪费）
+         * 只放绝对不可能是湾区租房的强信号词。
+         */
         mainlandOnlyWords: [
           "北京", "上海", "广州", "深圳", "成都", "杭州",
           "武汉", "西安", "南京", "苏州", "重庆", "天津",
-          "长沙", "郑州", "厦门", "青岛", "大连", "香港", "台北",
+          "长沙", "郑州", "厦门", "青岛", "大连",
         ],
       },
       llm: {
@@ -122,7 +120,6 @@
       hintText: "点击右下角按钮复制正文",
       carouselArrowHint: "手动点右侧箭头翻页，每张主图会上传到后端",
       carouselDoneCloseHint: "轮播图已到最后一张，点击左上角关闭",
-      carouselSingleCloseHint: "单图帖无需翻页，点击左上角关闭",
       shareHint: "点击分享按钮复制真实链接",
       pollIntervalMs: 1500,
     },
@@ -666,47 +663,43 @@
     const rule = config.judgement.rule;
 
     const bayHit = rule.bayAreaWords.find((w) => lower.includes(w.toLowerCase()));
-    const strongRentHit = rule.strongRentalWords.find((w) =>
-      lower.includes(w.toLowerCase()),
-    );
-    const weakRentHit = rule.weakRentalWords.find((w) =>
-      lower.includes(w.toLowerCase()),
-    );
-    const rentHit = strongRentHit || weakRentHit;
+    const rentHit = rule.rentalWords.find((w) => lower.includes(w.toLowerCase()));
 
-    const reject = (reason) => ({
-      stageName: "ruleScreenStage",
-      passed: false,
-      skipLlm: true,
-      confidence: 0.05,
-      reason,
-    });
-
-    if (!bayHit && !rentHit) {
-      return reject("无租房/湾区信号，跳过高亮");
+    // 强命中：城市词 + 租房词同时出现 → 直接判为相关，跳过 LLM
+    if (bayHit && rentHit) {
+      return {
+        stageName: "ruleScreenStage",
+        passed: true,
+        skipLlm: true,
+        confidence: 0.85,
+        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})`,
+      };
     }
 
-    if (!bayHit) {
-      const mainlandHit = rule.mainlandOnlyWords.find((w) =>
-        lower.includes(w.toLowerCase()),
-      );
+    // 排除：含大陆城市词且没有任何湾区/租房信号 → 直接拒绝，不耗 LLM
+    if (!bayHit && !rentHit) {
+      const mainlandHit = rule.mainlandOnlyWords.find((w) => lower.includes(w.toLowerCase()));
       if (mainlandHit) {
-        return reject(`大陆/港澳台城市(${mainlandHit})且无湾区词，排除`);
+        return {
+          stageName: "ruleScreenStage",
+          passed: false,
+          skipLlm: true,
+          confidence: 0.05,
+          reason: `大陆城市词(${mainlandHit})且无湾区/租房信号，排除`,
+        };
       }
     }
 
-    if (!bayHit && !strongRentHit && weakRentHit) {
-      return reject("仅泛租房词且无湾区词，排除");
-    }
-
+    // 其他一切：交给 LLM 判断
+    const anySignal = bayHit ?? rentHit ?? null;
     return {
       stageName: "ruleScreenStage",
       passed: true,
       skipLlm: false,
-      confidence: 0.3,
-      reason: bayHit
-        ? `有湾区词(${bayHit})，送 LLM 最终判定`
-        : `有强租房词(${strongRentHit})，送 LLM 判地理范围`,
+      confidence: anySignal ? 0.45 : 0.25,
+      reason: anySignal
+        ? `弱信号(${anySignal})，送 LLM 复核`
+        : "无明确关键词，送 LLM 判断",
     };
   };
 
@@ -788,20 +781,24 @@
 
   const llmReviewStage = async (input, config) => {
     const llmConfig = config.judgement.llm;
-    const failClosed = (reason) => ({
-      stageName: "llmReviewStage",
-      skipped: true,
-      passed: false,
-      confidence: 0,
-      reason,
-    });
-
     if (!config.judgement.enableLlmReview) {
-      return failClosed("LLM 未启用，拒绝高亮");
+      return {
+        stageName: "llmReviewStage",
+        skipped: true,
+        passed: true,
+        confidence: 0.5,
+        reason: "LLM 复核开关关闭，跳过",
+      };
     }
 
     if (!llmConfig.apiKey) {
-      return failClosed("未配置 API Key，拒绝高亮");
+      return {
+        stageName: "llmReviewStage",
+        skipped: true,
+        passed: true,
+        confidence: 0.5,
+        reason: "未配置 API Key，降级为规则结果",
+      };
     }
 
     const elapsed = now() - state.lastLlmCallAt;
@@ -810,22 +807,19 @@
     }
 
     if (state.llmReviewedInRound >= config.judgement.maxLlmReviewsPerRound) {
-      return failClosed("达到单轮 LLM 上限，本标题延后判定");
+      return {
+        stageName: "llmReviewStage",
+        skipped: true,
+        passed: true,
+        confidence: 0.5,
+        reason: "达到单轮 LLM 复核上限，降级为规则结果",
+      };
     }
 
     const systemPrompt =
-      "你是小红书标题分类器，只识别「美国旧金山湾区及周边」的租房帖。" +
-      "湾区包括：San Francisco、San Jose、South Bay/南湾、East Bay/东湾、Peninsula/半岛、" +
-      "Silicon Valley/硅谷、Fremont、Santa Clara、Berkeley 等。" +
-      "\n\nrelated=true 必须同时满足：" +
-      "\n1) 内容是出租/转租/求租/短租/找室友/sublease 等租房交易" +
-      "\n2) 地理范围是美国湾区（标题里明确或可合理推断）" +
-      "\n\nrelated=false 包括：" +
-      "\n- 其他美国城市（纽约、洛杉矶、西雅图、波士顿、芝加哥、休斯顿、圣地亚哥等）" +
-      "\n- 加拿大/英国/澳洲/欧洲/亚洲等非湾区城市" +
-      "\n- 无明确湾区地理信息的泛租房标题" +
-      "\n- 攻略/经验/家具/生活分享等非交易帖" +
-      "\n\n输出 JSON: {\"related\": boolean, \"confidence\": 0-1, \"reason\": string}";
+      "你是小红书帖子分类器，专门识别美国湾区（Bay Area / 硅谷 / 旧金山 / 南湾 / 东湾等）租房相关帖子。" +
+      "包括：出租/转租/短租/招租/求租/找房/找室友/roommate/sublease 等。" +
+      "判断标题是否属于此类。输出 JSON: {\"related\": boolean, \"confidence\": 0-1, \"reason\": string}";
     const userPrompt = `标题: ${input.titleText}`;
 
     const payload = {
@@ -858,21 +852,14 @@
     };
   };
 
-  const postProcessStage = (llmResult, config) => {
-    if (llmResult.skipped || !llmResult.passed) {
-      return {
-        stageName: "postProcessStage",
-        isBayAreaRentingRelated: false,
-        confidence: llmResult.confidence ?? 0,
-        reason: llmResult.reason || "LLM 未确认",
-      };
-    }
+  const postProcessStage = (ruleResult, llmResult, config) => {
+    const finalPass = llmResult.skipped ? ruleResult.passed : llmResult.passed;
+    const confidence = llmResult.skipped ? ruleResult.confidence : llmResult.confidence;
     return {
       stageName: "postProcessStage",
-      isBayAreaRentingRelated:
-        llmResult.confidence >= config.judgement.minConfidenceToHighlight,
-      confidence: clamp(llmResult.confidence, 0, 1),
-      reason: llmResult.reason,
+      isBayAreaRentingRelated: finalPass && confidence >= config.judgement.minConfidenceToHighlight,
+      confidence: clamp(confidence, 0, 1),
+      reason: llmResult.reason || ruleResult.reason,
     };
   };
 
@@ -887,16 +874,17 @@
     const ruleResult = ruleScreenStage(input, config);
     stageTrace.push(ruleResult);
 
-    // 预筛拒绝：不送 LLM，直接不高亮
+    // 强规则拒绝（仅大陆词命中）或强规则通过（城市+租房双命中跳过 LLM）
     if (ruleResult.skipLlm) {
       return {
-        isBayAreaRentingRelated: false,
+        isBayAreaRentingRelated: ruleResult.passed && ruleResult.confidence >= config.judgement.minConfidenceToHighlight,
         confidence: ruleResult.confidence,
         reason: ruleResult.reason,
         stageTrace,
       };
     }
 
+    // 其余全部交给 LLM；LLM 失败时降级为规则结果
     let llmResult;
     try {
       llmResult = await llmReviewStage(input, config);
@@ -904,14 +892,14 @@
       llmResult = {
         stageName: "llmReviewStage",
         skipped: true,
-        passed: false,
-        confidence: 0,
-        reason: `LLM 失败: ${error instanceof Error ? error.message : String(error)}`,
+        passed: ruleResult.passed,
+        confidence: ruleResult.confidence,
+        reason: `LLM 失败，降级规则结果: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
     stageTrace.push(llmResult);
 
-    const postResult = postProcessStage(llmResult, config);
+    const postResult = postProcessStage(ruleResult, llmResult, config);
     stageTrace.push(postResult);
     return {
       isBayAreaRentingRelated: postResult.isBayAreaRentingRelated,
@@ -990,9 +978,6 @@
       }
 
       const box = document.createElement("div");
-      box.className = "xhs-guide-highlight-box";
-      box.dataset.xhsGuideKind = "feed-title";
-      box.dataset.xhsGuideText = candidate.text;
       box.style.position = "fixed";
       box.style.top = `${rect.top}px`;
       box.style.left = `${rect.left}px`;
@@ -1005,8 +990,6 @@
       box.style.background = "transparent";
 
       const bubble = document.createElement("div");
-      bubble.className = "xhs-guide-highlight-bubble";
-      bubble.dataset.xhsGuideKind = "feed-title";
       bubble.style.position = "fixed";
       bubble.style.top = `${Math.max(VIEWPORT_MARGIN, rect.top - 34)}px`;
       bubble.style.left = `${rect.left}px`;
@@ -1017,9 +1000,7 @@
       bubble.style.padding = "4px 8px";
       bubble.style.borderRadius = "6px";
       bubble.style.pointerEvents = "none";
-      const bubbleText = `${config.highlight.hintPrefix} (${Math.round(candidate.judgement.confidence * 100)}%)`;
-      bubble.dataset.xhsGuideText = bubbleText;
-      bubble.textContent = bubbleText;
+      bubble.textContent = `${config.highlight.hintPrefix} (${Math.round(candidate.judgement.confidence * 100)}%)`;
 
       root.append(box, bubble);
     }
@@ -1128,9 +1109,6 @@
     const height = Math.max(0, rect.height + padding * 2);
 
     const box = document.createElement("div");
-    box.className = "xhs-guide-highlight-box";
-    box.dataset.xhsGuideKind = "detail";
-    box.dataset.xhsGuideText = bubbleText;
     box.style.position = "fixed";
     box.style.top = `${top}px`;
     box.style.left = `${left}px`;
@@ -1142,9 +1120,6 @@
     box.style.boxShadow = config.highlight.overlayShadow;
 
     const bubble = document.createElement("div");
-    bubble.className = "xhs-guide-highlight-bubble";
-    bubble.dataset.xhsGuideKind = "detail";
-    bubble.dataset.xhsGuideText = bubbleText;
     bubble.style.position = "fixed";
     bubble.style.top = `${Math.max(VIEWPORT_MARGIN, top - 34)}px`;
     bubble.style.left = `${left}px`;
@@ -1158,20 +1133,6 @@
     bubble.textContent = bubbleText;
 
     root.append(box, bubble);
-  };
-
-  const findDetailCloseButton = () => {
-    const closeButton = document.querySelector(".close.close-mask-dark");
-    return closeButton instanceof HTMLElement ? closeButton : null;
-  };
-
-  const appendCloseHighlight = (root, config, hintText) => {
-    const closeButton = findDetailCloseButton();
-    if (!closeButton) {
-      return false;
-    }
-    appendRectHighlight(root, config, closeButton, hintText);
-    return true;
   };
 
   const renderDetailHighlight = (config) => {
@@ -1189,7 +1150,15 @@
 
     const arrow = document.querySelector(".arrow-controller.right");
     if (arrow instanceof HTMLElement && arrow.classList.contains("forbidden")) {
-      appendCloseHighlight(root, config, config.detailCopy.carouselDoneCloseHint);
+      const closeButton = document.querySelector(".close.close-mask-dark");
+      if (closeButton instanceof HTMLElement) {
+        appendRectHighlight(
+          root,
+          config,
+          closeButton,
+          config.detailCopy.carouselDoneCloseHint,
+        );
+      }
     } else if (arrow instanceof HTMLElement) {
       appendRectHighlight(
         root,
@@ -1197,9 +1166,6 @@
         arrow,
         config.detailCopy.carouselArrowHint,
       );
-    } else if (state.shareUrlDone) {
-      // 单图帖没有右箭头，分享完成后直接引导关闭
-      appendCloseHighlight(root, config, config.detailCopy.carouselSingleCloseHint);
     }
 
     if (!state.shareUrlDone && (state.listingId || state.bodyCopied)) {
