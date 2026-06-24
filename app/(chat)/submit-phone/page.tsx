@@ -8,7 +8,6 @@ import { Label } from "@/components/ui/label";
 
 const BUSINESS_NAME = "FretGone LLC";
 const BRAND_NAME = "WillingLink";
-const PROGRAM_NAME = "FretGone Rental Info Alerts";
 
 export default function SubmitPhonePage() {
   const [firstName, setFirstName] = useState("");
@@ -16,7 +15,6 @@ export default function SubmitPhonePage() {
   const [phone, setPhone] = useState("");
   const [email, setEmail] = useState("");
   const [transactionalSms, setTransactionalSms] = useState(false);
-  const [promotionalSms, setPromotionalSms] = useState(false);
   const [acceptTerms, setAcceptTerms] = useState(false);
   const [submitted, setSubmitted] = useState(false);
 
@@ -28,7 +26,6 @@ export default function SubmitPhonePage() {
     setPhone("");
     setEmail("");
     setTransactionalSms(false);
-    setPromotionalSms(false);
     setAcceptTerms(false);
   };
 
@@ -44,9 +41,9 @@ export default function SubmitPhonePage() {
               {BRAND_NAME}
             </div>
             <p className="text-sm text-muted-foreground">
-              Welcome to {BRAND_NAME} by {BUSINESS_NAME}. Submit your contact
-              details and opt in to SMS updates about rental listings, viewing
-              coordination, and housing assistance through {PROGRAM_NAME}.
+              Welcome to {BRAND_NAME} by {BUSINESS_NAME}. Please submit your
+              contact details so we can text you about your housing needs,
+              coordinate viewings, and connect you with suitable landlords.
             </p>
           </div>
 
@@ -55,8 +52,8 @@ export default function SubmitPhonePage() {
               className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-center text-sm text-green-800"
               role="status"
             >
-              Submitted successfully. We will reach out if you opted in to SMS
-              messages.
+              Submitted successfully. If you opted in to SMS, we will reach out
+              shortly.
             </p>
           ) : (
             <form className="flex flex-col gap-6" onSubmit={handleSubmit}>
@@ -109,6 +106,26 @@ export default function SubmitPhonePage() {
                 </div>
               </div>
 
+              <p className="text-left text-xs leading-relaxed text-muted-foreground">
+                This form is for housing inquiries only. We send{" "}
+                <strong>transactional and informational SMS</strong> related to
+                your request—not promotional marketing blasts. See our{" "}
+                <Link
+                  className="text-primary underline underline-offset-2"
+                  href="/privacy"
+                >
+                  Privacy Policy
+                </Link>{" "}
+                and{" "}
+                <Link
+                  className="text-primary underline underline-offset-2"
+                  href="/terms"
+                >
+                  Terms and Conditions
+                </Link>{" "}
+                for details.
+              </p>
+
               <fieldset className="flex flex-col gap-4">
                 <legend className="sr-only">SMS and legal consent</legend>
 
@@ -122,38 +139,17 @@ export default function SubmitPhonePage() {
                     id="transactional-sms"
                     name="transactional-sms"
                     onChange={(e) => setTransactionalSms(e.target.checked)}
+                    required
                     type="checkbox"
                   />
                   <span>
-                    By checking, you are allowing to receive{" "}
-                    <strong>transactional/informational SMS</strong>{" "}
-                    communications regarding rental viewing confirmations,
-                    landlord contact details, account notifications, and customer
-                    care from {BUSINESS_NAME} ({BRAND_NAME}). Message frequency
-                    may vary. Message and data rates may apply. Reply HELP for
-                    help or STOP to opt-out.
-                  </span>
-                </label>
-
-                <label
-                  className="flex cursor-pointer items-start gap-3 rounded-md border p-3 text-sm leading-relaxed"
-                  htmlFor="promotional-sms"
-                >
-                  <input
-                    checked={promotionalSms}
-                    className="mt-1 size-4 shrink-0 accent-primary"
-                    id="promotional-sms"
-                    name="promotional-sms"
-                    onChange={(e) => setPromotionalSms(e.target.checked)}
-                    type="checkbox"
-                  />
-                  <span>
-                    By checking, you are allowing to receive{" "}
-                    <strong>promotional/marketing SMS</strong> communications
-                    about new rental listings, housing tips, and related offers
-                    from {BUSINESS_NAME} ({BRAND_NAME}). Frequency may vary.
-                    Message and data rates may apply. Reply HELP for help or STOP
-                    to opt-out.
+                    By checking, you agree to receive{" "}
+                    <strong>transactional/informational SMS</strong> regarding
+                    your rental inquiry, viewing coordination, landlord contact
+                    details, and customer care from {BUSINESS_NAME} ({BRAND_NAME}
+                    ). Message frequency may vary. Message and data rates may
+                    apply. Reply <strong>HELP</strong> for help or{" "}
+                    <strong>STOP</strong> to opt out.
                   </span>
                 </label>
 
@@ -171,12 +167,12 @@ export default function SubmitPhonePage() {
                     type="checkbox"
                   />
                   <span>
-                    By checking, I accept{" "}
+                    By checking, I accept the{" "}
                     <Link
                       className="text-primary underline underline-offset-2"
                       href="/terms"
                     >
-                      Terms of Service
+                      Terms and Conditions
                     </Link>{" "}
                     &amp;{" "}
                     <Link
