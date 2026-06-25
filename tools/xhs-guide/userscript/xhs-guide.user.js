@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.7
+// @version      0.7.8
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.7";
+  const SCRIPT_VERSION = "0.7.8";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -47,7 +47,7 @@
     judgement: {
       enableLlmReview: true,
       llmTimeoutMs: 12000,
-      maxLlmReviewsPerRound: 10,
+      maxLlmReviewsPerRound: 12,
       llmMinIntervalMs: 300,
       minConfidenceToHighlight: 0.6,
       rule: {
@@ -79,6 +79,10 @@
           "apartment", "condo", "公寓",
           "找房", "寻房", "搬家", "入住", "押金", "月租",
           "独卫", "独立", "furnished",
+        ],
+        strongRentalWords: [
+          "招租", "出租", "转租", "求租", "短租", "找房",
+          "找室友", "合租", "sublease", "roommate", "for rent",
         ],
         /**
          * 强排除词：含以下词且无湾区信号，直接拒绝（减少 LLM 浪费）
@@ -662,11 +666,29 @@
     const lower = input.titleText.toLowerCase();
     const rule = config.judgement.rule;
 
-    const bayHit = rule.bayAreaWords.find((w) => lower.includes(w.toLowerCase()));
-    const rentHit = rule.rentalWords.find((w) => lower.includes(w.toLowerCase()));
+    const bayHits = rule.bayAreaWords.filter((w) => lower.includes(w.toLowerCase()));
+    const rentHits = rule.rentalWords.filter((w) => lower.includes(w.toLowerCase()));
+    const strongRentalHit = rule.strongRentalWords.find((w) =>
+      lower.includes(w.toLowerCase()),
+    );
+    const mainlandHit = rule.mainlandOnlyWords.find((w) =>
+      lower.includes(w.toLowerCase()),
+    );
+    const bayHit = bayHits.at(0) ?? "";
+    const rentHit = rentHits.at(0) ?? "";
+
+    if (mainlandHit && bayHits.length === 0) {
+      return {
+        stageName: "ruleScreenStage",
+        passed: false,
+        skipLlm: true,
+        confidence: 0.05,
+        reason: `大陆城市词(${mainlandHit})且无湾区信号，排除`,
+      };
+    }
 
     // 强命中：城市词 + 租房词同时出现 → 直接判为相关，跳过 LLM
-    if (bayHit && rentHit) {
+    if (bayHits.length > 0 && rentHits.length > 0) {
       return {
         stageName: "ruleScreenStage",
         passed: true,
@@ -676,30 +698,43 @@
       };
     }
 
-    // 排除：含大陆城市词且没有任何湾区/租房信号 → 直接拒绝，不耗 LLM
-    if (!bayHit && !rentHit) {
-      const mainlandHit = rule.mainlandOnlyWords.find((w) => lower.includes(w.toLowerCase()));
-      if (mainlandHit) {
-        return {
-          stageName: "ruleScreenStage",
-          passed: false,
-          skipLlm: true,
-          confidence: 0.05,
-          reason: `大陆城市词(${mainlandHit})且无湾区/租房信号，排除`,
-        };
-      }
+    // 湾区城市出现多个，通常就是本地租房/生活帖，先展示，后台交给 LLM 纠错
+    if (bayHits.length >= 2) {
+      return {
+        stageName: "ruleScreenStage",
+        passed: true,
+        skipLlm: false,
+        confidence: 0.72,
+        reason: `多个湾区信号(${bayHits.slice(0, 2).join(", ")})，先高亮后复核`,
+      };
     }
 
-    // 其他一切：交给 LLM 判断
-    const anySignal = bayHit ?? rentHit ?? null;
+    if (strongRentalHit) {
+      return {
+        stageName: "ruleScreenStage",
+        passed: true,
+        skipLlm: false,
+        confidence: 0.7,
+        reason: `强租房信号(${strongRentalHit})，先高亮后复核`,
+      };
+    }
+
+    if (bayHit || rentHit) {
+      return {
+        stageName: "ruleScreenStage",
+        passed: true,
+        skipLlm: false,
+        confidence: 0.65,
+        reason: `弱信号(${bayHit || rentHit})，先高亮后复核`,
+      };
+    }
+
     return {
       stageName: "ruleScreenStage",
-      passed: true,
-      skipLlm: false,
-      confidence: anySignal ? 0.45 : 0.25,
-      reason: anySignal
-        ? `弱信号(${anySignal})，送 LLM 复核`
-        : "无明确关键词，送 LLM 判断",
+      passed: false,
+      skipLlm: true,
+      confidence: 0.1,
+      reason: "无湾区/租房信号，跳过 LLM",
     };
   };
 
@@ -766,39 +801,39 @@
     });
   };
 
-  const parseLlmJudgement = (rawText) => {
+  const parseBatchLlmJudgements = (rawText) => {
     const content = rawText.trim();
-    const matched = content.match(/\{[\s\S]*\}/);
-    const jsonText = matched ? matched[0] : content;
+    const arrayMatch = content.match(/\[[\s\S]*\]/);
+    const objectMatch = content.match(/\{[\s\S]*\}/);
+    const jsonText = arrayMatch ? arrayMatch[0] : objectMatch ? objectMatch[0] : content;
     const parsed = JSON.parse(jsonText);
-
-    return {
-      related: Boolean(parsed.related),
-      confidence: clamp(Number(parsed.confidence) || 0.5, 0, 1),
-      reason: typeof parsed.reason === "string" ? parsed.reason : "LLM 未提供原因",
-    };
+    const items = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed.results)
+        ? parsed.results
+        : [];
+    const results = new Map();
+    for (const item of items) {
+      const index = Number(item?.index);
+      if (!Number.isInteger(index)) {
+        continue;
+      }
+      results.set(index, {
+        related: Boolean(item.related),
+        confidence: clamp(Number(item.confidence) || 0.5, 0, 1),
+        reason:
+          typeof item.reason === "string"
+            ? item.reason
+            : "LLM 未提供原因",
+      });
+    }
+    return results;
   };
 
-  const llmReviewStage = async (input, config) => {
+  const llmBatchReviewStage = async (inputs, config) => {
     const llmConfig = config.judgement.llm;
-    if (!config.judgement.enableLlmReview) {
-      return {
-        stageName: "llmReviewStage",
-        skipped: true,
-        passed: true,
-        confidence: 0.5,
-        reason: "LLM 复核开关关闭，跳过",
-      };
-    }
-
-    if (!llmConfig.apiKey) {
-      return {
-        stageName: "llmReviewStage",
-        skipped: true,
-        passed: true,
-        confidence: 0.5,
-        reason: "未配置 API Key，降级为规则结果",
-      };
+    if (!config.judgement.enableLlmReview || !llmConfig.apiKey || inputs.length === 0) {
+      return new Map();
     }
 
     const elapsed = now() - state.lastLlmCallAt;
@@ -806,21 +841,14 @@
       await sleep(config.judgement.llmMinIntervalMs - elapsed);
     }
 
-    if (state.llmReviewedInRound >= config.judgement.maxLlmReviewsPerRound) {
-      return {
-        stageName: "llmReviewStage",
-        skipped: true,
-        passed: true,
-        confidence: 0.5,
-        reason: "达到单轮 LLM 复核上限，降级为规则结果",
-      };
-    }
-
+    const batch = inputs.slice(0, config.judgement.maxLlmReviewsPerRound);
     const systemPrompt =
-      "你是小红书帖子分类器，专门识别美国湾区（Bay Area / 硅谷 / 旧金山 / 南湾 / 东湾等）租房相关帖子。" +
-      "包括：出租/转租/短租/招租/求租/找房/找室友/roommate/sublease 等。" +
-      "判断标题是否属于此类。输出 JSON: {\"related\": boolean, \"confidence\": 0-1, \"reason\": string}";
-    const userPrompt = `标题: ${input.titleText}`;
+      "你是小红书帖子分类器，专门识别美国湾区租房相关标题。" +
+      "包括出租、转租、短租、招租、求租、找房、找室友、roommate、sublease。" +
+      "请逐条判断标题是否相关，只输出 JSON: {\"results\":[{\"index\":0,\"related\":true,\"confidence\":0.9,\"reason\":\"...\"}]}";
+    const userPrompt = batch
+      .map((input, index) => `${index}. ${input.titleText}`)
+      .join("\n");
 
     const payload = {
       model: llmConfig.model,
@@ -839,17 +867,10 @@
       config.judgement.llmTimeoutMs,
     );
     state.lastLlmCallAt = now();
-    state.llmReviewedInRound += 1;
+    state.llmReviewedInRound += batch.length;
 
     const text = response?.choices?.[0]?.message?.content || "";
-    const parsed = parseLlmJudgement(text);
-    return {
-      stageName: "llmReviewStage",
-      skipped: false,
-      passed: parsed.related,
-      confidence: parsed.confidence,
-      reason: parsed.reason,
-    };
+    return parseBatchLlmJudgements(text);
   };
 
   const postProcessStage = (ruleResult, llmResult, config) => {
@@ -860,52 +881,6 @@
       isBayAreaRentingRelated: finalPass && confidence >= config.judgement.minConfidenceToHighlight,
       confidence: clamp(confidence, 0, 1),
       reason: llmResult.reason || ruleResult.reason,
-    };
-  };
-
-  const runTitleJudgementPipeline = async (candidate, config) => {
-    const input = {
-      titleText: candidate.text,
-      pageUrl: window.location.href,
-      collectedAt: new Date().toISOString(),
-    };
-    const stageTrace = [];
-
-    const ruleResult = ruleScreenStage(input, config);
-    stageTrace.push(ruleResult);
-
-    // 强规则拒绝（仅大陆词命中）或强规则通过（城市+租房双命中跳过 LLM）
-    if (ruleResult.skipLlm) {
-      return {
-        isBayAreaRentingRelated: ruleResult.passed && ruleResult.confidence >= config.judgement.minConfidenceToHighlight,
-        confidence: ruleResult.confidence,
-        reason: ruleResult.reason,
-        stageTrace,
-      };
-    }
-
-    // 其余全部交给 LLM；LLM 失败时降级为规则结果
-    let llmResult;
-    try {
-      llmResult = await llmReviewStage(input, config);
-    } catch (error) {
-      llmResult = {
-        stageName: "llmReviewStage",
-        skipped: true,
-        passed: ruleResult.passed,
-        confidence: ruleResult.confidence,
-        reason: `LLM 失败，降级规则结果: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
-    stageTrace.push(llmResult);
-
-    const postResult = postProcessStage(ruleResult, llmResult, config);
-    stageTrace.push(postResult);
-    return {
-      isBayAreaRentingRelated: postResult.isBayAreaRentingRelated,
-      confidence: postResult.confidence,
-      reason: postResult.reason,
-      stageTrace,
     };
   };
 
@@ -2563,7 +2538,7 @@
       const relatedInRound = [];
       const needLlm = [];
 
-      // 第一遍：收集缓存命中的，立即渲染；未缓存的放入 needLlm
+      // 第一遍：缓存命中或规则命中的先立刻渲染，不等 LLM
       for (const candidate of candidates) {
         const cacheKey = normalizeTitle(candidate.text).toLowerCase();
         if (state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
@@ -2577,12 +2552,38 @@
           }
           continue;
         }
+
+        const input = {
+          titleText: candidate.text,
+          pageUrl: window.location.href,
+          collectedAt: new Date().toISOString(),
+        };
+        const ruleResult = ruleScreenStage(input, config);
+        const immediateResult = {
+          isBayAreaRentingRelated:
+            ruleResult.passed &&
+            ruleResult.confidence >= config.judgement.minConfidenceToHighlight,
+          confidence: ruleResult.confidence,
+          reason: ruleResult.reason,
+          stageTrace: [ruleResult],
+        };
+
+        if (immediateResult.isBayAreaRentingRelated) {
+          candidate.judgement = immediateResult;
+          relatedInRound.push(candidate);
+        }
+
+        if (ruleResult.skipLlm) {
+          state.judgeCache.set(cacheKey, immediateResult);
+          continue;
+        }
+
         if (!state.inFlightText.has(cacheKey)) {
-          needLlm.push(candidate);
+          needLlm.push({ candidate, cacheKey, input, ruleResult });
         }
       }
 
-      // 立即渲染缓存命中项，不等 LLM
+      // 立即渲染缓存命中 + 规则乐观命中项
       state.matchedById.clear();
       for (const candidate of relatedInRound) {
         if (!state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
@@ -2593,25 +2594,62 @@
         scheduleRender(config);
       }
 
-      // 第二遍：LLM 判断未缓存项
-      for (const candidate of needLlm) {
-        const cacheKey = normalizeTitle(candidate.text).toLowerCase();
-        if (state.inFlightText.has(cacheKey)) {
-          continue;
-        }
-        state.inFlightText.add(cacheKey);
-        const result = await runTitleJudgementPipeline(candidate, config);
-        state.judgeCache.set(cacheKey, result);
-        state.inFlightText.delete(cacheKey);
+      // 第二遍：LLM 批量后台复核，回来后只做纠错
+      const llmJobs = needLlm.slice(0, config.judgement.maxLlmReviewsPerRound);
+      for (const job of llmJobs) {
+        state.inFlightText.add(job.cacheKey);
+      }
+      try {
+        const batchResults = await llmBatchReviewStage(
+          llmJobs.map((job) => job.input),
+          config,
+        );
+        for (let index = 0; index < llmJobs.length; index += 1) {
+          const job = llmJobs[index];
+          const parsed = batchResults.get(index);
+          const llmResult = parsed
+            ? {
+                stageName: "llmBatchReviewStage",
+                skipped: false,
+                passed: parsed.related,
+                confidence: parsed.confidence,
+                reason: parsed.reason,
+              }
+            : {
+                stageName: "llmBatchReviewStage",
+                skipped: true,
+                passed: job.ruleResult.passed,
+                confidence: job.ruleResult.confidence,
+                reason: "LLM 批量复核未返回该项，保留规则结果",
+              };
+          const postResult = postProcessStage(job.ruleResult, llmResult, config);
+          const finalResult = {
+            isBayAreaRentingRelated: postResult.isBayAreaRentingRelated,
+            confidence: postResult.confidence,
+            reason: postResult.reason,
+            stageTrace: [job.ruleResult, llmResult, postResult],
+          };
+          state.judgeCache.set(job.cacheKey, finalResult);
 
-        if (result.isBayAreaRentingRelated) {
-          candidate.judgement = result;
-          relatedInRound.push(candidate);
-          if (!state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
-            state.matchedById.set(candidate.id, candidate);
-            scheduleRender(config);
+          if (finalResult.isBayAreaRentingRelated) {
+            job.candidate.judgement = finalResult;
+            if (!state.dismissedTitleKeys.has(getTitleDismissKey(job.candidate))) {
+              state.matchedById.set(job.candidate.id, job.candidate);
+            }
+          } else {
+            state.matchedById.delete(job.candidate.id);
           }
         }
+      } catch (error) {
+        logWarn(
+          "LLM 批量复核失败，保留本地规则结果",
+          error instanceof Error ? error.message : String(error),
+        );
+      } finally {
+        for (const job of llmJobs) {
+          state.inFlightText.delete(job.cacheKey);
+        }
+        scheduleRender(config);
       }
 
       scheduleRender(config);
