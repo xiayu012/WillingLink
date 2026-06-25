@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 
 const BUSINESS_NAME = "FretGone LLC";
 const BRAND_NAME = "WillingLink";
+const CONTACT_EMAIL = "contact@fretgone.com";
 
 export default function SubmitPhonePage() {
   const [firstName, setFirstName] = useState("");
@@ -36,11 +37,14 @@ export default function SubmitPhonePage() {
           <div className="mb-6 flex flex-col items-center text-center">
             <div
               aria-hidden="true"
-              className="mb-4 flex h-20 w-full max-w-xs items-center justify-center rounded-md border-2 border-dashed border-muted-foreground/30 bg-muted/50 text-lg font-semibold tracking-tight"
+              className="mb-4 flex h-20 w-full max-w-xs items-center justify-center rounded-md border-2 border-muted-foreground/30 border-dashed bg-muted/50 font-semibold text-lg tracking-tight"
             >
               {BRAND_NAME}
             </div>
-            <p className="text-sm text-muted-foreground">
+            <h1 className="mb-2 font-semibold text-2xl tracking-tight">
+              Request rental updates by text
+            </h1>
+            <p className="text-muted-foreground text-sm">
               Welcome to {BRAND_NAME} by {BUSINESS_NAME}. Please submit your
               contact details so we can text you about your housing needs,
               coordinate viewings, and connect you with suitable landlords.
@@ -48,13 +52,10 @@ export default function SubmitPhonePage() {
           </div>
 
           {submitted ? (
-            <p
-              className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-center text-sm text-green-800"
-              role="status"
-            >
+            <output className="rounded-md border border-green-200 bg-green-50 px-4 py-3 text-center text-green-800 text-sm">
               Submitted successfully. If you opted in to SMS, we will reach out
               shortly.
-            </p>
+            </output>
           ) : (
             <form className="flex flex-col gap-6" onSubmit={handleSubmit}>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -106,7 +107,7 @@ export default function SubmitPhonePage() {
                 </div>
               </div>
 
-              <p className="text-left text-xs leading-relaxed text-muted-foreground">
+              <p className="text-left text-muted-foreground text-xs leading-relaxed">
                 This form is for housing inquiries only. We send{" "}
                 <strong>transactional and informational SMS</strong> related to
                 your request—not promotional marketing blasts. See our{" "}
@@ -146,7 +147,8 @@ export default function SubmitPhonePage() {
                     By checking, you agree to receive{" "}
                     <strong>transactional/informational SMS</strong> regarding
                     your rental inquiry, viewing coordination, landlord contact
-                    details, and customer care from {BUSINESS_NAME} ({BRAND_NAME}
+                    details, and customer care from {BUSINESS_NAME} (
+                    {BRAND_NAME}
                     ). Message frequency may vary. Message and data rates may
                     apply. Reply <strong>HELP</strong> for help or{" "}
                     <strong>STOP</strong> to opt out.
@@ -187,14 +189,24 @@ export default function SubmitPhonePage() {
               </fieldset>
 
               <Button className="w-full" size="lg" type="submit">
-                Continue
+                Submit rental inquiry
               </Button>
             </form>
           )}
         </div>
+        <p className="mt-4 max-w-lg text-center text-muted-foreground text-xs">
+          Need help without SMS? Email{" "}
+          <a
+            className="underline hover:text-foreground"
+            href={`mailto:${CONTACT_EMAIL}`}
+          >
+            {CONTACT_EMAIL}
+          </a>
+          .
+        </p>
       </div>
 
-      <footer className="border-t bg-background px-4 py-3 text-center text-xs text-muted-foreground">
+      <footer className="border-t bg-background px-4 py-3 text-center text-muted-foreground text-xs">
         <span className="mr-2">
           © {new Date().getFullYear()} {BRAND_NAME}
         </span>
@@ -204,6 +216,10 @@ export default function SubmitPhonePage() {
         <span className="mx-1">·</span>
         <Link className="underline hover:text-foreground" href="/privacy">
           Privacy Policy
+        </Link>
+        <span className="mx-1">·</span>
+        <Link className="underline hover:text-foreground" href="/about">
+          About
         </Link>
       </footer>
     </div>

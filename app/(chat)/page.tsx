@@ -35,15 +35,19 @@ async function NewChatPage() {
         />
         <DataStreamHandler />
       </div>
-      <footer className="border-t px-4 py-3 text-center text-xs text-muted-foreground">
+      <footer className="border-t px-4 py-3 text-center text-muted-foreground text-xs">
         <Link
-          className="mb-2 inline-block rounded bg-primary px-4 py-2 text-sm font-medium text-primary-foreground"
+          className="mb-2 inline-block rounded bg-primary px-4 py-2 font-medium text-primary-foreground text-sm"
           href="/submit-phone"
         >
-          submit phone number
+          Request rental updates by text
         </Link>
         <div>
           <span className="mr-2">© {new Date().getFullYear()} WillingLink</span>
+          <Link className="underline hover:text-foreground" href="/about">
+            About
+          </Link>
+          <span className="mx-1">·</span>
           <Link className="underline hover:text-foreground" href="/terms">
             Terms and Conditions
           </Link>

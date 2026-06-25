@@ -10,7 +10,7 @@ const CONTACT_EMAIL = "contact@fretgone.com";
 export default function PrivacyPage() {
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-8 text-sm leading-relaxed">
-      <h1 className="text-2xl font-semibold">
+      <h1 className="font-semibold text-2xl">
         Privacy Policy – WillingLink by FretGone LLC
       </h1>
       <p>
@@ -19,7 +19,7 @@ export default function PrivacyPage() {
         information when you use the WillingLink website and related services.
       </p>
 
-      <h2 className="mt-4 text-lg font-semibold">1. Information We Collect</h2>
+      <h2 className="mt-4 font-semibold text-lg">1. Information We Collect</h2>
       <p>We may collect the following information when you use our site:</p>
       <ul className="list-disc space-y-1 pl-6">
         <li>First and last name</li>
@@ -35,7 +35,9 @@ export default function PrivacyPage() {
         </li>
       </ul>
 
-      <h2 className="mt-4 text-lg font-semibold">2. How We Use Your Information</h2>
+      <h2 className="mt-4 font-semibold text-lg">
+        2. How We Use Your Information
+      </h2>
       <p>We use the information we collect to:</p>
       <ul className="list-disc space-y-1 pl-6">
         <li>Respond to your rental inquiries and housing requests</li>
@@ -52,14 +54,14 @@ export default function PrivacyPage() {
         to your housing inquiry.
       </p>
 
-      <h2 className="mt-4 text-lg font-semibold">3. SMS Communication</h2>
+      <h2 className="mt-4 font-semibold text-lg">3. SMS Communication</h2>
       <p>
         If you submit your phone number and opt in on our contact form, you
-        consent to receive <strong>transactional and informational text
-        messages</strong> from FretGone LLC (WillingLink) about your rental
-        inquiry. These messages may include viewing confirmations, landlord
-        contact details, follow-up questions about your housing needs, and
-        related customer-care messages.
+        consent to receive{" "}
+        <strong>transactional and informational text messages</strong> from
+        FretGone LLC (WillingLink) about your rental inquiry. These messages may
+        include viewing confirmations, landlord contact details, follow-up
+        questions about your housing needs, and related customer-care messages.
       </p>
       <p>
         Message frequency may vary depending on your inquiry and listing
@@ -80,15 +82,28 @@ export default function PrivacyPage() {
         service providers (such as messaging platforms) solely to deliver
         messages on our behalf.
       </p>
+      <p>
+        Consent to receive SMS messages is not required to use our service. If
+        you prefer not to receive text messages, you can contact us by email at{" "}
+        <a
+          className="underline hover:text-foreground"
+          href={`mailto:${CONTACT_EMAIL}`}
+        >
+          {CONTACT_EMAIL}
+        </a>
+        .
+      </p>
 
-      <h2 className="mt-4 text-lg font-semibold">4. Information Sharing</h2>
+      <h2 className="mt-4 font-semibold text-lg">4. Information Sharing</h2>
       <p>
         We do not sell your personal information. We may share information only
         as needed to operate our services—for example, with SMS delivery
         providers, hosting providers, or when required by law.
       </p>
 
-      <h2 className="mt-4 text-lg font-semibold">5. Data Retention and Security</h2>
+      <h2 className="mt-4 font-semibold text-lg">
+        5. Data Retention and Security
+      </h2>
       <p>
         We retain personal information only as long as necessary to fulfill the
         purposes described in this policy or as required by law. We use
@@ -96,16 +111,18 @@ export default function PrivacyPage() {
         protect your information.
       </p>
 
-      <h2 className="mt-4 text-lg font-semibold">6. Your Rights</h2>
+      <h2 className="mt-4 font-semibold text-lg">6. Your Rights</h2>
       <p>You may contact us to:</p>
       <ul className="list-disc space-y-1 pl-6">
         <li>Request access to or a copy of your personal information</li>
         <li>Update or correct your contact details</li>
         <li>Withdraw SMS consent by replying STOP or contacting us directly</li>
-        <li>Request deletion of your information, subject to legal obligations</li>
+        <li>
+          Request deletion of your information, subject to legal obligations
+        </li>
       </ul>
 
-      <h2 className="mt-4 text-lg font-semibold">7. Contact Us</h2>
+      <h2 className="mt-4 font-semibold text-lg">7. Contact Us</h2>
       <p>
         For questions about this Privacy Policy, please contact:{" "}
         <a
@@ -125,7 +142,7 @@ export default function PrivacyPage() {
         .
       </p>
 
-      <h2 className="mt-4 text-lg font-semibold">Company</h2>
+      <h2 className="mt-4 font-semibold text-lg">Company</h2>
       <p>FretGone LLC — WillingLink</p>
     </main>
   );

@@ -1,16 +1,17 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { Toaster } from "sonner";
-import { ThemeProvider } from "@/components/theme-provider";
 import { PwaRegister } from "@/components/pwa-register";
+import { ThemeProvider } from "@/components/theme-provider";
 
 import "./globals.css";
 import { SessionProvider } from "next-auth/react";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://chat.vercel.ai"),
-  title: "Next.js Chatbot Template",
-  description: "Next.js chatbot template using the AI SDK.",
+  metadataBase: new URL("https://willinglink.com"),
+  title: "WillingLink",
+  description:
+    "WillingLink helps Bay Area renters find housing options and coordinate service-related follow-up.",
   manifest: "/manifest.webmanifest",
 };
 
