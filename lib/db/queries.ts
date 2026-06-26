@@ -1554,3 +1554,136 @@ export async function updateListingGeocode(
     console.error("Failed to update listing geocode:", error);
   }
 }
+
+// ─── XhsRentalWanted (tenant-seeking posts) ──────────────────────────────────
+
+export type XhsRentalWantedSearchResultRow = {
+  id: string;
+  sourceUrl: string;
+  title: string | null;
+  rawText: string;
+  budgetText: string | null;
+  budgetMin: string | null;
+  budgetMax: string | null;
+  preferredLocations: string | null;
+  moveInDate: string | null;
+  leaseDuration: string | null;
+  wantedType: string | null;
+  bedrooms: string | null;
+  bathrooms: string | null;
+  roomType: string | null;
+  furnished: string | null;
+  pets: string | null;
+  occupation: string | null;
+  householdSize: string | null;
+  gender: string | null;
+  requirements: string | null;
+  contactMethod: string | null;
+  imageUrls: string[] | null;
+  createdAt: Date;
+};
+
+type SearchXhsRentalWantedArgs = {
+  keywords?: string[] | null;
+  preferredLocation?: string | null;
+  roomType?: string | null;
+  bedrooms?: string | null;
+  gender?: string | null;
+  pets?: string | null;
+  limit?: number | null;
+};
+
+const WANTED_RESULT_LIMIT = 20;
+
+export async function searchXhsRentalWanted({
+  keywords,
+  preferredLocation,
+  roomType,
+  bedrooms,
+  gender,
+  pets,
+  limit,
+}: SearchXhsRentalWantedArgs): Promise<{
+  results: XhsRentalWantedSearchResultRow[];
+  totalCount: number;
+}> {
+  const cleanKeywords = (keywords ?? [])
+    .map((k) => (typeof k === "string" ? k.trim() : ""))
+    .filter((k) => k.length > 0);
+
+  try {
+    const rows = await client`
+      SELECT
+        id, "sourceUrl", title, "rawText",
+        "budgetText", "budgetMin", "budgetMax",
+        "preferredLocations", "moveInDate", "leaseDuration",
+        "wantedType", bedrooms, bathrooms, "roomType",
+        furnished, pets, occupation, "householdSize",
+        gender, requirements, "contactMethod",
+        "imageUrls", "createdAt",
+        COUNT(*) OVER() AS total_count
+      FROM "XhsRentalWanted"
+      WHERE
+            (${preferredLocation ?? null}::text IS NULL
+             OR "preferredLocations" ILIKE '%' || ${preferredLocation ?? null} || '%'
+             OR "rawText"            ILIKE '%' || ${preferredLocation ?? null} || '%'
+             OR COALESCE(title, '')  ILIKE '%' || ${preferredLocation ?? null} || '%')
+        AND (${roomType ?? null}::text IS NULL OR "roomType" ILIKE '%' || ${roomType ?? null} || '%'
+             OR "rawText" ILIKE '%' || ${roomType ?? null} || '%')
+        AND (${bedrooms ?? null}::text IS NULL OR bedrooms ILIKE '%' || ${bedrooms ?? null} || '%')
+        AND (${gender ?? null}::text IS NULL OR gender ILIKE '%' || ${gender ?? null} || '%')
+        AND (${pets ?? null}::text IS NULL OR pets ILIKE '%' || ${pets ?? null} || '%'
+             OR "rawText" ILIKE '%' || ${pets ?? null} || '%')
+        AND (
+          ${cleanKeywords.length === 0}::boolean
+          OR (
+            SELECT bool_and(
+              "rawText"                          ILIKE '%' || kw || '%'
+              OR COALESCE(title, '')             ILIKE '%' || kw || '%'
+              OR COALESCE("preferredLocations", '') ILIKE '%' || kw || '%'
+              OR COALESCE(requirements, '')      ILIKE '%' || kw || '%'
+            )
+            FROM unnest(${cleanKeywords}::text[]) AS kw
+          )
+        )
+      ORDER BY "createdAt" DESC
+      LIMIT ${limit ?? WANTED_RESULT_LIMIT}
+    `;
+
+    const totalCount = rows.length > 0 ? Number(rows[0].total_count) : 0;
+
+    const results: XhsRentalWantedSearchResultRow[] = rows.map((row) => ({
+      id: row.id as string,
+      sourceUrl: row.sourceUrl as string,
+      title: (row.title as string | null) ?? null,
+      rawText: row.rawText as string,
+      budgetText: (row.budgetText as string | null) ?? null,
+      budgetMin: (row.budgetMin as string | null) ?? null,
+      budgetMax: (row.budgetMax as string | null) ?? null,
+      preferredLocations: (row.preferredLocations as string | null) ?? null,
+      moveInDate: (row.moveInDate as string | null) ?? null,
+      leaseDuration: (row.leaseDuration as string | null) ?? null,
+      wantedType: (row.wantedType as string | null) ?? null,
+      bedrooms: (row.bedrooms as string | null) ?? null,
+      bathrooms: (row.bathrooms as string | null) ?? null,
+      roomType: (row.roomType as string | null) ?? null,
+      furnished: (row.furnished as string | null) ?? null,
+      pets: (row.pets as string | null) ?? null,
+      occupation: (row.occupation as string | null) ?? null,
+      householdSize: (row.householdSize as string | null) ?? null,
+      gender: (row.gender as string | null) ?? null,
+      requirements: (row.requirements as string | null) ?? null,
+      contactMethod: (row.contactMethod as string | null) ?? null,
+      imageUrls: Array.isArray(row.imageUrls) ? (row.imageUrls as string[]) : null,
+      createdAt: row.createdAt as Date,
+    }));
+
+    return { results, totalCount };
+  } catch (error) {
+    console.error("searchXhsRentalWanted error:", error);
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to search rental wanted posts"
+    );
+  }
+}

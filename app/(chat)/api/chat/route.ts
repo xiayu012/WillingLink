@@ -19,6 +19,7 @@ import { getLanguageModel } from "@/lib/ai/providers";
 import { findNearestTransit } from "@/lib/ai/tools/find-nearest-transit";
 import { getTransitTime } from "@/lib/ai/tools/get-transit-time";
 import { createSearchRentalTool } from "@/lib/ai/tools/search-rental";
+import { createSearchWantedTool } from "@/lib/ai/tools/search-wanted";
 import { queryListings } from "@/lib/ai/tools/query-listings";
 import { getWeather } from "@/lib/ai/tools/get-weather";
 import { isProductionEnvironment } from "@/lib/constants";
@@ -292,7 +293,7 @@ export async function POST(request: Request) {
           stopWhen: stepCountIs(5),
           experimental_activeTools: isReasoningModel
             ? []
-            : ["getWeather", "searchRental", "queryListings", "findNearestTransit", "getTransitTime"],
+            : ["getWeather", "searchRental", "searchWanted", "queryListings", "findNearestTransit", "getTransitTime"],
           experimental_transform: isReasoningModel
             ? undefined
             : smoothStream({ chunking: "word" }),
@@ -306,6 +307,7 @@ export async function POST(request: Request) {
           tools: {
             getWeather,
             searchRental: createSearchRentalTool(id),
+            searchWanted: createSearchWantedTool(id),
             queryListings,
             findNearestTransit,
             getTransitTime,
