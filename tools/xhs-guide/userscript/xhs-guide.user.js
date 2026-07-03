@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.8
+// @version      0.7.9
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.8";
+  const SCRIPT_VERSION = "0.7.9";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -72,8 +72,8 @@
           "SJSU", "UCSF", "SCU",
         ],
         rentalWords: [
-          "租", "房", "室友", "招租", "出租", "转租", "求租",
-          "短租", "合租", "一房", "两房", "主卧", "次卧",
+          "室友", "招租", "出租", "转租", "求租",
+          "短租", "合租", "租房", "一房", "两房", "主卧", "次卧",
           "1b", "2b", "1bd", "2bd", "studio",
           "lease", "sublease", "roommate", "rent",
           "apartment", "condo", "公寓",
@@ -83,6 +83,16 @@
         strongRentalWords: [
           "招租", "出租", "转租", "求租", "短租", "找房",
           "找室友", "合租", "sublease", "roommate", "for rent",
+        ],
+        /**
+         * 经验/科普/非交易信号词：出现时降级强命中为"先高亮后 LLM 复核"
+         * 防止"湾区租房避雷"之类的经验帖被直接跳过 LLM
+         */
+        experienceWords: [
+          "避雷", "避坑", "攻略", "经验", "干货", "科普",
+          "总结", "注意事项", "新手", "小白", "tips", "guide",
+          "踩坑", "防骗", "测评", "对比", "盘点", "必看",
+          "吐槽", "心得", "分享", "指南", "教程", "推荐",
         ],
         /**
          * 强排除词：含以下词且无湾区信号，直接拒绝（减少 LLM 浪费）
@@ -671,6 +681,9 @@
     const strongRentalHit = rule.strongRentalWords.find((w) =>
       lower.includes(w.toLowerCase()),
     );
+    const experienceHit = rule.experienceWords.find((w) =>
+      lower.includes(w.toLowerCase()),
+    );
     const mainlandHit = rule.mainlandOnlyWords.find((w) =>
       lower.includes(w.toLowerCase()),
     );
@@ -687,8 +700,18 @@
       };
     }
 
-    // 强命中：城市词 + 租房词同时出现 → 直接判为相关，跳过 LLM
+    // 强命中：城市词 + 租房词同时出现
     if (bayHits.length > 0 && rentHits.length > 0) {
+      // 含经验/科普信号时降级：先高亮，但交给 LLM 复核
+      if (experienceHit) {
+        return {
+          stageName: "ruleScreenStage",
+          passed: true,
+          skipLlm: false,
+          confidence: 0.55,
+          reason: `湾区(${bayHit})+租房(${rentHit})但含经验词(${experienceHit})，送 LLM 复核`,
+        };
+      }
       return {
         stageName: "ruleScreenStage",
         passed: true,
