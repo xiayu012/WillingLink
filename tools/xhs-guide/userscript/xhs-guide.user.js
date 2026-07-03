@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.9
+// @version      0.7.8
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.9";
+  const SCRIPT_VERSION = "0.7.8";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -47,13 +47,17 @@
     judgement: {
       enableLlmReview: true,
       llmTimeoutMs: 12000,
-      maxLlmReviewsPerRound: 12,
+      // 现在所有"通过并高亮"的候选都会异步复核（而不仅是弱信号），
+      // 与 titleScan.maxTitlesPerRound 对齐，确保一屏候选能在一次批量请求内验证完
+      maxLlmReviewsPerRound: 20,
       llmMinIntervalMs: 300,
       minConfidenceToHighlight: 0.6,
       rule: {
         /**
-         * 强命中列表：同时命中城市词 + 租房词即可跳过 LLM（节省开销）。
-         * 这里追求完整覆盖，漏掉的交给 LLM 判断。
+         * 关键词只用来决定"是否先乐观高亮"，不代表最终判定。
+         * 只要判定为高亮（passed=true），无论信号多强，都会异步交给 LLM 复核并可撤销——
+         * 因为关键词共现（如"湾区"+"租/房"）不等于真实意图，很多攻略/避雷/科普贴也会撞上这些词。
+         * 真正跳过 LLM 的，只有"直接拒绝、什么都不展示"的分支，因为拒绝不展示没有精度损失。
          */
         bayAreaWords: [
           "湾区", "Bay Area", "bay area",
@@ -72,8 +76,8 @@
           "SJSU", "UCSF", "SCU",
         ],
         rentalWords: [
-          "室友", "招租", "出租", "转租", "求租",
-          "短租", "合租", "租房", "一房", "两房", "主卧", "次卧",
+          "租", "房", "室友", "招租", "出租", "转租", "求租",
+          "短租", "合租", "一房", "两房", "主卧", "次卧",
           "1b", "2b", "1bd", "2bd", "studio",
           "lease", "sublease", "roommate", "rent",
           "apartment", "condo", "公寓",
@@ -83,16 +87,6 @@
         strongRentalWords: [
           "招租", "出租", "转租", "求租", "短租", "找房",
           "找室友", "合租", "sublease", "roommate", "for rent",
-        ],
-        /**
-         * 经验/科普/非交易信号词：出现时降级强命中为"先高亮后 LLM 复核"
-         * 防止"湾区租房避雷"之类的经验帖被直接跳过 LLM
-         */
-        experienceWords: [
-          "避雷", "避坑", "攻略", "经验", "干货", "科普",
-          "总结", "注意事项", "新手", "小白", "tips", "guide",
-          "踩坑", "防骗", "测评", "对比", "盘点", "必看",
-          "吐槽", "心得", "分享", "指南", "教程", "推荐",
         ],
         /**
          * 强排除词：含以下词且无湾区信号，直接拒绝（减少 LLM 浪费）
@@ -681,9 +675,6 @@
     const strongRentalHit = rule.strongRentalWords.find((w) =>
       lower.includes(w.toLowerCase()),
     );
-    const experienceHit = rule.experienceWords.find((w) =>
-      lower.includes(w.toLowerCase()),
-    );
     const mainlandHit = rule.mainlandOnlyWords.find((w) =>
       lower.includes(w.toLowerCase()),
     );
@@ -700,24 +691,15 @@
       };
     }
 
-    // 强命中：城市词 + 租房词同时出现
+    // 强命中：城市词 + 租房词同时出现 → 先乐观高亮，但仍需 LLM 异步复核意图
+    // （关键词共现常见于攻略/避雷/科普贴，不能直接当作最终判定）
     if (bayHits.length > 0 && rentHits.length > 0) {
-      // 含经验/科普信号时降级：先高亮，但交给 LLM 复核
-      if (experienceHit) {
-        return {
-          stageName: "ruleScreenStage",
-          passed: true,
-          skipLlm: false,
-          confidence: 0.55,
-          reason: `湾区(${bayHit})+租房(${rentHit})但含经验词(${experienceHit})，送 LLM 复核`,
-        };
-      }
       return {
         stageName: "ruleScreenStage",
         passed: true,
-        skipLlm: true,
+        skipLlm: false,
         confidence: 0.85,
-        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})`,
+        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})，先高亮后复核`,
       };
     }
 
