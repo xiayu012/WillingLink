@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.8
+// @version      0.7.9
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.8";
+  const SCRIPT_VERSION = "0.7.9";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -99,6 +99,7 @@
         ],
       },
       llm: {
+        /** 留空 apiKey 时自动走 willinglink 后端 /api/xhs/title-judge（国内推荐） */
         endpoint: "https://api.openai.com/v1/chat/completions",
         apiKey: "",
         model: "gpt-4o-mini",
@@ -760,7 +761,14 @@
           data: body,
           onload: (response) => {
             if (response.status < 200 || response.status >= 300) {
-              reject(new Error(`LLM 请求失败: ${response.status}`));
+              const preview = String(
+                response.responseText ?? response.response ?? "",
+              ).slice(0, 160);
+              reject(
+                new Error(
+                  `LLM 请求失败: ${response.status}${preview ? ` ${preview}` : ""}`,
+                ),
+              );
               return;
             }
             try {
@@ -791,7 +799,12 @@
         data: body,
         onload: (response) => {
           if (response.status < 200 || response.status >= 300) {
-            reject(new Error(`LLM 请求失败: ${response.status}`));
+            const preview = String(response.responseText ?? "").slice(0, 160);
+            reject(
+              new Error(
+                `LLM 请求失败: ${response.status}${preview ? ` ${preview}` : ""}`,
+              ),
+            );
             return;
           }
           try {
@@ -836,8 +849,17 @@
   };
 
   const llmBatchReviewStage = async (inputs, config) => {
+    if (!config.judgement.enableLlmReview || inputs.length === 0) {
+      return new Map();
+    }
+
     const llmConfig = config.judgement.llm;
-    if (!config.judgement.enableLlmReview || !llmConfig.apiKey || inputs.length === 0) {
+    const apiKey = llmConfig.apiKey?.trim() ?? "";
+    const baseUrl = config.ingest?.baseUrl?.trim() ?? "";
+    const useBackend = !apiKey && Boolean(baseUrl);
+
+    if (!useBackend && !apiKey) {
+      logWarn("未配置 LLM：apiKey 为空且 ingest.baseUrl 不可用，跳过复核");
       return new Map();
     }
 
@@ -847,10 +869,54 @@
     }
 
     const batch = inputs.slice(0, config.judgement.maxLlmReviewsPerRound);
+
+    if (useBackend) {
+      const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/title-judge`;
+      const body = JSON.stringify({
+        titles: batch.map((input) => input.titleText),
+      });
+      const { status, responseText } = await gmHttpPost(url, {
+        "Content-Type": "application/json",
+      }, body);
+
+      let data = {};
+      try {
+        data = JSON.parse(responseText || "{}");
+      } catch {
+        data = {};
+      }
+
+      if (status < 200 || status >= 300 || !data.ok) {
+        throw new Error(
+          `后端 title-judge 失败: ${status} ${typeof data.error === "string" ? data.error : responseText.slice(0, 120)}`,
+        );
+      }
+
+      state.lastLlmCallAt = now();
+      state.llmReviewedInRound += batch.length;
+
+      const results = new Map();
+      for (const item of data.results ?? []) {
+        const index = Number(item?.index);
+        if (!Number.isInteger(index)) {
+          continue;
+        }
+        results.set(index, {
+          related: Boolean(item.related),
+          confidence: clamp(Number(item.confidence) || 0.5, 0, 1),
+          reason:
+            typeof item.reason === "string"
+              ? item.reason
+              : "后端未提供原因",
+        });
+      }
+      return results;
+    }
+
     const systemPrompt =
-      "你是小红书帖子分类器，专门识别美国湾区租房相关标题。" +
-      "包括出租、转租、短租、招租、求租、找房、找室友、roommate、sublease。" +
-      "请逐条判断标题是否相关，只输出 JSON: {\"results\":[{\"index\":0,\"related\":true,\"confidence\":0.9,\"reason\":\"...\"}]}";
+      "你是小红书标题分类器，判断标题是否属于美国湾区租房交易帖（出租/转租/求租/找室友/找房）。" +
+      "避雷、攻略、经验、科普、总结、政策解读、吐槽类标题应判为不相关。" +
+      "只输出 JSON: {\"results\":[{\"index\":0,\"related\":true,\"confidence\":0.9,\"reason\":\"...\"}]}";
     const userPrompt = batch
       .map((input, index) => `${index}. ${input.titleText}`)
       .join("\n");
@@ -868,7 +934,7 @@
     const response = await requestByGmXmlHttp(
       llmConfig.endpoint,
       payload,
-      llmConfig.apiKey,
+      apiKey,
       config.judgement.llmTimeoutMs,
     );
     state.lastLlmCallAt = now();
