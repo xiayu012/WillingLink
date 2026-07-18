@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.7.9
+// @version      0.8.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.7.9";
+  const SCRIPT_VERSION = "0.8.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -99,7 +99,11 @@
         ],
       },
       llm: {
-        /** 留空 apiKey 时自动走 willinglink 后端 /api/xhs/title-judge（国内推荐） */
+        /**
+         * 国内务必走后端代理：只要 ingest.baseUrl 有值，就会优先请求
+         * /api/xhs/title-judge（服务端用 AI Gateway，不受 OpenAI 地区限制）。
+         * apiKey 仅在 baseUrl 不可用时作为直连 OpenAI 的兜底，国内直连会 403。
+         */
         endpoint: "https://api.openai.com/v1/chat/completions",
         apiKey: "",
         model: "gpt-4o-mini",
@@ -856,10 +860,11 @@
     const llmConfig = config.judgement.llm;
     const apiKey = llmConfig.apiKey?.trim() ?? "";
     const baseUrl = config.ingest?.baseUrl?.trim() ?? "";
-    const useBackend = !apiKey && Boolean(baseUrl);
+    // 有后端地址就强制走后端，避免国内浏览器直连 OpenAI 被地区封锁 403
+    const useBackend = Boolean(baseUrl);
 
     if (!useBackend && !apiKey) {
-      logWarn("未配置 LLM：apiKey 为空且 ingest.baseUrl 不可用，跳过复核");
+      logWarn("未配置 LLM：ingest.baseUrl 与 apiKey 都不可用，跳过复核");
       return new Map();
     }
 
@@ -872,6 +877,11 @@
 
     if (useBackend) {
       const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/title-judge`;
+      logInfo("标题复核走后端代理", {
+        url,
+        count: batch.length,
+        version: SCRIPT_VERSION,
+      });
       const body = JSON.stringify({
         titles: batch.map((input) => input.titleText),
       });
@@ -913,6 +923,7 @@
       return results;
     }
 
+    logWarn("ingest.baseUrl 为空，回退直连 OpenAI（国内易 403）");
     const systemPrompt =
       "你是小红书标题分类器，判断标题是否属于美国湾区租房交易帖（出租/转租/求租/找室友/找房）。" +
       "避雷、攻略、经验、科普、总结、政策解读、吐槽类标题应判为不相关。" +

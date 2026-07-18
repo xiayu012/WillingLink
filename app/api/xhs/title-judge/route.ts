@@ -40,7 +40,11 @@ export async function POST(request: Request) {
   const results = await classifyFeedTitles(titles);
   if (results.length === 0) {
     return jsonWithCors(
-      { ok: false, error: "Title classification unavailable" },
+      {
+        ok: false,
+        error:
+          "Title classification unavailable (check AI Gateway / model credentials on server)",
+      },
       503
     );
   }
