@@ -3,6 +3,17 @@ import { join } from "node:path";
 import { type BrowserContext, chromium, type Page } from "@playwright/test";
 import { config as loadDotenv } from "dotenv";
 import postgres from "postgres";
+import {
+  type CheckedLog,
+  forgetChecked,
+  isWithinCooldown,
+  loadCheckedLog,
+  priorityTimestamp,
+  pruneCheckedLog,
+  recordCheckedResult,
+  saveCheckedLog,
+  summarizeCheckedLog,
+} from "./lib/xhs-checked-log";
 
 loadDotenv({ path: ".env.local" });
 loadDotenv();
@@ -11,12 +22,23 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DAILY_LIMIT = 800;
 const DEFAULT_MIN_DELAY_SECONDS = 45;
 const DEFAULT_MAX_DELAY_SECONDS = 171;
+const DEFAULT_COOLDOWN_HOURS = 18;
+const DEFAULT_BLOCK_PAUSE_MIN_MINUTES = 60;
+const DEFAULT_BLOCK_PAUSE_MAX_MINUTES = 180;
+const ERROR_BACKOFF_THRESHOLD = 3;
 const PAGE_TIMEOUT_MS = 45_000;
 const CONTENT_TIMEOUT_MS = 20_000;
+const BLOCK_DETECT_MIN_WAIT_MS = 800;
+const BLOCK_DETECT_MAX_WAIT_MS = 1500;
 const PROFILE_DIR = join(
   process.cwd(),
   ".playwright",
   "xhs-rental-cleaner-profile"
+);
+const DEFAULT_LOG_PATH = join(
+  process.cwd(),
+  ".playwright",
+  "xhs-rental-checked-log.json"
 );
 const XHS_URL_PATTERN = "%xiaohongshu.com%";
 const XHSLINK_URL_PATTERN = "%xhslink.com%";
@@ -27,10 +49,42 @@ const RENTED_PATTERNS = [
   /(?:房子|房间|房間|房源|卧室|臥室|这间|這間).{0,12}(?:已|已经|已經).{0,12}(?:租|出)/u,
   /(?:租|出).{0,4}(?:掉了|出去了|走了)/u,
   /(?:房子|房间|房間|房源|卧室|臥室).{0,12}(?:没有了|沒了|没了|暂无|暫無)/u,
+  // 标题/正文里常见的短标签，如「【已租】」「[已租]」，"已"后面只跟单字"租"就结束
+  /(?:^|[[【(（])\s*已\s*租\s*(?:[\]】)）]|$)/u,
 ] as const;
 
 const QUESTION_OR_UNCERTAIN_PATTERN =
   /(?:吗|嗎|嘛|\?|？|请问|請問|还有|還有|还在|還在|还没|還沒|有没有|有沒有)/u;
+
+const UNAVAILABLE_CONTENT_PATTERN = /该内容暂时无法查看/u;
+const UNAVAILABLE_TOAST_POLL_MS = 300;
+const UNAVAILABLE_TOAST_WINDOW_MS = 15_000;
+
+const BLOCK_OR_LOGIN_PATTERN =
+  /(扫码登录|登录后查看更多|请先登录|完成验证后继续访问|请完成验证|访问(?:过于|太)频繁|操作(?:过于|太)频繁|异常访问|网络异常，请稍后重试)/u;
+
+const OPENAI_CHAT_COMPLETIONS_URL =
+  "https://api.openai.com/v1/chat/completions";
+const DEFAULT_AI_MODEL = "gpt-4.1-mini";
+const DEFAULT_AI_MIN_CONFIDENCE = 0.6;
+const AI_JUDGE_TIMEOUT_MS = 15_000;
+
+const AI_JUDGE_SYSTEM_PROMPT = `你是小红书租房帖状态判断器。给你标题、正文、帖子发布/编辑时间、今天日期，以及作者本人在评论区的发言和对应日期，判断这个房源当前是否已经不可租（已出租/已租出/租满/房源下架等）。
+
+重要：评论区里已经提前过滤掉了所有路人的发言，你看到的评论全部是作者本人说的话，可以直接当作房东/发帖人自己的最新说法来用，不用怀疑是路人。
+
+最重要的原则——以最新时间为准：
+- 标题/正文的状态对应的是"帖子发布/编辑时间"这个时间点。
+- 每条作者评论的状态对应的是"该评论的日期"这个时间点。
+- 把这些时间点排序，永远相信时间最靠后（最新）的那条信息，忽略更早时间点的说法。
+- 例如：标题写着已出租、编辑时间是较晚的日期，即使有一条日期更早的作者评论说"在"或听起来还能租，也应该判定为已出租（因为那条评论发生在标题更新之前，已经过时）。反过来，如果作者在标题编辑之后又发了一条更晚日期的评论说"还有房"，则应判定为未出租。
+
+判断规则：
+- 标题或正文出现"已租""已出租""租出""租掉""出租完毕""没有房间了""[已出]"等，判定为已出租（除非有更晚时间点的作者评论明确说还没租出去/还有房）。
+- 作者本人评论明确说"已经租出去了""没有了""租满了"，也判定为已出租。
+- 找不到明确已出租信号时，判定为未出租（仍然可租）。
+
+只输出 JSON，格式为 {"rented": boolean, "confidence": 0到1之间的数字, "reason": "一句话原因，需要说明你依据的是哪个时间点的信息"}，不要输出任何其它文字。`;
 
 type ListingRow = {
   id: string;
@@ -44,11 +98,66 @@ type ElementTexts = {
   comments: string;
 };
 
-type RentedSignal = {
-  element: keyof ElementTexts;
-  snippet: string;
-  pattern: string;
+type AuthorComment = {
+  text: string;
+  date: string;
 };
+
+/** 判断已出租时需要的完整时间上下文：帖子编辑/发布时间 + 每条作者本人评论各自的日期。 */
+type ListingContext = {
+  title: string;
+  noteContent: string;
+  postDate: string;
+  authorComments: AuthorComment[];
+};
+
+type DeleteSignal =
+  | {
+      kind: "rented";
+      element: keyof ElementTexts;
+      snippet: string;
+      pattern: string;
+    }
+  | {
+      kind: "unavailable";
+      snippet: string;
+    }
+  | {
+      kind: "ai";
+      reason: string;
+      confidence: number;
+    };
+
+type AiJudgement = {
+  rented: boolean;
+  confidence: number;
+  reason: string;
+};
+
+type AiJudgeConfig = {
+  enabled: boolean;
+  apiKey: string | null;
+  model: string;
+  minConfidence: number;
+};
+
+type ScheduledCandidates = {
+  candidates: ListingRow[];
+  log: CheckedLog;
+  totalActive: number;
+  activeIds: string[];
+};
+
+/** 命中疑似风控/登录墙时抛出，让调用方整体暂停而不是当作单条检查失败。 */
+class XhsBlockedError extends Error {
+  readonly snippet: string;
+
+  constructor(snippet: string) {
+    super(`检测到疑似风控/登录墙：${snippet}`);
+    this.name = "XhsBlockedError";
+    this.snippet = snippet;
+  }
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -83,6 +192,14 @@ function envBoolean(name: string, fallback: boolean): boolean {
   );
 }
 
+function envString(name: string, fallback: string): string {
+  const rawValue = process.env[name];
+  if (!rawValue || rawValue.trim().length === 0) {
+    return fallback;
+  }
+  return rawValue.trim();
+}
+
 function randomInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
@@ -105,7 +222,7 @@ function snippetAround(text: string, index: number, length: number): string {
   return text.slice(start, end).trim();
 }
 
-function findRentedSignal(texts: ElementTexts): RentedSignal | null {
+function findRentedSignalByRule(texts: ElementTexts): DeleteSignal | null {
   const entries = Object.entries(texts) as [keyof ElementTexts, string][];
 
   for (const [element, rawText] of entries) {
@@ -126,6 +243,7 @@ function findRentedSignal(texts: ElementTexts): RentedSignal | null {
       }
 
       return {
+        kind: "rented",
         element,
         snippet,
         pattern: pattern.source,
@@ -134,6 +252,211 @@ function findRentedSignal(texts: ElementTexts): RentedSignal | null {
   }
 
   return null;
+}
+
+function formatDeleteSignal(signal: DeleteSignal): string {
+  if (signal.kind === "unavailable") {
+    return `内容不可查看：${signal.snippet}`;
+  }
+
+  if (signal.kind === "ai") {
+    return `AI 判断已出租（置信度 ${signal.confidence.toFixed(2)}）：${signal.reason}`;
+  }
+
+  return `规则命中已出租 ${signal.element}：${signal.snippet}`;
+}
+
+function parseAiJudgement(raw: unknown): AiJudgement | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const value = raw as Record<string, unknown>;
+  if (typeof value.rented !== "boolean") {
+    return null;
+  }
+
+  const confidence =
+    typeof value.confidence === "number" && Number.isFinite(value.confidence)
+      ? Math.min(1, Math.max(0, value.confidence))
+      : 0.5;
+  const reason =
+    typeof value.reason === "string" && value.reason.trim().length > 0
+      ? value.reason.trim()
+      : "AI 未提供原因";
+
+  return { rented: value.rented, confidence, reason };
+}
+
+function formatAuthorCommentsForPrompt(comments: AuthorComment[]): string {
+  if (comments.length === 0) {
+    return "（作者本人没有在评论区发言）";
+  }
+
+  return comments
+    .map((comment) => `- [${comment.date || "日期未知"}] ${comment.text}`)
+    .join("\n");
+}
+
+/**
+ * 用 OpenAI 判断帖子是否已经出租/下架。纯规则正则容易漏掉像"【已租】"这类
+ * 没有恰好命中固定词组的写法，AI 能理解语义，作为主判断；请求失败或未配置
+ * API key 时返回 null，由调用方回退到规则判断。
+ */
+async function judgeRentedWithAi(
+  config: Pick<AiJudgeConfig, "apiKey" | "model">,
+  context: ListingContext
+): Promise<AiJudgement | null> {
+  if (!config.apiKey) {
+    return null;
+  }
+
+  const todayText = new Date().toISOString().slice(0, 10);
+  const userContent = [
+    `今天日期：${todayText}`,
+    `帖子发布/编辑时间：${context.postDate || "（未知）"}`,
+    `标题：${context.title.trim() || "（无）"}`,
+    `正文：${context.noteContent.trim().slice(0, 2000) || "（无）"}`,
+    `作者本人评论（已排除所有路人发言）：\n${formatAuthorCommentsForPrompt(context.authorComments)}`,
+  ].join("\n\n");
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), AI_JUDGE_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(OPENAI_CHAT_COMPLETIONS_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: config.model,
+        temperature: 0,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: AI_JUDGE_SYSTEM_PROMPT },
+          { role: "user", content: userContent },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => "");
+      console.warn(
+        `[ai] 请求失败 status=${response.status}：${errorBody.slice(0, 200)}`
+      );
+      return null;
+    }
+
+    const payload = (await response.json()) as {
+      choices?: { message?: { content?: string } }[];
+    };
+    const content = payload.choices?.[0]?.message?.content;
+    if (!content) {
+      console.warn("[ai] 响应中没有 content");
+      return null;
+    }
+
+    return parseAiJudgement(JSON.parse(content));
+  } catch (error) {
+    console.warn("[ai] 判断失败，回退到规则判断:", error);
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * AI 是主判断：AI 明确给出结论（无论是否已出租）就直接采信；
+ * 只有 AI 未启用/请求失败/置信度不够时，才回退到正则规则判断。
+ */
+async function resolveDeleteSignal(
+  texts: ElementTexts,
+  context: ListingContext,
+  aiConfig: AiJudgeConfig
+): Promise<DeleteSignal | null> {
+  if (aiConfig.enabled) {
+    const judgement = await judgeRentedWithAi(aiConfig, context);
+    if (judgement) {
+      console.log(
+        `[ai] rented=${judgement.rented} confidence=${judgement.confidence.toFixed(2)} reason=${judgement.reason}`
+      );
+
+      if (judgement.rented && judgement.confidence >= aiConfig.minConfidence) {
+        return {
+          kind: "ai",
+          reason: judgement.reason,
+          confidence: judgement.confidence,
+        };
+      }
+
+      if (!judgement.rented) {
+        return null;
+      }
+      // AI 认为已出租但置信度不够，交给规则再确认一次
+    }
+  }
+
+  return findRentedSignalByRule(texts);
+}
+
+async function detectUnavailableToast(
+  page: Page
+): Promise<DeleteSignal | null> {
+  const deadline = Date.now() + UNAVAILABLE_TOAST_WINDOW_MS;
+
+  while (Date.now() < deadline) {
+    const toastVisible = await page
+      .getByText(UNAVAILABLE_CONTENT_PATTERN)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (toastVisible) {
+      return {
+        kind: "unavailable",
+        snippet: "该内容暂时无法查看",
+      };
+    }
+
+    const bodyText = normalizeVisibleText(
+      await page
+        .locator("body")
+        .innerText({ timeout: 1000 })
+        .catch(() => "")
+    );
+    if (UNAVAILABLE_CONTENT_PATTERN.test(bodyText)) {
+      return {
+        kind: "unavailable",
+        snippet: "该内容暂时无法查看",
+      };
+    }
+
+    await delay(UNAVAILABLE_TOAST_POLL_MS);
+  }
+
+  return null;
+}
+
+/** 检测扫码登录/验证墙/访问频繁等风控信号；持续存在的墙面，不需要像浮层提示那样长时间轮询。 */
+async function detectBlockedOrLoginRequired(
+  page: Page
+): Promise<string | null> {
+  await humanPause(BLOCK_DETECT_MIN_WAIT_MS, BLOCK_DETECT_MAX_WAIT_MS);
+
+  const bodyText = normalizeVisibleText(
+    await page
+      .locator("body")
+      .innerText({ timeout: 2000 })
+      .catch(() => "")
+  );
+  const match = BLOCK_OR_LOGIN_PATTERN.exec(bodyText);
+  if (!match || match.index === undefined) {
+    return null;
+  }
+
+  return snippetAround(bodyText, match.index, match[0].length);
 }
 
 async function createBrowserContext(
@@ -168,6 +491,43 @@ async function waitForXhsContent(page: Page): Promise<void> {
     .catch(ignoreOptionalError);
 }
 
+/**
+ * 只提取评论区里"作者本人"的发言（通过 .author-wrapper 里是否带"作者" tag 判断），
+ * 路人的评论完全不采集，从源头上保证后续判断绝对不会被路人干扰。
+ */
+function extractAuthorComments(page: Page): Promise<AuthorComment[]> {
+  return page
+    .evaluate(() => {
+      const items = Array.from(
+        document.querySelectorAll(".comments-container .comment-item")
+      );
+      const results: { text: string; date: string }[] = [];
+
+      for (const item of items) {
+        const tagEl = item.querySelector(".author-wrapper .tag");
+        const isAuthor = tagEl?.textContent?.trim() === "作者";
+        if (!isAuthor) {
+          continue;
+        }
+
+        const contentEl = item.querySelector(".content");
+        const dateEl = item.querySelector(".info .date span");
+        const text = contentEl?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+        if (text.length === 0) {
+          continue;
+        }
+
+        results.push({
+          text,
+          date: dateEl?.textContent?.trim() ?? "",
+        });
+      }
+
+      return results;
+    })
+    .catch(() => []);
+}
+
 async function humanPause(minMs = 900, maxMs = 3500): Promise<void> {
   await delay(randomInt(minMs, maxMs));
 }
@@ -185,18 +545,39 @@ async function lightlyScroll(page: Page): Promise<void> {
 
 async function readListingPage(
   page: Page,
-  sourceUrl: string
-): Promise<ElementTexts> {
+  sourceUrl: string,
+  aiConfig: AiJudgeConfig
+): Promise<{ signal: DeleteSignal | null; texts: ElementTexts }> {
   await page.goto(sourceUrl, {
     waitUntil: "domcontentloaded",
     timeout: PAGE_TIMEOUT_MS,
   });
+
+  const blockedSnippet = await detectBlockedOrLoginRequired(page);
+  if (blockedSnippet) {
+    throw new XhsBlockedError(blockedSnippet);
+  }
+
+  const unavailableSignal = await detectUnavailableToast(page);
+  if (unavailableSignal) {
+    return {
+      signal: unavailableSignal,
+      texts: {
+        title: "",
+        noteContent: "",
+        comments: "",
+      },
+    };
+  }
 
   await waitForXhsContent(page);
   await humanPause(1500, 5000);
 
   const title = await safeInnerText(page, "#detail-title");
   const noteContent = await safeInnerText(page, ".note-content");
+  const postDate = normalizeVisibleText(
+    await safeInnerText(page, ".note-content .bottom-container .date")
+  );
 
   await page
     .locator(".comments-container")
@@ -205,12 +586,19 @@ async function readListingPage(
     .catch(ignoreOptionalError);
   await lightlyScroll(page);
 
-  const comments = await safeInnerText(page, ".comments-container");
-
-  return {
+  const authorComments = await extractAuthorComments(page);
+  const comments = formatAuthorCommentsForPrompt(authorComments);
+  const texts: ElementTexts = { title, noteContent, comments };
+  const context: ListingContext = {
     title,
     noteContent,
-    comments,
+    postDate,
+    authorComments,
+  };
+
+  return {
+    signal: await resolveDeleteSignal(texts, context, aiConfig),
+    texts,
   };
 }
 
@@ -225,6 +613,47 @@ function loadCandidates(sql: postgres.Sql): Promise<ListingRow[]> {
       AND "sourceUrl" NOT LIKE 'pending:%'
     ORDER BY random()
   `;
+}
+
+/**
+ * 拉取数据库全量候选，用本地记录裁剪掉已不存在的 id、过滤掉冷却期内的，
+ * 再按"最久未查看"升序排列（从未查看过的排最前面）。
+ */
+async function fetchScheduledCandidates(
+  sql: postgres.Sql,
+  log: CheckedLog,
+  cooldownMs: number
+): Promise<ScheduledCandidates> {
+  const dbRows = await loadCandidates(sql);
+  const activeIds = dbRows.map((row) => row.id);
+  const activeIdSet = new Set(activeIds);
+  const prunedLog = pruneCheckedLog(log, activeIdSet);
+  const now = Date.now();
+
+  const eligible = dbRows.filter(
+    (row) => !isWithinCooldown(prunedLog, row.id, cooldownMs, now)
+  );
+
+  const sorted = eligible
+    .map((row, index) => ({
+      row,
+      index,
+      priority: priorityTimestamp(prunedLog, row.id),
+    }))
+    .sort((a, b) => {
+      if (a.priority !== b.priority) {
+        return a.priority - b.priority;
+      }
+      return a.index - b.index;
+    })
+    .map((entry) => entry.row);
+
+  return {
+    candidates: sorted,
+    log: prunedLog,
+    totalActive: dbRows.length,
+    activeIds,
+  };
 }
 
 async function deleteListing(
@@ -261,27 +690,106 @@ async function main(): Promise<void> {
     "XHS_CLEANER_MAX_DELAY_SECONDS",
     DEFAULT_MAX_DELAY_SECONDS
   );
+  const cooldownHours = envNumber(
+    "XHS_CLEANER_COOLDOWN_HOURS",
+    DEFAULT_COOLDOWN_HOURS
+  );
+  const blockPauseMinMinutes = envNumber(
+    "XHS_CLEANER_BLOCK_PAUSE_MIN_MINUTES",
+    DEFAULT_BLOCK_PAUSE_MIN_MINUTES
+  );
+  const blockPauseMaxMinutes = envNumber(
+    "XHS_CLEANER_BLOCK_PAUSE_MAX_MINUTES",
+    DEFAULT_BLOCK_PAUSE_MAX_MINUTES
+  );
+  const logPath = envString("XHS_CLEANER_LOG_PATH", DEFAULT_LOG_PATH);
   const headless = envBoolean("XHS_CLEANER_HEADLESS", false);
   const dryRun = envBoolean("XHS_CLEANER_DRY_RUN", false);
+  const aiJudgeRequested = envBoolean("XHS_CLEANER_AI_JUDGE", true);
+  const aiModel = envString("XHS_CLEANER_AI_MODEL", DEFAULT_AI_MODEL);
+  const aiMinConfidence = envNumber(
+    "XHS_CLEANER_AI_MIN_CONFIDENCE",
+    DEFAULT_AI_MIN_CONFIDENCE
+  );
 
   if (minDelaySeconds > maxDelaySeconds) {
     throw new Error(
       "XHS_CLEANER_MIN_DELAY_SECONDS must be <= XHS_CLEANER_MAX_DELAY_SECONDS"
     );
   }
+  if (blockPauseMinMinutes > blockPauseMaxMinutes) {
+    throw new Error(
+      "XHS_CLEANER_BLOCK_PAUSE_MIN_MINUTES must be <= XHS_CLEANER_BLOCK_PAUSE_MAX_MINUTES"
+    );
+  }
+  if (aiMinConfidence > 1) {
+    throw new Error("XHS_CLEANER_AI_MIN_CONFIDENCE must be between 0 and 1");
+  }
+
+  const openaiApiKey = process.env.OPENAI_API_KEY?.trim() || null;
+  if (aiJudgeRequested && !openaiApiKey) {
+    console.warn(
+      "[ai] 已请求启用 AI 判断，但没有配置 OPENAI_API_KEY，将只用正则规则判断"
+    );
+  }
+  const aiConfig: AiJudgeConfig = {
+    enabled: aiJudgeRequested && Boolean(openaiApiKey),
+    apiKey: openaiApiKey,
+    model: aiModel,
+    minConfidence: aiMinConfidence,
+  };
+
+  const cooldownMs = cooldownHours * 60 * 60 * 1000;
 
   const sql = postgres(postgresUrl, { max: 1 });
   const context = await createBrowserContext(headless);
 
+  let checkedLog = await loadCheckedLog(logPath);
   let candidates: ListingRow[] = [];
   let checkedInWindow = 0;
   let deletedInWindow = 0;
   let windowStartedAt = Date.now();
 
+  const persistLog = async (): Promise<void> => {
+    await saveCheckedLog(logPath, checkedLog).catch((error) => {
+      console.error("[log] 保存记录文件失败:", error);
+    });
+  };
+
+  let shuttingDown = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    console.log(`\n[shutdown] 收到 ${signal}，正在保存记录并退出...`);
+    await persistLog();
+    await context.close().catch(ignoreOptionalError);
+    await sql.end({ timeout: 5 }).catch(ignoreOptionalError);
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => {
+    shutdown("SIGINT").catch((error) => {
+      console.error("[shutdown] 出错:", error);
+      process.exit(1);
+    });
+  });
+  process.on("SIGTERM", () => {
+    shutdown("SIGTERM").catch((error) => {
+      console.error("[shutdown] 出错:", error);
+      process.exit(1);
+    });
+  });
+
   console.log(
-    `[start] dailyLimit=${dailyLimit}, delay=${minDelaySeconds}-${maxDelaySeconds}s, headless=${headless}, dryRun=${dryRun}`
+    `[start] dailyLimit=${dailyLimit}, delay=${minDelaySeconds}-${maxDelaySeconds}s, cooldown=${cooldownHours}h, blockPause=${blockPauseMinMinutes}-${blockPauseMaxMinutes}min, headless=${headless}, dryRun=${dryRun}`
+  );
+  console.log(
+    `[ai] enabled=${aiConfig.enabled}, model=${aiConfig.model}, minConfidence=${aiConfig.minConfidence}`
   );
   console.log(`[browser] 使用持久化 profile：${PROFILE_DIR}`);
+  console.log(`[log] 使用本地记录文件：${logPath}`);
 
   try {
     while (true) {
@@ -306,8 +814,21 @@ async function main(): Promise<void> {
       }
 
       if (candidates.length === 0) {
-        candidates = await loadCandidates(sql);
-        console.log(`[db] 本轮随机候选 ${candidates.length} 条`);
+        const scheduled = await fetchScheduledCandidates(
+          sql,
+          checkedLog,
+          cooldownMs
+        );
+        checkedLog = scheduled.log;
+        candidates = scheduled.candidates;
+
+        const summary = summarizeCheckedLog(checkedLog, scheduled.activeIds);
+        const cooldownSkipped = scheduled.totalActive - candidates.length;
+        console.log(
+          `[db] 候选总数=${scheduled.totalActive}，可查看=${candidates.length}，冷却中=${cooldownSkipped}，从未查看=${summary.neverChecked}，最早查看=${summary.oldestCheckedAt ?? "无"}`
+        );
+        await persistLog();
+
         if (candidates.length === 0) {
           await delay(30 * 60 * 1000);
           continue;
@@ -319,48 +840,75 @@ async function main(): Promise<void> {
         continue;
       }
 
+      let blockedSnippet: string | null = null;
       const page = await context.newPage();
       try {
         console.log(
           `[check] ${checkedInWindow + 1}/${dailyLimit} ${row.id} ${row.sourceUrl}`
         );
-        const texts = await readListingPage(page, row.sourceUrl);
-        const signal = findRentedSignal(texts);
+        const { signal } = await readListingPage(page, row.sourceUrl, aiConfig);
         checkedInWindow += 1;
 
         if (!signal) {
-          console.log(`[keep] 未发现已出租信号：${row.id}`);
+          console.log(`[keep] 未发现删除信号：${row.id}`);
+          checkedLog = recordCheckedResult(checkedLog, row.id, "kept");
         } else if (dryRun) {
           console.log(
-            `[dry-run] 将删除 ${row.id}，命中 ${signal.element}：${signal.snippet}`
+            `[dry-run] 将删除 ${row.id}，${formatDeleteSignal(signal)}`
           );
+          checkedLog = recordCheckedResult(checkedLog, row.id, "kept");
         } else {
           const deleted = await deleteListing(sql, row);
           if (deleted) {
             deletedInWindow += 1;
             console.log(
-              `[delete] 已删除 ${row.id}，命中 ${signal.element}：${signal.snippet}`
+              `[delete] 已删除 ${row.id}，${formatDeleteSignal(signal)}`
             );
           } else {
             console.log(
               `[skip] 删除时未找到行，可能已被其他任务处理：${row.id}`
             );
           }
+          checkedLog = forgetChecked(checkedLog, row.id);
         }
 
         console.log(
           `[stats] 24小时窗口 checked=${checkedInWindow}, deleted=${deletedInWindow}`
         );
       } catch (error) {
-        checkedInWindow += 1;
-        console.error(`[error] 检查失败 ${row.id}:`, error);
+        if (error instanceof XhsBlockedError) {
+          blockedSnippet = error.snippet;
+        } else {
+          checkedInWindow += 1;
+          const previousErrors = checkedLog[row.id]?.consecutiveErrors ?? 0;
+          const keepStaleForRetry =
+            previousErrors + 1 < ERROR_BACKOFF_THRESHOLD;
+          checkedLog = recordCheckedResult(checkedLog, row.id, "error", {
+            keepStaleForRetry,
+          });
+          console.error(`[error] 检查失败 ${row.id}:`, error);
+        }
       } finally {
         await page.close().catch(ignoreOptionalError);
       }
 
+      if (blockedSnippet) {
+        candidates.unshift(row);
+        const pauseMs =
+          randomInt(blockPauseMinMinutes, blockPauseMaxMinutes) * 60 * 1000;
+        console.warn(
+          `[block] 疑似触发风控/登录墙：${blockedSnippet}，暂停 ${Math.round(pauseMs / 60_000)} 分钟后继续`
+        );
+        await persistLog();
+        await delay(pauseMs);
+        continue;
+      }
+
+      await persistLog();
       await sleepBetweenChecks(minDelaySeconds, maxDelaySeconds);
     }
   } finally {
+    await persistLog();
     await context.close();
     await sql.end();
   }
