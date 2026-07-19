@@ -1,7 +1,7 @@
 import {
   resolveXhsRecordKind,
-  type XhsRecordKind,
   updateXhsRecordSourceUrl,
+  type XhsRecordKind,
 } from "@/lib/db/queries";
 
 const corsHeaders = {
@@ -93,6 +93,7 @@ export async function POST(request: Request) {
   return jsonWithCors({
     ok: true,
     id: row.id,
+    duplicate: row.duplicate,
     sourceUrl: row.sourceUrl,
     listingKind: resolvedKind,
   });

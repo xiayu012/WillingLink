@@ -1,5 +1,6 @@
 ﻿import "server-only";
 
+import { createHash } from "node:crypto";
 import {
   and,
   asc,
@@ -11,11 +12,14 @@ import {
   inArray,
   isNotNull,
   lt,
+  or,
   type SQL,
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
+
 type ArtifactKind = string; // artifact component removed
+
 import type { VisibilityType } from "@/components/visibility-selector";
 import { ChatSDKError } from "../errors";
 import { generateUUID } from "../utils";
@@ -705,7 +709,10 @@ export async function saveShift({
     await db.insert(shift).values({
       id,
       whattodo,
-      startTime: typeof startTime === "string" ? new Date(startTime) : (startTime ?? null),
+      startTime:
+        typeof startTime === "string"
+          ? new Date(startTime)
+          : (startTime ?? null),
       location,
       skillsNeeded,
       whoIsBeingHelped,
@@ -855,40 +862,101 @@ export async function resolveXhsRecordKind(
   return null;
 }
 
+export type UpdateXhsSourceUrlResult = {
+  id: string;
+  sourceUrl: string;
+  duplicate: boolean;
+};
+
+/**
+ * Attach a real sourceUrl to a pending row. If that sourceUrl already
+ * belongs to another (previously confirmed) row — the partial unique index
+ * on sourceUrl fires — this is a genuine duplicate submission: leave the
+ * pending row untouched and hand back the existing row's id instead of
+ * throwing an unhandled unique_violation.
+ */
 export async function updateXhsListingSourceUrl(
   listingId: string,
   sourceUrl: string
-) {
-  const [row] = await db
-    .update(xhsRentalListing)
-    .set({ sourceUrl })
-    .where(eq(xhsRentalListing.id, listingId))
-    .returning({ id: xhsRentalListing.id, sourceUrl: xhsRentalListing.sourceUrl });
-  return row ?? null;
+): Promise<UpdateXhsSourceUrlResult | null> {
+  try {
+    const [row] = await db
+      .update(xhsRentalListing)
+      .set({ sourceUrl })
+      .where(eq(xhsRentalListing.id, listingId))
+      .returning({
+        id: xhsRentalListing.id,
+        sourceUrl: xhsRentalListing.sourceUrl,
+      });
+    return row ? { ...row, duplicate: false } : null;
+  } catch (err) {
+    if (!isUniqueViolation(err)) {
+      throw err;
+    }
+    const [existing] = await db
+      .select({
+        id: xhsRentalListing.id,
+        sourceUrl: xhsRentalListing.sourceUrl,
+      })
+      .from(xhsRentalListing)
+      .where(eq(xhsRentalListing.sourceUrl, sourceUrl))
+      .limit(1);
+    return existing ? { ...existing, duplicate: true } : null;
+  }
 }
 
 export async function updateXhsWantedSourceUrl(
   wantedId: string,
   sourceUrl: string
-) {
-  const [row] = await db
-    .update(xhsRentalWanted)
-    .set({ sourceUrl })
-    .where(eq(xhsRentalWanted.id, wantedId))
-    .returning({ id: xhsRentalWanted.id, sourceUrl: xhsRentalWanted.sourceUrl });
-  return row ?? null;
+): Promise<UpdateXhsSourceUrlResult | null> {
+  try {
+    const [row] = await db
+      .update(xhsRentalWanted)
+      .set({ sourceUrl })
+      .where(eq(xhsRentalWanted.id, wantedId))
+      .returning({
+        id: xhsRentalWanted.id,
+        sourceUrl: xhsRentalWanted.sourceUrl,
+      });
+    return row ? { ...row, duplicate: false } : null;
+  } catch (err) {
+    if (!isUniqueViolation(err)) {
+      throw err;
+    }
+    const [existing] = await db
+      .select({ id: xhsRentalWanted.id, sourceUrl: xhsRentalWanted.sourceUrl })
+      .from(xhsRentalWanted)
+      .where(eq(xhsRentalWanted.sourceUrl, sourceUrl))
+      .limit(1);
+    return existing ? { ...existing, duplicate: true } : null;
+  }
 }
 
 export async function updateXhsOtherSourceUrl(
   otherId: string,
   sourceUrl: string
-) {
-  const [row] = await db
-    .update(xhsRentalOther)
-    .set({ sourceUrl })
-    .where(eq(xhsRentalOther.id, otherId))
-    .returning({ id: xhsRentalOther.id, sourceUrl: xhsRentalOther.sourceUrl });
-  return row ?? null;
+): Promise<UpdateXhsSourceUrlResult | null> {
+  try {
+    const [row] = await db
+      .update(xhsRentalOther)
+      .set({ sourceUrl })
+      .where(eq(xhsRentalOther.id, otherId))
+      .returning({
+        id: xhsRentalOther.id,
+        sourceUrl: xhsRentalOther.sourceUrl,
+      });
+    return row ? { ...row, duplicate: false } : null;
+  } catch (err) {
+    if (!isUniqueViolation(err)) {
+      throw err;
+    }
+    const [existing] = await db
+      .select({ id: xhsRentalOther.id, sourceUrl: xhsRentalOther.sourceUrl })
+      .from(xhsRentalOther)
+      .where(eq(xhsRentalOther.sourceUrl, sourceUrl))
+      .limit(1);
+    return existing ? { ...existing, duplicate: true } : null;
+  }
 }
 
 export async function updateXhsRecordSourceUrl(
@@ -1015,7 +1083,12 @@ export async function appendXhsOtherImageById(
 
   const existing = rows[0];
   if (!existing) {
-    return { id: null, imageUrlsLength: 0, duplicated: false, listingFound: false };
+    return {
+      id: null,
+      imageUrlsLength: 0,
+      duplicated: false,
+      listingFound: false,
+    };
   }
 
   const list: string[] = Array.isArray(existing.imageUrls)
@@ -1023,7 +1096,12 @@ export async function appendXhsOtherImageById(
     : [];
 
   if (list.includes(blobPublicUrl)) {
-    return { id: existing.id, imageUrlsLength: list.length, duplicated: true, listingFound: true };
+    return {
+      id: existing.id,
+      imageUrlsLength: list.length,
+      duplicated: true,
+      listingFound: true,
+    };
   }
 
   list.push(blobPublicUrl);
@@ -1032,7 +1110,12 @@ export async function appendXhsOtherImageById(
     .set({ imageUrls: list })
     .where(eq(xhsRentalOther.id, existing.id));
 
-  return { id: existing.id, imageUrlsLength: list.length, duplicated: false, listingFound: true };
+  return {
+    id: existing.id,
+    imageUrlsLength: list.length,
+    duplicated: false,
+    listingFound: true,
+  };
 }
 
 export async function appendXhsRecordImageById(
@@ -1058,6 +1141,27 @@ export async function appendXhsRecordImageById(
   };
 }
 
+/**
+ * SHA-256 of rawText (hex). Used for content-based deduplication —
+ * catches the same post being submitted again before a real share URL
+ * (sourceUrl starts with "pending:...") has been captured.
+ */
+function sha256(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/** True if err is a Postgres unique_violation (23505), e.g. from onConflictDoNothing-less UPDATE. */
+function isUniqueViolation(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    (err as { code?: string }).code === "23505"
+  );
+}
+
+export type CreateXhsRecordResult = { id: string; duplicate: boolean };
+
 export type CreateXhsRentalOtherInput = {
   sourceUrl: string;
   rawText: string;
@@ -1066,7 +1170,16 @@ export type CreateXhsRentalOtherInput = {
   postedAt?: Date | null;
 };
 
-export async function createXhsRentalOther(input: CreateXhsRentalOtherInput) {
+/**
+ * Insert a "other" post. Deduplicated on (sourceUrl) and (contentHash of rawText):
+ * a matching real sourceUrl, or identical rawText submitted again while still
+ * "pending:", silently resolves to the existing row instead of erroring or
+ * inserting a duplicate.
+ */
+export async function createXhsRentalOther(
+  input: CreateXhsRentalOtherInput
+): Promise<CreateXhsRecordResult | null> {
+  const contentHash = sha256(input.rawText);
   const [row] = await db
     .insert(xhsRentalOther)
     .values({
@@ -1076,9 +1189,29 @@ export async function createXhsRentalOther(input: CreateXhsRentalOtherInput) {
       aiReason: input.aiReason ?? null,
       postedAt: input.postedAt ?? null,
       createdAt: new Date(),
+      contentHash,
     })
+    .onConflictDoNothing()
     .returning({ id: xhsRentalOther.id });
-  return row ?? null;
+
+  if (row) {
+    return { id: row.id, duplicate: false };
+  }
+
+  const isPending = input.sourceUrl.startsWith("pending:");
+  const [existing] = await db
+    .select({ id: xhsRentalOther.id })
+    .from(xhsRentalOther)
+    .where(
+      isPending
+        ? eq(xhsRentalOther.contentHash, contentHash)
+        : or(
+            eq(xhsRentalOther.sourceUrl, input.sourceUrl),
+            eq(xhsRentalOther.contentHash, contentHash)
+          )
+    )
+    .limit(1);
+  return existing ? { id: existing.id, duplicate: true } : null;
 }
 
 export type CreateXhsRentalWantedInput = {
@@ -1107,7 +1240,14 @@ export type CreateXhsRentalWantedInput = {
   postedAt?: Date | null;
 };
 
-export async function createXhsRentalWanted(input: CreateXhsRentalWantedInput) {
+/**
+ * Insert a "wanted" post. Same dedup rule as createXhsRentalOther: matching
+ * sourceUrl or contentHash resolves to the existing row instead of duplicating.
+ */
+export async function createXhsRentalWanted(
+  input: CreateXhsRentalWantedInput
+): Promise<CreateXhsRecordResult | null> {
+  const contentHash = sha256(input.rawText);
   const [row] = await db
     .insert(xhsRentalWanted)
     .values({
@@ -1135,9 +1275,29 @@ export async function createXhsRentalWanted(input: CreateXhsRentalWantedInput) {
       aiReason: input.aiReason ?? null,
       postedAt: input.postedAt ?? null,
       createdAt: new Date(),
+      contentHash,
     })
+    .onConflictDoNothing()
     .returning({ id: xhsRentalWanted.id });
-  return row ?? null;
+
+  if (row) {
+    return { id: row.id, duplicate: false };
+  }
+
+  const isPending = input.sourceUrl.startsWith("pending:");
+  const [existing] = await db
+    .select({ id: xhsRentalWanted.id })
+    .from(xhsRentalWanted)
+    .where(
+      isPending
+        ? eq(xhsRentalWanted.contentHash, contentHash)
+        : or(
+            eq(xhsRentalWanted.sourceUrl, input.sourceUrl),
+            eq(xhsRentalWanted.contentHash, contentHash)
+          )
+    )
+    .limit(1);
+  return existing ? { id: existing.id, duplicate: true } : null;
 }
 
 /** Parse monthly rent text to integer (100–15000 USD). Returns null if unparseable. */
@@ -1145,13 +1305,19 @@ function parseRentNumeric(rent: string | null | undefined): number | null {
   if (!rent) return null;
   const m = rent.match(/\d+/);
   if (!m) return null;
-  const n = parseInt(m[0], 10);
+  const n = Number.parseInt(m[0], 10);
   return n >= 100 && n <= 15_000 ? n : null;
 }
 
+/**
+ * Insert a rental listing. Same dedup rule as createXhsRentalOther: matching
+ * sourceUrl or contentHash (SHA-256 of rawText) resolves to the existing row
+ * instead of duplicating.
+ */
 export async function createXhsRentalListing(
   input: CreateXhsRentalListingInput
-) {
+): Promise<CreateXhsRecordResult | null> {
+  const contentHash = sha256(input.rawText);
   const [row] = await db
     .insert(xhsRentalListing)
     .values({
@@ -1179,9 +1345,29 @@ export async function createXhsRentalListing(
       couplesOk: input.couplesOk ?? null,
       utilitiesIncluded: input.utilitiesIncluded ?? null,
       parkingIncluded: input.parkingIncluded ?? null,
+      contentHash,
     })
+    .onConflictDoNothing()
     .returning({ id: xhsRentalListing.id });
-  return row ?? null;
+
+  if (row) {
+    return { id: row.id, duplicate: false };
+  }
+
+  const isPending = input.sourceUrl.startsWith("pending:");
+  const [existing] = await db
+    .select({ id: xhsRentalListing.id })
+    .from(xhsRentalListing)
+    .where(
+      isPending
+        ? eq(xhsRentalListing.contentHash, contentHash)
+        : or(
+            eq(xhsRentalListing.sourceUrl, input.sourceUrl),
+            eq(xhsRentalListing.contentHash, contentHash)
+          )
+    )
+    .limit(1);
+  return existing ? { id: existing.id, duplicate: true } : null;
 }
 
 export type AppendXhsListingImageResult = {
@@ -1674,7 +1860,9 @@ export async function searchXhsRentalWanted({
       gender: (row.gender as string | null) ?? null,
       requirements: (row.requirements as string | null) ?? null,
       contactMethod: (row.contactMethod as string | null) ?? null,
-      imageUrls: Array.isArray(row.imageUrls) ? (row.imageUrls as string[]) : null,
+      imageUrls: Array.isArray(row.imageUrls)
+        ? (row.imageUrls as string[])
+        : null,
       createdAt: row.createdAt as Date,
     }));
 

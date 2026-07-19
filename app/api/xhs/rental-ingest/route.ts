@@ -7,7 +7,10 @@ import {
   createXhsRentalWanted,
 } from "@/lib/db/queries";
 import { classifyPost } from "@/lib/xhs/classify-post";
-import { parseListingFields, parseWantedFields } from "@/lib/xhs/parse-rental-text";
+import {
+  parseListingFields,
+  parseWantedFields,
+} from "@/lib/xhs/parse-rental-text";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -55,7 +58,8 @@ export async function POST(request: Request) {
 
   if (broadCategory === "other") {
     // 真实写入 XhsRentalOther 表
-    const inferredTitle = rawText.split(/[\n。！？!?]/)[0]?.slice(0, 80) ?? null;
+    const inferredTitle =
+      rawText.split(/[\n。！？!?]/)[0]?.slice(0, 80) ?? null;
     const row = await createXhsRentalOther({
       sourceUrl: sourceUrlRaw,
       rawText,
@@ -64,12 +68,16 @@ export async function POST(request: Request) {
     });
 
     if (!row) {
-      return jsonWithCors({ ok: false, error: "Failed to save other post" }, 500);
+      return jsonWithCors(
+        { ok: false, error: "Failed to save other post" },
+        500
+      );
     }
 
     return jsonWithCors({
       ok: true,
       id: row.id,
+      duplicate: row.duplicate,
       sourceUrl: sourceUrlRaw,
       listingKind: "other",
       classification: {
@@ -114,12 +122,16 @@ export async function POST(request: Request) {
     });
 
     if (!row) {
-      return jsonWithCors({ ok: false, error: "Failed to save wanted post" }, 500);
+      return jsonWithCors(
+        { ok: false, error: "Failed to save wanted post" },
+        500
+      );
     }
 
     return jsonWithCors({
       ok: true,
       id: row.id,
+      duplicate: row.duplicate,
       sourceUrl: sourceUrlRaw,
       listingKind: "wanted",
       classification: {
@@ -157,6 +169,7 @@ export async function POST(request: Request) {
   return jsonWithCors({
     ok: true,
     id: row.id,
+    duplicate: row.duplicate,
     sourceUrl: sourceUrlRaw,
     listingKind: "listing",
     classification: {
