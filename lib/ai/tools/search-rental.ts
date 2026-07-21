@@ -35,6 +35,12 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { embedText, rerankDocuments } from "@/lib/ai/embeddings";
+import { type CityEntry, detectCity } from "@/lib/rental/cities";
+import {
+  applyHardConstraints,
+  extractHardConstraints,
+  hasAnyConstraint,
+} from "@/lib/rental/query-constraints";
 import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
 import {
   searchXhsRentalListings,
@@ -46,39 +52,6 @@ import {
 
 const VECTOR_CANDIDATES = 50;   // pgvector top-N before rerank
 const LAST_RESORT_LIMIT = 50;   // wider pool for Phase 4 last-resort rerank
-
-// ── City table ────────────────────────────────────────────────────────────────
-
-type CityEntry = {
-  re: RegExp;
-  en: string;
-  zh: string;
-  neighbors: string[];  // ≤3 adjacent cities to append to the query vector
-};
-
-const CITY_TABLE: CityEntry[] = [
-  { re: /圣何塞|San\s*Jose/i,             en: "San Jose",       zh: "圣何塞",    neighbors: ["Santa Clara", "Milpitas", "Sunnyvale"] },
-  { re: /旧金山|三藩市|San\s*Francisco/i,  en: "San Francisco",  zh: "旧金山",    neighbors: ["Daly City", "South San Francisco", "Oakland"] },
-  { re: /伯克利|Berkeley/i,               en: "Berkeley",       zh: "伯克利",    neighbors: ["Oakland", "Albany", "Emeryville"] },
-  { re: /奥克兰|Oakland/i,                en: "Oakland",        zh: "奥克兰",    neighbors: ["Berkeley", "Emeryville", "San Leandro"] },
-  { re: /帕罗奥图|帕洛阿尔托|Palo\s*Alto/i, en: "Palo Alto",    zh: "帕洛阿尔托", neighbors: ["Menlo Park", "Mountain View", "Los Altos"] },
-  { re: /山景城|Mountain\s*View/i,        en: "Mountain View",  zh: "山景城",    neighbors: ["Sunnyvale", "Palo Alto", "Los Altos"] },
-  { re: /桑尼维尔|Sunnyvale/i,            en: "Sunnyvale",      zh: "桑尼维尔",   neighbors: ["Santa Clara", "Mountain View", "Cupertino"] },
-  { re: /弗里蒙特|Fremont/i,              en: "Fremont",        zh: "弗里蒙特",   neighbors: ["Newark", "Union City", "Milpitas"] },
-  { re: /圣克拉拉|Santa\s*Clara/i,        en: "Santa Clara",    zh: "圣克拉拉",   neighbors: ["Sunnyvale", "San Jose", "Cupertino"] },
-  { re: /戴利城|Daly\s*City/i,            en: "Daly City",      zh: "戴利城",    neighbors: ["San Francisco", "South San Francisco", "Colma"] },
-  { re: /库比蒂诺|Cupertino/i,            en: "Cupertino",      zh: "库比蒂诺",   neighbors: ["Sunnyvale", "Santa Clara", "Saratoga"] },
-  { re: /圣马特奥|San\s*Mateo/i,          en: "San Mateo",      zh: "圣马特奥",   neighbors: ["Foster City", "Burlingame", "Redwood City"] },
-  { re: /红木城|Redwood\s*City/i,         en: "Redwood City",   zh: "红木城",    neighbors: ["San Carlos", "Menlo Park", "San Mateo"] },
-  { re: /圣克鲁斯|Santa\s*Cruz/i,         en: "Santa Cruz",     zh: "圣克鲁斯",   neighbors: ["Capitola", "Scotts Valley", "Aptos"] },
-];
-
-function detectCity(query: string): CityEntry | null {
-  for (const entry of CITY_TABLE) {
-    if (entry.re.test(query)) return entry;
-  }
-  return null;
-}
 
 // ── Geo-expansion (deterministic, no LLM) ────────────────────────────────────
 // Replaces any Chinese city name with its English form and appends ≤3 neighbors.
@@ -212,12 +185,24 @@ async function findNextListing(
   const city = detectCity(query);
   const expandedQuery = city ? lightGeoExpand(query, city) : query;
 
+  // Hard constraints (budget ceiling, bedroom count, move-in feasibility) are
+  // deterministic invariants a vector ranker cannot enforce. Recover them from
+  // the query and drop rows that PROVABLY violate them before ranking. Lenient
+  // by design: rows with an unparsed structured field are kept, and the whole
+  // step is a no-op when the query states no constraint.
+  const constraints = extractHardConstraints(query);
+  const constrained = (
+    rows: XhsRentalSearchResultRow[]
+  ): XhsRentalSearchResultRow[] => applyHardConstraints(rows, constraints);
+
   // ═══════════════════════════════════════════════════════════════════════════
   // Phase 1 — Vector search (semantic, best quality)
   // Uses geo-expanded query so neighbor-city listings are reachable.
   // ═══════════════════════════════════════════════════════════════════════════
 
-  const vectorCandidates = await vectorSearch(expandedQuery, excludeIds);
+  const vectorCandidates = constrained(
+    await vectorSearch(expandedQuery, excludeIds)
+  );
 
   // 1a: vector candidates that pass the block filter
   const vectorStrict = applyBlockFilter(vectorCandidates, blockTerms);
@@ -243,7 +228,7 @@ async function findNextListing(
     const { results: cityRows } = await searchXhsRentalListings({
       keywords: [city.en],
     });
-    const cityUnseen = filterExcluded(cityRows, excludeIds);
+    const cityUnseen = constrained(filterExcluded(cityRows, excludeIds));
 
     // 2a: strict
     const cityStrict = applyBlockFilter(cityUnseen, blockTerms);
@@ -274,7 +259,7 @@ async function findNextListing(
     const { results: kwRows } = await searchXhsRentalListings({
       keywords: nonCityKeywords,
     });
-    const kwUnseen = filterExcluded(kwRows, excludeIds);
+    const kwUnseen = constrained(filterExcluded(kwRows, excludeIds));
 
     // 3a: strict
     const kwStrict = applyBlockFilter(kwUnseen, blockTerms);
@@ -303,12 +288,27 @@ async function findNextListing(
   const { results: recentRows } = await searchXhsRentalListings({
     limit: LAST_RESORT_LIMIT,
   });
-  const remaining = filterExcluded(recentRows, excludeIds);
+  const remaining = constrained(filterExcluded(recentRows, excludeIds));
   if (remaining.length > 0) {
     return {
       listing: await pickBest(query, remaining),
       relaxedNote: "湾区内暂无完全匹配的房源，已从最近发布的所有房源中为您挑选最接近的",
     };
+  }
+
+  // Constraint-relaxed fallback: the tenant stated hard requirements (budget /
+  // bedrooms / move-in) but nothing in the pool satisfies them. Rather than
+  // dead-ending, surface the closest recent listing and clearly warn that it
+  // may not meet every requirement, so the user decides.
+  if (hasAnyConstraint(constraints)) {
+    const relaxed = filterExcluded(recentRows, excludeIds);
+    if (relaxed.length > 0) {
+      return {
+        listing: await pickBest(query, relaxed),
+        relaxedNote:
+          "没有完全满足预算 / 房型 / 入住时间要求的房源；以下是最接近的，请留意是否符合你的硬性条件。",
+      };
+    }
   }
 
   return null;

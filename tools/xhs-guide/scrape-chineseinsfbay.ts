@@ -693,10 +693,8 @@ async function main() {
     }
 
     let inserted = 0;
-    let updated = 0;
     let deduped = 0;
     let skipped = 0;
-    let failed = 0;
 
     for (let index = 0; index < threads.length; index += 1) {
       const candidate = threads[index];
@@ -760,122 +758,79 @@ async function main() {
       const uploadedImageUrls = await uploadImageUrls(blobToken, candidate.url, imageUrls);
       const uniqueUploaded = Array.from(new Set(uploadedImageUrls));
 
-      // 单条帖子的数据库写入独立 try/catch：任意一条失败只记录并跳过，
-      // 不能让整批（约 37 条）中断退出。
-      try {
-        const existing = existingByFingerprint.get(fp);
-        if (existing) {
-          if (uniqueUploaded.length > 0) {
-            const rows = (await sql`
-              select "imageUrls"
-              from "XhsRentalListing"
-              where "id" = ${existing.id}
-              limit 1
-            `) as Array<{ imageUrls: string[] | null }>;
-            const current = Array.isArray(rows[0]?.imageUrls) ? rows[0].imageUrls : [];
-            const merged = Array.from(new Set([...current, ...uniqueUploaded]));
-            await sql`
-              update "XhsRentalListing"
-              set "imageUrls" = ${JSON.stringify(merged)}::jsonb
-              where "id" = ${existing.id}
-            `;
-          }
-          deduped += 1;
-          continue;
+      const existing = existingByFingerprint.get(fp);
+      if (existing) {
+        if (uniqueUploaded.length > 0) {
+          const rows = (await sql`
+            select "imageUrls"
+            from "XhsRentalListing"
+            where "id" = ${existing.id}
+            limit 1
+          `) as Array<{ imageUrls: string[] | null }>;
+          const current = Array.isArray(rows[0]?.imageUrls) ? rows[0].imageUrls : [];
+          const merged = Array.from(new Set([...current, ...uniqueUploaded]));
+          await sql`
+            update "XhsRentalListing"
+            set "imageUrls" = ${JSON.stringify(merged)}::jsonb
+            where "id" = ${existing.id}
+          `;
         }
-
-        // sourceUrl 唯一约束 uq_listing_sourceurl 冲突时，改为更新最新抓取内容
-        // （价格、正文、联系方式、出租状态等），而不是报错退出。
-        // 只更新本次抓取得到的字段；id / createdAt / rentNumeric / city /
-        // petFriendly 等非本次抓取字段不写入 SET，保持原值不被重置。
-        const upsertedRows = (await sql`
-          insert into "XhsRentalListing" (
-            "sourceUrl",
-            "title",
-            "rawText",
-            "rent",
-            "deposit",
-            "availableFrom",
-            "leaseEndDate",
-            "listingType",
-            "bedrooms",
-            "bathrooms",
-            "roomType",
-            "propertyName",
-            "locationText",
-            "furnished",
-            "contactMethod",
-            "imageUrls",
-            "postedAt",
-            "createdAt"
-          ) values (
-            ${candidate.url},
-            ${normalizedStructured.title ?? title ?? candidate.title},
-            ${rawText},
-            ${normalizedStructured.rent},
-            ${normalizedStructured.deposit},
-            ${normalizedStructured.availableFrom},
-            ${normalizedStructured.leaseEndDate},
-            ${normalizedStructured.listingType},
-            ${normalizedStructured.bedrooms},
-            ${normalizedStructured.bathrooms},
-            ${normalizedStructured.roomType},
-            ${normalizedStructured.propertyName},
-            ${normalizedStructured.locationText},
-            ${normalizedStructured.furnished},
-            ${normalizedStructured.contactMethod},
-            ${JSON.stringify(uniqueUploaded)}::jsonb,
-            ${postedAt ? postedAt.toISOString() : null},
-            ${new Date().toISOString()}
-          )
-          on conflict ("sourceUrl") do update set
-            "title" = excluded."title",
-            "rawText" = excluded."rawText",
-            "rent" = excluded."rent",
-            "deposit" = excluded."deposit",
-            "availableFrom" = excluded."availableFrom",
-            "leaseEndDate" = excluded."leaseEndDate",
-            "listingType" = excluded."listingType",
-            "bedrooms" = excluded."bedrooms",
-            "bathrooms" = excluded."bathrooms",
-            "roomType" = excluded."roomType",
-            "propertyName" = excluded."propertyName",
-            "locationText" = excluded."locationText",
-            "furnished" = excluded."furnished",
-            "contactMethod" = excluded."contactMethod",
-            "postedAt" = coalesce(excluded."postedAt", "XhsRentalListing"."postedAt"),
-            "imageUrls" = (
-              select coalesce(jsonb_agg(distinct img), '[]'::jsonb)
-              from jsonb_array_elements(
-                coalesce("XhsRentalListing"."imageUrls"::jsonb, '[]'::jsonb)
-                || coalesce(excluded."imageUrls"::jsonb, '[]'::jsonb)
-              ) as img
-            )
-          returning "id", (xmax::text::bigint = 0) as inserted
-        `) as Array<{ id: string; inserted: boolean }>;
-
-        const row = upsertedRows[0];
-        const upsertedId = row?.id;
-        if (upsertedId) {
-          existingByFingerprint.set(fp, { id: upsertedId, fingerprint: fp });
-        }
-        if (row?.inserted) {
-          inserted += 1;
-          console.log(`[scrape] insert(新增): id=${upsertedId} url=${candidate.url}`);
-        } else {
-          updated += 1;
-          console.log(`[scrape] update(更新已有): id=${upsertedId} url=${candidate.url}`);
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.log(`[scrape] skip(写入失败): url=${candidate.url} error=${message}`);
-        failed += 1;
+        deduped += 1;
         continue;
       }
+
+      const insertedRows = (await sql`
+        insert into "XhsRentalListing" (
+          "sourceUrl",
+          "title",
+          "rawText",
+          "rent",
+          "deposit",
+          "availableFrom",
+          "leaseEndDate",
+          "listingType",
+          "bedrooms",
+          "bathrooms",
+          "roomType",
+          "propertyName",
+          "locationText",
+          "furnished",
+          "contactMethod",
+          "imageUrls",
+          "postedAt",
+          "createdAt"
+        ) values (
+          ${candidate.url},
+          ${normalizedStructured.title ?? title ?? candidate.title},
+          ${rawText},
+          ${normalizedStructured.rent},
+          ${normalizedStructured.deposit},
+          ${normalizedStructured.availableFrom},
+          ${normalizedStructured.leaseEndDate},
+          ${normalizedStructured.listingType},
+          ${normalizedStructured.bedrooms},
+          ${normalizedStructured.bathrooms},
+          ${normalizedStructured.roomType},
+          ${normalizedStructured.propertyName},
+          ${normalizedStructured.locationText},
+          ${normalizedStructured.furnished},
+          ${normalizedStructured.contactMethod},
+          ${JSON.stringify(uniqueUploaded)}::jsonb,
+          ${postedAt ? postedAt.toISOString() : null},
+          ${new Date().toISOString()}
+        )
+        returning "id"
+      `) as Array<{ id: string }>;
+
+      const insertedId = insertedRows[0]?.id;
+      if (insertedId) {
+        existingByFingerprint.set(fp, { id: insertedId, fingerprint: fp });
+      }
+      inserted += 1;
     }
 
     console.log(
-      `[scrape] 完成: inserted=${inserted}, updated=${updated}, deduped=${deduped}, skipped=${skipped}, failed=${failed}`
+      `[scrape] 完成: inserted=${inserted}, deduped=${deduped}, skipped=${skipped}`
     );
   } finally {
     await sql.end();

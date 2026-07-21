@@ -16,6 +16,11 @@
 import { tool } from "ai";
 import { z } from "zod";
 import {
+  checkMoveInFeasibility,
+  extractQueryDate,
+  parseFlexibleDate,
+} from "@/lib/rental/date-availability";
+import {
   getSeenListingIds,
   incrementSearchAttempts,
   markListingAsSeen,
@@ -153,13 +158,31 @@ export async function findNextWanted(
   const location = detectLocation(query);
   const keywords = extractKeywords(query);
 
+  // Move-in feasibility (mirror of the tenant side): a tenant can only move in
+  // ON or AFTER the landlord's unit is available. When the landlord's query
+  // states when the room is available, drop seekers whose move-in date is
+  // earlier than that. No-op when the query has no date.
+  const landlordAvailable = extractQueryDate(query);
+  const dateFeasible = (
+    rows: XhsRentalWantedSearchResultRow[]
+  ): XhsRentalWantedSearchResultRow[] => {
+    if (landlordAvailable.kind === "unknown") return rows;
+    return rows.filter(
+      (r) =>
+        checkMoveInFeasibility(
+          landlordAvailable,
+          parseFlexibleDate(r.moveInDate)
+        ) !== "infeasible"
+    );
+  };
+
   // Phase 1 — location + keywords, strict → up to 4 exact matches
   if (location || keywords.length > 0) {
     const { results } = await searchXhsRentalWanted({
       preferredLocation: location,
       keywords: keywords.length > 0 ? keywords : undefined,
     });
-    const unseen = filterExcluded(results, excludeIds);
+    const unseen = dateFeasible(filterExcluded(results, excludeIds));
 
     const strict = applyBlockFilter(unseen, blockTerms);
     if (strict.length > 0) {
@@ -179,7 +202,7 @@ export async function findNextWanted(
   // Phase 3 — location only, drop keywords → one relaxed post
   if (location && keywords.length > 0) {
     const { results } = await searchXhsRentalWanted({ preferredLocation: location });
-    const unseen = filterExcluded(results, excludeIds);
+    const unseen = dateFeasible(filterExcluded(results, excludeIds));
 
     const strict = applyBlockFilter(unseen, blockTerms);
     if (strict.length > 0) {
@@ -196,9 +219,12 @@ export async function findNextWanted(
     }
   }
 
-  // Phase 4 — last resort: one post from the 50 most recent
+  // Phase 4 — last resort: one post from the 50 most recent.
+  // Prefer move-in-feasible seekers, but never dead-end on the date alone.
   const { results: recent } = await searchXhsRentalWanted({ limit: 50 });
-  const unseen = filterExcluded(recent, excludeIds);
+  const recentUnseen = filterExcluded(recent, excludeIds);
+  const recentFeasible = dateFeasible(recentUnseen);
+  const unseen = recentFeasible.length > 0 ? recentFeasible : recentUnseen;
   if (unseen.length > 0) {
     return {
       wanted: [pickOne(unseen)],

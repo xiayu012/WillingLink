@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.8.0
+// @version      0.8.1
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.8.0";
+  const SCRIPT_VERSION = "0.8.1";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -396,6 +396,59 @@
     });
 
   const normalizeTitle = (text) => text.replace(/\s+/g, " ").trim();
+
+  // ---- 当天采集进度上报（很简陋）：只看 24 小时内、低频上报到后端，方便在 Vercel runtime log 里看进度 ----
+  const PROGRESS_STORAGE_KEY = "xhs-guide-progress";
+  const PROGRESS_MIN_INTERVAL_MS = 10 * 60 * 1000; // 最多 10 分钟报一次，避免刷屏
+  const todayKey = () => new Date().toISOString().slice(0, 10); // 跨天自动归零，只在意当天
+  const readProgress = () => {
+    try {
+      const raw = JSON.parse(localStorage.getItem(PROGRESS_STORAGE_KEY) || "{}");
+      if (raw && raw.day === todayKey()) {
+        return raw;
+      }
+    } catch {
+      /* ignore */
+    }
+    return { day: todayKey(), count: 0, lastReportAt: 0 };
+  };
+  const writeProgress = (p) => {
+    try {
+      localStorage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(p));
+    } catch {
+      /* 隐私模式没有 localStorage 就算了 */
+    }
+  };
+  const bumpTodayCount = () => {
+    const p = readProgress();
+    p.count += 1;
+    writeProgress(p);
+    return p.count;
+  };
+  const reportProgress = async (config, reason) => {
+    const baseUrl = config.ingest?.baseUrl?.trim();
+    if (!baseUrl) {
+      return;
+    }
+    const p = readProgress();
+    if (now() - (p.lastReportAt || 0) < PROGRESS_MIN_INTERVAL_MS) {
+      return; // 低频：距上次上报不足 10 分钟就跳过
+    }
+    p.lastReportAt = now();
+    writeProgress(p);
+    const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/progress`;
+    const body = JSON.stringify({
+      day: p.day,
+      count: p.count,
+      reason,
+      version: SCRIPT_VERSION,
+    });
+    try {
+      await gmHttpPost(url, { "Content-Type": "application/json" }, body);
+    } catch {
+      /* 进度上报失败无所谓，不影响主流程 */
+    }
+  };
 
   const makeCandidateId = (text, element) => {
     const rect = element.getBoundingClientRect();
@@ -2461,6 +2514,8 @@
 
         const ingestResult = await submitIngestAfterCopy(config, plainText);
         if (ingestResult) {
+          bumpTodayCount();
+          void reportProgress(config, "入库");
           state.listingId = ingestResult.id;
           state.listingKind = ingestResult.listingKind;
           state.shareUrlDone = false;
@@ -2910,6 +2965,7 @@
     }
 
     switchModeByUrl(config);
+    void reportProgress(config, "启动");
     state.currentUrl = window.location.href;
     state.routeTimer = window.setInterval(() => {
       if (window.location.href === state.currentUrl) {
