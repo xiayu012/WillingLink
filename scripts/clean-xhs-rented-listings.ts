@@ -65,26 +65,31 @@ const BLOCK_OR_LOGIN_PATTERN =
 
 const OPENAI_CHAT_COMPLETIONS_URL =
   "https://api.openai.com/v1/chat/completions";
-const DEFAULT_AI_MODEL = "gpt-4.1-mini";
-const DEFAULT_AI_MIN_CONFIDENCE = 0.6;
-const AI_JUDGE_TIMEOUT_MS = 15_000;
+const DEFAULT_AI_MODEL = "gpt-5.6-terra";
+const DEFAULT_AI_MIN_CONFIDENCE = 0.7;
+const AI_JUDGE_TIMEOUT_MS = 30_000;
+const MIN_EVIDENCE_QUOTE_LENGTH = 2;
 
-const AI_JUDGE_SYSTEM_PROMPT = `你是小红书租房帖状态判断器。给你标题、正文、帖子发布/编辑时间、今天日期，以及作者本人在评论区的发言和对应日期，判断这个房源当前是否已经不可租（已出租/已租出/租满/房源下架等）。
+const AI_JUDGE_SYSTEM_PROMPT = `你是小红书租房帖状态判断器，负责判断房源当前是否已经确定不可租（已出租/已租出/租满/下架等）。你的判断会直接触发删除数据库记录，这个操作不可撤销：错判"已出租"（把还能租的房源删掉）的代价，远大于错判"未出租"（把已经租出去的房源留着多检查几次）。所以必须非常谨慎、保守，宁可漏判，不能错判。
 
-重要：评论区里已经提前过滤掉了所有路人的发言，你看到的评论全部是作者本人说的话，可以直接当作房东/发帖人自己的最新说法来用，不用怀疑是路人。
+你会看到：今天日期、帖子发布/编辑时间、标题、正文，以及作者本人在评论区的发言和对应日期（评论区已经提前排除了所有路人发言，你看到的评论全部是作者本人说的话，可以直接当作房东自己的话来用，不用怀疑是路人）。
 
-最重要的原则——以最新时间为准：
-- 标题/正文的状态对应的是"帖子发布/编辑时间"这个时间点。
-- 每条作者评论的状态对应的是"该评论的日期"这个时间点。
-- 把这些时间点排序，永远相信时间最靠后（最新）的那条信息，忽略更早时间点的说法。
-- 例如：标题写着已出租、编辑时间是较晚的日期，即使有一条日期更早的作者评论说"在"或听起来还能租，也应该判定为已出租（因为那条评论发生在标题更新之前，已经过时）。反过来，如果作者在标题编辑之后又发了一条更晚日期的评论说"还有房"，则应判定为未出租。
+【绝对禁止的两种错误推理】（过去已经因为这两种推理错删过还在出租的房源，务必避免）：
+1. 禁止用"日期已经过去"来反推房源已经出租。比如正文写"入住截止到7月17日"，检查时是7月20日——这只能说明"帖子里写的这个日期已经过去了"，不能因此推断房源租出去了，也不能因此把作者当时的"可以""好的"之类的简短回复曲解成"没有房间了"的暗示。日期信息只能用来判断"多条信息里哪条更新"，永远不能单独作为已出租的证据。
+2. 禁止把模糊、双关、需要脑补才能理解的用词当作已出租的证据，常见的坑：
+   - "出" 单独出现（不是"已出""出了""出掉"），一般是回应别人"是不是在出租"的确认词，意思是"对，这个在出租/出售中"，跟"已经出租完毕"完全相反，不能当证据。
+   - "私你了"/"私您了"/"已私信"/"已经加你了"，表示作者主动私信联系了对方，只是在跟进咨询，跟房源是否已经租出完全无关。
+   - "可以"/"好的"/"在"/"嗯"/"是的" 等简短确认词，本身不包含任何关于房源状态的信息，不能单独作为证据。
 
-判断规则：
-- 标题或正文出现"已租""已出租""租出""租掉""出租完毕""没有房间了""[已出]"等，判定为已出租（除非有更晚时间点的作者评论明确说还没租出去/还有房）。
-- 作者本人评论明确说"已经租出去了""没有了""租满了"，也判定为已出租。
-- 找不到明确已出租信号时，判定为未出租（仍然可租）。
+【判断规则】
+- 只有当标题、正文或某条作者评论里，存在一段可以逐字摘出来的原文，而且这段原文本身（不需要你做任何额外推理、不需要联想上下文）就清楚地表达"已经出租/卖出/租满/下架"的完成语气（例如"已出租""已经租出去了""租出去了""租掉了""租满了""没有房间了""客满""下架"，或者独立的"已出""【已出】""[已出]"），才能判定为已出租。
+- 找到证据后，把这段原文一字不改地填进 evidenceQuote 字段；如果找不到符合上述标准的原文，直接判定为未出租，evidenceQuote 填空字符串 ""。
+- 如果多条信息互相矛盾，只用发布/编辑时间和评论日期判断"哪条信息更新"，采信更新的那条；但仍然要求那条更新的信息本身包含上面说的明确已出租原文，才能判定为已出租，光靠"这条更新所以应该更可信"这种推理本身不算证据。
+- 找不到明确证据时，一律判定为未出租（仍然可租）。
 
-只输出 JSON，格式为 {"rented": boolean, "confidence": 0到1之间的数字, "reason": "一句话原因，需要说明你依据的是哪个时间点的信息"}，不要输出任何其它文字。`;
+只输出 JSON，格式为：
+{"rented": boolean, "confidence": 0到1之间的数字, "reason": "一句话原因", "evidenceQuote": "你依据的逐字原文，找不到证据时填空字符串"}
+不要输出任何其它文字。`;
 
 type ListingRow = {
   id: string;
@@ -132,6 +137,7 @@ type AiJudgement = {
   rented: boolean;
   confidence: number;
   reason: string;
+  evidenceQuote: string;
 };
 
 type AiJudgeConfig = {
@@ -284,8 +290,36 @@ function parseAiJudgement(raw: unknown): AiJudgement | null {
     typeof value.reason === "string" && value.reason.trim().length > 0
       ? value.reason.trim()
       : "AI 未提供原因";
+  const evidenceQuote =
+    typeof value.evidenceQuote === "string" ? value.evidenceQuote.trim() : "";
 
-  return { rented: value.rented, confidence, reason };
+  return { rented: value.rented, confidence, reason, evidenceQuote };
+}
+
+function collectListingSourceTexts(context: ListingContext): string[] {
+  return [
+    context.title,
+    context.noteContent,
+    ...context.authorComments.map((comment) => comment.text),
+  ];
+}
+
+/**
+ * AI 判定已出租时必须给出能在原文里逐字找到的证据；找不到就说明这是脑补/推理出来的
+ * 结论（比如靠日期推算、或者曲解"出""私你了"这类模糊用词），一律当作没有证据。
+ */
+function isEvidenceQuoteVerified(
+  context: ListingContext,
+  evidenceQuote: string
+): boolean {
+  const normalizedQuote = normalizeVisibleText(evidenceQuote);
+  if (normalizedQuote.length < MIN_EVIDENCE_QUOTE_LENGTH) {
+    return false;
+  }
+
+  return collectListingSourceTexts(context).some((text) =>
+    normalizeVisibleText(text).includes(normalizedQuote)
+  );
 }
 
 function formatAuthorCommentsForPrompt(comments: AuthorComment[]): string {
@@ -381,21 +415,29 @@ async function resolveDeleteSignal(
     const judgement = await judgeRentedWithAi(aiConfig, context);
     if (judgement) {
       console.log(
-        `[ai] rented=${judgement.rented} confidence=${judgement.confidence.toFixed(2)} reason=${judgement.reason}`
+        `[ai] rented=${judgement.rented} confidence=${judgement.confidence.toFixed(2)} reason=${judgement.reason} quote="${judgement.evidenceQuote}"`
       );
 
-      if (judgement.rented && judgement.confidence >= aiConfig.minConfidence) {
-        return {
-          kind: "ai",
-          reason: judgement.reason,
-          confidence: judgement.confidence,
-        };
-      }
-
-      if (!judgement.rented) {
+      if (judgement.rented) {
+        const quoteVerified = isEvidenceQuoteVerified(
+          context,
+          judgement.evidenceQuote
+        );
+        if (!quoteVerified) {
+          console.warn(
+            `[ai] AI 判断已出租但引用的原文核对不到，视为推测过头，忽略该结论：${judgement.evidenceQuote || "(空)"}`
+          );
+        } else if (judgement.confidence >= aiConfig.minConfidence) {
+          return {
+            kind: "ai",
+            reason: judgement.reason,
+            confidence: judgement.confidence,
+          };
+        }
+        // 引用没通过校验，或置信度不够，交给规则再确认一次
+      } else {
         return null;
       }
-      // AI 认为已出租但置信度不够，交给规则再确认一次
     }
   }
 
