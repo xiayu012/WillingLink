@@ -9,6 +9,11 @@ import "server-only";
 import postgres from "postgres";
 import { requireGptKey } from "@/lib/api/gpt-auth";
 import { embedText } from "@/lib/ai/embeddings";
+import {
+  checkMoveInFeasibility,
+  extractQueryDate,
+  parseFlexibleDate,
+} from "@/lib/rental/date-availability";
 import { vectorSearchXhsRentalListings } from "@/lib/db/queries";
 import type { XhsRentalSearchResultRow } from "@/lib/db/queries";
 
@@ -273,6 +278,24 @@ export async function POST(request: Request) {
     if (candidates.length === 0) {
       candidates = await getSqlFallbackCandidates(excludeIds ?? []);
       searchMode = "sql_fallback";
+    }
+
+    // Move-in feasibility: a tenant can only move in ON or AFTER a unit is
+    // available. When the query voices a move-in date, prefer listings that are
+    // available by then; only fall back to the full pool if none qualify, so we
+    // never dead-end on the date alone.
+    const desiredMoveIn = extractQueryDate(query.trim());
+    if (desiredMoveIn.kind !== "unknown") {
+      const feasible = candidates.filter(
+        (row) =>
+          checkMoveInFeasibility(
+            parseFlexibleDate(row.availableFrom),
+            desiredMoveIn
+          ) !== "infeasible"
+      );
+      if (feasible.length > 0) {
+        candidates = feasible;
+      }
     }
 
     const strictFiltered = applyFilters(candidates, filters);

@@ -1439,8 +1439,11 @@ export type SearchXhsRentalListingsArgs = {
   rentMax?: number | null;
   bedroomsMin?: number | null;
   bathroomsMin?: number | null;
-  availableFromAfter?: string | null;
-  availableFromBefore?: string | null;
+  // NOTE: no availableFrom range args here. `availableFrom` is FREE TEXT
+  // ("7/1", "ASAP", "8月初"), so SQL string comparison on it is lexicographic,
+  // not chronological, and silently wrong. Move-in feasibility is enforced in
+  // the app layer via lib/rental/date-availability.ts — the single source of
+  // truth. Do not reintroduce a SQL `>=` / `<=` filter on this column.
   /**
    * Free-text keywords — ALL must appear in rawText, title, locationText, or propertyName.
    * Useful for city names, room types, amenities.
@@ -1583,8 +1586,6 @@ export async function searchXhsRentalListings({
   rentMax,
   bedroomsMin,
   bathroomsMin,
-  availableFromAfter,
-  availableFromBefore,
   keywords,
   limit,
 }: SearchXhsRentalListingsArgs) {
@@ -1614,8 +1615,8 @@ export async function searchXhsRentalListings({
         AND (${rentMax ?? null}::int  IS NULL OR "rentNumeric" <= ${rentMax ?? null}::int)
         AND (${bedroomsMin ?? null}::int  IS NULL OR COALESCE(NULLIF(substring("bedrooms"  from '\d+'), '')::int, 0) >= ${bedroomsMin ?? null}::int)
         AND (${bathroomsMin ?? null}::int IS NULL OR COALESCE(NULLIF(substring("bathrooms" from '\d+'), '')::int, 0) >= ${bathroomsMin ?? null}::int)
-        AND (${availableFromAfter ?? null}::text  IS NULL OR "availableFrom" >= ${availableFromAfter ?? null})
-        AND (${availableFromBefore ?? null}::text IS NULL OR "availableFrom" <= ${availableFromBefore ?? null})
+        -- availableFrom is free text; move-in feasibility is enforced in the app
+        -- layer (lib/rental/date-availability.ts), never by SQL string compare.
         AND (
           ${cleanKeywords.length === 0}::boolean
           OR (
