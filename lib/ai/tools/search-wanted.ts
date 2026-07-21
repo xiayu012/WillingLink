@@ -4,15 +4,22 @@
  * Used by landlords / property owners looking for tenants or roommates.
  * No vector index on this table, so search cascade is keyword-based:
  *
- *  Phase 1 — location + keywords, strict block filter
- *  Phase 2 — location + keywords, relaxed (drop block filter)
- *  Phase 3 — location only (drop extra keywords)
- *  Phase 4 — recent 50 posts as last resort
+ *  Phase 1 — location + keywords, strict block filter → UP TO 4 exact matches
+ *  Phase 2 — location + keywords, relaxed (drop block filter) → 1 post
+ *  Phase 3 — location only (drop extra keywords) → 1 post
+ *  Phase 4 — recent 50 posts as last resort → 1 post
+ *
+ * Exact matches return up to 4 posts at once; any relaxation returns exactly
+ * one post plus a relaxedNote that the assistant surfaces to the user.
  */
 
 import { tool } from "ai";
 import { z } from "zod";
-import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
+import {
+  getSeenListingIds,
+  incrementSearchAttempts,
+  markListingAsSeen,
+} from "@/lib/db/seen-listings";
 import {
   searchXhsRentalWanted,
   type XhsRentalWantedSearchResultRow,
@@ -110,14 +117,35 @@ function pickOne(
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+/** Take the most-recent `n` posts (rows already arrive newest-first). */
+function pickTop(
+  rows: XhsRentalWantedSearchResultRow[],
+  n: number
+): XhsRentalWantedSearchResultRow[] {
+  return rows.slice(0, n);
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+/** Max exact-match posts returned in a single call. */
+export const EXACT_MATCH_MAX = 4;
+
+/**
+ * Once a chat has triggered this many searches, the tool starts nudging the
+ * assistant that it has tried hard enough and may honestly conclude the
+ * database has nothing better. The assistant still decides for itself.
+ */
+export const SEARCH_ATTEMPT_HINT_THRESHOLD = 5;
+
 // ── Search cascade ────────────────────────────────────────────────────────────
 
 type CascadeResult = {
-  wanted: XhsRentalWantedSearchResultRow;
+  /** 1–4 exact matches, or exactly one post when criteria were relaxed. */
+  wanted: XhsRentalWantedSearchResultRow[];
   relaxedNote: string | null;
 } | null;
 
-async function findNextWanted(
+export async function findNextWanted(
   query: string,
   excludeIds: string[],
   blockTerms: string[]
@@ -125,7 +153,7 @@ async function findNextWanted(
   const location = detectLocation(query);
   const keywords = extractKeywords(query);
 
-  // Phase 1 — location + keywords, strict
+  // Phase 1 — location + keywords, strict → up to 4 exact matches
   if (location || keywords.length > 0) {
     const { results } = await searchXhsRentalWanted({
       preferredLocation: location,
@@ -135,19 +163,20 @@ async function findNextWanted(
 
     const strict = applyBlockFilter(unseen, blockTerms);
     if (strict.length > 0) {
-      return { wanted: pickOne(strict), relaxedNote: null };
+      return { wanted: pickTop(strict, EXACT_MATCH_MAX), relaxedNote: null };
     }
 
-    // Phase 2 — drop block filter
+    // Phase 2 — drop block filter → one relaxed post
     if (unseen.length > 0) {
       return {
-        wanted: pickOne(unseen),
-        relaxedNote: "找不到完全符合要求的求租帖，已放宽部分限制条件",
+        wanted: [pickOne(unseen)],
+        relaxedNote:
+          "找不到完全符合要求的求租帖，已放宽部分限制条件，先给你看一条最接近的",
       };
     }
   }
 
-  // Phase 3 — location only, drop keywords
+  // Phase 3 — location only, drop keywords → one relaxed post
   if (location && keywords.length > 0) {
     const { results } = await searchXhsRentalWanted({ preferredLocation: location });
     const unseen = filterExcluded(results, excludeIds);
@@ -155,29 +184,43 @@ async function findNextWanted(
     const strict = applyBlockFilter(unseen, blockTerms);
     if (strict.length > 0) {
       return {
-        wanted: pickOne(strict),
-        relaxedNote: `已放宽关键词限制，仅保留${location}地区筛选`,
+        wanted: [pickOne(strict)],
+        relaxedNote: `找不到完全符合要求的，已放宽关键词，仅保留${location}地区筛选，先给你看一条`,
       };
     }
     if (unseen.length > 0) {
       return {
-        wanted: pickOne(unseen),
-        relaxedNote: `已放宽限制，为您展示${location}地区的求租帖`,
+        wanted: [pickOne(unseen)],
+        relaxedNote: `找不到完全符合要求的，已放宽限制，先给你看一条${location}地区的求租帖`,
       };
     }
   }
 
-  // Phase 4 — last resort: 50 most recent
+  // Phase 4 — last resort: one post from the 50 most recent
   const { results: recent } = await searchXhsRentalWanted({ limit: 50 });
   const unseen = filterExcluded(recent, excludeIds);
   if (unseen.length > 0) {
     return {
-      wanted: pickOne(unseen),
-      relaxedNote: "暂无精确匹配的求租帖，已从最近发布的帖子中为您推荐",
+      wanted: [pickOne(unseen)],
+      relaxedNote: "暂无精确匹配的求租帖，已从最近发布的帖子中为你挑一条",
     };
   }
 
   return null;
+}
+
+/**
+ * When the chat has searched enough times without satisfying the user, returns
+ * a note telling the assistant it may — at its own discretion — stop cycling
+ * and honestly say the database has nothing better. Empty string otherwise.
+ */
+export function exhaustionNotice(attempts: number): string {
+  if (attempts < SEARCH_ATTEMPT_HINT_THRESHOLD) return "";
+  return (
+    ` EXHAUSTION_NOTICE: 这轮对话你已经搜索了 ${attempts} 次。` +
+    "如果用户仍然不满意，请自行判断：可以坦诚告诉对方数据库里暂时没有更合适的求租帖，" +
+    "建议调整条件或稍后再来，不要机械地无限“换一个”。"
+  );
 }
 
 // ── Tool factory ──────────────────────────────────────────────────────────────
@@ -187,8 +230,8 @@ export function createSearchWantedTool(chatId: string) {
     description:
       "Search the XhsRentalWanted database for tenant-seeking posts (求租信息). " +
       "Call this when the user is a LANDLORD or PROPERTY OWNER looking to find tenants or roommates. " +
-      "Returns ONE unseen post per call. " +
-      "Call again for '换一个'/'next'/'不满意' — server deduplicates automatically.",
+      "Returns UP TO 4 unseen exact-match posts, or exactly ONE relaxed post (with relaxedNote) when no exact match exists. " +
+      "Call again for '换一个'/'next'/'不满意' — server deduplicates automatically and tracks how many times you've searched.",
     inputSchema: z.object({
       query: z.string().describe(
         "Full natural language description of the tenant the landlord is looking for. " +
@@ -211,45 +254,56 @@ export function createSearchWantedTool(chatId: string) {
           .map((t) => t.trim().toLowerCase())
           .filter((t) => t.length > 0);
 
+        const attempts = await incrementSearchAttempts(chatId);
+        const exhaustion = exhaustionNotice(attempts);
+
         const result = await findNextWanted(query, excludeIds, blockTerms);
 
         if (!result) {
           return {
-            wanted: null,
+            wanted: [],
+            count: 0,
             relaxedNote: null,
             action:
-              excludeIds.length > 0
+              (excludeIds.length > 0
                 ? "NO_MORE: 已经没有更多符合条件的求租帖了。建议调整筛选条件再试。"
-                : "NO_RESULTS: 数据库暂无可推荐的求租帖，请稍后再试。",
+                : "NO_RESULTS: 数据库暂无可推荐的求租帖，请稍后再试。") + exhaustion,
           };
         }
 
-        await markListingAsSeen(chatId, result.wanted.id);
+        for (const post of result.wanted) {
+          await markListingAsSeen(chatId, post.id);
+        }
 
         if (result.relaxedNote) {
           return {
             wanted: result.wanted,
+            count: result.wanted.length,
             relaxedNote: result.relaxedNote,
             action:
               "SHOW_RELAXED_WANTED: No exact match found; criteria were auto-relaxed. " +
-              "Show relaxedNote in italics as the first line, then display the post in standard format. " +
+              "Show relaxedNote in italics as the first line, then display the SINGLE post in standard format. " +
               "End with: '如仍不满意，可告诉我具体要求，我再为您调整。' " +
-              "For subsequent '换一个': call searchWanted again with the SAME query.",
+              "For subsequent '换一个': call searchWanted again with the SAME query." +
+              exhaustion,
           };
         }
 
         return {
           wanted: result.wanted,
+          count: result.wanted.length,
           relaxedNote: null,
           action:
-            "SHOW_WANTED: Display this tenant-seeking post in standard format. " +
+            `SHOW_WANTED: Display these ${result.wanted.length} exact-match tenant-seeking post(s), each as its own block in standard format. ` +
             "For '换一个'/'next'/'不满意': call searchWanted again with the SAME query — " +
-            "server automatically excludes already-shown posts.",
+            "server automatically excludes already-shown posts." +
+            exhaustion,
         };
       } catch (error) {
         console.error("[searchWanted] tool error:", error);
         return {
-          wanted: null,
+          wanted: [],
+          count: 0,
           relaxedNote: null,
           action: "SEARCH_FAILED: Tell the user the search hit a temporary error and ask them to retry.",
         };

@@ -95,13 +95,13 @@ How to build the searchWanted arguments:
 - **query**: Full natural language description of the ideal tenant, including ALL context from the conversation: location, room type, lease duration, budget expectation, gender preference, pet policy, etc. Carry all context forward on every call.
 - **mustNotContain**: Hard negative constraints — posts containing these words are disqualified. Accumulate across turns.
 
-**There is NO excludeIds parameter.** The server deduplicates automatically.
+**There is NO excludeIds parameter.** The server deduplicates automatically and also counts how many times you have searched this conversation.
 
-After the tool returns, read the "action" field:
+After the tool returns, read the "action" field. The "wanted" field is an ARRAY: up to 4 posts for an exact match, exactly 1 post when criteria were relaxed.
 
 ### SHOW_WANTED
 
-Display the tenant-seeking post in this format — every field on its OWN line:
+Display EVERY post in the "wanted" array (up to 4), each as its own block, in this format — every field on its OWN line:
 
   **<title or "(无标题)">** ([原帖](sourceUrl))
   - **期望位置:** preferredLocations
@@ -118,12 +118,13 @@ Display the tenant-seeking post in this format — every field on its OWN line:
   - **简介:** first 120 chars of rawText then "..."
   - If imageUrls is non-empty: ![](imageUrls[0])
 
-  After showing a post, add a one-line note on why this tenant might suit the landlord. Then hint: "如需换一个，直接告诉我"
+  After showing the post(s), add a one-line note on why these tenants might suit the landlord. Then hint: "如需换一个，直接告诉我"
 
 ### SHOW_RELAXED_WANTED
 
+No exact match existed, so the tool relaxed criteria and returned ONE post.
 1. Show relaxedNote in *italics* as the first line.
-2. Display the post in the format above.
+2. Display the single post in the format above.
 3. End with: "如仍不满意，可告诉我具体要求，我再为您调整。"
 
 **For subsequent "换一个":** call searchWanted again with the SAME query.
@@ -131,6 +132,10 @@ Display the tenant-seeking post in this format — every field on its OWN line:
 ### NO_MORE / NO_RESULTS / SEARCH_FAILED
 
 Say what the action field instructs.
+
+### EXHAUSTION_NOTICE (appended to any action)
+
+When the action string contains "EXHAUSTION_NOTICE", you have already searched this conversation many times. Use your own judgment: if the landlord still isn't satisfied, it is fine to stop cycling and honestly tell them the database currently has no better match, and suggest they adjust their requirements or check back later. Do NOT keep calling searchWanted forever.
 
 Never invent data. Only use what the tool returned.
 

@@ -87,6 +87,38 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /api/gpt/search-wanted:
+    post:
+      operationId: searchWanted
+      summary: Search tenant-seeking posts (求租信息) for landlords looking for tenants
+      description: >
+        Use this when the user is a LANDLORD or PROPERTY OWNER looking for a
+        tenant or roommate, not a tenant looking for housing. Returns UP TO 4
+        exact-match posts in `wanted`, or exactly ONE relaxed post plus a
+        `relaxedNote` when no exact match exists. Supports mustNotContain and
+        excludeIds. Returns action (SHOW_WANTED, SHOW_RELAXED_WANTED, NO_MORE,
+        NO_RESULTS) — follow it exactly. When `exhaustionHint` is present, you
+        may honestly tell the user the database has nothing better.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchWantedRequest"
+      responses:
+        "200":
+          description: Up to 4 tenant-seeking posts plus action protocol
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchWantedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /api/gpt/listings/{id}:
     get:
       operationId: getListing
@@ -386,6 +418,146 @@ components:
           format: date-time
         rawTextExcerpt:
           type: string
+
+    SearchWantedRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          description: >
+            Full natural-language description of the tenant the landlord is
+            looking for. Include location, room type, lease duration, budget
+            expectation, gender preference, etc. Carry ALL context forward
+            from the conversation on every call.
+          example: "旧金山女生室友，2B2B，长租，预算2000-2500，不养宠物"
+        mustNotContain:
+          type: array
+          nullable: true
+          description: >
+            Keywords that disqualify a post if found in its text. Accumulate
+            across turns.
+          items:
+            type: string
+          example: ["中介", "转租"]
+        excludeIds:
+          type: array
+          nullable: true
+          description: >
+            Post ids already shown in this conversation. Use when user says
+            换一个 / next / 不满意 / 还有吗.
+          items:
+            type: string
+            format: uuid
+
+    SearchWantedResponse:
+      type: object
+      properties:
+        wanted:
+          type: array
+          description: >
+            Up to 4 exact-match posts, or exactly one post when relaxedNote is
+            set. Empty for NO_MORE / NO_RESULTS.
+          items:
+            $ref: "#/components/schemas/WantedPost"
+        count:
+          type: integer
+          description: Number of posts in `wanted`.
+        relaxedNote:
+          type: string
+          nullable: true
+          description: >
+            Present only when criteria were relaxed (single post). Show it in
+            italics as the first line before the post.
+        action:
+          type: string
+          enum: [SHOW_WANTED, SHOW_RELAXED_WANTED, NO_MORE, NO_RESULTS, SEARCH_FAILED]
+          description: Follow this action protocol exactly in the GPT response.
+        exhaustionHint:
+          type: string
+          nullable: true
+          description: >
+            Present after many rounds of searching. A cue that you may, at your
+            own discretion, stop cycling and honestly tell the user the database
+            has no better match.
+        message:
+          type: string
+          nullable: true
+
+    WantedPost:
+      type: object
+      nullable: true
+      properties:
+        id:
+          type: string
+          format: uuid
+        sourceUrl:
+          type: string
+        title:
+          type: string
+          nullable: true
+        rawText:
+          type: string
+        budgetText:
+          type: string
+          nullable: true
+        budgetMin:
+          type: string
+          nullable: true
+        budgetMax:
+          type: string
+          nullable: true
+        preferredLocations:
+          type: string
+          nullable: true
+        moveInDate:
+          type: string
+          nullable: true
+        leaseDuration:
+          type: string
+          nullable: true
+        wantedType:
+          type: string
+          nullable: true
+        bedrooms:
+          type: string
+          nullable: true
+        bathrooms:
+          type: string
+          nullable: true
+        roomType:
+          type: string
+          nullable: true
+        furnished:
+          type: string
+          nullable: true
+        pets:
+          type: string
+          nullable: true
+        occupation:
+          type: string
+          nullable: true
+        householdSize:
+          type: string
+          nullable: true
+        gender:
+          type: string
+          nullable: true
+        requirements:
+          type: string
+          nullable: true
+        contactMethod:
+          type: string
+          nullable: true
+        imageUrls:
+          type: array
+          nullable: true
+          items:
+            type: string
+        createdAt:
+          type: string
+          format: date-time
 
     FullListing:
       allOf:
