@@ -66,39 +66,30 @@ const BLOCK_OR_LOGIN_PATTERN =
 const OPENAI_CHAT_COMPLETIONS_URL =
   "https://api.openai.com/v1/chat/completions";
 const DEFAULT_AI_MODEL = "gpt-4.1-mini";
-const DEFAULT_AI_MIN_CONFIDENCE = 0.75;
+const DEFAULT_AI_MIN_CONFIDENCE = 0.6;
 const AI_JUDGE_TIMEOUT_MS = 15_000;
 
-const AI_JUDGE_SYSTEM_PROMPT = `你是小红书租房帖状态判断器，负责判断一条帖子对应的房源现在是不是已经确定租出去了（已出租/已租出/租满/房源下架等）。你的判断会直接触发数据库删除，宁可保守放过，也绝对不能错删还在出租的房源。
+const AI_JUDGE_SYSTEM_PROMPT = `你是小红书租房帖状态判断器。给你标题、正文、帖子发布/编辑时间、今天日期，以及作者本人在评论区的发言和对应日期，判断这个房源当前是否已经不可租（已出租/已租出/租满/房源下架等）。
 
-给你的信息：标题、正文、帖子发布/编辑时间、今天日期，以及作者本人在评论区的发言（每条都带日期）。评论区已经提前过滤掉了所有路人的发言，你看到的评论全部是作者本人说的话，不用怀疑是路人，但也不能过度解读。
+重要：评论区里已经提前过滤掉了所有路人的发言，你看到的评论全部是作者本人说的话，可以直接当作房东/发帖人自己的最新说法来用，不用怀疑是路人。
 
-【第一原则：只认"已完成"的明确信号，不接受"进行时"或模糊表述】
-- 能判定已出租的：标题/正文/评论里出现"已租""已出租""租出去了""租掉了""出租完毕""没有房间了""满租""下架""[已出]"等，明确表示"这件事已经发生/结束"。
-- 不能当作已出租证据（这些都只是"房源正在被提供"的进行时态，不代表交易已完成）：
-  - 单独的"出"字、"在租""求租中""可租""还在""可以约看"等——这些是房源仍在出租中的意思，不是已经出租。
-  - 作者说"私你了""私信你了""加你微信了""联系你了""看房"之类——这说明作者正在和某个感兴趣的人沟通看房/洽谈，恰恰说明房源还没确定租出去，绝不能判定为已出租。
-  - 作者只回复"可以""好的""嗯""稍等""看下"等模糊/礙口的话，没有明确说明房源状态——这些不构成任何方向的证据，直接忽略，不要脑补成"已出租"或"未出租"。
+最重要的原则——以最新时间为准：
+- 标题/正文的状态对应的是"帖子发布/编辑时间"这个时间点。
+- 每条作者评论的状态对应的是"该评论的日期"这个时间点。
+- 把这些时间点排序，永远相信时间最靠后（最新）的那条信息，忽略更早时间点的说法。
+- 例如：标题写着已出租、编辑时间是较晚的日期，即使有一条日期更早的作者评论说"在"或听起来还能租，也应该判定为已出租（因为那条评论发生在标题更新之前，已经过时）。反过来，如果作者在标题编辑之后又发了一条更晚日期的评论说"还有房"，则应判定为未出租。
 
-【第二原则：日期只能用来排序信息新旧，不能单独当作出租证据】
-- 帖子里的"可入住时间/起租日期/入住截止到 X 月 X 日"等字样，说明的是这个房子的入住安排（比如租期什么时候开始、最晚什么时候要入住），跟"现在是否已经出租出去"没有任何直接关系。
-- 就算"今天日期"已经超过了帖子里提到的某个日期（比如"入住截止到 7 月 17 日"而今天是 7 月 20 日），也绝对不能因此推断"房源已经过期/已经被租走"——这是错误的推理。日期过期顶多说明帖子可能不新鲜了，不代表房源状态发生了变化。
-- 日期信息真正的用法：当有多条互相矛盾的"已完成"信号时（比如标题说已出租，但作者更晚的评论明确说还有房），才用日期比较谁更新，采信更晚的那条。如果所有信号本身都不是"已完成"的明确信号，日期再怎么比较也不能拼出一个"已出租"的结论。
+判断规则：
+- 标题或正文出现"已租""已出租""租出""租掉""出租完毕""没有房间了""[已出]"等，判定为已出租（除非有更晚时间点的作者评论明确说还没租出去/还有房）。
+- 作者本人评论明确说"已经租出去了""没有了""租满了"，也判定为已出租。
+- 找不到明确已出租信号时，判定为未出租（仍然可租）。
 
-【反面例子——以下推理都是错的，不要重复】
-- 错误："正文说可入住时间截止到 7 月 17 日，今天是 7 月 20 日，作者只回复过一次‘可以’，所以推断房源已经租出去了。" → 错。截止日期跟出租状态无关，"可以"是模糊回复不构成证据，找不到明确信号时必须判定未出租。
-- 错误："作者在评论区说‘出，私您了’，表明房源已出租。" → 错。"出"表示还在出租，"私您了"说明作者正在跟感兴趣的人私信洽谈看房，这恰恰说明房源还没租出去，应判定未出租。
-
-【第三原则：证据必须能直接引用原文】
-- 你给出的判断必须能从给你的文本里原样摘出一句作为证据；如果摘不出符合"第一原则"的明确"已完成"表述，就必须判定未出租，无论你多想因为其它线索（语气、日期、常识推测）判定已出租都不行。
-
-只输出 JSON，格式为 {"rented": boolean, "confidence": 0到1之间的数字, "evidence": "从原文摘出的一句话证据，找不到就填空字符串", "reason": "一句话原因，说明你依据的是哪句话/哪个时间点"}，不要输出任何其它文字。`;
+只输出 JSON，格式为 {"rented": boolean, "confidence": 0到1之间的数字, "reason": "一句话原因，需要说明你依据的是哪个时间点的信息"}，不要输出任何其它文字。`;
 
 type ListingRow = {
   id: string;
   sourceUrl: string;
   title: string | null;
-  postedAt: Date;
 };
 
 type ElementTexts = {
@@ -135,13 +126,11 @@ type DeleteSignal =
       kind: "ai";
       reason: string;
       confidence: number;
-      evidence: string;
     };
 
 type AiJudgement = {
   rented: boolean;
   confidence: number;
-  evidence: string;
   reason: string;
 };
 
@@ -271,8 +260,7 @@ function formatDeleteSignal(signal: DeleteSignal): string {
   }
 
   if (signal.kind === "ai") {
-    const evidenceText = signal.evidence ? `，证据：${signal.evidence}` : "";
-    return `AI 判断已出租（置信度 ${signal.confidence.toFixed(2)}）：${signal.reason}${evidenceText}`;
+    return `AI 判断已出租（置信度 ${signal.confidence.toFixed(2)}）：${signal.reason}`;
   }
 
   return `规则命中已出租 ${signal.element}：${signal.snippet}`;
@@ -296,10 +284,8 @@ function parseAiJudgement(raw: unknown): AiJudgement | null {
     typeof value.reason === "string" && value.reason.trim().length > 0
       ? value.reason.trim()
       : "AI 未提供原因";
-  const evidence =
-    typeof value.evidence === "string" ? value.evidence.trim() : "";
 
-  return { rented: value.rented, confidence, evidence, reason };
+  return { rented: value.rented, confidence, reason };
 }
 
 function formatAuthorCommentsForPrompt(comments: AuthorComment[]): string {
@@ -395,30 +381,21 @@ async function resolveDeleteSignal(
     const judgement = await judgeRentedWithAi(aiConfig, context);
     if (judgement) {
       console.log(
-        `[ai] rented=${judgement.rented} confidence=${judgement.confidence.toFixed(2)} evidence="${judgement.evidence}" reason=${judgement.reason}`
+        `[ai] rented=${judgement.rented} confidence=${judgement.confidence.toFixed(2)} reason=${judgement.reason}`
       );
 
-      // 要求 AI 必须能摘出证据原文，摘不出来的"已出租"判断一律不采信，
-      // 避免它凭时间推理或语气脑补出一个没有原文支撑的结论。
-      const hasEvidence = judgement.evidence.trim().length > 0;
-
-      if (
-        judgement.rented &&
-        hasEvidence &&
-        judgement.confidence >= aiConfig.minConfidence
-      ) {
+      if (judgement.rented && judgement.confidence >= aiConfig.minConfidence) {
         return {
           kind: "ai",
           reason: judgement.reason,
           confidence: judgement.confidence,
-          evidence: judgement.evidence,
         };
       }
 
       if (!judgement.rented) {
         return null;
       }
-      // AI 认为已出租，但没给出证据原文或置信度不够，交给规则再确认一次
+      // AI 认为已出租但置信度不够，交给规则再确认一次
     }
   }
 
@@ -625,27 +602,22 @@ async function readListingPage(
   };
 }
 
-/**
- * 按帖子发布时间（优先 postedAt，没有则用入库时间 createdAt 兜底）从旧到新排序，
- * 保证优先检查最早发布的帖子，而不是像之前一样随机挑选。
- */
 function loadCandidates(sql: postgres.Sql): Promise<ListingRow[]> {
   return sql<ListingRow[]>`
-    SELECT id, "sourceUrl", title, COALESCE("postedAt", "createdAt") AS "postedAt"
+    SELECT id, "sourceUrl", title
     FROM "XhsRentalListing"
     WHERE (
       "sourceUrl" ILIKE ${XHS_URL_PATTERN}
       OR "sourceUrl" ILIKE ${XHSLINK_URL_PATTERN}
     )
       AND "sourceUrl" NOT LIKE 'pending:%'
-    ORDER BY COALESCE("postedAt", "createdAt") ASC
+    ORDER BY random()
   `;
 }
 
 /**
- * 拉取数据库全量候选（已按发布时间从旧到新排好序），用本地记录裁剪掉已不存在
- * 的 id、过滤掉冷却期内的，再按"最久未查看"升序排列（从未查看过的排最前面，
- * 同为从未查看时保留发布时间从旧到新的顺序）。
+ * 拉取数据库全量候选，用本地记录裁剪掉已不存在的 id、过滤掉冷却期内的，
+ * 再按"最久未查看"升序排列（从未查看过的排最前面）。
  */
 async function fetchScheduledCandidates(
   sql: postgres.Sql,
@@ -852,9 +824,8 @@ async function main(): Promise<void> {
 
         const summary = summarizeCheckedLog(checkedLog, scheduled.activeIds);
         const cooldownSkipped = scheduled.totalActive - candidates.length;
-        const nextPostedAt = candidates[0]?.postedAt.toISOString().slice(0, 10);
         console.log(
-          `[db] 候选总数=${scheduled.totalActive}，可查看=${candidates.length}，冷却中=${cooldownSkipped}，从未查看=${summary.neverChecked}，最早查看=${summary.oldestCheckedAt ?? "无"}，下一条发布于=${nextPostedAt ?? "无"}`
+          `[db] 候选总数=${scheduled.totalActive}，可查看=${candidates.length}，冷却中=${cooldownSkipped}，从未查看=${summary.neverChecked}，最早查看=${summary.oldestCheckedAt ?? "无"}`
         );
         await persistLog();
 
@@ -873,7 +844,7 @@ async function main(): Promise<void> {
       const page = await context.newPage();
       try {
         console.log(
-          `[check] ${checkedInWindow + 1}/${dailyLimit} ${row.id} 发布于 ${row.postedAt.toISOString().slice(0, 10)} ${row.sourceUrl}`
+          `[check] ${checkedInWindow + 1}/${dailyLimit} ${row.id} ${row.sourceUrl}`
         );
         const { signal } = await readListingPage(page, row.sourceUrl, aiConfig);
         checkedInWindow += 1;
