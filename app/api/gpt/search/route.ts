@@ -10,10 +10,11 @@ import postgres from "postgres";
 import { requireGptKey } from "@/lib/api/gpt-auth";
 import { embedText } from "@/lib/ai/embeddings";
 import {
-  checkMoveInFeasibility,
-  extractQueryDate,
-  parseFlexibleDate,
-} from "@/lib/rental/date-availability";
+  applyBlockTerms,
+  applyHardConstraints,
+  constraintsFromParams,
+  relaxationLevels,
+} from "@/lib/rental/query-constraints";
 import { vectorSearchXhsRentalListings } from "@/lib/db/queries";
 import type { XhsRentalSearchResultRow } from "@/lib/db/queries";
 
@@ -70,77 +71,6 @@ function toListingSummary(row: XhsRentalSearchResultRow) {
     createdAt: row.createdAt,
     rawTextExcerpt: row.rawText.slice(0, RAW_TEXT_EXCERPT_CHARS),
   };
-}
-
-function applyFilters(
-  rows: XhsRentalSearchResultRow[],
-  filters: Omit<SearchRequest, "query" | "limit" | "excludeIds">
-): XhsRentalSearchResultRow[] {
-  const blockedTerms = (filters.mustNotContain ?? [])
-    .map((term) => term.trim().toLowerCase())
-    .filter((term) => term.length > 0);
-
-  return rows.filter((row) => {
-    if (blockedTerms.length > 0) {
-      const searchableText = [
-        row.title,
-        row.rawText,
-        row.locationText,
-        row.propertyName,
-      ]
-        .filter((value): value is string => typeof value === "string")
-        .join("\n")
-        .toLowerCase();
-
-      if (blockedTerms.some((term) => searchableText.includes(term))) {
-        return false;
-      }
-    }
-
-    if (
-      filters.city != null &&
-      row.city?.toLowerCase() !== filters.city.toLowerCase()
-    ) {
-      return false;
-    }
-    if (filters.rentMin != null) {
-      if (row.rentNumeric == null || row.rentNumeric < filters.rentMin) {
-        return false;
-      }
-    }
-    if (filters.rentMax != null) {
-      if (row.rentNumeric == null || row.rentNumeric > filters.rentMax) {
-        return false;
-      }
-    }
-    if (filters.bedroomsNum != null) {
-      if (row.bedroomsNum == null || row.bedroomsNum !== filters.bedroomsNum) {
-        return false;
-      }
-    }
-    if (filters.petFriendly === true && row.petFriendly !== true) {
-      return false;
-    }
-    if (filters.petFriendly === false && row.petFriendly === true) {
-      return false;
-    }
-    if (filters.couplesOk === true && row.couplesOk !== true) {
-      return false;
-    }
-    if (filters.utilitiesIncluded === true && row.utilitiesIncluded !== true) {
-      return false;
-    }
-    if (filters.parkingIncluded === true && row.parkingIncluded !== true) {
-      return false;
-    }
-    if (
-      filters.furnished != null &&
-      row.furnished?.toLowerCase() !== filters.furnished.toLowerCase()
-    ) {
-      return false;
-    }
-    return true;
-  });
 }
 
 async function getSqlFallbackCandidates(
@@ -207,36 +137,6 @@ async function getSqlFallbackCandidates(
   }));
 }
 
-function relaxFilters(
-  filters: Omit<SearchRequest, "query" | "limit" | "excludeIds">,
-  level: 1 | 2 | 3
-): Omit<SearchRequest, "query" | "limit" | "excludeIds"> {
-  if (level === 1) {
-    return {
-      ...filters,
-      furnished: null,
-      utilitiesIncluded: null,
-      parkingIncluded: null,
-      couplesOk: null,
-    };
-  }
-
-  if (level === 2) {
-    return {
-      ...relaxFilters(filters, 1),
-      rentMax:
-        typeof filters.rentMax === "number"
-          ? Math.ceil(filters.rentMax * 1.15)
-          : filters.rentMax,
-    };
-  }
-
-  return {
-    ...relaxFilters(filters, 2),
-    city: null,
-  };
-}
-
 export async function OPTIONS() {
   return new Response(null, { status: 204 });
 }
@@ -280,56 +180,25 @@ export async function POST(request: Request) {
       searchMode = "sql_fallback";
     }
 
-    // Move-in feasibility: a tenant can only move in ON or AFTER a unit is
-    // available. When the query voices a move-in date, prefer listings that are
-    // available by then; only fall back to the full pool if none qualify, so we
-    // never dead-end on the date alone.
-    const desiredMoveIn = extractQueryDate(query.trim());
-    if (desiredMoveIn.kind !== "unknown") {
-      const feasible = candidates.filter(
-        (row) =>
-          checkMoveInFeasibility(
-            parseFlexibleDate(row.availableFrom),
-            desiredMoveIn
-          ) !== "infeasible"
-      );
-      if (feasible.length > 0) {
-        candidates = feasible;
-      }
-    }
+    // Same brain as the in-app searchRental tool: block-term exclusion, then the
+    // shared hard-constraint ladder (budget / bedrooms / move-in feasibility /
+    // pet / couples / utilities / parking / furnished, with neighbour-aware
+    // city). Typed params are merged with anything the NL query also expresses.
+    const constraints = constraintsFromParams(filters, query.trim());
+    const blockTerms = filters.mustNotContain ?? [];
+    const pool = applyBlockTerms(candidates, blockTerms);
 
-    const strictFiltered = applyFilters(candidates, filters);
-    let filtered = strictFiltered;
+    let filtered: XhsRentalSearchResultRow[] = [];
     let action = "SHOW_LISTING";
     let relaxedNote: string | null = null;
 
-    if (filtered.length === 0) {
-      const level1 = applyFilters(candidates, relaxFilters(filters, 1));
-      if (level1.length > 0) {
-        filtered = level1;
-        action = "SHOW_RELAXED_LISTING";
-        relaxedNote =
-          "没有完全匹配的房源；我先放宽家具、水电、停车、情侣入住等生活偏好，保留核心地点/预算/卧室要求。";
-      }
-    }
-
-    if (filtered.length === 0) {
-      const level2 = applyFilters(candidates, relaxFilters(filters, 2));
-      if (level2.length > 0) {
-        filtered = level2;
-        action = "SHOW_RELAXED_LISTING";
-        relaxedNote =
-          "没有完全匹配的房源；我把预算上限大约放宽 15%，同时保留其他核心要求。";
-      }
-    }
-
-    if (filtered.length === 0) {
-      const level3 = applyFilters(candidates, relaxFilters(filters, 3));
-      if (level3.length > 0) {
-        filtered = level3;
-        action = "SHOW_RELAXED_LISTING";
-        relaxedNote =
-          "没有完全匹配的房源；我放宽到附近区域/全湾区候选，但仍尽量保留预算和房型要求。";
+    for (const level of relaxationLevels(constraints)) {
+      const matched = applyHardConstraints(pool, level.constraints);
+      if (matched.length > 0) {
+        filtered = matched;
+        relaxedNote = level.note;
+        action = level.note ? "SHOW_RELAXED_LISTING" : "SHOW_LISTING";
+        break;
       }
     }
 
