@@ -36,10 +36,10 @@ import { tool } from "ai";
 import { z } from "zod";
 import { embedText, rerankDocuments } from "@/lib/ai/embeddings";
 import {
-  checkMoveInFeasibility,
-  extractQueryDate,
-  parseFlexibleDate,
-} from "@/lib/rental/date-availability";
+  applyHardConstraints,
+  extractHardConstraints,
+  hasAnyConstraint,
+} from "@/lib/rental/query-constraints";
 import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
 import {
   searchXhsRentalListings,
@@ -217,29 +217,22 @@ async function findNextListing(
   const city = detectCity(query);
   const expandedQuery = city ? lightGeoExpand(query, city) : query;
 
-  // Move-in feasibility: a tenant can only move in ON or AFTER a unit's
-  // available-from date. When the query voices a move-in date, drop listings
-  // that only become available later. No-op when the query has no date.
-  const desiredMoveIn = extractQueryDate(query);
-  const dateFeasible = (
+  // Hard constraints (budget ceiling, bedroom count, move-in feasibility) are
+  // deterministic invariants a vector ranker cannot enforce. Recover them from
+  // the query and drop rows that PROVABLY violate them before ranking. Lenient
+  // by design: rows with an unparsed structured field are kept, and the whole
+  // step is a no-op when the query states no constraint.
+  const constraints = extractHardConstraints(query);
+  const constrained = (
     rows: XhsRentalSearchResultRow[]
-  ): XhsRentalSearchResultRow[] => {
-    if (desiredMoveIn.kind === "unknown") return rows;
-    return rows.filter(
-      (r) =>
-        checkMoveInFeasibility(
-          parseFlexibleDate(r.availableFrom),
-          desiredMoveIn
-        ) !== "infeasible"
-    );
-  };
+  ): XhsRentalSearchResultRow[] => applyHardConstraints(rows, constraints);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // Phase 1 — Vector search (semantic, best quality)
   // Uses geo-expanded query so neighbor-city listings are reachable.
   // ═══════════════════════════════════════════════════════════════════════════
 
-  const vectorCandidates = dateFeasible(
+  const vectorCandidates = constrained(
     await vectorSearch(expandedQuery, excludeIds)
   );
 
@@ -267,7 +260,7 @@ async function findNextListing(
     const { results: cityRows } = await searchXhsRentalListings({
       keywords: [city.en],
     });
-    const cityUnseen = dateFeasible(filterExcluded(cityRows, excludeIds));
+    const cityUnseen = constrained(filterExcluded(cityRows, excludeIds));
 
     // 2a: strict
     const cityStrict = applyBlockFilter(cityUnseen, blockTerms);
@@ -298,7 +291,7 @@ async function findNextListing(
     const { results: kwRows } = await searchXhsRentalListings({
       keywords: nonCityKeywords,
     });
-    const kwUnseen = dateFeasible(filterExcluded(kwRows, excludeIds));
+    const kwUnseen = constrained(filterExcluded(kwRows, excludeIds));
 
     // 3a: strict
     const kwStrict = applyBlockFilter(kwUnseen, blockTerms);
@@ -327,7 +320,7 @@ async function findNextListing(
   const { results: recentRows } = await searchXhsRentalListings({
     limit: LAST_RESORT_LIMIT,
   });
-  const remaining = dateFeasible(filterExcluded(recentRows, excludeIds));
+  const remaining = constrained(filterExcluded(recentRows, excludeIds));
   if (remaining.length > 0) {
     return {
       listing: await pickBest(query, remaining),
@@ -335,16 +328,17 @@ async function findNextListing(
     };
   }
 
-  // Date-relaxed fallback: the tenant gave a move-in date but nothing is
-  // available by then. Rather than dead-ending, surface the closest recent
-  // listing and clearly warn that its start date is later.
-  if (desiredMoveIn.kind !== "unknown") {
-    const dateRelaxed = filterExcluded(recentRows, excludeIds);
-    if (dateRelaxed.length > 0) {
+  // Constraint-relaxed fallback: the tenant stated hard requirements (budget /
+  // bedrooms / move-in) but nothing in the pool satisfies them. Rather than
+  // dead-ending, surface the closest recent listing and clearly warn that it
+  // may not meet every requirement, so the user decides.
+  if (hasAnyConstraint(constraints)) {
+    const relaxed = filterExcluded(recentRows, excludeIds);
+    if (relaxed.length > 0) {
       return {
-        listing: await pickBest(query, dateRelaxed),
+        listing: await pickBest(query, relaxed),
         relaxedNote:
-          "没有在您期望入住时间之前起租的房源；以下房源起租时间可能更晚，请留意入住时间是否合适。",
+          "没有完全满足预算 / 房型 / 入住时间要求的房源；以下是最接近的，请留意是否符合你的硬性条件。",
       };
     }
   }
