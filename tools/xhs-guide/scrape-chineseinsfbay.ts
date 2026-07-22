@@ -668,6 +668,7 @@ async function main() {
     `) as ExistingRow[];
 
     const existingByFingerprint = new Map<string, ExistingFingerprint>();
+    const existingBySourceUrl = new Map<string, string>();
     for (const row of existingRows) {
       const fp = listingFingerprint(
         row.title ?? "",
@@ -690,7 +691,30 @@ async function main() {
         }
       );
       existingByFingerprint.set(fp, { id: row.id, fingerprint: fp });
+      existingBySourceUrl.set(row.sourceUrl, row.id);
     }
+
+    const mergeImagesAndMaybePostedAt = async (
+      listingId: string,
+      uploaded: string[],
+      nextPostedAt: Date | null
+    ) => {
+      const rows = (await sql`
+        select "imageUrls"
+        from "XhsRentalListing"
+        where "id" = ${listingId}
+        limit 1
+      `) as Array<{ imageUrls: string[] | null }>;
+      const current = Array.isArray(rows[0]?.imageUrls) ? rows[0].imageUrls : [];
+      const merged = Array.from(new Set([...current, ...uploaded]));
+      await sql`
+        update "XhsRentalListing"
+        set
+          "imageUrls" = ${JSON.stringify(merged)}::jsonb,
+          "postedAt" = coalesce(${nextPostedAt ? nextPostedAt.toISOString() : null}::timestamptz, "postedAt")
+        where "id" = ${listingId}
+      `;
+    };
 
     let inserted = 0;
     let deduped = 0;
@@ -758,75 +782,89 @@ async function main() {
       const uploadedImageUrls = await uploadImageUrls(blobToken, candidate.url, imageUrls);
       const uniqueUploaded = Array.from(new Set(uploadedImageUrls));
 
-      const existing = existingByFingerprint.get(fp);
-      if (existing) {
-        if (uniqueUploaded.length > 0) {
-          const rows = (await sql`
-            select "imageUrls"
-            from "XhsRentalListing"
-            where "id" = ${existing.id}
-            limit 1
-          `) as Array<{ imageUrls: string[] | null }>;
-          const current = Array.isArray(rows[0]?.imageUrls) ? rows[0].imageUrls : [];
-          const merged = Array.from(new Set([...current, ...uniqueUploaded]));
-          await sql`
-            update "XhsRentalListing"
-            set "imageUrls" = ${JSON.stringify(merged)}::jsonb
-            where "id" = ${existing.id}
-          `;
-        }
+      const existingId =
+        existingBySourceUrl.get(candidate.url) ??
+        existingByFingerprint.get(fp)?.id ??
+        null;
+      if (existingId) {
+        await mergeImagesAndMaybePostedAt(existingId, uniqueUploaded, postedAt);
+        existingByFingerprint.set(fp, { id: existingId, fingerprint: fp });
+        existingBySourceUrl.set(candidate.url, existingId);
         deduped += 1;
         continue;
       }
 
-      const insertedRows = (await sql`
-        insert into "XhsRentalListing" (
-          "sourceUrl",
-          "title",
-          "rawText",
-          "rent",
-          "deposit",
-          "availableFrom",
-          "leaseEndDate",
-          "listingType",
-          "bedrooms",
-          "bathrooms",
-          "roomType",
-          "propertyName",
-          "locationText",
-          "furnished",
-          "contactMethod",
-          "imageUrls",
-          "postedAt",
-          "createdAt"
-        ) values (
-          ${candidate.url},
-          ${normalizedStructured.title ?? title ?? candidate.title},
-          ${rawText},
-          ${normalizedStructured.rent},
-          ${normalizedStructured.deposit},
-          ${normalizedStructured.availableFrom},
-          ${normalizedStructured.leaseEndDate},
-          ${normalizedStructured.listingType},
-          ${normalizedStructured.bedrooms},
-          ${normalizedStructured.bathrooms},
-          ${normalizedStructured.roomType},
-          ${normalizedStructured.propertyName},
-          ${normalizedStructured.locationText},
-          ${normalizedStructured.furnished},
-          ${normalizedStructured.contactMethod},
-          ${JSON.stringify(uniqueUploaded)}::jsonb,
-          ${postedAt ? postedAt.toISOString() : null},
-          ${new Date().toISOString()}
-        )
-        returning "id"
-      `) as Array<{ id: string }>;
+      try {
+        const insertedRows = (await sql`
+          insert into "XhsRentalListing" (
+            "sourceUrl",
+            "title",
+            "rawText",
+            "rent",
+            "deposit",
+            "availableFrom",
+            "leaseEndDate",
+            "listingType",
+            "bedrooms",
+            "bathrooms",
+            "roomType",
+            "propertyName",
+            "locationText",
+            "furnished",
+            "contactMethod",
+            "imageUrls",
+            "postedAt",
+            "createdAt"
+          ) values (
+            ${candidate.url},
+            ${normalizedStructured.title ?? title ?? candidate.title},
+            ${rawText},
+            ${normalizedStructured.rent},
+            ${normalizedStructured.deposit},
+            ${normalizedStructured.availableFrom},
+            ${normalizedStructured.leaseEndDate},
+            ${normalizedStructured.listingType},
+            ${normalizedStructured.bedrooms},
+            ${normalizedStructured.bathrooms},
+            ${normalizedStructured.roomType},
+            ${normalizedStructured.propertyName},
+            ${normalizedStructured.locationText},
+            ${normalizedStructured.furnished},
+            ${normalizedStructured.contactMethod},
+            ${JSON.stringify(uniqueUploaded)}::jsonb,
+            ${postedAt ? postedAt.toISOString() : null},
+            ${new Date().toISOString()}
+          )
+          returning "id"
+        `) as Array<{ id: string }>;
 
-      const insertedId = insertedRows[0]?.id;
-      if (insertedId) {
-        existingByFingerprint.set(fp, { id: insertedId, fingerprint: fp });
+        const insertedId = insertedRows[0]?.id;
+        if (insertedId) {
+          existingByFingerprint.set(fp, { id: insertedId, fingerprint: fp });
+          existingBySourceUrl.set(candidate.url, insertedId);
+        }
+        inserted += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("uq_listing_sourceurl") || message.includes("duplicate key")) {
+          console.log(`[scrape] skip(URL已存在): url=${candidate.url}`);
+          const rows = (await sql`
+            select "id"
+            from "XhsRentalListing"
+            where "sourceUrl" = ${candidate.url}
+            limit 1
+          `) as Array<{ id: string }>;
+          const foundId = rows[0]?.id;
+          if (foundId) {
+            await mergeImagesAndMaybePostedAt(foundId, uniqueUploaded, postedAt);
+            existingByFingerprint.set(fp, { id: foundId, fingerprint: fp });
+            existingBySourceUrl.set(candidate.url, foundId);
+          }
+          deduped += 1;
+          continue;
+        }
+        throw error;
       }
-      inserted += 1;
     }
 
     console.log(
