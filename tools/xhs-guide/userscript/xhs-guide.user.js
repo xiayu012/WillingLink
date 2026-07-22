@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.8.1
+// @version      0.8.2
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.8.1";
+  const SCRIPT_VERSION = "0.8.2";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -783,12 +783,16 @@
     }
 
     if (bayHit || rentHit) {
+      // 只有单一弱信号（例如仅提到一个湾区地名，没有任何租房词）时，
+      // 大量非租房内容（拼邮/拼车/团购/招聘/社交活动等）也会命中——
+      // 置信度故意设在高亮阈值以下，不抢先闪现红框，先排队等 LLM 定论。
+      // LLM 若判定相关，会在复核结果里用它自己的置信度重新点亮。
       return {
         stageName: "ruleScreenStage",
         passed: true,
         skipLlm: false,
-        confidence: 0.65,
-        reason: `弱信号(${bayHit || rentHit})，先高亮后复核`,
+        confidence: 0.4,
+        reason: `单一弱信号(${bayHit || rentHit})，等待 LLM 复核后再决定是否高亮`,
       };
     }
 
@@ -978,8 +982,13 @@
 
     logWarn("ingest.baseUrl 为空，回退直连 OpenAI（国内易 403）");
     const systemPrompt =
-      "你是小红书标题分类器，判断标题是否属于美国湾区租房交易帖（出租/转租/求租/找室友/找房）。" +
-      "避雷、攻略、经验、科普、总结、政策解读、吐槽类标题应判为不相关。" +
+      "你是小红书标题分类器，判断标题是否属于美国湾区租房/找室友交易帖。" +
+      "related=true 仅当标题明确表达具体住房交易意图（出租/转租/求租/找房/找室友/合租/roommate wanted 等），" +
+      "即有人在提供或寻找一个具体的房源/床位/室友名额。" +
+      "即使标题提到湾区地名或含有\"房\"\"租\"等字，只要没有具体交易意图也判 false，" +
+      "包括：经验分享/攻略/科普/总结/政策解读/吐槽、团购/拼邮/拼团/代购、拼车/顺风车、" +
+      "二手物品买卖、招聘兼职、社交活动/聚会/相亲、探店/旅游/购物分享、房价行情或买房讨论等。" +
+      "无法确定时判 false（宁可漏检也不要误判）。" +
       "只输出 JSON: {\"results\":[{\"index\":0,\"related\":true,\"confidence\":0.9,\"reason\":\"...\"}]}";
     const userPrompt = batch
       .map((input, index) => `${index}. ${input.titleText}`)
