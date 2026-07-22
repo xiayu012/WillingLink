@@ -392,56 +392,21 @@
 
   const normalizeTitle = (text) => text.replace(/\s+/g, " ").trim();
 
-  // ---- 当天采集进度上报（很简陋）：只看 24 小时内、低频上报到后端，方便在 Vercel runtime log 里看进度 ----
-  const PROGRESS_STORAGE_KEY = "xhs-guide-progress";
-  const PROGRESS_MIN_INTERVAL_MS = 10 * 60 * 1000; // 最多 10 分钟报一次，避免刷屏
-  const todayKey = () => new Date().toISOString().slice(0, 10); // 跨天自动归零，只在意当天
-  const readProgress = () => {
-    try {
-      const raw = JSON.parse(localStorage.getItem(PROGRESS_STORAGE_KEY) || "{}");
-      if (raw && raw.day === todayKey()) {
-        return raw;
-      }
-    } catch {
-      /* ignore */
-    }
-    return { day: todayKey(), count: 0, lastReportAt: 0 };
-  };
-  const writeProgress = (p) => {
-    try {
-      localStorage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(p));
-    } catch {
-      /* 隐私模式没有 localStorage 就算了 */
-    }
-  };
-  const bumpTodayCount = () => {
-    const p = readProgress();
-    p.count += 1;
-    writeProgress(p);
-    return p.count;
-  };
-  const reportProgress = async (config, reason) => {
+  // ---- 信息流标题点击上报：点一次记一次，方便在 Vercel runtime log 里对比「点击」vs「入库」----
+  const reportTitleClick = async (config, title) => {
     const baseUrl = config.ingest?.baseUrl?.trim();
     if (!baseUrl) {
       return;
     }
-    const p = readProgress();
-    if (now() - (p.lastReportAt || 0) < PROGRESS_MIN_INTERVAL_MS) {
-      return; // 低频：距上次上报不足 10 分钟就跳过
-    }
-    p.lastReportAt = now();
-    writeProgress(p);
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/progress`;
     const body = JSON.stringify({
-      day: p.day,
-      count: p.count,
-      reason,
+      title: String(title || "").slice(0, 200),
       version: SCRIPT_VERSION,
     });
     try {
       await gmHttpPost(url, { "Content-Type": "application/json" }, body);
     } catch {
-      /* 进度上报失败无所谓，不影响主流程 */
+      /* 点击上报失败无所谓，不影响主流程 */
     }
   };
 
@@ -2471,8 +2436,6 @@
 
         const ingestResult = await submitIngestAfterCopy(config, plainText);
         if (ingestResult) {
-          bumpTodayCount();
-          void reportProgress(config, "入库");
           state.listingId = ingestResult.id;
           state.listingKind = ingestResult.listingKind;
           state.shareUrlDone = false;
@@ -2579,6 +2542,7 @@
       if (!isClickOnCandidate(candidate, event)) {
         continue;
       }
+      void reportTitleClick(config, candidate.text);
       dismissTitleCandidate(config, candidate);
       return;
     }
@@ -2922,7 +2886,6 @@
     }
 
     switchModeByUrl(config);
-    void reportProgress(config, "启动");
     state.currentUrl = window.location.href;
     state.routeTimer = window.setInterval(() => {
       if (window.location.href === state.currentUrl) {

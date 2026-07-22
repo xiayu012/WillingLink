@@ -8,23 +8,20 @@ export function OPTIONS() {
   return new Response(null, { status: 204, headers: corsHeaders });
 }
 
-// 很简陋：油猴脚本低频上报当天累计数，这里只打一行中文日志，方便在 Vercel runtime log 里看进度。
+// 油猴脚本：信息流每点一次帖子标题就打一行日志，方便对比点击 vs 入库。
 export async function POST(request: Request) {
-  let body: { day?: unknown; count?: unknown; reason?: unknown; version?: unknown } = {};
+  let body: { title?: unknown; version?: unknown } = {};
   try {
     body = await request.json();
   } catch {
     // 忽略非法 JSON
   }
 
-  const day = typeof body.day === "string" ? body.day : "未知日期";
-  const count = Number(body.count) || 0;
-  const reason = typeof body.reason === "string" ? body.reason : "未知";
+  const title = typeof body.title === "string" ? body.title.trim() : "";
   const version = typeof body.version === "string" ? body.version : "?";
+  const titleLabel = title || "(无标题)";
 
-  console.log(
-    `[小红书今日进度] ${day} 已采集 ${count} 条（触发: ${reason}, 脚本 v${version}）`
-  );
+  console.log(`[小红书标题点击] ${titleLabel}（脚本 v${version}）`);
 
   return Response.json({ ok: true }, { headers: corsHeaders });
 }
