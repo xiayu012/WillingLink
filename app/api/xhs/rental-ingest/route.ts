@@ -6,7 +6,6 @@ import {
   createXhsRentalOther,
   createXhsRentalWanted,
 } from "@/lib/db/queries";
-import { classifyPost } from "@/lib/xhs/classify-post";
 import {
   parseListingFields,
   parseWantedFields,
@@ -53,18 +52,19 @@ export async function POST(request: Request) {
     optString(payload.pageUrl) ??
     `pending:${randomUUID()}`;
 
-  // Step 1: 先判断是否为非交易帖（经验/科普）
-  const broadCategory = await classifyPost(rawText);
+  // 统一三分类：listing(招租) / wanted(求租) / other(非交易帖)。
+  // 只有关键词命中非常确定时才走规则硬判断快速路径，其余一律交给 LLM
+  // 阅读全文软判断——不再有单独的、仅靠关键词计数就跳过 LLM 的 "other 硬判断门"。
+  const classification = await classifyRentalPostIntent(rawText);
 
-  if (broadCategory === "other") {
-    // 真实写入 XhsRentalOther 表
+  if (classification.intent === "other") {
     const inferredTitle =
       rawText.split(/[\n。！？!?]/)[0]?.slice(0, 80) ?? null;
     const row = await createXhsRentalOther({
       sourceUrl: sourceUrlRaw,
       rawText,
       title: optString(payload.title) ?? inferredTitle,
-      aiReason: "经验/科普/非交易帖，由规则分类器识别",
+      aiReason: classification.reason,
     });
 
     if (!row) {
@@ -82,16 +82,13 @@ export async function POST(request: Request) {
       listingKind: "other",
       classification: {
         intent: "other",
-        confidence: 1,
-        reason: "经验/科普帖",
-        source: "rule",
+        confidence: classification.confidence,
+        reason: classification.reason,
+        source: classification.source,
       },
     });
   }
 
-  // Step 2: 对所有租房帖，使用 AI 全文阅读来区分招租 vs 求租
-  // 不依赖关键词分类结果，避免误判
-  const classification = await classifyRentalPostIntent(rawText);
   const isSeeker =
     classification.intent === "seeker" && classification.confidence >= 0.55;
 

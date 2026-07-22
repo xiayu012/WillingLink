@@ -43,7 +43,7 @@ export async function POST(request: Request) {
       {
         ok: false,
         error:
-          "Title classification unavailable (check AI Gateway / model credentials on server)",
+          "Title classification unavailable (火山方舟调用失败)",
       },
       503
     );
