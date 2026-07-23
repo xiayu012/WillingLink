@@ -36,7 +36,12 @@ import { tool } from "ai";
 import { after } from "next/server";
 import { z } from "zod";
 import { embedText, rerankDocuments } from "@/lib/ai/embeddings";
-import { type CityEntry, detectCity } from "@/lib/rental/cities";
+import {
+  type CityEntry,
+  cityAliases,
+  detectCity,
+  detectCityStrict,
+} from "@/lib/rental/cities";
 import {
   applyHardConstraints,
   extractHardConstraints,
@@ -52,8 +57,8 @@ import {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const VECTOR_CANDIDATES = 50;   // pgvector top-N before rerank
-const LAST_RESORT_LIMIT = 50;   // wider pool for Phase 4 last-resort rerank
+const VECTOR_CANDIDATES = 50; // pgvector top-N before rerank
+const LAST_RESORT_LIMIT = 50; // wider pool for Phase 4 last-resort rerank
 
 // ── Geo-expansion (deterministic, no LLM) ────────────────────────────────────
 // Normalizes the city mention to its bilingual canonical form ("San Jose
@@ -72,13 +77,24 @@ function lightGeoExpand(query: string, city: CityEntry): string {
 // City name is intentionally excluded — Phase 2 handles the city specifically.
 
 const RENTAL_KEYWORDS: string[] = [
-  "主卧", "次卧", "客卧",
-  "studio", "整租", "合租", "转租", "sublease",
-  "宠物", "pet",
-  "情侣", "couples",
-  "水电", "utilities",
-  "停车", "parking",
-  "家具", "furnished",
+  "主卧",
+  "次卧",
+  "客卧",
+  "studio",
+  "整租",
+  "合租",
+  "转租",
+  "sublease",
+  "宠物",
+  "pet",
+  "情侣",
+  "couples",
+  "水电",
+  "utilities",
+  "停车",
+  "parking",
+  "家具",
+  "furnished",
 ];
 
 function extractNonCityKeywords(query: string): string[] {
@@ -106,7 +122,11 @@ async function vectorSearch(
   if (!process.env.VOYAGE_API_KEY) return [];
   try {
     const vec = await embedText(query, "query");
-    return await vectorSearchXhsRentalListings(vec, VECTOR_CANDIDATES, excludeIds);
+    return await vectorSearchXhsRentalListings(
+      vec,
+      VECTOR_CANDIDATES,
+      excludeIds
+    );
   } catch (err) {
     console.error("[searchRental] vectorSearch failed:", err);
     return [];
@@ -131,6 +151,46 @@ function filterExcluded(
 ): XhsRentalSearchResultRow[] {
   if (excludeIds.length === 0) return rows;
   return rows.filter((r) => !excludeIds.includes(r.id));
+}
+
+// ── City-region preference ─────────────────────────────────────────────────
+// Vector similarity is dominated by room-type / amenity wording, so a "旧金山
+// 2B2B" query can rank a Santa Clara 2B2B above every San Francisco listing.
+// When the query names a city, PREFER candidates that actually sit in that
+// city's region (city + neighbours, matched across EN/ZH aliases and the stored
+// `city` column). Soft, not strict: if NONE of the semantic candidates are in
+// region, keep them all rather than dead-end — a later cascade phase or the
+// ranker still gets a shot.
+
+function rowInCityRegion(
+  row: XhsRentalSearchResultRow,
+  city: CityEntry
+): boolean {
+  const region = [city.en, ...city.neighbors].map((s) => s.toLowerCase());
+
+  // 1. Trust the LLM-normalized `city` column when present — it is the single
+  //    canonical city and covers non-table neighbours (e.g. "San Leandro").
+  //    A column naming a different real city is authoritative → out of region.
+  const col = row.city?.trim().toLowerCase();
+  if (col && col !== "null" && col.length > 0) {
+    return region.includes(col);
+  }
+
+  // 2. No column → detect from text with region-wide "湾区/Bay Area" phrases
+  //    neutralized, so "旧金山湾区…东湾Hayward" is read as Hayward, not SF.
+  const rc = detectCityStrict(
+    `${row.title ?? ""} ${row.locationText ?? ""} ${row.propertyName ?? ""} ${row.rawText}`
+  );
+  return rc ? region.includes(rc.en.toLowerCase()) : false;
+}
+
+function preferCityRegion(
+  rows: XhsRentalSearchResultRow[],
+  city: CityEntry | null
+): XhsRentalSearchResultRow[] {
+  if (!city) return rows;
+  const inRegion = rows.filter((r) => rowInCityRegion(r, city));
+  return inRegion.length > 0 ? inRegion : rows;
 }
 
 // ── Pick best with variety ────────────────────────────────────────────────────
@@ -164,7 +224,7 @@ async function pickBest(
         if (isDeterministic()) {
           return candidates[topIndices[0]] ?? candidates[0];
         }
-        const weights = topIndices.map((_, i) => topK - i);  // [3, 2, 1]
+        const weights = topIndices.map((_, i) => topK - i); // [3, 2, 1]
         const total = weights.reduce((a, b) => a + b, 0);
         let rnd = Math.random() * total;
         for (let i = 0; i < topIndices.length; i++) {
@@ -216,9 +276,17 @@ async function findNextListing(
   // Uses geo-expanded query so neighbor-city listings are reachable.
   // ═══════════════════════════════════════════════════════════════════════════
 
-  const vectorCandidates = constrained(
+  // When the query names a city, restrict Phase 1 to semantic candidates that
+  // sit in that city's region. If NONE are in region, leave Phase 1 empty and
+  // fall through to the city-keyword phase (P2), which scans the whole table —
+  // returning an out-of-region listing here would short-circuit before P2 runs
+  // and hide correct-city stock that merely ranked past the vector top-N.
+  const rawVectorCandidates = constrained(
     await vectorSearch(expandedQuery, excludeIds)
   );
+  const vectorCandidates = city
+    ? rawVectorCandidates.filter((r) => rowInCityRegion(r, city))
+    : rawVectorCandidates;
 
   // 1a: vector candidates that pass the block filter
   const vectorStrict = applyBlockFilter(vectorCandidates, blockTerms);
@@ -234,7 +302,8 @@ async function findNextListing(
   if (blockTerms.length > 0 && vectorCandidates.length > 0) {
     return {
       listing: await pickBest(query, vectorCandidates),
-      relaxedNote: "找不到完全符合要求的房源，已放宽部分限制条件，为您找到以下最相近的房源",
+      relaxedNote:
+        "找不到完全符合要求的房源，已放宽部分限制条件，为您找到以下最相近的房源",
       phase: "P1_VECTOR_RELAXED",
     };
   }
@@ -246,10 +315,19 @@ async function findNextListing(
   // ═══════════════════════════════════════════════════════════════════════════
 
   if (city) {
+    // Match the city across ALL its spellings (EN + ZH), not just the English
+    // canonical — Chinese-only listings ("旧金山" with no "San Francisco") are a
+    // large slice of the data and a single English keyword misses every one.
     const { results: cityRows } = await searchXhsRentalListings({
-      keywords: [city.en],
+      locationTerms: cityAliases(city),
+      limit: LAST_RESORT_LIMIT,
     });
-    const cityUnseen = constrained(filterExcluded(cityRows, excludeIds));
+    // SQL alias-match favours recall (catches Chinese-only posts) but also pulls
+    // in "旧金山湾区…东湾X" false positives; re-filter to the precise region so a
+    // San-Mateo/East-Bay listing never answers a San-Francisco query.
+    const cityUnseen = constrained(filterExcluded(cityRows, excludeIds)).filter(
+      (r) => rowInCityRegion(r, city)
+    );
 
     // 2a: strict
     const cityStrict = applyBlockFilter(cityUnseen, blockTerms);
@@ -289,7 +367,8 @@ async function findNextListing(
     if (kwStrict.length > 0) {
       return {
         listing: await pickBest(query, kwStrict),
-        relaxedNote: "找不到精确匹配的房源，已按关键词扩大搜索，为您找到以下房源",
+        relaxedNote:
+          "找不到精确匹配的房源，已按关键词扩大搜索，为您找到以下房源",
         phase: "P3_KEYWORD",
       };
     }
@@ -313,11 +392,15 @@ async function findNextListing(
   const { results: recentRows } = await searchXhsRentalListings({
     limit: LAST_RESORT_LIMIT,
   });
-  const remaining = constrained(filterExcluded(recentRows, excludeIds));
+  const remaining = preferCityRegion(
+    constrained(filterExcluded(recentRows, excludeIds)),
+    city
+  );
   if (remaining.length > 0) {
     return {
       listing: await pickBest(query, remaining),
-      relaxedNote: "湾区内暂无完全匹配的房源，已从最近发布的所有房源中为您挑选最接近的",
+      relaxedNote:
+        "湾区内暂无完全匹配的房源，已从最近发布的所有房源中为您挑选最接近的",
       phase: "P4_RECENT",
     };
   }
@@ -357,20 +440,22 @@ export function createSearchRentalTool(chatId: string) {
       "If no exact match, the tool automatically relaxes criteria and returns the closest available listing. " +
       "Never skip calling this; the server handles deduplication automatically.",
     inputSchema: z.object({
-      query: z.string().describe(
-        "Full natural language search request with ALL accumulated context. " +
-        "Carry forward location, budget, bedrooms, move-in date, requirements from prior turns. " +
-        "Example: '圣何塞两室一厅，预算2500以下，宠物友好，情侣入住'"
-      ),
+      query: z
+        .string()
+        .describe(
+          "Full natural language search request with ALL accumulated context. " +
+            "Carry forward location, budget, bedrooms, move-in date, requirements from prior turns. " +
+            "Example: '圣何塞两室一厅，预算2500以下，宠物友好，情侣入住'"
+        ),
       mustNotContain: z
         .array(z.string())
         .optional()
         .describe(
           "Keywords that disqualify a listing if found in its rawText (hard negative constraints). " +
-          "Carry forward across turns. Include both Chinese and English variants. Examples:\n" +
-          "- Couples/family → ['仅限一人', '单人', 'one person only', '一人入住']\n" +
-          "- No agent posts → ['中介', 'agent fee', '佣金']\n" +
-          "- No seekers/roommate ads → ['求租', '找室友', '合租找人']"
+            "Carry forward across turns. Include both Chinese and English variants. Examples:\n" +
+            "- Couples/family → ['仅限一人', '单人', 'one person only', '一人入住']\n" +
+            "- No agent posts → ['中介', 'agent fee', '佣金']\n" +
+            "- No seekers/roommate ads → ['求租', '找室友', '合租找人']"
         ),
     }),
     execute: async ({ query, mustNotContain }) => {
@@ -439,7 +524,8 @@ export function createSearchRentalTool(chatId: string) {
         return {
           listing: null,
           relaxedNote: null,
-          action: "SEARCH_FAILED: Tell the user the search hit a temporary error and ask them to retry.",
+          action:
+            "SEARCH_FAILED: Tell the user the search hit a temporary error and ask them to retry.",
         };
       }
     },
