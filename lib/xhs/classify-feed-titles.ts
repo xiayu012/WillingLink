@@ -1,7 +1,7 @@
 import { generateObject } from "ai";
 import { z } from "zod";
 
-import { getArkModel } from "@/lib/ai/ark";
+import { getTitleModel } from "@/lib/ai/providers";
 
 export type FeedTitleJudgement = {
   index: number;
@@ -57,9 +57,8 @@ export async function classifyFeedTitles(
 
   try {
     const { object } = await generateObject({
-      model: getArkModel(),
+      model: getTitleModel(),
       schema: batchSchema,
-      temperature: 0,
       system: SYSTEM_PROMPT,
       prompt: userPrompt,
     });
