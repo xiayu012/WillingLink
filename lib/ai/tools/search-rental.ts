@@ -43,6 +43,7 @@ import {
 } from "@/lib/rental/query-constraints";
 import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
 import {
+  logSearchQuery,
   searchXhsRentalListings,
   vectorSearchXhsRentalListings,
   type XhsRentalSearchResultRow,
@@ -187,6 +188,8 @@ async function pickBest(
 type CascadeResult = {
   listing: XhsRentalSearchResultRow;
   relaxedNote: string | null;
+  /** Which cascade phase produced the result (for logging/eval). */
+  phase: string;
 } | null;
 
 async function findNextListing(
@@ -219,7 +222,11 @@ async function findNextListing(
   // 1a: vector candidates that pass the block filter
   const vectorStrict = applyBlockFilter(vectorCandidates, blockTerms);
   if (vectorStrict.length > 0) {
-    return { listing: await pickBest(query, vectorStrict), relaxedNote: null };
+    return {
+      listing: await pickBest(query, vectorStrict),
+      relaxedNote: null,
+      phase: "P1_VECTOR",
+    };
   }
 
   // 1b: block filter is the only obstacle — relax it, keep semantic candidates
@@ -227,6 +234,7 @@ async function findNextListing(
     return {
       listing: await pickBest(query, vectorCandidates),
       relaxedNote: "找不到完全符合要求的房源，已放宽部分限制条件，为您找到以下最相近的房源",
+      phase: "P1_VECTOR_RELAXED",
     };
   }
 
@@ -248,6 +256,7 @@ async function findNextListing(
       return {
         listing: await pickBest(query, cityStrict),
         relaxedNote: null,
+        phase: "P2_CITY",
       };
     }
 
@@ -256,6 +265,7 @@ async function findNextListing(
       return {
         listing: await pickBest(query, cityUnseen),
         relaxedNote: `找不到完全匹配的房源，已在${city.zh}范围内为您找到以下房源`,
+        phase: "P2_CITY_RELAXED",
       };
     }
   }
@@ -279,6 +289,7 @@ async function findNextListing(
       return {
         listing: await pickBest(query, kwStrict),
         relaxedNote: "找不到精确匹配的房源，已按关键词扩大搜索，为您找到以下房源",
+        phase: "P3_KEYWORD",
       };
     }
 
@@ -287,6 +298,7 @@ async function findNextListing(
       return {
         listing: await pickBest(query, kwUnseen),
         relaxedNote: "找不到精确匹配的房源，已扩大搜索范围并放宽限制条件",
+        phase: "P3_KEYWORD_RELAXED",
       };
     }
   }
@@ -305,6 +317,7 @@ async function findNextListing(
     return {
       listing: await pickBest(query, remaining),
       relaxedNote: "湾区内暂无完全匹配的房源，已从最近发布的所有房源中为您挑选最接近的",
+      phase: "P4_RECENT",
     };
   }
 
@@ -319,6 +332,7 @@ async function findNextListing(
         listing: await pickBest(query, relaxed),
         relaxedNote:
           "没有完全满足预算 / 房型 / 入住时间要求的房源；以下是最接近的，请留意是否符合你的硬性条件。",
+        phase: "P4_CONSTRAINT_RELAXED",
       };
     }
   }
@@ -359,6 +373,7 @@ export function createSearchRentalTool(chatId: string) {
         ),
     }),
     execute: async ({ query, mustNotContain }) => {
+      const startedAt = Date.now();
       try {
         const excludeIds = await getSeenListingIds(chatId);
         const blockTerms = (mustNotContain ?? [])
@@ -366,6 +381,19 @@ export function createSearchRentalTool(chatId: string) {
           .filter((t) => t.length > 0);
 
         const result = await findNextListing(query, excludeIds, blockTerms);
+
+        // 留档（评测抽样 + 不满意信号数据源）；失败绝不影响搜索
+        logSearchQuery({
+          chatId,
+          query,
+          mustNotContain: mustNotContain ?? null,
+          phase: result?.phase ?? "NO_RESULT",
+          listingId: result?.listing.id ?? null,
+          relaxed: Boolean(result?.relaxedNote),
+          durationMs: Date.now() - startedAt,
+        }).catch((err) => {
+          console.error("[searchRental] logSearchQuery failed:", err);
+        });
 
         if (!result) {
           return {

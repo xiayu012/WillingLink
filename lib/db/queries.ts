@@ -33,6 +33,7 @@ import {
   shift,
   stream,
   suggestion,
+  searchQueryLog,
   type User,
   user,
   vote,
@@ -1559,6 +1560,31 @@ export async function vectorSearchXhsRentalListings(
       "Failed to vector search rental listings"
     );
   }
+}
+
+/**
+ * searchRental 查询留档（评测抽样 + 不满意信号的数据源）。
+ * 调用方需自行 catch —— 留档失败绝不能影响搜索本身。
+ */
+export async function logSearchQuery(input: {
+  chatId: string;
+  query: string;
+  mustNotContain: string[] | null;
+  phase: string;
+  listingId: string | null;
+  relaxed: boolean;
+  durationMs: number;
+}): Promise<void> {
+  await db.insert(searchQueryLog).values({
+    chatId: input.chatId,
+    query: input.query,
+    mustNotContain: input.mustNotContain,
+    phase: input.phase,
+    listingId: input.listingId,
+    relaxed: input.relaxed,
+    durationMs: input.durationMs,
+    createdAt: new Date(),
+  });
 }
 
 /** ????????????????????????????????? */
