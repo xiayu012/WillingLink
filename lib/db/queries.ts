@@ -1447,9 +1447,16 @@ export type SearchXhsRentalListingsArgs = {
   // truth. Do not reintroduce a SQL `>=` / `<=` filter on this column.
   /**
    * Free-text keywords — ALL must appear in rawText, title, locationText, or propertyName.
-   * Useful for city names, room types, amenities.
+   * Useful for room types, amenities.
    */
   keywords?: string[] | null;
+  /**
+   * Location aliases — ANY may appear in rawText, title, locationText, or
+   * propertyName (OR semantics). Use to match one city across its English AND
+   * Chinese spellings (e.g. ["San Francisco","旧金山","三藩市"]); a single
+   * English keyword silently misses Chinese-only posts.
+   */
+  locationTerms?: string[] | null;
   /**
    * Override the default RENTAL_RESULT_LIMIT (20).
    * Use a higher value for last-resort searches where a wider pool improves reranking quality.
@@ -1613,10 +1620,14 @@ export async function searchXhsRentalListings({
   bedroomsMin,
   bathroomsMin,
   keywords,
+  locationTerms,
   limit,
 }: SearchXhsRentalListingsArgs) {
   try {
     const cleanKeywords = (keywords ?? [])
+      .map((k) => (typeof k === "string" ? k.trim() : ""))
+      .filter((k) => k.length > 0);
+    const cleanLocTerms = (locationTerms ?? [])
       .map((k) => (typeof k === "string" ? k.trim() : ""))
       .filter((k) => k.length > 0);
 
@@ -1653,6 +1664,18 @@ export async function searchXhsRentalListings({
               OR COALESCE("propertyName", '') ILIKE '%' || kw || '%'
             )
             FROM unnest(${cleanKeywords}::text[]) AS kw
+          )
+        )
+        AND (
+          ${cleanLocTerms.length === 0}::boolean
+          OR (
+            SELECT bool_or(
+              "rawText"      ILIKE '%' || lt || '%'
+              OR COALESCE("title", '')        ILIKE '%' || lt || '%'
+              OR COALESCE("locationText", '') ILIKE '%' || lt || '%'
+              OR COALESCE("propertyName", '') ILIKE '%' || lt || '%'
+            )
+            FROM unnest(${cleanLocTerms}::text[]) AS lt
           )
         )
       ORDER BY "createdAt" DESC
@@ -1799,6 +1822,13 @@ export type XhsRentalWantedSearchResultRow = {
 type SearchXhsRentalWantedArgs = {
   keywords?: string[] | null;
   preferredLocation?: string | null;
+  /**
+   * Location aliases — ANY may appear in preferredLocations, rawText, or title
+   * (OR semantics). Match one city across its English AND Chinese spellings so
+   * a seeker who wrote only "旧金山" is not missed by an English-only search.
+   * Takes precedence over `preferredLocation` when non-empty.
+   */
+  locationTerms?: string[] | null;
   roomType?: string | null;
   bedrooms?: string | null;
   gender?: string | null;
@@ -1811,6 +1841,7 @@ const WANTED_RESULT_LIMIT = 20;
 export async function searchXhsRentalWanted({
   keywords,
   preferredLocation,
+  locationTerms,
   roomType,
   bedrooms,
   gender,
@@ -1821,6 +1852,9 @@ export async function searchXhsRentalWanted({
   totalCount: number;
 }> {
   const cleanKeywords = (keywords ?? [])
+    .map((k) => (typeof k === "string" ? k.trim() : ""))
+    .filter((k) => k.length > 0);
+  const cleanLocTerms = (locationTerms ?? [])
     .map((k) => (typeof k === "string" ? k.trim() : ""))
     .filter((k) => k.length > 0);
 
@@ -1837,7 +1871,16 @@ export async function searchXhsRentalWanted({
         COUNT(*) OVER() AS total_count
       FROM "XhsRentalWanted"
       WHERE
-            (${preferredLocation ?? null}::text IS NULL
+            (${cleanLocTerms.length === 0}::boolean
+             OR (
+               SELECT bool_or(
+                 "preferredLocations"       ILIKE '%' || lt || '%'
+                 OR "rawText"               ILIKE '%' || lt || '%'
+                 OR COALESCE(title, '')     ILIKE '%' || lt || '%'
+               )
+               FROM unnest(${cleanLocTerms}::text[]) AS lt
+             ))
+        AND (${preferredLocation ?? null}::text IS NULL
              OR "preferredLocations" ILIKE '%' || ${preferredLocation ?? null} || '%'
              OR "rawText"            ILIKE '%' || ${preferredLocation ?? null} || '%'
              OR COALESCE(title, '')  ILIKE '%' || ${preferredLocation ?? null} || '%')
