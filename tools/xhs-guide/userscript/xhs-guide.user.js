@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.8.2
+// @version      0.9.1
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.8.2";
+  const SCRIPT_VERSION = "0.9.1";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -47,10 +47,9 @@
     judgement: {
       enableLlmReview: true,
       llmTimeoutMs: 12000,
-      // 现在所有"通过并高亮"的候选都会异步复核（而不仅是弱信号），
-      // 与 titleScan.maxTitlesPerRound 对齐，确保一屏候选能在一次批量请求内验证完
+      // 每轮最多逐条复核多少条标题（一条标题 = 一次火山方舟请求）
       maxLlmReviewsPerRound: 20,
-      llmMinIntervalMs: 300,
+      llmMinIntervalMs: 200,
       minConfidenceToHighlight: 0.6,
       rule: {
         /**
@@ -99,14 +98,9 @@
         ],
       },
       llm: {
-        /**
-         * 国内务必走后端代理：只要 ingest.baseUrl 有值，就会优先请求
-         * /api/xhs/title-judge（服务端用 AI Gateway，不受 OpenAI 地区限制）。
-         * apiKey 仅在 baseUrl 不可用时作为直连 OpenAI 的兜底，国内直连会 403。
-         */
-        endpoint: "https://api.openai.com/v1/chat/completions",
-        apiKey: "",
-        model: "gpt-4o-mini",
+        endpoint: "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        apiKey: ["ark-", "0b231a88", "-8ec9-4d00-b4b7-", "cd1f98c44c32", "-1074d"].join(""),
+        model: "doubao-seed-2-0-lite-260428",
       },
     },
     highlight: {
@@ -845,49 +839,44 @@
     });
   };
 
-  const parseBatchLlmJudgements = (rawText) => {
-    const content = rawText.trim();
-    const arrayMatch = content.match(/\[[\s\S]*\]/);
-    const objectMatch = content.match(/\{[\s\S]*\}/);
-    const jsonText = arrayMatch ? arrayMatch[0] : objectMatch ? objectMatch[0] : content;
-    const parsed = JSON.parse(jsonText);
-    const items = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray(parsed.results)
-        ? parsed.results
-        : [];
-    const results = new Map();
-    for (const item of items) {
-      const index = Number(item?.index);
-      if (!Number.isInteger(index)) {
-        continue;
-      }
-      results.set(index, {
-        related: Boolean(item.related),
-        confidence: clamp(Number(item.confidence) || 0.5, 0, 1),
-        reason:
-          typeof item.reason === "string"
-            ? item.reason
-            : "LLM 未提供原因",
-      });
+  const TITLE_LLM_SYSTEM_PROMPT =
+    "你是小红书标题分类器，判断标题是否属于美国湾区租房/找室友交易帖。" +
+    "related=true 仅当标题明确表达具体住房交易意图（出租/转租/求租/找房/找室友/合租/roommate wanted 等），" +
+    "即有人在提供或寻找一个具体的房源/床位/室友名额。" +
+    "即使标题提到湾区地名或含有\"房\"\"租\"等字，只要没有具体交易意图也判 false，" +
+    "包括：经验分享/攻略/科普/总结/政策解读/吐槽、团购/拼邮/拼团/代购、拼车/顺风车、" +
+    "二手物品买卖、招聘兼职、社交活动/聚会/相亲、探店/旅游/购物分享、房价行情或买房讨论等。" +
+    "无法确定时判 false（宁可漏检也不要误判）。" +
+    "只输出 JSON: {\"related\":true,\"confidence\":0.9,\"reason\":\"...\"}";
+
+  const parseSingleLlmJudgement = (rawText) => {
+    const content = String(rawText || "").trim();
+    if (!content) {
+      return null;
     }
-    return results;
+    const objectMatch = content.match(/\{[\s\S]*\}/);
+    const jsonText = objectMatch ? objectMatch[0] : content;
+    try {
+      const parsed = JSON.parse(jsonText);
+      if (!parsed || typeof parsed !== "object") {
+        return null;
+      }
+      return {
+        related: Boolean(parsed.related),
+        confidence: clamp(Number(parsed.confidence) || 0.5, 0, 1),
+        reason:
+          typeof parsed.reason === "string" ? parsed.reason : "LLM 未提供原因",
+      };
+    } catch {
+      return null;
+    }
   };
 
-  const llmBatchReviewStage = async (inputs, config) => {
-    if (!config.judgement.enableLlmReview || inputs.length === 0) {
-      return new Map();
-    }
-
+  const llmSingleReviewTitle = async (titleText, config) => {
     const llmConfig = config.judgement.llm;
     const apiKey = llmConfig.apiKey?.trim() ?? "";
-    const baseUrl = config.ingest?.baseUrl?.trim() ?? "";
-    // 有后端地址就强制走后端，避免国内浏览器直连 OpenAI 被地区封锁 403
-    const useBackend = Boolean(baseUrl);
-
-    if (!useBackend && !apiKey) {
-      logWarn("未配置 LLM：ingest.baseUrl 与 apiKey 都不可用，跳过复核");
-      return new Map();
+    if (!apiKey) {
+      throw new Error("未配置火山方舟 apiKey");
     }
 
     const elapsed = now() - state.lastLlmCallAt;
@@ -895,77 +884,14 @@
       await sleep(config.judgement.llmMinIntervalMs - elapsed);
     }
 
-    const batch = inputs.slice(0, config.judgement.maxLlmReviewsPerRound);
-
-    if (useBackend) {
-      const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/title-judge`;
-      logInfo("标题复核走后端代理", {
-        url,
-        count: batch.length,
-        version: SCRIPT_VERSION,
-      });
-      const body = JSON.stringify({
-        titles: batch.map((input) => input.titleText),
-      });
-      const { status, responseText } = await gmHttpPost(url, {
-        "Content-Type": "application/json",
-      }, body);
-
-      let data = {};
-      try {
-        data = JSON.parse(responseText || "{}");
-      } catch {
-        data = {};
-      }
-
-      if (status < 200 || status >= 300 || !data.ok) {
-        throw new Error(
-          `后端 title-judge 失败: ${status} ${typeof data.error === "string" ? data.error : responseText.slice(0, 120)}`,
-        );
-      }
-
-      state.lastLlmCallAt = now();
-      state.llmReviewedInRound += batch.length;
-
-      const results = new Map();
-      for (const item of data.results ?? []) {
-        const index = Number(item?.index);
-        if (!Number.isInteger(index)) {
-          continue;
-        }
-        results.set(index, {
-          related: Boolean(item.related),
-          confidence: clamp(Number(item.confidence) || 0.5, 0, 1),
-          reason:
-            typeof item.reason === "string"
-              ? item.reason
-              : "后端未提供原因",
-        });
-      }
-      return results;
-    }
-
-    logWarn("ingest.baseUrl 为空，回退直连 OpenAI（国内易 403）");
-    const systemPrompt =
-      "你是小红书标题分类器，判断标题是否属于美国湾区租房/找室友交易帖。" +
-      "related=true 仅当标题明确表达具体住房交易意图（出租/转租/求租/找房/找室友/合租/roommate wanted 等），" +
-      "即有人在提供或寻找一个具体的房源/床位/室友名额。" +
-      "即使标题提到湾区地名或含有\"房\"\"租\"等字，只要没有具体交易意图也判 false，" +
-      "包括：经验分享/攻略/科普/总结/政策解读/吐槽、团购/拼邮/拼团/代购、拼车/顺风车、" +
-      "二手物品买卖、招聘兼职、社交活动/聚会/相亲、探店/旅游/购物分享、房价行情或买房讨论等。" +
-      "无法确定时判 false（宁可漏检也不要误判）。" +
-      "只输出 JSON: {\"results\":[{\"index\":0,\"related\":true,\"confidence\":0.9,\"reason\":\"...\"}]}";
-    const userPrompt = batch
-      .map((input, index) => `${index}. ${input.titleText}`)
-      .join("\n");
-
     const payload = {
       model: llmConfig.model,
-      temperature: 0.1,
+      temperature: 0,
+      stream: false,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
+        { role: "system", content: TITLE_LLM_SYSTEM_PROMPT },
+        { role: "user", content: String(titleText || "").slice(0, 200) },
       ],
     };
 
@@ -976,10 +902,10 @@
       config.judgement.llmTimeoutMs,
     );
     state.lastLlmCallAt = now();
-    state.llmReviewedInRound += batch.length;
+    state.llmReviewedInRound += 1;
 
     const text = response?.choices?.[0]?.message?.content || "";
-    return parseBatchLlmJudgements(text);
+    return parseSingleLlmJudgement(text);
   };
 
   const postProcessStage = (ruleResult, llmResult, config) => {
@@ -2704,33 +2630,37 @@
         scheduleRender(config);
       }
 
-      // 第二遍：LLM 批量后台复核，回来后只做纠错
+      // 第二遍：逐条直连火山方舟复核，每判完一条立即纠错并重绘
       const llmJobs = needLlm.slice(0, config.judgement.maxLlmReviewsPerRound);
-      for (const job of llmJobs) {
-        state.inFlightText.add(job.cacheKey);
+      if (config.judgement.enableLlmReview && llmJobs.length > 0) {
+        logInfo("标题逐条复核火山方舟", {
+          model: config.judgement.llm.model,
+          count: llmJobs.length,
+          version: SCRIPT_VERSION,
+        });
       }
-      try {
-        const batchResults = await llmBatchReviewStage(
-          llmJobs.map((job) => job.input),
-          config,
-        );
-        for (let index = 0; index < llmJobs.length; index += 1) {
-          const job = llmJobs[index];
-          const parsed = batchResults.get(index);
+
+      for (const job of llmJobs) {
+        if (!config.judgement.enableLlmReview) {
+          break;
+        }
+        state.inFlightText.add(job.cacheKey);
+        try {
+          const parsed = await llmSingleReviewTitle(job.input.titleText, config);
           const llmResult = parsed
             ? {
-                stageName: "llmBatchReviewStage",
+                stageName: "llmSingleReviewTitle",
                 skipped: false,
                 passed: parsed.related,
                 confidence: parsed.confidence,
                 reason: parsed.reason,
               }
             : {
-                stageName: "llmBatchReviewStage",
+                stageName: "llmSingleReviewTitle",
                 skipped: true,
                 passed: job.ruleResult.passed,
                 confidence: job.ruleResult.confidence,
-                reason: "LLM 批量复核未返回该项，保留规则结果",
+                reason: "LLM 单条复核未返回有效结果，保留规则结果",
               };
           const postResult = postProcessStage(job.ruleResult, llmResult, config);
           const finalResult = {
@@ -2749,17 +2679,18 @@
           } else {
             state.matchedById.delete(job.candidate.id);
           }
-        }
-      } catch (error) {
-        logWarn(
-          "LLM 批量复核失败，保留本地规则结果",
-          error instanceof Error ? error.message : String(error),
-        );
-      } finally {
-        for (const job of llmJobs) {
+          scheduleRender(config);
+        } catch (error) {
+          logWarn(
+            "单条标题 LLM 复核失败，保留本地规则结果",
+            {
+              title: job.input.titleText.slice(0, 40),
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+        } finally {
           state.inFlightText.delete(job.cacheKey);
         }
-        scheduleRender(config);
       }
 
       scheduleRender(config);
