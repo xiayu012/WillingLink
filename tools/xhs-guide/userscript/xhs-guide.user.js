@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.9.1
+// @version      0.9.2
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.9.1";
+  const SCRIPT_VERSION = "0.9.2";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -53,10 +53,9 @@
       minConfidenceToHighlight: 0.6,
       rule: {
         /**
-         * 关键词只用来决定"是否先乐观高亮"，不代表最终判定。
-         * 只要判定为高亮（passed=true），无论信号多强，都会异步交给 LLM 复核并可撤销——
-         * 因为关键词共现（如"湾区"+"租/房"）不等于真实意图，很多攻略/避雷/科普贴也会撞上这些词。
-         * 真正跳过 LLM 的，只有"直接拒绝、什么都不展示"的分支，因为拒绝不展示没有精度损失。
+         * 关键词只用来筛「要不要送 LLM」，不直接决定高亮。
+         * 真正高亮等火山方舟单条复核通过后再画，避免规则先亮、LLM 再撤的闪烁。
+         * skipLlm=true 仅用于硬拒绝（大陆词/无信号），直接跳过且不高亮。
          */
         bayAreaWords: [
           "湾区", "Bay Area", "bay area",
@@ -708,26 +707,25 @@
       };
     }
 
-    // 强命中：城市词 + 租房词同时出现 → 先乐观高亮，但仍需 LLM 异步复核意图
-    // （关键词共现常见于攻略/避雷/科普贴，不能直接当作最终判定）
+    // 强命中：城市词 + 租房词 → 送 LLM，不先高亮
     if (bayHits.length > 0 && rentHits.length > 0) {
       return {
         stageName: "ruleScreenStage",
         passed: true,
         skipLlm: false,
         confidence: 0.85,
-        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})，先高亮后复核`,
+        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})，送 LLM 复核`,
       };
     }
 
-    // 湾区城市出现多个，通常就是本地租房/生活帖，先展示，后台交给 LLM 纠错
+    // 多个湾区城市信号 → 送 LLM
     if (bayHits.length >= 2) {
       return {
         stageName: "ruleScreenStage",
         passed: true,
         skipLlm: false,
         confidence: 0.72,
-        reason: `多个湾区信号(${bayHits.slice(0, 2).join(", ")})，先高亮后复核`,
+        reason: `多个湾区信号(${bayHits.slice(0, 2).join(", ")})，送 LLM 复核`,
       };
     }
 
@@ -737,7 +735,7 @@
         passed: true,
         skipLlm: false,
         confidence: 0.7,
-        reason: `强租房信号(${strongRentalHit})，先高亮后复核`,
+        reason: `强租房信号(${strongRentalHit})，送 LLM 复核`,
       };
     }
 
@@ -2595,7 +2593,7 @@
           collectedAt: new Date().toISOString(),
         };
         const ruleResult = ruleScreenStage(input, config);
-        const immediateResult = {
+        const ruleJudgement = {
           isBayAreaRentingRelated:
             ruleResult.passed &&
             ruleResult.confidence >= config.judgement.minConfidenceToHighlight,
@@ -2604,31 +2602,36 @@
           stageTrace: [ruleResult],
         };
 
-        if (immediateResult.isBayAreaRentingRelated) {
-          candidate.judgement = immediateResult;
-          relatedInRound.push(candidate);
-        }
-
+        // 硬拒绝：直接缓存，不高亮
         if (ruleResult.skipLlm) {
-          state.judgeCache.set(cacheKey, immediateResult);
+          state.judgeCache.set(cacheKey, ruleJudgement);
           continue;
         }
 
-        if (!state.inFlightText.has(cacheKey)) {
-          needLlm.push({ candidate, cacheKey, input, ruleResult });
+        // 需要 LLM：先不入高亮，等火山方舟结果再决定，避免「闪一下又消失」
+        if (config.judgement.enableLlmReview) {
+          if (!state.inFlightText.has(cacheKey)) {
+            needLlm.push({ candidate, cacheKey, input, ruleResult });
+          }
+          continue;
+        }
+
+        // LLM 关闭时才退回规则结果
+        if (ruleJudgement.isBayAreaRentingRelated) {
+          candidate.judgement = ruleJudgement;
+          relatedInRound.push(candidate);
+          state.judgeCache.set(cacheKey, ruleJudgement);
         }
       }
 
-      // 立即渲染缓存命中 + 规则乐观命中项
+      // 先渲染缓存命中的最终结果（不含待 LLM 项）
       state.matchedById.clear();
       for (const candidate of relatedInRound) {
         if (!state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
           state.matchedById.set(candidate.id, candidate);
         }
       }
-      if (relatedInRound.length > 0) {
-        scheduleRender(config);
-      }
+      scheduleRender(config);
 
       // 第二遍：逐条直连火山方舟复核，每判完一条立即纠错并重绘
       const llmJobs = needLlm.slice(0, config.judgement.maxLlmReviewsPerRound);
