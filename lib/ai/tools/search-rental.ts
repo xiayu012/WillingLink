@@ -33,6 +33,7 @@
  */
 
 import { tool } from "ai";
+import { after } from "next/server";
 import { z } from "zod";
 import { embedText, rerankDocuments } from "@/lib/ai/embeddings";
 import { type CityEntry, detectCity } from "@/lib/rental/cities";
@@ -382,18 +383,23 @@ export function createSearchRentalTool(chatId: string) {
 
         const result = await findNextListing(query, excludeIds, blockTerms);
 
-        // 留档（评测抽样 + 不满意信号数据源）；失败绝不影响搜索
-        logSearchQuery({
-          chatId,
-          query,
-          mustNotContain: mustNotContain ?? null,
-          phase: result?.phase ?? "NO_RESULT",
-          listingId: result?.listing.id ?? null,
-          relaxed: Boolean(result?.relaxedNote),
-          durationMs: Date.now() - startedAt,
-        }).catch((err) => {
-          console.error("[searchRental] logSearchQuery failed:", err);
-        });
+        // 留档（评测抽样 + 不满意信号数据源）；失败绝不影响搜索。
+        // 用 after() 而非裸 fire-and-forget：serverless 在 execute 返回后可能
+        // 立刻冻结/回收函数，未 await 的 insert 会被静默丢弃——而留档正是本功能
+        // 的全部意义。after() 让平台等这条写入完成再回收。
+        after(() =>
+          logSearchQuery({
+            chatId,
+            query,
+            mustNotContain: mustNotContain ?? null,
+            phase: result?.phase ?? "NO_RESULT",
+            listingId: result?.listing.id ?? null,
+            relaxed: Boolean(result?.relaxedNote),
+            durationMs: Date.now() - startedAt,
+          }).catch((err) => {
+            console.error("[searchRental] logSearchQuery failed:", err);
+          })
+        );
 
         if (!result) {
           return {
