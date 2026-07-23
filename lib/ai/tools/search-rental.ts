@@ -135,6 +135,13 @@ function filterExcluded(
 // Reranks top-3 candidates via Voyage, then selects using weighted randomness
 // so users get different listings on each "换一个" even for the same query.
 // Weight: rank-1 = 3×, rank-2 = 2×, rank-3 = 1×.
+//
+// SEARCH_DETERMINISTIC=1 disables the randomness (always rank-1) so eval runs
+// are reproducible. Never set in production.
+
+function isDeterministic(): boolean {
+  return process.env.SEARCH_DETERMINISTIC === "1";
+}
 
 async function pickBest(
   query: string,
@@ -152,6 +159,9 @@ async function pickBest(
       );
 
       if (topIndices.length > 0) {
+        if (isDeterministic()) {
+          return candidates[topIndices[0]] ?? candidates[0];
+        }
         const weights = topIndices.map((_, i) => topK - i);  // [3, 2, 1]
         const total = weights.reduce((a, b) => a + b, 0);
         let rnd = Math.random() * total;
@@ -166,7 +176,8 @@ async function pickBest(
     }
   }
 
-  // No reranker: random pick from first 3
+  // No reranker: random pick from first 3 (rank-1 when deterministic)
+  if (isDeterministic()) return candidates[0];
   const pool = candidates.slice(0, Math.min(3, candidates.length));
   return pool[Math.floor(Math.random() * pool.length)];
 }
