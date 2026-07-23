@@ -50,3 +50,6 @@ twa/keystore/
 
 # TypeScript incremental build info
 *.tsbuildinfo
+
+# Search eval reports (generated artifacts)
+tests/search-eval/reports/
