@@ -107,10 +107,19 @@ const SYSTEM_PROMPT = `你是一个小红书帖子分类器，专门处理美国
 - wanted：租客发布的求租/找房帖（在找住所）
 - other：经验分享、攻略总结、科普、生活记录等非交易帖`;
 
+// Every default-to-"listing" path is a silent misclassification risk: a
+// transient OpenAI blip biases posts into the listing table (where they then
+// get embedded and stored). Behavior is unchanged, but each fallback now logs
+// a stable, greppable reason so these can be counted/alerted on.
+function fallbackListing(reason: string): PostCategory {
+  console.warn(`[classifyPost] falling back to "listing": ${reason}`);
+  return "listing";
+}
+
 async function aiClassify(rawText: string): Promise<PostCategory> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    return "listing";
+    return fallbackListing("OPENAI_API_KEY not set");
   }
 
   const excerpt = rawText.slice(0, 600);
@@ -133,12 +142,14 @@ async function aiClassify(rawText: string): Promise<PostCategory> {
         ],
       }),
     });
-  } catch {
-    return "listing";
+  } catch (err) {
+    return fallbackListing(
+      `fetch threw: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 
   if (!resp.ok) {
-    return "listing";
+    return fallbackListing(`OpenAI HTTP ${resp.status}`);
   }
 
   try {
@@ -149,7 +160,7 @@ async function aiClassify(rawText: string): Promise<PostCategory> {
     const jsonStart = content.indexOf("{");
     const jsonEnd = content.lastIndexOf("}");
     if (jsonStart === -1 || jsonEnd === -1) {
-      return "listing";
+      return fallbackListing("no JSON object in model output");
     }
     const parsed = JSON.parse(content.slice(jsonStart, jsonEnd + 1)) as {
       category?: string;
@@ -158,11 +169,12 @@ async function aiClassify(rawText: string): Promise<PostCategory> {
     if (cat === "listing" || cat === "wanted" || cat === "other") {
       return cat;
     }
-  } catch {
-    /* ignore */
+    return fallbackListing(`unexpected category: ${String(cat)}`);
+  } catch (err) {
+    return fallbackListing(
+      `JSON parse failed: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
-
-  return "listing";
 }
 
 export async function classifyPost(rawText: string): Promise<PostCategory> {
