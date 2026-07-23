@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.9.2
+// @version      0.9.3
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.9.2";
+  const SCRIPT_VERSION = "0.9.3";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -46,15 +46,15 @@
     },
     judgement: {
       enableLlmReview: true,
-      llmTimeoutMs: 12000,
-      // 每轮最多逐条复核多少条标题（一条标题 = 一次火山方舟请求）
+      llmTimeoutMs: 30000,
+      // 每轮最多逐条复核多少条标题（一条标题 = 一次本地 Ollama 请求）
       maxLlmReviewsPerRound: 20,
-      llmMinIntervalMs: 200,
+      llmMinIntervalMs: 50,
       minConfidenceToHighlight: 0.6,
       rule: {
         /**
          * 关键词只用来筛「要不要送 LLM」，不直接决定高亮。
-         * 真正高亮等火山方舟单条复核通过后再画，避免规则先亮、LLM 再撤的闪烁。
+         * 真正高亮等本地 qwen 单条复核通过后再画，避免规则先亮、LLM 再撤的闪烁。
          * skipLlm=true 仅用于硬拒绝（大陆词/无信号），直接跳过且不高亮。
          */
         bayAreaWords: [
@@ -97,9 +97,10 @@
         ],
       },
       llm: {
-        endpoint: "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
-        apiKey: ["ark-", "0b231a88", "-8ec9-4d00-b4b7-", "cd1f98c44c32", "-1074d"].join(""),
-        model: "doubao-seed-2-0-lite-260428",
+        // 仅信息流标题高亮走本地 Ollama；入库等其他路径仍用后端原模型
+        endpoint: "http://127.0.0.1:11434/v1/chat/completions",
+        apiKey: "ollama",
+        model: "qwen2.5:3b",
       },
     },
     highlight: {
@@ -872,10 +873,7 @@
 
   const llmSingleReviewTitle = async (titleText, config) => {
     const llmConfig = config.judgement.llm;
-    const apiKey = llmConfig.apiKey?.trim() ?? "";
-    if (!apiKey) {
-      throw new Error("未配置火山方舟 apiKey");
-    }
+    const apiKey = llmConfig.apiKey?.trim() || "ollama";
 
     const elapsed = now() - state.lastLlmCallAt;
     if (elapsed < config.judgement.llmMinIntervalMs) {
@@ -886,7 +884,6 @@
       model: llmConfig.model,
       temperature: 0,
       stream: false,
-      response_format: { type: "json_object" },
       messages: [
         { role: "system", content: TITLE_LLM_SYSTEM_PROMPT },
         { role: "user", content: String(titleText || "").slice(0, 200) },
@@ -2608,7 +2605,7 @@
           continue;
         }
 
-        // 需要 LLM：先不入高亮，等火山方舟结果再决定，避免「闪一下又消失」
+        // 需要 LLM：先不入高亮，等本地 qwen 结果再决定，避免「闪一下又消失」
         if (config.judgement.enableLlmReview) {
           if (!state.inFlightText.has(cacheKey)) {
             needLlm.push({ candidate, cacheKey, input, ruleResult });
@@ -2633,11 +2630,12 @@
       }
       scheduleRender(config);
 
-      // 第二遍：逐条直连火山方舟复核，每判完一条立即纠错并重绘
+      // 第二遍：逐条直连本地 Ollama(qwen2.5:3b) 复核，每判完一条立即纠错并重绘
       const llmJobs = needLlm.slice(0, config.judgement.maxLlmReviewsPerRound);
       if (config.judgement.enableLlmReview && llmJobs.length > 0) {
-        logInfo("标题逐条复核火山方舟", {
+        logInfo("标题逐条复核本地 qwen", {
           model: config.judgement.llm.model,
+          endpoint: config.judgement.llm.endpoint,
           count: llmJobs.length,
           version: SCRIPT_VERSION,
         });
