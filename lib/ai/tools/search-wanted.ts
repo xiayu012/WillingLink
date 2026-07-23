@@ -15,6 +15,7 @@
 
 import { tool } from "ai";
 import { z } from "zod";
+import { cityAliases, detectCity } from "@/lib/rental/cities";
 import {
   checkMoveInFeasibility,
   extractQueryDate,
@@ -31,38 +32,45 @@ import {
 } from "@/lib/db/queries";
 
 // ── Location detection ────────────────────────────────────────────────────────
+// Primary source of truth is the shared CITY_TABLE (cities.ts) so this stays in
+// sync with the tenant side and gains Chinese-alias coverage — a Fremont
+// landlord must match a seeker who wrote only "弗里蒙特", and "屋仑" must resolve
+// to Oakland (the old private list silently missed both). A small supplemental
+// table covers regions/cities not (yet) in CITY_TABLE.
 
-const LOCATION_ENTRIES: { re: RegExp; canonical: string }[] = [
-  { re: /圣何塞|San\s*Jose/i, canonical: "San Jose" },
-  { re: /旧金山|三藩市|San\s*Francisco|\bSF\b/i, canonical: "San Francisco" },
-  { re: /伯克利|Berkeley/i, canonical: "Berkeley" },
-  { re: /奥克兰|Oakland/i, canonical: "Oakland" },
-  { re: /帕罗奥图|帕洛阿尔托|Palo\s*Alto/i, canonical: "Palo Alto" },
-  { re: /山景城|Mountain\s*View/i, canonical: "Mountain View" },
-  { re: /桑尼维尔|Sunnyvale/i, canonical: "Sunnyvale" },
-  { re: /弗里蒙特|Fremont/i, canonical: "Fremont" },
-  { re: /圣克拉拉|Santa\s*Clara/i, canonical: "Santa Clara" },
-  { re: /戴利城|Daly\s*City/i, canonical: "Daly City" },
-  { re: /库比蒂诺|Cupertino/i, canonical: "Cupertino" },
-  { re: /圣马特奥|San\s*Mateo/i, canonical: "San Mateo" },
-  { re: /红木城|Redwood\s*City/i, canonical: "Redwood City" },
-  { re: /Milpitas/i, canonical: "Milpitas" },
-  { re: /Hayward/i, canonical: "Hayward" },
-  { re: /Menlo\s*Park|门洛帕克/i, canonical: "Menlo Park" },
-  { re: /Los\s*Altos/i, canonical: "Los Altos" },
-  { re: /Saratoga/i, canonical: "Saratoga" },
-  { re: /Campbell/i, canonical: "Campbell" },
-  { re: /Foster\s*City/i, canonical: "Foster City" },
-  { re: /Burlingame/i, canonical: "Burlingame" },
-  { re: /South\s*Bay|南湾/i, canonical: "South Bay" },
-  { re: /East\s*Bay|东湾/i, canonical: "East Bay" },
-  { re: /Peninsula|半岛/i, canonical: "Peninsula" },
-  { re: /湾区|Bay\s*Area/i, canonical: "湾区" },
-];
+const SUPPLEMENTAL_LOCATIONS: { re: RegExp; label: string; terms: string[] }[] =
+  [
+    {
+      re: /Menlo\s*Park|门洛帕克/i,
+      label: "Menlo Park",
+      terms: ["Menlo Park", "门洛帕克"],
+    },
+    { re: /Los\s*Altos/i, label: "Los Altos", terms: ["Los Altos"] },
+    { re: /Saratoga/i, label: "Saratoga", terms: ["Saratoga"] },
+    { re: /Campbell/i, label: "Campbell", terms: ["Campbell"] },
+    {
+      re: /Foster\s*City|福斯特城/i,
+      label: "Foster City",
+      terms: ["Foster City", "福斯特城"],
+    },
+    { re: /Burlingame/i, label: "Burlingame", terms: ["Burlingame"] },
+    { re: /South\s*Bay|南湾/i, label: "南湾", terms: ["South Bay", "南湾"] },
+    { re: /East\s*Bay|东湾/i, label: "东湾", terms: ["East Bay", "东湾"] },
+    { re: /Peninsula|半岛/i, label: "半岛", terms: ["Peninsula", "半岛"] },
+  ];
 
-function detectLocation(query: string): string | null {
-  for (const entry of LOCATION_ENTRIES) {
-    if (entry.re.test(query)) return entry.canonical;
+/**
+ * Resolve a location mentioned in the query to a display label plus the set of
+ * text terms (EN + ZH spellings) that identify it. CITY_TABLE first (with all
+ * its aliases), then the supplemental regions. Null when no location is voiced.
+ */
+function detectLocation(
+  query: string
+): { label: string; terms: string[] } | null {
+  const city = detectCity(query);
+  if (city) return { label: city.zh, terms: cityAliases(city) };
+  for (const entry of SUPPLEMENTAL_LOCATIONS) {
+    if (entry.re.test(query)) return { label: entry.label, terms: entry.terms };
   }
   return null;
 }
@@ -70,15 +78,34 @@ function detectLocation(query: string): string | null {
 // ── Keyword extraction ────────────────────────────────────────────────────────
 
 const WANTED_KEYWORDS: string[] = [
-  "主卧", "次卧", "客卧",
-  "studio", "Studio",
-  "整租", "合租", "转租", "sublease",
-  "短租", "长租",
-  "宠物", "pet", "猫", "狗",
-  "情侣", "couples",
-  "女生", "男生", "female", "male",
-  "实习", "intern", "学生",
-  "1B1B", "2B2B", "1b1b", "2b2b",
+  "主卧",
+  "次卧",
+  "客卧",
+  "studio",
+  "Studio",
+  "整租",
+  "合租",
+  "转租",
+  "sublease",
+  "短租",
+  "长租",
+  "宠物",
+  "pet",
+  "猫",
+  "狗",
+  "情侣",
+  "couples",
+  "女生",
+  "男生",
+  "female",
+  "male",
+  "实习",
+  "intern",
+  "学生",
+  "1B1B",
+  "2B2B",
+  "1b1b",
+  "2b2b",
 ];
 
 function extractKeywords(query: string): string[] {
@@ -179,7 +206,7 @@ export async function findNextWanted(
   // Phase 1 — location + keywords, strict → up to 4 exact matches
   if (location || keywords.length > 0) {
     const { results } = await searchXhsRentalWanted({
-      preferredLocation: location,
+      locationTerms: location?.terms,
       keywords: keywords.length > 0 ? keywords : undefined,
     });
     const unseen = dateFeasible(filterExcluded(results, excludeIds));
@@ -201,20 +228,22 @@ export async function findNextWanted(
 
   // Phase 3 — location only, drop keywords → one relaxed post
   if (location && keywords.length > 0) {
-    const { results } = await searchXhsRentalWanted({ preferredLocation: location });
+    const { results } = await searchXhsRentalWanted({
+      locationTerms: location.terms,
+    });
     const unseen = dateFeasible(filterExcluded(results, excludeIds));
 
     const strict = applyBlockFilter(unseen, blockTerms);
     if (strict.length > 0) {
       return {
         wanted: [pickOne(strict)],
-        relaxedNote: `找不到完全符合要求的，已放宽关键词，仅保留${location}地区筛选，先给你看一条`,
+        relaxedNote: `找不到完全符合要求的，已放宽关键词，仅保留${location.label}地区筛选，先给你看一条`,
       };
     }
     if (unseen.length > 0) {
       return {
         wanted: [pickOne(unseen)],
-        relaxedNote: `找不到完全符合要求的，已放宽限制，先给你看一条${location}地区的求租帖`,
+        relaxedNote: `找不到完全符合要求的，已放宽限制，先给你看一条${location.label}地区的求租帖`,
       };
     }
   }
@@ -259,18 +288,20 @@ export function createSearchWantedTool(chatId: string) {
       "Returns UP TO 4 unseen exact-match posts, or exactly ONE relaxed post (with relaxedNote) when no exact match exists. " +
       "Call again for '换一个'/'next'/'不满意' — server deduplicates automatically and tracks how many times you've searched.",
     inputSchema: z.object({
-      query: z.string().describe(
-        "Full natural language description of the tenant the landlord is looking for. " +
-        "Include location, room type, lease duration, budget expectation, gender preference, etc. " +
-        "Carry ALL context forward from the conversation on every call. " +
-        "Example: '旧金山女生室友，2B2B，长租，预算2000-2500，不养宠物'"
-      ),
+      query: z
+        .string()
+        .describe(
+          "Full natural language description of the tenant the landlord is looking for. " +
+            "Include location, room type, lease duration, budget expectation, gender preference, etc. " +
+            "Carry ALL context forward from the conversation on every call. " +
+            "Example: '旧金山女生室友，2B2B，长租，预算2000-2500，不养宠物'"
+        ),
       mustNotContain: z
         .array(z.string())
         .optional()
         .describe(
           "Keywords that disqualify a post if found in its text. " +
-          "Accumulate across turns. Examples: ['中介', '转租'] to exclude subletting posts."
+            "Accumulate across turns. Examples: ['中介', '转租'] to exclude subletting posts."
         ),
     }),
     execute: async ({ query, mustNotContain }) => {
@@ -293,7 +324,8 @@ export function createSearchWantedTool(chatId: string) {
             action:
               (excludeIds.length > 0
                 ? "NO_MORE: 已经没有更多符合条件的求租帖了。建议调整筛选条件再试。"
-                : "NO_RESULTS: 数据库暂无可推荐的求租帖，请稍后再试。") + exhaustion,
+                : "NO_RESULTS: 数据库暂无可推荐的求租帖，请稍后再试。") +
+              exhaustion,
           };
         }
 
@@ -331,7 +363,8 @@ export function createSearchWantedTool(chatId: string) {
           wanted: [],
           count: 0,
           relaxedNote: null,
-          action: "SEARCH_FAILED: Tell the user the search hit a temporary error and ask them to retry.",
+          action:
+            "SEARCH_FAILED: Tell the user the search hit a temporary error and ask them to retry.",
         };
       }
     },
