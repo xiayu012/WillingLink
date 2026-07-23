@@ -123,6 +123,44 @@ export async function POST(request: Request) {
   // Step 2: 对所有租房帖，使用 AI 全文阅读来区分招租 vs 求租
   // 不依赖关键词分类结果，避免误判
   const classification = await classifyRentalPostIntent(rawText);
+
+  // Defensive "other" escape hatch: if the full-text LLM is confident this is
+  // a non-transaction post that slipped past Step-1's keyword gate, divert it
+  // to XhsRentalOther instead of force-bucketing it into seeker/lister. Kept
+  // conservative (>= 0.6) so borderline posts still fall through to the
+  // seeker/lister path below unchanged.
+  if (classification.intent === "other" && classification.confidence >= 0.6) {
+    const inferredTitle =
+      rawText.split(/[\n。！？!?]/)[0]?.slice(0, 80) ?? null;
+    const row = await createXhsRentalOther({
+      sourceUrl: sourceUrlRaw,
+      rawText,
+      title: optString(payload.title) ?? inferredTitle,
+      aiReason: classification.reason,
+    });
+
+    if (!row) {
+      return jsonWithCors(
+        { ok: false, error: "Failed to save other post" },
+        500
+      );
+    }
+
+    return jsonWithCors({
+      ok: true,
+      id: row.id,
+      duplicate: row.duplicate,
+      sourceUrl: sourceUrlRaw,
+      listingKind: "other",
+      classification: {
+        intent: "other",
+        confidence: classification.confidence,
+        reason: classification.reason,
+        source: classification.source,
+      },
+    });
+  }
+
   const isSeeker =
     classification.intent === "seeker" && classification.confidence >= 0.55;
 

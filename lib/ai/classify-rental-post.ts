@@ -3,7 +3,13 @@ import { z } from "zod";
 
 import { getTitleModel } from "@/lib/ai/providers";
 
-export type RentalPostIntent = "seeker" | "lister";
+// "other" is a defensive escape hatch, reachable only via the LLM path.
+// Step-1 (classifyPost) is the primary non-transaction gate; but its fast path
+// is keyword-driven and "other" is a diffuse negative class that keywords
+// cannot reliably identify positively. So we let the full-text LLM here say
+// "other" too, giving the pipeline a second chance to keep 攻略/科普 posts out
+// of the rental library instead of force-bucketing them into seeker/lister.
+export type RentalPostIntent = "seeker" | "lister" | "other";
 
 export type RentalPostClassification = {
   intent: RentalPostIntent;
@@ -13,7 +19,7 @@ export type RentalPostClassification = {
 };
 
 const classificationSchema = z.object({
-  intent: z.enum(["seeker", "lister"]),
+  intent: z.enum(["seeker", "lister", "other"]),
   confidence: z.number().min(0).max(1),
   reason: z.string(),
 });
@@ -96,7 +102,7 @@ export async function classifyRentalPostIntent(
     const { object } = await generateObject({
       model: getTitleModel(),
       schema: classificationSchema,
-      system: `你是美国湾区租房帖分类器。判断发帖人是「求租者」还是「招租者」。
+      system: `你是美国湾区租房帖分类器。判断发帖人是「求租者」「招租者」还是「非交易帖」。
 
 seeker（求租者）：
 - 自己在找房、求租、找合租位、找室友加入
@@ -107,6 +113,10 @@ lister（招租者）：
 - 房东、转租者、已有租约并出租房间
 - 描述现有房源、租金、可入住时间、房屋条件
 - 招租或转租
+
+other（非交易帖）：
+- 经验分享、攻略、科普、避坑、生活记录等，既不求租也不招租
+- 只有当明显不是求租/招租时才用 other；拿不准时优先 seeker/lister
 
 注意：「找室友」需结合上下文。若已有房并出租床位→lister；若找房并求合租→seeker。
 
