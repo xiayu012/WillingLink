@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.9.3
+// @version      0.9.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,11 +20,15 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.9.3";
+  const SCRIPT_VERSION = "0.9.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
   const TITLE_HIGHLIGHT_MAX_HEIGHT = 80;
+  /** 慢路径（全量对账 + 回退批量复核）的防抖间隔；快路径逐标题判定不吃这个延迟 */
+  const OBSERVER_DEBOUNCE_MS = 250;
+  /** 单批 mutation 里快路径最多处理的标题数，护住当帧主线程 */
+  const FAST_PATH_TITLE_BUDGET = 30;
 
   const DEFAULT_CONFIG = {
     app: {
@@ -46,16 +50,39 @@
     },
     judgement: {
       enableLlmReview: true,
-      llmTimeoutMs: 30000,
-      // 每轮最多逐条复核多少条标题（一条标题 = 一次本地 Ollama 请求）
+      llmTimeoutMs: 12000,
+      // 现在所有"通过并高亮"的候选都会异步复核（而不仅是弱信号），
+      // 与 titleScan.maxTitlesPerRound 对齐，确保一屏候选能在一次批量请求内验证完
       maxLlmReviewsPerRound: 20,
-      llmMinIntervalMs: 50,
+      llmMinIntervalMs: 300,
       minConfidenceToHighlight: 0.6,
+      /** true = 只有 LLM 判定过的标题才高亮；规则只做预筛，不再乐观抢跑 */
+      requireLlmConfirm: true,
+      /**
+       * 本地 OpenAI 兼容 LLM（ollama / LM Studio / llama.cpp / vLLM 均可）。
+       * boot 时按端口探测第一个可用服务，并从 /models 里自动挑含 qwen 的模型。
+       * 命中后启用低延迟通道：逐标题即发、1 token 输出、KV 前缀缓存，
+       * 单条判定目标 ~20-40ms，端到端（标题出现→红框）~50ms。
+       */
+      localLlm: {
+        enable: true,
+        baseUrlCandidates: [
+          "http://127.0.0.1:11434/v1",
+          "http://127.0.0.1:1234/v1",
+          "http://127.0.0.1:8080/v1",
+          "http://127.0.0.1:8000/v1",
+        ],
+        /** 留空自动从 /models 挑；需指定时填如 "qwen2.5:1.5b-instruct" */
+        model: "",
+        timeoutMs: 4000,
+        maxConcurrent: 6,
+      },
       rule: {
         /**
-         * 关键词只用来筛「要不要送 LLM」，不直接决定高亮。
-         * 真正高亮等本地 qwen 单条复核通过后再画，避免规则先亮、LLM 再撤的闪烁。
-         * skipLlm=true 仅用于硬拒绝（大陆词/无信号），直接跳过且不高亮。
+         * 关键词只用来决定"是否先乐观高亮"，不代表最终判定。
+         * 只要判定为高亮（passed=true），无论信号多强，都会异步交给 LLM 复核并可撤销——
+         * 因为关键词共现（如"湾区"+"租/房"）不等于真实意图，很多攻略/避雷/科普贴也会撞上这些词。
+         * 真正跳过 LLM 的，只有"直接拒绝、什么都不展示"的分支，因为拒绝不展示没有精度损失。
          */
         bayAreaWords: [
           "湾区", "Bay Area", "bay area",
@@ -97,10 +124,14 @@
         ],
       },
       llm: {
-        // 仅信息流标题高亮走本地 Ollama；入库等其他路径仍用后端原模型
-        endpoint: "http://127.0.0.1:11434/v1/chat/completions",
-        apiKey: "ollama",
-        model: "qwen2.5:3b",
+        /**
+         * 国内务必走后端代理：只要 ingest.baseUrl 有值，就会优先请求
+         * /api/xhs/title-judge（服务端用 AI Gateway，不受 OpenAI 地区限制）。
+         * apiKey 仅在 baseUrl 不可用时作为直连 OpenAI 的兜底，国内直连会 403。
+         */
+        endpoint: "https://api.openai.com/v1/chat/completions",
+        apiKey: "",
+        model: "gpt-4o-mini",
       },
     },
     highlight: {
@@ -146,6 +177,13 @@
     titleClickHandler: null,
     llmReviewedInRound: 0,
     lastLlmCallAt: 0,
+    /** 探测到的本地 LLM {baseUrl, model}；null = 不可用，回退后端批量复核 */
+    localLlm: null,
+    localLlmProbing: false,
+    localLlmActive: 0,
+    /** 待判定任务 {cacheKey, run}，由 pumpLocalJudgeQueue 按并发上限消费 */
+    localLlmQueue: [],
+    observerDebounceTimer: 0,
     analyzeInFlight: false,
     analyzeScheduled: false,
     loopTimer: 0,
@@ -212,13 +250,16 @@
    * Tampermonkey 5+ 使用 GM.xmlHttpRequest（Promise）；旧版为 GM_xmlhttpRequest（回调）。
    * 二者均在扩展上下文发请求，不触发页面 CORS 预检；若都不可用会退回 fetch（易 CORS）。
    */
-  const gmHttpPost = (url, headers, bodyString) => {
+  const gmHttpPost = (url, headers, bodyString, timeoutMs) => {
     const detail = {
       method: "POST",
       url,
       headers,
       data: bodyString,
     };
+    if (timeoutMs) {
+      detail.timeout = timeoutMs;
+    }
 
     if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") {
       return new Promise((resolve, reject) => {
@@ -708,25 +749,26 @@
       };
     }
 
-    // 强命中：城市词 + 租房词 → 送 LLM，不先高亮
+    // 强命中：城市词 + 租房词同时出现 → 先乐观高亮，但仍需 LLM 异步复核意图
+    // （关键词共现常见于攻略/避雷/科普贴，不能直接当作最终判定）
     if (bayHits.length > 0 && rentHits.length > 0) {
       return {
         stageName: "ruleScreenStage",
         passed: true,
         skipLlm: false,
         confidence: 0.85,
-        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})，送 LLM 复核`,
+        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})，先高亮后复核`,
       };
     }
 
-    // 多个湾区城市信号 → 送 LLM
+    // 湾区城市出现多个，通常就是本地租房/生活帖，先展示，后台交给 LLM 纠错
     if (bayHits.length >= 2) {
       return {
         stageName: "ruleScreenStage",
         passed: true,
         skipLlm: false,
         confidence: 0.72,
-        reason: `多个湾区信号(${bayHits.slice(0, 2).join(", ")})，送 LLM 复核`,
+        reason: `多个湾区信号(${bayHits.slice(0, 2).join(", ")})，先高亮后复核`,
       };
     }
 
@@ -736,7 +778,7 @@
         passed: true,
         skipLlm: false,
         confidence: 0.7,
-        reason: `强租房信号(${strongRentalHit})，送 LLM 复核`,
+        reason: `强租房信号(${strongRentalHit})，先高亮后复核`,
       };
     }
 
@@ -838,55 +880,127 @@
     });
   };
 
-  const TITLE_LLM_SYSTEM_PROMPT =
-    "你是小红书标题分类器，判断标题是否属于美国湾区租房/找室友交易帖。" +
-    "related=true 仅当标题明确表达具体住房交易意图（出租/转租/求租/找房/找室友/合租/roommate wanted 等），" +
-    "即有人在提供或寻找一个具体的房源/床位/室友名额。" +
-    "即使标题提到湾区地名或含有\"房\"\"租\"等字，只要没有具体交易意图也判 false，" +
-    "包括：经验分享/攻略/科普/总结/政策解读/吐槽、团购/拼邮/拼团/代购、拼车/顺风车、" +
-    "二手物品买卖、招聘兼职、社交活动/聚会/相亲、探店/旅游/购物分享、房价行情或买房讨论等。" +
-    "无法确定时判 false（宁可漏检也不要误判）。" +
-    "只输出 JSON: {\"related\":true,\"confidence\":0.9,\"reason\":\"...\"}";
-
-  const parseSingleLlmJudgement = (rawText) => {
-    const content = String(rawText || "").trim();
-    if (!content) {
-      return null;
-    }
+  const parseBatchLlmJudgements = (rawText) => {
+    const content = rawText.trim();
+    const arrayMatch = content.match(/\[[\s\S]*\]/);
     const objectMatch = content.match(/\{[\s\S]*\}/);
-    const jsonText = objectMatch ? objectMatch[0] : content;
-    try {
-      const parsed = JSON.parse(jsonText);
-      if (!parsed || typeof parsed !== "object") {
-        return null;
+    const jsonText = arrayMatch ? arrayMatch[0] : objectMatch ? objectMatch[0] : content;
+    const parsed = JSON.parse(jsonText);
+    const items = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed.results)
+        ? parsed.results
+        : [];
+    const results = new Map();
+    for (const item of items) {
+      const index = Number(item?.index);
+      if (!Number.isInteger(index)) {
+        continue;
       }
-      return {
-        related: Boolean(parsed.related),
-        confidence: clamp(Number(parsed.confidence) || 0.5, 0, 1),
+      results.set(index, {
+        related: Boolean(item.related),
+        confidence: clamp(Number(item.confidence) || 0.5, 0, 1),
         reason:
-          typeof parsed.reason === "string" ? parsed.reason : "LLM 未提供原因",
-      };
-    } catch {
-      return null;
+          typeof item.reason === "string"
+            ? item.reason
+            : "LLM 未提供原因",
+      });
     }
+    return results;
   };
 
-  const llmSingleReviewTitle = async (titleText, config) => {
+  const llmBatchReviewStage = async (inputs, config) => {
+    if (!config.judgement.enableLlmReview || inputs.length === 0) {
+      return new Map();
+    }
+
     const llmConfig = config.judgement.llm;
-    const apiKey = llmConfig.apiKey?.trim() || "ollama";
+    const apiKey = llmConfig.apiKey?.trim() ?? "";
+    const baseUrl = config.ingest?.baseUrl?.trim() ?? "";
+    // 有后端地址就强制走后端，避免国内浏览器直连 OpenAI 被地区封锁 403
+    const useBackend = Boolean(baseUrl);
+
+    if (!useBackend && !apiKey) {
+      logWarn("未配置 LLM：ingest.baseUrl 与 apiKey 都不可用，跳过复核");
+      return new Map();
+    }
 
     const elapsed = now() - state.lastLlmCallAt;
     if (elapsed < config.judgement.llmMinIntervalMs) {
       await sleep(config.judgement.llmMinIntervalMs - elapsed);
     }
 
+    const batch = inputs.slice(0, config.judgement.maxLlmReviewsPerRound);
+
+    if (useBackend) {
+      const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/title-judge`;
+      logInfo("标题复核走后端代理", {
+        url,
+        count: batch.length,
+        version: SCRIPT_VERSION,
+      });
+      const body = JSON.stringify({
+        titles: batch.map((input) => input.titleText),
+      });
+      const { status, responseText } = await gmHttpPost(url, {
+        "Content-Type": "application/json",
+      }, body);
+
+      let data = {};
+      try {
+        data = JSON.parse(responseText || "{}");
+      } catch {
+        data = {};
+      }
+
+      if (status < 200 || status >= 300 || !data.ok) {
+        throw new Error(
+          `后端 title-judge 失败: ${status} ${typeof data.error === "string" ? data.error : responseText.slice(0, 120)}`,
+        );
+      }
+
+      state.lastLlmCallAt = now();
+      state.llmReviewedInRound += batch.length;
+
+      const results = new Map();
+      for (const item of data.results ?? []) {
+        const index = Number(item?.index);
+        if (!Number.isInteger(index)) {
+          continue;
+        }
+        results.set(index, {
+          related: Boolean(item.related),
+          confidence: clamp(Number(item.confidence) || 0.5, 0, 1),
+          reason:
+            typeof item.reason === "string"
+              ? item.reason
+              : "后端未提供原因",
+        });
+      }
+      return results;
+    }
+
+    logWarn("ingest.baseUrl 为空，回退直连 OpenAI（国内易 403）");
+    const systemPrompt =
+      "你是小红书标题分类器，判断标题是否属于美国湾区租房/找室友交易帖。" +
+      "related=true 仅当标题明确表达具体住房交易意图（出租/转租/求租/找房/找室友/合租/roommate wanted 等），" +
+      "即有人在提供或寻找一个具体的房源/床位/室友名额。" +
+      "即使标题提到湾区地名或含有\"房\"\"租\"等字，只要没有具体交易意图也判 false，" +
+      "包括：经验分享/攻略/科普/总结/政策解读/吐槽、团购/拼邮/拼团/代购、拼车/顺风车、" +
+      "二手物品买卖、招聘兼职、社交活动/聚会/相亲、探店/旅游/购物分享、房价行情或买房讨论等。" +
+      "无法确定时判 false（宁可漏检也不要误判）。" +
+      "只输出 JSON: {\"results\":[{\"index\":0,\"related\":true,\"confidence\":0.9,\"reason\":\"...\"}]}";
+    const userPrompt = batch
+      .map((input, index) => `${index}. ${input.titleText}`)
+      .join("\n");
+
     const payload = {
       model: llmConfig.model,
-      temperature: 0,
-      stream: false,
+      temperature: 0.1,
+      response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: TITLE_LLM_SYSTEM_PROMPT },
-        { role: "user", content: String(titleText || "").slice(0, 200) },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
       ],
     };
 
@@ -897,10 +1011,10 @@
       config.judgement.llmTimeoutMs,
     );
     state.lastLlmCallAt = now();
-    state.llmReviewedInRound += 1;
+    state.llmReviewedInRound += batch.length;
 
     const text = response?.choices?.[0]?.message?.content || "";
-    return parseSingleLlmJudgement(text);
+    return parseBatchLlmJudgements(text);
   };
 
   const postProcessStage = (ruleResult, llmResult, config) => {
@@ -914,6 +1028,266 @@
     };
   };
 
+  // ---- 本地 LLM 低延迟通道：逐标题即发、1 token 输出、KV 前缀缓存 ----
+  // 延迟预算：检测 <1ms（零 layout）+ localhost RTT 1-3ms + 推理 15-35ms + rAF ≤16ms ≈ 50ms
+
+  const LOCAL_LLM_SYSTEM_PROMPT =
+    "你是小红书标题分类器。判断标题是否是美国湾区租房/找室友交易帖，" +
+    "即有人在提供或寻找一个具体的房源/床位/室友名额（出租/转租/求租/找房/合租/roommate 等）。" +
+    "攻略/科普/避雷/吐槽/拼车/拼邮/二手买卖/招聘/社交活动/房价买房讨论都不算。" +
+    "无法确定判否。只输出一个字符：1=是，0=否。";
+
+  const gmHttpGetJson = (url, timeoutMs) => {
+    const detail = { method: "GET", url, timeout: timeoutMs };
+    if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM.xmlHttpRequest({
+          ...detail,
+          onload: (response) =>
+            resolve({
+              status: response.status,
+              responseText: response.responseText ?? response.response ?? "",
+            }),
+          onerror: () => reject(new Error("GM GET onerror")),
+          ontimeout: () => reject(new Error("GM GET timeout")),
+        });
+      });
+    }
+    if (typeof GM_xmlhttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          ...detail,
+          onload: (response) =>
+            resolve({
+              status: response.status,
+              responseText: response.responseText ?? "",
+            }),
+          onerror: () => reject(new Error("GM GET onerror")),
+          ontimeout: () => reject(new Error("GM GET timeout")),
+        });
+      });
+    }
+    return Promise.reject(new Error("NO_GM_HTTP"));
+  };
+
+  const callLocalLlmJudge = async (config, titleText) => {
+    const { baseUrl, model } = state.localLlm;
+    const payload = {
+      model,
+      temperature: 0,
+      // decode 是生成式模型的延迟大头，输出压到 1 个字符只付一次 decode
+      max_tokens: 3,
+      stream: false,
+      // llama.cpp：复用 system prompt 的 KV 前缀缓存，每次只 prefill 标题；其他服务忽略此字段
+      cache_prompt: true,
+      // ollama：模型常驻显存 30 分钟，避免空闲卸载后的秒级冷启动；其他服务忽略
+      keep_alive: "30m",
+      messages: [
+        { role: "system", content: LOCAL_LLM_SYSTEM_PROMPT },
+        { role: "user", content: titleText },
+      ],
+    };
+    const { status, responseText } = await gmHttpPost(
+      `${baseUrl}/chat/completions`,
+      { "Content-Type": "application/json" },
+      JSON.stringify(payload),
+      config.judgement.localLlm.timeoutMs,
+    );
+    if (status < 200 || status >= 300) {
+      throw new Error(
+        `本地 LLM ${status}: ${String(responseText).slice(0, 120)}`,
+      );
+    }
+    const data = JSON.parse(responseText || "{}");
+    const content = String(data?.choices?.[0]?.message?.content ?? "").trim();
+    const related = content.startsWith("1");
+    return {
+      isBayAreaRentingRelated: related,
+      confidence: related ? 0.92 : 0.1,
+      reason: `本地LLM(${model})输出 ${content || "空"}`,
+    };
+  };
+
+  const warmupLocalLlm = async (config) => {
+    try {
+      const t0 = performance.now();
+      await callLocalLlmJudge(config, "预热");
+      logInfo("本地 LLM 预热完成", {
+        ms: Math.round(performance.now() - t0),
+        model: state.localLlm?.model,
+      });
+    } catch (e) {
+      logWarn("本地 LLM 预热失败", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const discoverLocalLlm = async (config) => {
+    const cfg = config.judgement.localLlm;
+    if (!cfg?.enable || state.localLlm || state.localLlmProbing) {
+      return;
+    }
+    state.localLlmProbing = true;
+    try {
+      for (const baseUrl of cfg.baseUrlCandidates) {
+        try {
+          const { status, responseText } = await gmHttpGetJson(
+            `${baseUrl}/models`,
+            1200,
+          );
+          if (status < 200 || status >= 300) {
+            continue;
+          }
+          const data = JSON.parse(responseText || "{}");
+          const ids = Array.isArray(data?.data)
+            ? data.data.map((m) => String(m?.id ?? ""))
+            : [];
+          const model =
+            cfg.model?.trim() ||
+            ids.find((id) => /qwen/i.test(id)) ||
+            ids[0] ||
+            "";
+          if (!model) {
+            continue;
+          }
+          state.localLlm = { baseUrl, model };
+          logInfo("发现本地 LLM，启用逐标题低延迟判定", state.localLlm);
+          // 预热：把模型拉进显存并缓存 system prompt 的 KV，首条真实判定不吃冷启动
+          void warmupLocalLlm(config);
+          return;
+        } catch {
+          /* 该端口不可用，试下一个 */
+        }
+      }
+      logWarn("未探测到本地 LLM 服务，回退后端批量复核", cfg.baseUrlCandidates);
+    } finally {
+      state.localLlmProbing = false;
+    }
+  };
+
+  const pumpLocalJudgeQueue = (config) => {
+    const maxConcurrent = config.judgement.localLlm.maxConcurrent;
+    while (
+      state.localLlmActive < maxConcurrent &&
+      state.localLlmQueue.length > 0
+    ) {
+      const job = state.localLlmQueue.shift();
+      state.localLlmActive += 1;
+      void (async () => {
+        try {
+          await job.run();
+        } finally {
+          state.localLlmActive -= 1;
+          pumpLocalJudgeQueue(config);
+        }
+      })();
+    }
+  };
+
+  const addLlmConfirmedMatch = (config, element, text, judgement) => {
+    if (!judgement.isBayAreaRentingRelated || !element.isConnected) {
+      return;
+    }
+    const candidate = {
+      id: makeCandidateId(text, element),
+      text,
+      element,
+      postRoot: getCandidatePostRoot(element),
+      judgement,
+    };
+    if (state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
+      return;
+    }
+    state.matchedById.set(candidate.id, candidate);
+    scheduleRender(config);
+  };
+
+  /**
+   * 快路径：单标题立即送本地 LLM。不攒批、不等防抖、不受 llmMinIntervalMs 节流。
+   * 检测阶段零 layout（纯字符串规则预筛）；rect 相关工作全部推迟到渲染帧。
+   */
+  const dispatchLocalJudge = (config, element, rawText) => {
+    if (!state.localLlm) {
+      return;
+    }
+    const text = normalizeTitle(rawText);
+    if (text.length < config.titleScan.minTitleLength) {
+      return;
+    }
+    const cacheKey = text.toLowerCase();
+
+    const cached = state.judgeCache.get(cacheKey);
+    if (cached) {
+      // 虚拟列表滚回来复插节点：缓存命中当帧重亮，0 额外推理
+      addLlmConfirmedMatch(config, element, text, cached);
+      return;
+    }
+    if (state.inFlightText.has(cacheKey)) {
+      return;
+    }
+
+    const ruleResult = ruleScreenStage({ titleText: text }, config);
+    if (ruleResult.skipLlm) {
+      // 规则硬拒绝（无任何信号/大陆城市）不值得花推理，直接缓存否
+      state.judgeCache.set(cacheKey, {
+        isBayAreaRentingRelated: false,
+        confidence: ruleResult.confidence,
+        reason: ruleResult.reason,
+        stageTrace: [ruleResult],
+      });
+      return;
+    }
+
+    state.inFlightText.add(cacheKey);
+    state.localLlmQueue.push({
+      cacheKey,
+      run: async () => {
+        const t0 = performance.now();
+        try {
+          const verdict = await callLocalLlmJudge(config, text);
+          const finalResult = {
+            ...verdict,
+            stageTrace: [
+              ruleResult,
+              { stageName: "localLlmStage", ...verdict },
+            ],
+          };
+          state.judgeCache.set(cacheKey, finalResult);
+          addLlmConfirmedMatch(config, element, text, finalResult);
+          logInfo("本地 LLM 判定", {
+            ms: Math.round(performance.now() - t0),
+            related: finalResult.isBayAreaRentingRelated,
+            title: text.slice(0, 40),
+          });
+        } catch (e) {
+          logWarn(
+            "本地 LLM 判定失败",
+            e instanceof Error ? e.message : String(e),
+          );
+        } finally {
+          state.inFlightText.delete(cacheKey);
+        }
+      },
+    });
+    pumpLocalJudgeQueue(config);
+  };
+
+  const collectTitleElementsFromRoot = (config, root) => {
+    const found = [];
+    for (const selector of config.titleScan.selectorCandidates) {
+      try {
+        if (root.matches(selector)) {
+          found.push(root);
+        }
+        for (const el of root.querySelectorAll(selector)) {
+          found.push(el);
+        }
+      } catch {
+        /* 无效选择器由慢路径统一告警 */
+      }
+    }
+    return found;
+  };
+
   const renderHighlightItems = (candidates, config) => {
     const root = ensureOverlayRoot();
     root.replaceChildren();
@@ -923,10 +1297,13 @@
       return;
     }
 
+    // getCandidateHighlightRect 内部会强制 layout，这里算一遍缓存，画框时复用
     const holes = [];
+    const rectByCandidateId = new Map();
     for (const candidate of list) {
       const rect = getCandidateHighlightRect(candidate);
       if (rect) {
+        rectByCandidateId.set(candidate.id, rect);
         holes.push(rect);
       }
     }
@@ -977,7 +1354,7 @@
     root.append(svg);
 
     for (const candidate of list) {
-      const rect = getCandidateHighlightRect(candidate);
+      const rect = rectByCandidateId.get(candidate.id);
       if (!rect) {
         continue;
       }
@@ -2590,7 +2967,7 @@
           collectedAt: new Date().toISOString(),
         };
         const ruleResult = ruleScreenStage(input, config);
-        const ruleJudgement = {
+        const immediateResult = {
           isBayAreaRentingRelated:
             ruleResult.passed &&
             ruleResult.confidence >= config.judgement.minConfidenceToHighlight,
@@ -2599,69 +2976,69 @@
           stageTrace: [ruleResult],
         };
 
-        // 硬拒绝：直接缓存，不高亮
-        if (ruleResult.skipLlm) {
-          state.judgeCache.set(cacheKey, ruleJudgement);
-          continue;
-        }
-
-        // 需要 LLM：先不入高亮，等本地 qwen 结果再决定，避免「闪一下又消失」
-        if (config.judgement.enableLlmReview) {
-          if (!state.inFlightText.has(cacheKey)) {
-            needLlm.push({ candidate, cacheKey, input, ruleResult });
-          }
-          continue;
-        }
-
-        // LLM 关闭时才退回规则结果
-        if (ruleJudgement.isBayAreaRentingRelated) {
-          candidate.judgement = ruleJudgement;
+        // requireLlmConfirm 开启时，规则通过不再乐观高亮，必须等 LLM 判决
+        if (
+          !config.judgement.requireLlmConfirm &&
+          immediateResult.isBayAreaRentingRelated
+        ) {
+          candidate.judgement = immediateResult;
           relatedInRound.push(candidate);
-          state.judgeCache.set(cacheKey, ruleJudgement);
+        }
+
+        if (ruleResult.skipLlm) {
+          state.judgeCache.set(cacheKey, immediateResult);
+          continue;
+        }
+
+        if (!state.inFlightText.has(cacheKey)) {
+          needLlm.push({ candidate, cacheKey, input, ruleResult });
         }
       }
 
-      // 先渲染缓存命中的最终结果（不含待 LLM 项）
+      // 立即渲染缓存命中 + 规则乐观命中项
       state.matchedById.clear();
       for (const candidate of relatedInRound) {
         if (!state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
           state.matchedById.set(candidate.id, candidate);
         }
       }
-      scheduleRender(config);
-
-      // 第二遍：逐条直连本地 Ollama(qwen2.5:3b) 复核，每判完一条立即纠错并重绘
-      const llmJobs = needLlm.slice(0, config.judgement.maxLlmReviewsPerRound);
-      if (config.judgement.enableLlmReview && llmJobs.length > 0) {
-        logInfo("标题逐条复核本地 qwen", {
-          model: config.judgement.llm.model,
-          endpoint: config.judgement.llm.endpoint,
-          count: llmJobs.length,
-          version: SCRIPT_VERSION,
-        });
+      if (relatedInRound.length > 0) {
+        scheduleRender(config);
       }
 
-      for (const job of llmJobs) {
-        if (!config.judgement.enableLlmReview) {
-          break;
+      // 第二遍：本地 LLM 可用时逐条即发（低延迟通道，兜住 boot 时已在页上的标题
+      // 和快路径漏掉的），否则批量走后端复核
+      if (state.localLlm) {
+        for (const job of needLlm) {
+          dispatchLocalJudge(config, job.candidate.element, job.candidate.text);
         }
+      } else {
+      const llmJobs = needLlm.slice(0, config.judgement.maxLlmReviewsPerRound);
+      for (const job of llmJobs) {
         state.inFlightText.add(job.cacheKey);
-        try {
-          const parsed = await llmSingleReviewTitle(job.input.titleText, config);
+      }
+      try {
+        const batchResults = await llmBatchReviewStage(
+          llmJobs.map((job) => job.input),
+          config,
+        );
+        for (let index = 0; index < llmJobs.length; index += 1) {
+          const job = llmJobs[index];
+          const parsed = batchResults.get(index);
           const llmResult = parsed
             ? {
-                stageName: "llmSingleReviewTitle",
+                stageName: "llmBatchReviewStage",
                 skipped: false,
                 passed: parsed.related,
                 confidence: parsed.confidence,
                 reason: parsed.reason,
               }
             : {
-                stageName: "llmSingleReviewTitle",
+                stageName: "llmBatchReviewStage",
                 skipped: true,
                 passed: job.ruleResult.passed,
                 confidence: job.ruleResult.confidence,
-                reason: "LLM 单条复核未返回有效结果，保留规则结果",
+                reason: "LLM 批量复核未返回该项，保留规则结果",
               };
           const postResult = postProcessStage(job.ruleResult, llmResult, config);
           const finalResult = {
@@ -2680,18 +3057,18 @@
           } else {
             state.matchedById.delete(job.candidate.id);
           }
-          scheduleRender(config);
-        } catch (error) {
-          logWarn(
-            "单条标题 LLM 复核失败，保留本地规则结果",
-            {
-              title: job.input.titleText.slice(0, 40),
-              error: error instanceof Error ? error.message : String(error),
-            },
-          );
-        } finally {
+        }
+      } catch (error) {
+        logWarn(
+          "LLM 批量复核失败，保留本地规则结果",
+          error instanceof Error ? error.message : String(error),
+        );
+      } finally {
+        for (const job of llmJobs) {
           state.inFlightText.delete(job.cacheKey);
         }
+        scheduleRender(config);
+      }
       }
 
       scheduleRender(config);
@@ -2728,8 +3105,16 @@
   };
 
   const setupObservers = (config) => {
+    // 慢路径防抖：全量对账 + （本地 LLM 不可用时的）批量复核。
+    // 快路径逐标题判定不吃这 250ms——它直接在 mutation 回调里即发。
     const triggerAnalyze = () => {
-      void analyzeRound(config);
+      if (state.observerDebounceTimer) {
+        window.clearTimeout(state.observerDebounceTimer);
+      }
+      state.observerDebounceTimer = window.setTimeout(() => {
+        state.observerDebounceTimer = 0;
+        void analyzeRound(config);
+      }, OBSERVER_DEBOUNCE_MS);
     };
 
     state.scrollHandler = () => {
@@ -2741,13 +3126,34 @@
     window.addEventListener("scroll", state.scrollHandler, { passive: true });
     window.addEventListener("resize", state.resizeHandler);
 
-    state.observer = new MutationObserver(() => {
+    state.observer = new MutationObserver((mutations) => {
+      // 快路径：新插入子树里的标题立刻逐条送本地 LLM。
+      // 只读 textContent（不触发 layout）；推理在 GPU 上异步跑，不占主线程。
+      // 离屏插入的卡片也照判——等用户滚到时判决早已就绪，感知 0ms。
+      if (state.localLlm) {
+        let budget = FAST_PATH_TITLE_BUDGET;
+        outer: for (const mutation of mutations) {
+          for (const node of mutation.addedNodes) {
+            if (!(node instanceof Element)) {
+              continue;
+            }
+            for (const el of collectTitleElementsFromRoot(config, node)) {
+              if (budget <= 0) {
+                break outer;
+              }
+              budget -= 1;
+              dispatchLocalJudge(config, el, el.textContent || "");
+            }
+          }
+        }
+      }
       triggerAnalyze();
     });
+    // 只观察节点增删：新标题只随卡片插入出现；attribute 级抖动（懒加载状态类、
+    // 视频进度等）极高频且与标题无关，观察它只会把防抖无限续期并逼出无意义全扫。
     state.observer.observe(document.body, {
       childList: true,
       subtree: true,
-      attributes: true,
     });
   };
 
@@ -2791,6 +3197,15 @@
       cancelAnimationFrame(state.rafId);
       state.rafId = 0;
     }
+    if (state.observerDebounceTimer) {
+      window.clearTimeout(state.observerDebounceTimer);
+      state.observerDebounceTimer = 0;
+    }
+    // 丢弃未执行的本地判定任务时要释放 inFlight 标记，否则该标题永远不会再被判
+    for (const job of state.localLlmQueue) {
+      state.inFlightText.delete(job.cacheKey);
+    }
+    state.localLlmQueue = [];
     if (state.detailTimer) {
       clearInterval(state.detailTimer);
       state.detailTimer = 0;
@@ -2868,6 +3283,10 @@
       logInfo("当前 URL 不在匹配范围，跳过");
       return;
     }
+
+    // 尽早探测本地 LLM 并预热（拉模型进显存 + 缓存 system prompt 的 KV），
+    // 探测完成前的标题由慢路径兜住，完成后 analyzeRound 会把它们逐条补判
+    void discoverLocalLlm(config);
 
     switchModeByUrl(config);
     state.currentUrl = window.location.href;

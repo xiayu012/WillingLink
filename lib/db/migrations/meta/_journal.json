@@ -64,6 +64,13 @@
       "when": 1771682229223,
       "tag": "0008_damp_betty_brant",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1784783280965,
+      "tag": "0009_secret_jazinda",
+      "breakpoints": true
     }
   ]
 }

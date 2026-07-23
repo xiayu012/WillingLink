@@ -207,6 +207,25 @@ export const searchAudio = pgTable("SearchAudio", {
 
 export type SearchAudio = InferSelectModel<typeof searchAudio>;
 
+/**
+ * searchRental 查询留档：每次真实搜索记一行。
+ * 用途：评测抽样（真实措辞分布）+ "同 chatId 连续换一个" 的不满意信号。
+ */
+export const searchQueryLog = pgTable("SearchQueryLog", {
+  id: uuid("id").primaryKey().notNull().defaultRandom(),
+  chatId: text("chatId").notNull(),
+  query: text("query").notNull(),
+  mustNotContain: json("mustNotContain").$type<string[] | null>(),
+  /** 命中的搜索阶段：P1_VECTOR / P2_CITY / P3_KEYWORD / P4_RECENT（_RELAXED 后缀=松弛）/ NO_RESULT */
+  phase: text("phase").notNull(),
+  listingId: uuid("listingId"),
+  relaxed: boolean("relaxed").notNull().default(false),
+  durationMs: integer("durationMs"),
+  createdAt: timestamp("createdAt", { withTimezone: true }).notNull(),
+});
+
+export type SearchQueryLog = InferSelectModel<typeof searchQueryLog>;
+
 /** 小红书租房帖（复制按钮上报 + 可选结构化字段） */
 export const xhsRentalListing = pgTable("XhsRentalListing", {
   id: uuid("id").primaryKey().notNull().defaultRandom(),
