@@ -1,11 +1,17 @@
 import { randomUUID } from "crypto";
 
 import { classifyRentalPostIntent } from "@/lib/ai/classify-rental-post";
+import { embedText } from "@/lib/ai/embeddings";
 import {
   createXhsRentalListing,
   createXhsRentalOther,
   createXhsRentalWanted,
+  updateListingEmbedding,
 } from "@/lib/db/queries";
+import {
+  composeListingEmbeddingDoc,
+  type ListingEmbeddingFields,
+} from "@/lib/rental/listing-embedding";
 import { classifyPost } from "@/lib/xhs/classify-post";
 import {
   parseListingFields,
@@ -24,6 +30,30 @@ function jsonWithCors(body: unknown, status = 200) {
 
 export function OPTIONS() {
   return new Response(null, { status: 204, headers: corsHeaders });
+}
+
+/**
+ * Embed the composed listing document and store the vector, at ingest time.
+ * New listings are otherwise invisible to vector search (P1) until the manual
+ * backfill script runs. Failures are logged but never fail the ingest — the
+ * row stays with embedding NULL and scripts/embed-listings.ts picks it up.
+ */
+async function embedListingSafe(
+  id: string,
+  fields: ListingEmbeddingFields
+): Promise<boolean> {
+  if (!process.env.VOYAGE_API_KEY) {
+    return false;
+  }
+  try {
+    const doc = composeListingEmbeddingDoc(fields);
+    const vector = await embedText(doc, "document");
+    await updateListingEmbedding(id, vector);
+    return true;
+  } catch (error) {
+    console.error("[rental-ingest] embedding failed for", id, error);
+    return false;
+  }
 }
 
 function optString(v: unknown): string | null {
@@ -144,8 +174,7 @@ export async function POST(request: Request) {
   }
 
   const parsed = parseListingFields(rawText);
-  const row = await createXhsRentalListing({
-    sourceUrl: sourceUrlRaw,
+  const listingFields = {
     rawText,
     title: optString(payload.title) ?? parsed.title,
     rent: optString(payload.rent) ?? parsed.rent,
@@ -160,16 +189,27 @@ export async function POST(request: Request) {
     locationText: optString(payload.locationText) ?? parsed.locationText,
     furnished: optString(payload.furnished) ?? parsed.furnished,
     contactMethod: optString(payload.contactMethod) ?? parsed.contactMethod,
+  };
+  const row = await createXhsRentalListing({
+    sourceUrl: sourceUrlRaw,
+    ...listingFields,
   });
 
   if (!row) {
     return jsonWithCors({ ok: false, error: "Failed to save" }, 500);
   }
 
+  // Embed at ingest so the listing is immediately searchable via pgvector.
+  // Duplicates already have an embedding from their first ingest.
+  const embedded = row.duplicate
+    ? false
+    : await embedListingSafe(row.id, listingFields);
+
   return jsonWithCors({
     ok: true,
     id: row.id,
     duplicate: row.duplicate,
+    embedded,
     sourceUrl: sourceUrlRaw,
     listingKind: "listing",
     classification: {

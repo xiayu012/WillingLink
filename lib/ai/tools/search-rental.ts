@@ -54,14 +54,15 @@ const VECTOR_CANDIDATES = 50;   // pgvector top-N before rerank
 const LAST_RESORT_LIMIT = 50;   // wider pool for Phase 4 last-resort rerank
 
 // ── Geo-expansion (deterministic, no LLM) ────────────────────────────────────
-// Replaces any Chinese city name with its English form and appends ≤3 neighbors.
-// Keeps query vectors meaningfully distinct across cities while still matching
-// listings that only mention a neighboring city.
+// Normalizes the city mention to its bilingual canonical form ("San Jose
+// 圣何塞" — mirroring the 城市: line in composeListingEmbeddingDoc) and
+// appends ≤3 neighbors. Keeps query vectors meaningfully distinct across
+// cities while still matching listings that only mention a neighboring city.
 
 function lightGeoExpand(query: string, city: CityEntry): string {
-  const withEn = query.replace(city.re, city.en);
+  const withCanonical = query.replace(city.re, `${city.en} ${city.zh}`);
   const neighborStr = city.neighbors.join(" ");
-  return `${withEn} ${neighborStr}`;
+  return `${withCanonical} ${neighborStr}`;
 }
 
 // ── Non-city keyword extraction ───────────────────────────────────────────────

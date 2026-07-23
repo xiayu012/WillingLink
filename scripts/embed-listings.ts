@@ -1,33 +1,48 @@
 /**
- * 一次性回填脚本：为 XhsRentalListing 表中所有缺少 embedding 的行生成向量。
+ * 回填脚本：为 XhsRentalListing 生成向量。
  *
  * 使用方法：
- *   npx tsx scripts/embed-listings.ts
+ *   npx tsx scripts/embed-listings.ts          # 只补缺失 embedding 的行
+ *   npx tsx scripts/embed-listings.ts --all    # 全量重嵌（嵌入文档格式变更后用）
  *
- * 前置条件：
- *   1. .env.local 中已配置 POSTGRES_URL 和 VOYAGE_API_KEY
- *   2. 数据库已执行 tools/xhs-guide/db/add_vector_embedding.sql
- *      （添加 embedding vector(1024) 列 + HNSW 索引）
+ * 与入库环节（app/api/xhs/rental-ingest）使用同一份
+ * composeListingEmbeddingDoc，保证所有向量在同一语义空间。
+ *
+ * 前置条件：.env.local 中已配置 POSTGRES_URL 和 VOYAGE_API_KEY。
  */
 
 import { config } from "dotenv";
 import postgres from "postgres";
-import { VoyageAIClient } from "voyageai";
-
-type EmbedDataItem = { index?: number; embedding?: number[] };
+import { embedBatch } from "../lib/ai/embeddings";
+import { composeListingEmbeddingDoc } from "../lib/rental/listing-embedding";
 
 config({ path: ".env.local" });
+for (const key of ["POSTGRES_URL", "VOYAGE_API_KEY"]) {
+  const v = process.env[key];
+  if (v?.startsWith('"')) {
+    process.env[key] = v.slice(1, -1);
+  }
+}
 
 const BATCH_SIZE = 32;
-const EMBED_MODEL = "voyage-3";
+const REEMBED_ALL = process.argv.includes("--all");
 
 const db = postgres(process.env.POSTGRES_URL!);
-// biome-ignore lint: required env var
-const voyage = new VoyageAIClient({ apiKey: process.env.VOYAGE_API_KEY! });
 
-type RawRow = {
+type ListingRow = {
   id: string;
   rawText: string;
+  title: string | null;
+  city: string | null;
+  locationText: string | null;
+  propertyName: string | null;
+  rent: string | null;
+  roomType: string | null;
+  bedrooms: string | null;
+  bathrooms: string | null;
+  listingType: string | null;
+  availableFrom: string | null;
+  furnished: string | null;
 };
 
 async function runMigration(): Promise<void> {
@@ -49,15 +64,20 @@ async function runMigration(): Promise<void> {
 async function main(): Promise<void> {
   await runMigration();
 
-  const rows = await db<RawRow[]>`
-    SELECT id, "rawText"
+  const rows = await db<ListingRow[]>`
+    SELECT
+      id, "rawText", "title", "city", "locationText", "propertyName",
+      "rent", "roomType", "bedrooms", "bathrooms", "listingType",
+      "availableFrom", "furnished"
     FROM "XhsRentalListing"
-    WHERE embedding IS NULL
-      AND trim("rawText") <> ''
+    WHERE trim("rawText") <> ''
+      ${REEMBED_ALL ? db`` : db`AND embedding IS NULL`}
     ORDER BY "createdAt" DESC
   `;
 
-  console.log(`Found ${rows.length} listings without embeddings.`);
+  console.log(
+    `Found ${rows.length} listings to embed (${REEMBED_ALL ? "re-embed all" : "missing only"}).`
+  );
   if (rows.length === 0) {
     console.log("Nothing to do.");
     await db.end();
@@ -67,24 +87,17 @@ async function main(): Promise<void> {
   let done = 0;
 
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const batch = rows.slice(i, i + BATCH_SIZE).filter((row) => row.rawText.trim().length > 0);
-    if (batch.length === 0) continue;
-
-    const texts = batch.map((row) => row.rawText);
-
-    const res = await voyage.embed({
-      input: texts,
-      model: EMBED_MODEL,
-      inputType: "document",
-    });
-
-    const embeddings = (res.data ?? [])
-      .slice()
-      .sort((a: EmbedDataItem, b: EmbedDataItem) => (a.index ?? 0) - (b.index ?? 0))
-      .map((d: EmbedDataItem) => d.embedding ?? []);
+    const batch = rows.slice(i, i + BATCH_SIZE);
+    const docs = batch.map((row) => composeListingEmbeddingDoc(row));
+    const embeddings = await embedBatch(docs, "document");
 
     for (let j = 0; j < batch.length; j++) {
-      const vectorLiteral = `[${embeddings[j].join(",")}]`;
+      const vec = embeddings[j];
+      if (!vec || vec.length === 0) {
+        console.warn(`  ⚠ empty embedding for ${batch[j].id}, skipping`);
+        continue;
+      }
+      const vectorLiteral = `[${vec.join(",")}]`;
       await db`
         UPDATE "XhsRentalListing"
         SET embedding = ${vectorLiteral}::vector

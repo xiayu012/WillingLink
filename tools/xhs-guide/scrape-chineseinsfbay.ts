@@ -3,6 +3,8 @@ import { config as loadDotenv } from "dotenv";
 import { put } from "@vercel/blob";
 import { chromium } from "@playwright/test";
 import postgres from "postgres";
+import { embedText } from "../../lib/ai/embeddings";
+import { composeListingEmbeddingDoc } from "../../lib/rental/listing-embedding";
 
 loadDotenv({ path: ".env.local" });
 loadDotenv();
@@ -842,6 +844,39 @@ async function main() {
         if (insertedId) {
           existingByFingerprint.set(fp, { id: insertedId, fingerprint: fp });
           existingBySourceUrl.set(candidate.url, insertedId);
+
+          // 入库即嵌入：否则向量搜索（WHERE embedding IS NOT NULL）看不到新房源。
+          // 失败不阻塞抓取，留给 scripts/embed-listings.ts 兜底。
+          if (process.env.VOYAGE_API_KEY) {
+            try {
+              const doc = composeListingEmbeddingDoc({
+                rawText,
+                title: normalizedStructured.title ?? title ?? candidate.title,
+                locationText: normalizedStructured.locationText,
+                propertyName: normalizedStructured.propertyName,
+                rent: normalizedStructured.rent,
+                roomType: normalizedStructured.roomType,
+                bedrooms: normalizedStructured.bedrooms,
+                bathrooms: normalizedStructured.bathrooms,
+                listingType: normalizedStructured.listingType,
+                availableFrom: normalizedStructured.availableFrom,
+                furnished: normalizedStructured.furnished,
+              });
+              const vector = await embedText(doc, "document");
+              const vectorLiteral = `[${vector.join(",")}]`;
+              await sql`
+                update "XhsRentalListing"
+                set embedding = ${vectorLiteral}::vector
+                where "id" = ${insertedId}
+              `;
+            } catch (error) {
+              const message =
+                error instanceof Error ? error.message : String(error);
+              console.log(
+                `[scrape] warn(嵌入失败，稍后可运行 embed-listings.ts 兜底): ${message}`
+              );
+            }
+          }
         }
         inserted += 1;
       } catch (error) {
