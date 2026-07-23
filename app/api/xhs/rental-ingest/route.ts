@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { after } from "next/server";
 
 import { classifyRentalPostIntent } from "@/lib/ai/classify-rental-post";
 import { embedText } from "@/lib/ai/embeddings";
@@ -199,17 +200,22 @@ export async function POST(request: Request) {
     return jsonWithCors({ ok: false, error: "Failed to save" }, 500);
   }
 
-  // Embed at ingest so the listing is immediately searchable via pgvector.
+  // Embed at ingest so the listing becomes searchable via pgvector, but do it
+  // in after() rather than blocking the response: embedding is a Voyage API
+  // round-trip and failure is non-fatal (embedding stays NULL and
+  // scripts/embed-listings.ts backfills it). Keeping it off the critical path
+  // shaves that round-trip off every ingest POST the userscript makes.
   // Duplicates already have an embedding from their first ingest.
-  const embedded = row.duplicate
-    ? false
-    : await embedListingSafe(row.id, listingFields);
+  const embeddingScheduled = !row.duplicate;
+  if (embeddingScheduled) {
+    after(() => embedListingSafe(row.id, listingFields));
+  }
 
   return jsonWithCors({
     ok: true,
     id: row.id,
     duplicate: row.duplicate,
-    embedded,
+    embeddingScheduled,
     sourceUrl: sourceUrlRaw,
     listingKind: "listing",
     classification: {
