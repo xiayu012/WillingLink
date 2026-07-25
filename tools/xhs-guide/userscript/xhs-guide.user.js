@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.9.0
+// @version      0.9.1
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.9.0";
+  const SCRIPT_VERSION = "0.9.1";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -59,6 +59,13 @@
       /** true = 只有 LLM 判定过的标题才高亮；规则只做预筛，不再乐观抢跑 */
       requireLlmConfirm: true,
       /**
+       * true = 连关键词都没命中的标题也交给 LLM 软判断（排在有信号的候选之后）。
+       * 关键词表永远补不全（sublet / 床位 / 转 lease / 没收录的地名…），硬拒绝会静默漏检，
+       * 而本地模型免费且单条 ~20-40ms，多判几条不影响体感。
+       * 仅在本地模型在线时生效：只剩远端批量那条路时，为零信号标题排队会拖慢真候选。
+       */
+      softJudgeNoSignal: true,
+      /**
        * 本地 OpenAI 兼容 LLM（ollama / LM Studio / llama.cpp / vLLM 均可）。
        * boot 时按端口探测第一个可用服务，并从 /models 里自动挑含 qwen 的模型。
        * 命中后启用低延迟通道：逐标题即发、1 token 输出、KV 前缀缓存，
@@ -79,35 +86,45 @@
       },
       rule: {
         /**
-         * 关键词只用来决定"是否先乐观高亮"，不代表最终判定。
-         * 只要判定为高亮（passed=true），无论信号多强，都会异步交给 LLM 复核并可撤销——
-         * 因为关键词共现（如"湾区"+"租/房"）不等于真实意图，很多攻略/避雷/科普贴也会撞上这些词。
-         * 真正跳过 LLM 的，只有"直接拒绝、什么都不展示"的分支，因为拒绝不展示没有精度损失。
+         * 关键词只做预筛，决定"是否值得送 LLM、以及排在队列哪个位置"，从不直接点亮红框。
+         * 最终判定一律由 LLM 给出（requireLlmConfirm），所以这里宁可放宽召回：
+         * 误收的攻略/科普/拼邮贴会在 LLM 那关被否掉，代价只是一次推理；
+         * 而这里漏掉的真房源，若 softJudgeNoSignal 关闭就再也没有第二次机会。
          */
         bayAreaWords: [
           "湾区", "Bay Area", "bay area",
           "San Francisco", "SF", "旧金山",
-          "San Jose", "SJ", "South Bay", "南湾",
-          "Oakland", "East Bay", "东湾",
+          "San Jose", "SJ", "圣何塞", "圣荷西", "South Bay", "南湾",
+          "Oakland", "East Bay", "东湾", "奥克兰", "屋仑",
           "Fremont", "Milpitas", "Cupertino",
-          "Santa Clara", "Mountain View", "Sunnyvale",
-          "Palo Alto", "Los Altos", "Menlo Park",
-          "Redwood City", "Foster City", "San Mateo",
-          "Daly City", "San Bruno",
+          "费利蒙", "库比蒂诺", "米尔皮塔斯",
+          "Santa Clara", "Mountain View", "Sunnyvale", "MTV",
+          "山景城", "桑尼维尔", "圣克拉拉",
+          "Palo Alto", "Los Altos", "Menlo Park", "帕洛阿托",
+          "Redwood City", "Foster City", "San Mateo", "RWC",
+          "Daly City", "San Bruno", "Millbrae", "Burlingame",
+          "Belmont", "San Carlos", "Pacifica", "SSF",
           "Berkeley", "伯克利",
           "Hayward", "Alameda", "Campbell",
           "Saratoga", "Los Gatos",
+          "Union City", "Newark", "San Leandro", "Castro Valley",
+          "Pleasanton", "Dublin", "Livermore",
+          "Walnut Creek", "Concord", "Emeryville", "Richmond",
+          "Morgan Hill", "Gilroy", "San Ramon", "Danville",
           "Stanford", "斯坦福", "硅谷", "North Bay", "北湾",
           "SJSU", "UCSF", "SCU",
         ],
         rentalWords: [
           "租", "房", "室友", "招租", "出租", "转租", "求租",
-          "短租", "合租", "一房", "两房", "主卧", "次卧",
-          "1b", "2b", "1bd", "2bd", "studio",
-          "lease", "sublease", "roommate", "rent",
-          "apartment", "condo", "公寓",
-          "找房", "寻房", "搬家", "入住", "押金", "月租",
-          "独卫", "独立", "furnished",
+          "短租", "合租", "整租", "分租", "单间", "床位",
+          "一房", "两房", "主卧", "次卧", "卧室", "空房", "房源",
+          "1b", "2b", "3b", "1bd", "2bd", "1b1b", "2b2b", "studio",
+          "lease", "sublease", "sublet", "roommate", "rent",
+          "apartment", "condo", "townhouse", "duplex", "公寓",
+          "master room", "master bedroom", "private room", "shared room",
+          "找房", "寻房", "看房", "搬家", "入住", "押金", "月租",
+          "房东", "二房东", "招房客", "求房源", "拎包入住",
+          "独卫", "独立", "furnished", "move in", "move-in",
         ],
         strongRentalWords: [
           "招租", "出租", "转租", "求租", "短租", "找房",
@@ -749,26 +766,25 @@
       };
     }
 
-    // 强命中：城市词 + 租房词同时出现 → 先乐观高亮，但仍需 LLM 异步复核意图
-    // （关键词共现常见于攻略/避雷/科普贴，不能直接当作最终判定）
+    // 以下分支都不点亮红框，只表示"值得送 LLM"，confidence 仅在 LLM 失败时作兜底权重。
+    // 关键词共现（"湾区"+"租/房"）常见于攻略/避雷/科普贴，所以再强的命中也要过 LLM。
     if (bayHits.length > 0 && rentHits.length > 0) {
       return {
         stageName: "ruleScreenStage",
         passed: true,
         skipLlm: false,
         confidence: 0.85,
-        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})，先高亮后复核`,
+        reason: `强命中: 湾区(${bayHit}) + 租房(${rentHit})，送 LLM 判定`,
       };
     }
 
-    // 湾区城市出现多个，通常就是本地租房/生活帖，先展示，后台交给 LLM 纠错
     if (bayHits.length >= 2) {
       return {
         stageName: "ruleScreenStage",
         passed: true,
         skipLlm: false,
         confidence: 0.72,
-        reason: `多个湾区信号(${bayHits.slice(0, 2).join(", ")})，先高亮后复核`,
+        reason: `多个湾区信号(${bayHits.slice(0, 2).join(", ")})，送 LLM 判定`,
       };
     }
 
@@ -778,30 +794,38 @@
         passed: true,
         skipLlm: false,
         confidence: 0.7,
-        reason: `强租房信号(${strongRentalHit})，先高亮后复核`,
+        reason: `强租房信号(${strongRentalHit})，送 LLM 判定`,
       };
     }
 
     if (bayHit || rentHit) {
-      // 只有单一弱信号（例如仅提到一个湾区地名，没有任何租房词）时，
-      // 大量非租房内容（拼邮/拼车/团购/招聘/社交活动等）也会命中——
-      // 置信度故意设在高亮阈值以下，不抢先闪现红框，先排队等 LLM 定论。
-      // LLM 若判定相关，会在复核结果里用它自己的置信度重新点亮。
+      // 单一弱信号（只提到一个湾区地名、或只有"租/房"单字）：拼邮/拼车/团购/招聘/
+      // 社交活动都会命中，置信度压在高亮阈值以下，交给 LLM 定夺。
       return {
         stageName: "ruleScreenStage",
         passed: true,
         skipLlm: false,
         confidence: 0.4,
-        reason: `单一弱信号(${bayHit || rentHit})，等待 LLM 复核后再决定是否高亮`,
+        reason: `单一弱信号(${bayHit || rentHit})，送 LLM 判定`,
       };
     }
 
+    // 零关键词信号：本地模型在线时仍兜底软判断，只是排在有信号的候选之后，
+    // 避免关键词表覆盖不到的写法（sublet / 床位 / 没收录的地名）被静默漏掉。
+    const softJudge =
+      config.judgement.softJudgeNoSignal && Boolean(state.localLlm);
     return {
       stageName: "ruleScreenStage",
       passed: false,
-      skipLlm: true,
+      skipLlm: !softJudge,
+      lowPriority: true,
+      // 本地模型还在探测时先不要把"否"写进缓存，否则模型就绪后这批标题不会再被复核
+      provisional:
+        !softJudge && config.judgement.softJudgeNoSignal && state.localLlmProbing,
       confidence: 0.1,
-      reason: "无湾区/租房信号，跳过 LLM",
+      reason: softJudge
+        ? "无关键词信号，交本地模型兜底软判断"
+        : "无湾区/租房信号，跳过 LLM",
     };
   };
 
@@ -1238,8 +1262,9 @@
     }
 
     state.inFlightText.add(cacheKey);
-    state.localLlmQueue.push({
+    const job = {
       cacheKey,
+      lowPriority: Boolean(ruleResult.lowPriority),
       run: async () => {
         const t0 = performance.now();
         try {
@@ -1267,7 +1292,17 @@
           state.inFlightText.delete(cacheKey);
         }
       },
-    });
+    };
+
+    // 有关键词信号的候选插到零信号兜底任务之前，保证真候选的红框不被兜底推理拖慢
+    const firstLowIndex = job.lowPriority
+      ? -1
+      : state.localLlmQueue.findIndex((item) => item.lowPriority);
+    if (firstLowIndex === -1) {
+      state.localLlmQueue.push(job);
+    } else {
+      state.localLlmQueue.splice(firstLowIndex, 0, job);
+    }
     pumpLocalJudgeQueue(config);
   };
 
@@ -2986,7 +3021,10 @@
         }
 
         if (ruleResult.skipLlm) {
-          state.judgeCache.set(cacheKey, immediateResult);
+          // provisional：本地模型仍在探测，先不缓存"否"，等它就绪后还能软判断一次
+          if (!ruleResult.provisional) {
+            state.judgeCache.set(cacheKey, immediateResult);
+          }
           continue;
         }
 
@@ -3013,7 +3051,11 @@
           dispatchLocalJudge(config, job.candidate.element, job.candidate.text);
         }
       } else {
-      const llmJobs = needLlm.slice(0, config.judgement.maxLlmReviewsPerRound);
+      // 远端批量有条数预算，按规则置信度降序，别让弱信号挤掉强候选
+      const llmJobs = needLlm
+        .slice()
+        .sort((a, b) => b.ruleResult.confidence - a.ruleResult.confidence)
+        .slice(0, config.judgement.maxLlmReviewsPerRound);
       for (const job of llmJobs) {
         state.inFlightText.add(job.cacheKey);
       }
