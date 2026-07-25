@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.9.1
+// @version      0.10.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.9.1";
+  const SCRIPT_VERSION = "0.10.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -82,7 +82,17 @@
         /** 留空自动从 /models 挑；需指定时填如 "qwen2.5:1.5b-instruct" */
         model: "",
         timeoutMs: 4000,
-        maxConcurrent: 6,
+        /**
+         * Ollama 默认会在服务端串行/排队同一模型的请求。浏览器同时发 6 条只会把
+         * 优先级控制权交给服务端，让已经滚过去的标题堵住即将进视窗的标题。
+         * 单通道由浏览器自己动态挑选下一条，吞吐不降，首屏/前方标题延迟更低。
+         */
+        maxConcurrent: 1,
+        /** 只保留有限的待判任务；快速滚动时淘汰最远、已断开和身后的标题 */
+        maxPendingJobs: 36,
+        /** 零关键词标题只在进入这个前瞻带后才占用推理（下方 3 屏、上方半屏） */
+        prefetchAheadViewport: 3,
+        prefetchBehindViewport: 0.5,
       },
       rule: {
         /**
@@ -198,8 +208,14 @@
     localLlm: null,
     localLlmProbing: false,
     localLlmActive: 0,
-    /** 待判定任务 {cacheKey, run}，由 pumpLocalJudgeQueue 按并发上限消费 */
+    /** 待判定任务；每次推理完成后按当前位置和滚动方向重新选最优任务 */
     localLlmQueue: [],
+    localLlmPrefetchObserver: null,
+    localLlmObservedElements: new WeakSet(),
+    localLlmPumpRafId: 0,
+    lastScrollY: window.scrollY,
+    scrollDirection: 1,
+    scrollRafId: 0,
     observerDebounceTimer: 0,
     analyzeInFlight: false,
     analyzeScheduled: false,
@@ -1099,8 +1115,8 @@
     const payload = {
       model,
       temperature: 0,
-      // decode 是生成式模型的延迟大头，输出压到 1 个字符只付一次 decode
-      max_tokens: 3,
+      // 输出协议只有 0/1，一个 token 足够；不让模型生成解释占用下一条标题的通道
+      max_tokens: 1,
       stream: false,
       // llama.cpp：复用 system prompt 的 KV 前缀缓存，每次只 prefill 标题；其他服务忽略此字段
       cache_prompt: true,
@@ -1175,8 +1191,14 @@
           }
           state.localLlm = { baseUrl, model };
           logInfo("发现本地 LLM，启用逐标题低延迟判定", state.localLlm);
-          // 预热：把模型拉进显存并缓存 system prompt 的 KV，首条真实判定不吃冷启动
-          void warmupLocalLlm(config);
+          // 先完成预热，再建立前瞻队列；避免预热和真实标题争抢同一模型
+          await warmupLocalLlm(config);
+          ensureLocalPrefetchObserver(config);
+          registerCurrentFeedTitles(config);
+          // 探测期间慢路径可能已运行过；模型就绪后立即对账，不再等 1.8 秒轮询
+          if (state.mode === "title") {
+            void analyzeRound(config);
+          }
           return;
         } catch {
           /* 该端口不可用，试下一个 */
@@ -1188,13 +1210,101 @@
     }
   };
 
+  const getLocalJobPriority = (job) => {
+    if (!job.element?.isConnected) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const rect = job.element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return 50_000;
+    }
+    const viewportHeight = Math.max(1, window.innerHeight);
+    const isVisible = rect.bottom >= 0 && rect.top <= viewportHeight;
+    if (isVisible) {
+      return -10_000 + Math.abs(rect.top) - job.ruleConfidence * 100;
+    }
+
+    const distance =
+      state.scrollDirection >= 0
+        ? rect.top > viewportHeight
+          ? rect.top - viewportHeight
+          : viewportHeight * 8 + Math.abs(rect.bottom)
+        : rect.bottom < 0
+          ? Math.abs(rect.bottom)
+          : viewportHeight * 8 + rect.top;
+
+    return (
+      distance +
+      (job.lowPriority ? viewportHeight * 1.5 : 0) -
+      job.ruleConfidence * 100
+    );
+  };
+
+  const pruneLocalJudgeQueue = (config) => {
+    const maxPending = config.judgement.localLlm.maxPendingJobs;
+    const liveJobs = [];
+    const behindLimit =
+      window.innerHeight *
+      config.judgement.localLlm.prefetchBehindViewport;
+    for (const job of state.localLlmQueue) {
+      if (!job.element?.isConnected) {
+        state.inFlightText.delete(job.cacheKey);
+        continue;
+      }
+      const rect = job.element.getBoundingClientRect();
+      const alreadyPassed =
+        state.scrollDirection >= 0
+          ? rect.bottom < -behindLimit
+          : rect.top > window.innerHeight + behindLimit;
+      if (alreadyPassed) {
+        // 快速滚动已经越过的任务不再消耗模型；反向滚回来时 IntersectionObserver 会重入队
+        state.inFlightText.delete(job.cacheKey);
+        state.localLlmObservedElements.delete(job.element);
+        observeTitleForPrefetch(config, job.element);
+        continue;
+      }
+      liveJobs.push(job);
+    }
+    liveJobs.sort((a, b) => getLocalJobPriority(a) - getLocalJobPriority(b));
+    const kept = liveJobs.slice(0, maxPending);
+    for (const dropped of liveJobs.slice(maxPending)) {
+      state.inFlightText.delete(dropped.cacheKey);
+      if (dropped.element?.isConnected) {
+        const rect = dropped.element.getBoundingClientRect();
+        const outsidePrefetchBand =
+          rect.top >
+            window.innerHeight *
+              (1 + config.judgement.localLlm.prefetchAheadViewport) ||
+          rect.bottom < -behindLimit;
+        if (outsidePrefetchBand) {
+          state.localLlmObservedElements.delete(dropped.element);
+          observeTitleForPrefetch(config, dropped.element);
+        }
+      }
+    }
+    state.localLlmQueue = kept;
+  };
+
   const pumpLocalJudgeQueue = (config) => {
+    pruneLocalJudgeQueue(config);
     const maxConcurrent = config.judgement.localLlm.maxConcurrent;
     while (
       state.localLlmActive < maxConcurrent &&
       state.localLlmQueue.length > 0
     ) {
+      // 每次只取此刻最值得判的标题；滚动后优先级会自动反映新视窗和新方向
+      state.localLlmQueue.sort(
+        (a, b) => getLocalJobPriority(a) - getLocalJobPriority(b),
+      );
       const job = state.localLlmQueue.shift();
+      if (!job?.element?.isConnected) {
+        if (job) {
+          state.inFlightText.delete(job.cacheKey);
+        }
+        continue;
+      }
+
       state.localLlmActive += 1;
       void (async () => {
         try {
@@ -1207,8 +1317,25 @@
     }
   };
 
+  const scheduleLocalJudgePump = (config) => {
+    if (state.localLlmPumpRafId) {
+      return;
+    }
+    state.localLlmPumpRafId = requestAnimationFrame(() => {
+      state.localLlmPumpRafId = 0;
+      pumpLocalJudgeQueue(config);
+    });
+  };
+
   const addLlmConfirmedMatch = (config, element, text, judgement) => {
+    // 瀑布流可能复用同一个 DOM 节点并替换标题；先清掉该节点上一条内容留下的框。
+    for (const [id, candidate] of state.matchedById) {
+      if (candidate.element === element) {
+        state.matchedById.delete(id);
+      }
+    }
     if (!judgement.isBayAreaRentingRelated || !element.isConnected) {
+      scheduleRender(config);
       return;
     }
     const candidate = {
@@ -1229,7 +1356,23 @@
    * 快路径：单标题立即送本地 LLM。不攒批、不等防抖、不受 llmMinIntervalMs 节流。
    * 检测阶段零 layout（纯字符串规则预筛）；rect 相关工作全部推迟到渲染帧。
    */
-  const dispatchLocalJudge = (config, element, rawText) => {
+  const observeTitleForPrefetch = (config, element) => {
+    if (
+      !state.localLlmPrefetchObserver ||
+      state.localLlmObservedElements.has(element)
+    ) {
+      return;
+    }
+    state.localLlmObservedElements.add(element);
+    state.localLlmPrefetchObserver.observe(element);
+  };
+
+  const dispatchLocalJudge = (
+    config,
+    element,
+    rawText,
+    { allowLowPriority = false } = {},
+  ) => {
     if (!state.localLlm) {
       return;
     }
@@ -1249,6 +1392,10 @@
       return;
     }
 
+    // 虚拟瀑布流可能复用元素并改写 textContent；旧标题留下的观察状态不能挡住新标题
+    state.localLlmPrefetchObserver?.unobserve(element);
+    state.localLlmObservedElements.delete(element);
+
     const ruleResult = ruleScreenStage({ titleText: text }, config);
     if (ruleResult.skipLlm) {
       // 规则硬拒绝（无任何信号/大陆城市）不值得花推理，直接缓存否
@@ -1260,10 +1407,16 @@
       });
       return;
     }
+    if (ruleResult.lowPriority && !allowLowPriority) {
+      observeTitleForPrefetch(config, element);
+      return;
+    }
 
     state.inFlightText.add(cacheKey);
     const job = {
       cacheKey,
+      element,
+      ruleConfidence: ruleResult.confidence,
       lowPriority: Boolean(ruleResult.lowPriority),
       run: async () => {
         const t0 = performance.now();
@@ -1294,16 +1447,9 @@
       },
     };
 
-    // 有关键词信号的候选插到零信号兜底任务之前，保证真候选的红框不被兜底推理拖慢
-    const firstLowIndex = job.lowPriority
-      ? -1
-      : state.localLlmQueue.findIndex((item) => item.lowPriority);
-    if (firstLowIndex === -1) {
-      state.localLlmQueue.push(job);
-    } else {
-      state.localLlmQueue.splice(firstLowIndex, 0, job);
-    }
-    pumpLocalJudgeQueue(config);
+    state.localLlmQueue.push(job);
+    // 一批卡片通常在同一个 mutation 批次插入；合并到下一帧只做一次 layout + 排序
+    scheduleLocalJudgePump(config);
   };
 
   const collectTitleElementsFromRoot = (config, root) => {
@@ -1321,6 +1467,58 @@
       }
     }
     return found;
+  };
+
+  const ensureLocalPrefetchObserver = (config) => {
+    if (state.localLlmPrefetchObserver || !state.localLlm) {
+      return;
+    }
+    const cfg = config.judgement.localLlm;
+    const aheadPx = Math.round(window.innerHeight * cfg.prefetchAheadViewport);
+    const behindPx = Math.round(window.innerHeight * cfg.prefetchBehindViewport);
+    state.localLlmPrefetchObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) {
+            continue;
+          }
+          state.localLlmPrefetchObserver?.unobserve(entry.target);
+          dispatchLocalJudge(
+            config,
+            entry.target,
+            entry.target.textContent || "",
+            { allowLowPriority: true },
+          );
+        }
+      },
+      {
+        root: null,
+        rootMargin: `${behindPx}px 0px ${aheadPx}px 0px`,
+        threshold: 0,
+      },
+    );
+  };
+
+  const registerCurrentFeedTitles = (config) => {
+    if (!state.localLlm) {
+      return;
+    }
+    const seen = new Set();
+    for (const selector of config.titleScan.selectorCandidates) {
+      let elements = [];
+      try {
+        elements = document.querySelectorAll(selector);
+      } catch {
+        continue;
+      }
+      for (const element of elements) {
+        if (!(element instanceof HTMLElement) || seen.has(element)) {
+          continue;
+        }
+        seen.add(element);
+        dispatchLocalJudge(config, element, element.textContent || "");
+      }
+    }
   };
 
   const renderHighlightItems = (candidates, config) => {
@@ -2959,7 +3157,15 @@
       const liveMatches = Array.from(state.matchedById.values()).filter(
         (item) =>
           document.body.contains(item.element) &&
+          isElementVisible(item.element) &&
           !state.dismissedTitleKeys.has(getTitleDismissKey(item)),
+      );
+      // matchedById 还保留离屏已确认项，滚到它们附近即可直接复用；
+      // 渲染时只取当前视窗并按从上到下排序，避免离屏项占掉 10 个红框名额。
+      liveMatches.sort(
+        (a, b) =>
+          a.element.getBoundingClientRect().top -
+          b.element.getBoundingClientRect().top,
       );
       renderHighlightItems(liveMatches, config);
     });
@@ -3033,8 +3239,13 @@
         }
       }
 
-      // 立即渲染缓存命中 + 规则乐观命中项
-      state.matchedById.clear();
+      // 对账不能 clear 全表：前瞻推理已经确认、但尚未进视窗的标题必须保留，
+      // 否则 1.8 秒轮询会抹掉预判成果，用户滚到时又要等下一轮。
+      for (const [id, item] of state.matchedById) {
+        if (!item.element?.isConnected) {
+          state.matchedById.delete(id);
+        }
+      }
       for (const candidate of relatedInRound) {
         if (!state.dismissedTitleKeys.has(getTitleDismissKey(candidate))) {
           state.matchedById.set(candidate.id, candidate);
@@ -3160,9 +3371,28 @@
     };
 
     state.scrollHandler = () => {
-      scheduleRender(config);
+      const nextScrollY = window.scrollY;
+      const delta = nextScrollY - state.lastScrollY;
+      if (Math.abs(delta) >= 4) {
+        state.scrollDirection = delta > 0 ? 1 : -1;
+      }
+      state.lastScrollY = nextScrollY;
+      if (state.scrollRafId) {
+        return;
+      }
+      state.scrollRafId = requestAnimationFrame(() => {
+        state.scrollRafId = 0;
+        scheduleRender(config);
+        // 滚动会改变所有待判标题的价值；下一条必须重新按新视窗选，而不是守旧 FIFO
+        pumpLocalJudgeQueue(config);
+      });
     };
     state.resizeHandler = () => {
+      state.localLlmPrefetchObserver?.disconnect();
+      state.localLlmPrefetchObserver = null;
+      state.localLlmObservedElements = new WeakSet();
+      ensureLocalPrefetchObserver(config);
+      registerCurrentFeedTitles(config);
       triggerAnalyze();
     };
     window.addEventListener("scroll", state.scrollHandler, { passive: true });
@@ -3171,11 +3401,16 @@
     state.observer = new MutationObserver((mutations) => {
       // 快路径：新插入子树里的标题立刻逐条送本地 LLM。
       // 只读 textContent（不触发 layout）；推理在 GPU 上异步跑，不占主线程。
-      // 离屏插入的卡片也照判——等用户滚到时判决早已就绪，感知 0ms。
+      // 有关键词信号的离屏卡片立即判；零信号卡片进入前瞻带再判。
+      let shouldAnalyze = !state.localLlm;
       if (state.localLlm) {
         let budget = FAST_PATH_TITLE_BUDGET;
         outer: for (const mutation of mutations) {
-          for (const node of mutation.addedNodes) {
+          const roots =
+            mutation.type === "characterData"
+              ? [mutation.target.parentElement]
+              : mutation.addedNodes;
+          for (const node of roots) {
             if (!(node instanceof Element)) {
               continue;
             }
@@ -3189,12 +3424,15 @@
           }
         }
       }
-      triggerAnalyze();
+      if (shouldAnalyze) {
+        triggerAnalyze();
+      }
     });
     // 只观察节点增删：新标题只随卡片插入出现；attribute 级抖动（懒加载状态类、
     // 视频进度等）极高频且与标题无关，观察它只会把防抖无限续期并逼出无意义全扫。
     state.observer.observe(document.body, {
       childList: true,
+      characterData: true,
       subtree: true,
     });
   };
@@ -3239,6 +3477,14 @@
       cancelAnimationFrame(state.rafId);
       state.rafId = 0;
     }
+    if (state.scrollRafId) {
+      cancelAnimationFrame(state.scrollRafId);
+      state.scrollRafId = 0;
+    }
+    if (state.localLlmPumpRafId) {
+      cancelAnimationFrame(state.localLlmPumpRafId);
+      state.localLlmPumpRafId = 0;
+    }
     if (state.observerDebounceTimer) {
       window.clearTimeout(state.observerDebounceTimer);
       state.observerDebounceTimer = 0;
@@ -3248,6 +3494,9 @@
       state.inFlightText.delete(job.cacheKey);
     }
     state.localLlmQueue = [];
+    state.localLlmPrefetchObserver?.disconnect();
+    state.localLlmPrefetchObserver = null;
+    state.localLlmObservedElements = new WeakSet();
     if (state.detailTimer) {
       clearInterval(state.detailTimer);
       state.detailTimer = 0;
@@ -3283,8 +3532,15 @@
     ensureOverlayRoot();
     setupTitleClickDismiss(config);
     setupObservers(config);
+    ensureLocalPrefetchObserver(config);
+    registerCurrentFeedTitles(config);
     void analyzeRound(config);
     state.loopTimer = window.setInterval(() => {
+      if (state.localLlm) {
+        // 本地路径是 MutationObserver + IntersectionObserver 驱动；不要每 1.8 秒全扫 DOM，
+        // 否则高速滚动时周期性 layout 会和页面瀑布流及红框渲染争主线程。
+        return;
+      }
       void analyzeRound(config);
     }, config.app.loopIntervalMs);
     logInfo("多标题判断高亮已启动", {
