@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.10.0
+// @version      0.10.1
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.10.0";
+  const SCRIPT_VERSION = "0.10.1";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -199,6 +199,8 @@
     overlayRoot: null,
     judgeCache: new Map(),
     inFlightText: new Set(),
+    /** 同一标题推理期间出现的所有虚拟列表节点；完成时一次性回填仍在线的节点 */
+    inFlightElements: new Map(),
     matchedById: new Map(),
     dismissedTitleKeys: new Set(),
     titleClickHandler: null,
@@ -213,6 +215,7 @@
     localLlmPrefetchObserver: null,
     localLlmObservedElements: new WeakSet(),
     localLlmPumpRafId: 0,
+    feedRegistrationTimer: 0,
     lastScrollY: window.scrollY,
     scrollDirection: 1,
     scrollRafId: 0,
@@ -1249,8 +1252,16 @@
       config.judgement.localLlm.prefetchBehindViewport;
     for (const job of state.localLlmQueue) {
       if (!job.element?.isConnected) {
-        state.inFlightText.delete(job.cacheKey);
-        continue;
+        const replacement = Array.from(
+          state.inFlightElements.get(job.cacheKey) ?? [],
+        ).find((element) => element.isConnected);
+        if (replacement) {
+          job.element = replacement;
+        } else {
+          state.inFlightText.delete(job.cacheKey);
+          state.inFlightElements.delete(job.cacheKey);
+          continue;
+        }
       }
       const rect = job.element.getBoundingClientRect();
       const alreadyPassed =
@@ -1260,6 +1271,7 @@
       if (alreadyPassed) {
         // 快速滚动已经越过的任务不再消耗模型；反向滚回来时 IntersectionObserver 会重入队
         state.inFlightText.delete(job.cacheKey);
+        state.inFlightElements.delete(job.cacheKey);
         state.localLlmObservedElements.delete(job.element);
         observeTitleForPrefetch(config, job.element);
         continue;
@@ -1270,6 +1282,7 @@
     const kept = liveJobs.slice(0, maxPending);
     for (const dropped of liveJobs.slice(maxPending)) {
       state.inFlightText.delete(dropped.cacheKey);
+      state.inFlightElements.delete(dropped.cacheKey);
       if (dropped.element?.isConnected) {
         const rect = dropped.element.getBoundingClientRect();
         const outsidePrefetchBand =
@@ -1301,6 +1314,7 @@
       if (!job?.element?.isConnected) {
         if (job) {
           state.inFlightText.delete(job.cacheKey);
+          state.inFlightElements.delete(job.cacheKey);
         }
         continue;
       }
@@ -1389,6 +1403,9 @@
       return;
     }
     if (state.inFlightText.has(cacheKey)) {
+      const waiters = state.inFlightElements.get(cacheKey) ?? new Set();
+      waiters.add(element);
+      state.inFlightElements.set(cacheKey, waiters);
       return;
     }
 
@@ -1413,6 +1430,7 @@
     }
 
     state.inFlightText.add(cacheKey);
+    state.inFlightElements.set(cacheKey, new Set([element]));
     const job = {
       cacheKey,
       element,
@@ -1430,7 +1448,14 @@
             ],
           };
           state.judgeCache.set(cacheKey, finalResult);
-          addLlmConfirmedMatch(config, element, text, finalResult);
+          for (const waiter of state.inFlightElements.get(cacheKey) ?? []) {
+            const waiterText = normalizeTitle(
+              waiter.textContent || "",
+            ).toLowerCase();
+            if (waiter.isConnected && waiterText === cacheKey) {
+              addLlmConfirmedMatch(config, waiter, text, finalResult);
+            }
+          }
           logInfo("本地 LLM 判定", {
             ms: Math.round(performance.now() - t0),
             related: finalResult.isBayAreaRentingRelated,
@@ -1443,6 +1468,7 @@
           );
         } finally {
           state.inFlightText.delete(cacheKey);
+          state.inFlightElements.delete(cacheKey);
         }
       },
     };
@@ -1519,6 +1545,16 @@
         dispatchLocalJudge(config, element, element.textContent || "");
       }
     }
+  };
+
+  const scheduleFeedRegistration = (config) => {
+    if (state.feedRegistrationTimer) {
+      return;
+    }
+    state.feedRegistrationTimer = window.setTimeout(() => {
+      state.feedRegistrationTimer = 0;
+      registerCurrentFeedTitles(config);
+    }, 0);
   };
 
   const renderHighlightItems = (candidates, config) => {
@@ -3416,6 +3452,8 @@
             }
             for (const el of collectTitleElementsFromRoot(config, node)) {
               if (budget <= 0) {
+                // 这一批标题超过快路径预算：下一任务统一补扫，避免静默漏掉第 31 条以后
+                scheduleFeedRegistration(config);
                 break outer;
               }
               budget -= 1;
@@ -3485,6 +3523,10 @@
       cancelAnimationFrame(state.localLlmPumpRafId);
       state.localLlmPumpRafId = 0;
     }
+    if (state.feedRegistrationTimer) {
+      window.clearTimeout(state.feedRegistrationTimer);
+      state.feedRegistrationTimer = 0;
+    }
     if (state.observerDebounceTimer) {
       window.clearTimeout(state.observerDebounceTimer);
       state.observerDebounceTimer = 0;
@@ -3494,6 +3536,7 @@
       state.inFlightText.delete(job.cacheKey);
     }
     state.localLlmQueue = [];
+    state.inFlightElements.clear();
     state.localLlmPrefetchObserver?.disconnect();
     state.localLlmPrefetchObserver = null;
     state.localLlmObservedElements = new WeakSet();
