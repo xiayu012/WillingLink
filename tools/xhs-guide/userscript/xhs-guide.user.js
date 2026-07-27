@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.10.1
+// @version      0.11.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,12 +20,12 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.10.1";
+  const SCRIPT_VERSION = "0.11.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
   const TITLE_HIGHLIGHT_MAX_HEIGHT = 80;
-  /** 慢路径（全量对账 + 回退批量复核）的防抖间隔；快路径逐标题判定不吃这个延迟 */
+  /** 慢路径全量对账的防抖间隔；快路径逐标题判定不吃这个延迟 */
   const OBSERVER_DEBOUNCE_MS = 250;
   /** 单批 mutation 里快路径最多处理的标题数，护住当帧主线程 */
   const FAST_PATH_TITLE_BUDGET = 30;
@@ -61,15 +61,13 @@
       /**
        * true = 连关键词都没命中的标题也交给 LLM 软判断（排在有信号的候选之后）。
        * 关键词表永远补不全（sublet / 床位 / 转 lease / 没收录的地名…），硬拒绝会静默漏检，
-       * 而本地模型免费且单条 ~20-40ms，多判几条不影响体感。
-       * 仅在本地模型在线时生效：只剩远端批量那条路时，为零信号标题排队会拖慢真候选。
+       * 但实测本地模型单条约 260-350ms，所以零信号标题只在停止滚动后用空闲通道补判。
+       * 仅在本地模型已完成预热时生效；信息流不再回退远端批量接口。
        */
       softJudgeNoSignal: true,
       /**
-       * 本地 OpenAI 兼容 LLM（ollama / LM Studio / llama.cpp / vLLM 均可）。
-       * boot 时按端口探测第一个可用服务，并从 /models 里自动挑含 qwen 的模型。
-       * 命中后启用低延迟通道：逐标题即发、1 token 输出、KV 前缀缓存，
-       * 单条判定目标 ~20-40ms，端到端（标题出现→红框）~50ms。
+       * boot 时按端口探测本地 LLM；Ollama 使用原生 /api/chat 并让模型常驻内存，
+       * 其他 OpenAI 兼容服务仍使用 /v1/chat/completions。逐标题只输出 1 token。
        */
       localLlm: {
         enable: true,
@@ -79,8 +77,8 @@
           "http://127.0.0.1:8080/v1",
           "http://127.0.0.1:8000/v1",
         ],
-        /** 留空自动从 /models 挑；需指定时填如 "qwen2.5:1.5b-instruct" */
-        model: "",
+        /** 信息流标题固定用这个本地模型；只有本机不存在时才回退到其他 qwen */
+        model: "qwen2.5:3b",
         timeoutMs: 4000,
         /**
          * Ollama 默认会在服务端串行/排队同一模型的请求。浏览器同时发 6 条只会把
@@ -90,9 +88,11 @@
         maxConcurrent: 1,
         /** 只保留有限的待判任务；快速滚动时淘汰最远、已断开和身后的标题 */
         maxPendingJobs: 36,
-        /** 零关键词标题只在进入这个前瞻带后才占用推理（下方 3 屏、上方半屏） */
-        prefetchAheadViewport: 3,
+        /** 有信号标题插入即判；零信号标题只在接近视窗且停止滚动后使用空闲算力 */
+        prefetchAheadViewport: 0.75,
         prefetchBehindViewport: 0.5,
+        scrollIdleMs: 500,
+        maxLowPriorityPending: 2,
       },
       rule: {
         /**
@@ -206,9 +206,11 @@
     titleClickHandler: null,
     llmReviewedInRound: 0,
     lastLlmCallAt: 0,
-    /** 探测到的本地 LLM {baseUrl, model}；null = 不可用，回退后端批量复核 */
+    /** 探测到的本地 LLM {baseUrl, model}；信息流标题不使用远端回退 */
     localLlm: null,
+    localLlmReady: false,
     localLlmProbing: false,
+    localLlmUnavailableLogged: false,
     localLlmActive: 0,
     /** 待判定任务；每次推理完成后按当前位置和滚动方向重新选最优任务 */
     localLlmQueue: [],
@@ -216,7 +218,9 @@
     localLlmObservedElements: new WeakSet(),
     localLlmPumpRafId: 0,
     feedRegistrationTimer: 0,
+    lowPriorityResumeTimer: 0,
     lastScrollY: window.scrollY,
+    lastScrollAt: 0,
     scrollDirection: 1,
     scrollRafId: 0,
     observerDebounceTimer: 0,
@@ -832,7 +836,9 @@
     // 零关键词信号：本地模型在线时仍兜底软判断，只是排在有信号的候选之后，
     // 避免关键词表覆盖不到的写法（sublet / 床位 / 没收录的地名）被静默漏掉。
     const softJudge =
-      config.judgement.softJudgeNoSignal && Boolean(state.localLlm);
+      config.judgement.softJudgeNoSignal &&
+      Boolean(state.localLlm) &&
+      state.localLlmReady;
     return {
       stageName: "ruleScreenStage",
       passed: false,
@@ -1113,28 +1119,46 @@
     return Promise.reject(new Error("NO_GM_HTTP"));
   };
 
-  const callLocalLlmJudge = async (config, titleText) => {
+  const callLocalLlmJudge = async (
+    config,
+    titleText,
+    timeoutMs = config.judgement.localLlm.timeoutMs,
+  ) => {
     const { baseUrl, model } = state.localLlm;
-    const payload = {
-      model,
-      temperature: 0,
-      // 输出协议只有 0/1，一个 token 足够；不让模型生成解释占用下一条标题的通道
-      max_tokens: 1,
-      stream: false,
-      // llama.cpp：复用 system prompt 的 KV 前缀缓存，每次只 prefill 标题；其他服务忽略此字段
-      cache_prompt: true,
-      // ollama：模型常驻显存 30 分钟，避免空闲卸载后的秒级冷启动；其他服务忽略
-      keep_alive: "30m",
-      messages: [
-        { role: "system", content: LOCAL_LLM_SYSTEM_PROMPT },
-        { role: "user", content: titleText },
-      ],
-    };
+    const messages = [
+      { role: "system", content: LOCAL_LLM_SYSTEM_PROMPT },
+      { role: "user", content: titleText },
+    ];
+    const isOllama = /127\.0\.0\.1:11434|localhost:11434/.test(baseUrl);
+    const endpoint = isOllama
+      ? `${baseUrl.replace(/\/v1\/?$/, "")}/api/chat`
+      : `${baseUrl}/chat/completions`;
+    const payload = isOllama
+      ? {
+          model,
+          messages,
+          stream: false,
+          // 原生 Ollama API 才保证识别 keep_alive；-1 表示本次浏览期间不卸载模型
+          keep_alive: -1,
+          options: {
+            temperature: 0,
+            num_predict: 1,
+            num_ctx: 512,
+          },
+        }
+      : {
+          model,
+          messages,
+          temperature: 0,
+          max_tokens: 1,
+          stream: false,
+          cache_prompt: true,
+        };
     const { status, responseText } = await gmHttpPost(
-      `${baseUrl}/chat/completions`,
+      endpoint,
       { "Content-Type": "application/json" },
       JSON.stringify(payload),
-      config.judgement.localLlm.timeoutMs,
+      timeoutMs,
     );
     if (status < 200 || status >= 300) {
       throw new Error(
@@ -1142,21 +1166,37 @@
       );
     }
     const data = JSON.parse(responseText || "{}");
-    const content = String(data?.choices?.[0]?.message?.content ?? "").trim();
+    const content = String(
+      (isOllama
+        ? data?.message?.content
+        : data?.choices?.[0]?.message?.content) ?? "",
+    ).trim();
     const related = content.startsWith("1");
     return {
       isBayAreaRentingRelated: related,
       confidence: related ? 0.92 : 0.1,
       reason: `本地LLM(${model})输出 ${content || "空"}`,
+      ollamaLoadMs: isOllama
+        ? Math.round(Number(data?.load_duration || 0) / 1_000_000)
+        : 0,
+      ollamaPromptMs: isOllama
+        ? Math.round(Number(data?.prompt_eval_duration || 0) / 1_000_000)
+        : 0,
+      ollamaEvalMs: isOllama
+        ? Math.round(Number(data?.eval_duration || 0) / 1_000_000)
+        : 0,
     };
   };
 
   const warmupLocalLlm = async (config) => {
     try {
       const t0 = performance.now();
-      await callLocalLlmJudge(config, "预热");
+      const timing = await callLocalLlmJudge(config, "预热", 15_000);
       logInfo("本地 LLM 预热完成", {
         ms: Math.round(performance.now() - t0),
+        loadMs: timing.ollamaLoadMs,
+        promptMs: timing.ollamaPromptMs,
+        evalMs: timing.ollamaEvalMs,
         model: state.localLlm?.model,
       });
     } catch (e) {
@@ -1184,18 +1224,28 @@
           const ids = Array.isArray(data?.data)
             ? data.data.map((m) => String(m?.id ?? ""))
             : [];
+          const requestedModel = cfg.model?.trim() ?? "";
           const model =
-            cfg.model?.trim() ||
+            ids.find((id) => id === requestedModel) ||
+            ids.find((id) => id === "qwen2.5:3b") ||
             ids.find((id) => /qwen/i.test(id)) ||
             ids[0] ||
             "";
           if (!model) {
             continue;
           }
+          if (requestedModel && model !== requestedModel) {
+            logWarn("指定的本地模型不存在，回退到可用 qwen", {
+              requested: requestedModel,
+              selected: model,
+            });
+          }
           state.localLlm = { baseUrl, model };
+          state.localLlmUnavailableLogged = false;
           logInfo("发现本地 LLM，启用逐标题低延迟判定", state.localLlm);
           // 先完成预热，再建立前瞻队列；避免预热和真实标题争抢同一模型
           await warmupLocalLlm(config);
+          state.localLlmReady = true;
           ensureLocalPrefetchObserver(config);
           registerCurrentFeedTitles(config);
           // 探测期间慢路径可能已运行过；模型就绪后立即对账，不再等 1.8 秒轮询
@@ -1207,7 +1257,7 @@
           /* 该端口不可用，试下一个 */
         }
       }
-      logWarn("未探测到本地 LLM 服务，回退后端批量复核", cfg.baseUrlCandidates);
+      logWarn("未探测到本地 LLM 服务，信息流标题判断暂停", cfg.baseUrlCandidates);
     } finally {
       state.localLlmProbing = false;
     }
@@ -1225,7 +1275,12 @@
     const viewportHeight = Math.max(1, window.innerHeight);
     const isVisible = rect.bottom >= 0 && rect.top <= viewportHeight;
     if (isVisible) {
-      return -10_000 + Math.abs(rect.top) - job.ruleConfidence * 100;
+      return (
+        -10_000 +
+        Math.abs(rect.top) +
+        (job.lowPriority ? 20_000 : 0) -
+        job.ruleConfidence * 100
+      );
     }
 
     const distance =
@@ -1239,10 +1294,13 @@
 
     return (
       distance +
-      (job.lowPriority ? viewportHeight * 1.5 : 0) -
+      (job.lowPriority ? 20_000 : 0) -
       job.ruleConfidence * 100
     );
   };
+
+  const isLocalScrollIdle = (config) =>
+    now() - state.lastScrollAt >= config.judgement.localLlm.scrollIdleMs;
 
   const pruneLocalJudgeQueue = (config) => {
     const maxPending = config.judgement.localLlm.maxPendingJobs;
@@ -1279,11 +1337,23 @@
       liveJobs.push(job);
     }
     liveJobs.sort((a, b) => getLocalJobPriority(a) - getLocalJobPriority(b));
-    const kept = liveJobs.slice(0, maxPending);
-    for (const dropped of liveJobs.slice(maxPending)) {
+    const highPriorityJobs = liveJobs.filter((job) => !job.lowPriority);
+    const lowPriorityJobs = liveJobs
+      .filter((job) => job.lowPriority)
+      .slice(0, config.judgement.localLlm.maxLowPriorityPending);
+    const kept = [...highPriorityJobs, ...lowPriorityJobs]
+      .sort((a, b) => getLocalJobPriority(a) - getLocalJobPriority(b))
+      .slice(0, maxPending);
+    const keptSet = new Set(kept);
+    for (const dropped of liveJobs.filter((job) => !keptSet.has(job))) {
       state.inFlightText.delete(dropped.cacheKey);
       state.inFlightElements.delete(dropped.cacheKey);
       if (dropped.element?.isConnected) {
+        if (dropped.lowPriority) {
+          // 空闲补扫会重新注册；这里不立刻 observe，避免仍在前瞻带内时反复入队
+          state.localLlmObservedElements.delete(dropped.element);
+          continue;
+        }
         const rect = dropped.element.getBoundingClientRect();
         const outsidePrefetchBand =
           rect.top >
@@ -1310,6 +1380,12 @@
       state.localLlmQueue.sort(
         (a, b) => getLocalJobPriority(a) - getLocalJobPriority(b),
       );
+      if (
+        state.localLlmQueue[0]?.lowPriority &&
+        !isLocalScrollIdle(config)
+      ) {
+        return;
+      }
       const job = state.localLlmQueue.shift();
       if (!job?.element?.isConnected) {
         if (job) {
@@ -1387,7 +1463,7 @@
     rawText,
     { allowLowPriority = false } = {},
   ) => {
-    if (!state.localLlm) {
+    if (!state.localLlm || !state.localLlmReady) {
       return;
     }
     const text = normalizeTitle(rawText);
@@ -1428,6 +1504,10 @@
       observeTitleForPrefetch(config, element);
       return;
     }
+    if (ruleResult.lowPriority && !isLocalScrollIdle(config)) {
+      // 快速滚动期间不让无信号标题占用唯一推理通道；停止后统一补扫当前附近标题
+      return;
+    }
 
     state.inFlightText.add(cacheKey);
     state.inFlightElements.set(cacheKey, new Set([element]));
@@ -1436,8 +1516,10 @@
       element,
       ruleConfidence: ruleResult.confidence,
       lowPriority: Boolean(ruleResult.lowPriority),
+      enqueuedAt: now(),
       run: async () => {
         const t0 = performance.now();
+        const queueMs = now() - job.enqueuedAt;
         try {
           const verdict = await callLocalLlmJudge(config, text);
           const finalResult = {
@@ -1458,6 +1540,11 @@
           }
           logInfo("本地 LLM 判定", {
             ms: Math.round(performance.now() - t0),
+            queueMs,
+            loadMs: verdict.ollamaLoadMs,
+            promptMs: verdict.ollamaPromptMs,
+            evalMs: verdict.ollamaEvalMs,
+            lane: job.lowPriority ? "idle" : "priority",
             related: finalResult.isBayAreaRentingRelated,
             title: text.slice(0, 40),
           });
@@ -1469,6 +1556,9 @@
         } finally {
           state.inFlightText.delete(cacheKey);
           state.inFlightElements.delete(cacheKey);
+          if (job.lowPriority && isLocalScrollIdle(config)) {
+            scheduleFeedRegistration(config);
+          }
         }
       },
     };
@@ -3291,73 +3381,21 @@
         scheduleRender(config);
       }
 
-      // 第二遍：本地 LLM 可用时逐条即发（低延迟通道，兜住 boot 时已在页上的标题
-      // 和快路径漏掉的），否则批量走后端复核
-      if (state.localLlm) {
+      // 第二遍：本地 LLM 预热完成后逐条即发，兜住 boot 时已在页上的标题和快路径漏项
+      if (state.localLlm && state.localLlmReady) {
         for (const job of needLlm) {
           dispatchLocalJudge(config, job.candidate.element, job.candidate.text);
         }
-      } else {
-      // 远端批量有条数预算，按规则置信度降序，别让弱信号挤掉强候选
-      const llmJobs = needLlm
-        .slice()
-        .sort((a, b) => b.ruleResult.confidence - a.ruleResult.confidence)
-        .slice(0, config.judgement.maxLlmReviewsPerRound);
-      for (const job of llmJobs) {
-        state.inFlightText.add(job.cacheKey);
-      }
-      try {
-        const batchResults = await llmBatchReviewStage(
-          llmJobs.map((job) => job.input),
-          config,
-        );
-        for (let index = 0; index < llmJobs.length; index += 1) {
-          const job = llmJobs[index];
-          const parsed = batchResults.get(index);
-          const llmResult = parsed
-            ? {
-                stageName: "llmBatchReviewStage",
-                skipped: false,
-                passed: parsed.related,
-                confidence: parsed.confidence,
-                reason: parsed.reason,
-              }
-            : {
-                stageName: "llmBatchReviewStage",
-                skipped: true,
-                passed: job.ruleResult.passed,
-                confidence: job.ruleResult.confidence,
-                reason: "LLM 批量复核未返回该项，保留规则结果",
-              };
-          const postResult = postProcessStage(job.ruleResult, llmResult, config);
-          const finalResult = {
-            isBayAreaRentingRelated: postResult.isBayAreaRentingRelated,
-            confidence: postResult.confidence,
-            reason: postResult.reason,
-            stageTrace: [job.ruleResult, llmResult, postResult],
-          };
-          state.judgeCache.set(job.cacheKey, finalResult);
-
-          if (finalResult.isBayAreaRentingRelated) {
-            job.candidate.judgement = finalResult;
-            if (!state.dismissedTitleKeys.has(getTitleDismissKey(job.candidate))) {
-              state.matchedById.set(job.candidate.id, job.candidate);
-            }
-          } else {
-            state.matchedById.delete(job.candidate.id);
-          }
-        }
-      } catch (error) {
-        logWarn(
-          "LLM 批量复核失败，保留本地规则结果",
-          error instanceof Error ? error.message : String(error),
-        );
-      } finally {
-        for (const job of llmJobs) {
-          state.inFlightText.delete(job.cacheKey);
-        }
-        scheduleRender(config);
-      }
+      } else if (
+        !state.localLlmProbing &&
+        needLlm.length > 0 &&
+        !state.localLlmUnavailableLogged
+      ) {
+        // 信息流标题只允许本地模型判断；本地不可用时宁可暂不高亮，也不走远端造成秒级延迟
+        state.localLlmUnavailableLogged = true;
+        logWarn("本地 LLM 不可用，本轮信息流标题暂不复核", {
+          pending: needLlm.length,
+        });
       }
 
       scheduleRender(config);
@@ -3394,7 +3432,7 @@
   };
 
   const setupObservers = (config) => {
-    // 慢路径防抖：全量对账 + （本地 LLM 不可用时的）批量复核。
+    // 慢路径防抖：全量对账；本地 LLM 不可用时不把信息流标题发往远端。
     // 快路径逐标题判定不吃这 250ms——它直接在 mutation 回调里即发。
     const triggerAnalyze = () => {
       if (state.observerDebounceTimer) {
@@ -3413,6 +3451,15 @@
         state.scrollDirection = delta > 0 ? 1 : -1;
       }
       state.lastScrollY = nextScrollY;
+      state.lastScrollAt = now();
+      if (state.lowPriorityResumeTimer) {
+        window.clearTimeout(state.lowPriorityResumeTimer);
+      }
+      state.lowPriorityResumeTimer = window.setTimeout(() => {
+        state.lowPriorityResumeTimer = 0;
+        registerCurrentFeedTitles(config);
+        scheduleLocalJudgePump(config);
+      }, config.judgement.localLlm.scrollIdleMs);
       if (state.scrollRafId) {
         return;
       }
@@ -3438,8 +3485,8 @@
       // 快路径：新插入子树里的标题立刻逐条送本地 LLM。
       // 只读 textContent（不触发 layout）；推理在 GPU 上异步跑，不占主线程。
       // 有关键词信号的离屏卡片立即判；零信号卡片进入前瞻带再判。
-      let shouldAnalyze = !state.localLlm;
-      if (state.localLlm) {
+      let shouldAnalyze = !state.localLlmReady;
+      if (state.localLlm && state.localLlmReady) {
         let budget = FAST_PATH_TITLE_BUDGET;
         outer: for (const mutation of mutations) {
           const roots =
@@ -3526,6 +3573,10 @@
     if (state.feedRegistrationTimer) {
       window.clearTimeout(state.feedRegistrationTimer);
       state.feedRegistrationTimer = 0;
+    }
+    if (state.lowPriorityResumeTimer) {
+      window.clearTimeout(state.lowPriorityResumeTimer);
+      state.lowPriorityResumeTimer = 0;
     }
     if (state.observerDebounceTimer) {
       window.clearTimeout(state.observerDebounceTimer);
@@ -3625,8 +3676,8 @@
       return;
     }
 
-    // 尽早探测本地 LLM 并预热（拉模型进显存 + 缓存 system prompt 的 KV），
-    // 探测完成前的标题由慢路径兜住，完成后 analyzeRound 会把它们逐条补判
+    // 尽早探测并独占完成本地 LLM 预热；完成前不发真实标题，也不回退远端。
+    // 就绪后 analyzeRound 会把启动期间出现的标题逐条补判。
     void discoverLocalLlm(config);
 
     switchModeByUrl(config);
