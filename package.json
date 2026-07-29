@@ -17,6 +17,8 @@
     "db:up": "drizzle-kit up",
     "test": "export PLAYWRIGHT=True && pnpm exec playwright test",
     "xhs:clean-rented": "tsx scripts/clean-xhs-rented-listings.ts",
+    "xhs:generate-geo-index": "node tools/xhs-guide/geo/generate-geo-index.mjs",
+    "xhs:verify-geo-index": "node tools/xhs-guide/geo/verify-geo-index.mjs",
     "search-eval": "NODE_OPTIONS=--conditions=react-server tsx scripts/search-eval.ts"
   },
   "dependencies": {
