@@ -43,6 +43,7 @@ async function NewChatPage() {
           Request rental updates by text
         </Link>
         <div>
+          <span className="mr-2">WillingLink Operated by FretGone LLC</span>
           <span className="mr-2">© {new Date().getFullYear()} WillingLink</span>
           <Link className="underline hover:text-foreground" href="/about">
             About
