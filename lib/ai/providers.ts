@@ -49,3 +49,10 @@ export function getTitleModel() {
   }
   return gateway.languageModel("anthropic/claude-haiku-4.5");
 }
+
+export function getFeedTitleModel() {
+  if (isTestEnvironment && myProvider) {
+    return myProvider.languageModel("title-model");
+  }
+  return gateway.languageModel("openai/gpt-4o-mini");
+}
