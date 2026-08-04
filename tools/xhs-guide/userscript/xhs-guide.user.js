@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.13.1
+// @version      0.13.2
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.13.1";
+  const SCRIPT_VERSION = "0.13.2";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -54,18 +54,22 @@
       requireLlmConfirm: true,
       /**
        * 信息流候选请求 Vercel 后端，由服务端调用 OpenAI gpt-4o-mini。
-       * 远程固定 RTT/冷启动成本高：优先微批摊销，并用更大预取区抢在进视窗前判完。
+       * 预取可微批；视窗内标题走紧急小批，并始终预留并发槽，绝不被慢请求堵死。
        */
       remoteLlm: {
         enable: true,
         model: "gpt-4o-mini",
         timeoutMs: 12_000,
-        /** 每个请求是一批标题；两路并发兼顾吞吐，又避免打爆网关。 */
-        maxConcurrent: 2,
-        /** 单次请求最多并入的标题数；远端比本地更能吃批。 */
-        batchSize: 8,
-        /** 仅预取任务可短暂攒批；视窗内标题立刻发、不为此等。 */
-        coalesceMs: 40,
+        /** 总并发；请求彼此独立，完成一条立刻再取下一批，不是串行等上一批。 */
+        maxConcurrent: 6,
+        /** 视窗内/即将进入视窗的小批：低延迟优先。 */
+        urgentBatchSize: 2,
+        /** 前方预取大批：摊销远端固定 RTT。 */
+        prefetchBatchSize: 6,
+        /** 永远留给紧急通道的空槽，避免预取占满后视窗标题还要等上一次返回。 */
+        urgentReservedSlots: 2,
+        /** 仅预取任务可短暂攒批；紧急标题立刻发。 */
+        coalesceMs: 24,
         /** 只保留有限的待判任务；快速滚动时淘汰最远、已断开和身后的标题 */
         maxPendingJobs: 36,
         /** 更大前瞻：滚到时尽量已经命中缓存 */
@@ -1206,29 +1210,73 @@
     state.remoteLlmQueue = kept;
   };
 
-  const takeNextRemoteBatch = (config) => {
-    const batchSize = config.judgement.remoteLlm.batchSize;
+  const isUrgentRemoteJob = (job) => {
+    const priority = getRemoteJobPriority(job);
+    if (priority < 0) {
+      return true;
+    }
+    // 即将进视窗的半屏内标题也走紧急小批，避免刚露脸时还卡在预取大表后面。
+    return priority < Math.max(1, window.innerHeight) * 0.35;
+  };
+
+  const takeRemoteJobs = (predicate, limit) => {
     const batch = [];
-    while (batch.length < batchSize && state.remoteLlmQueue.length > 0) {
+    const deferred = [];
+    while (batch.length < limit && state.remoteLlmQueue.length > 0) {
       const job = state.remoteLlmQueue.shift();
-      if (!job?.element?.isConnected) {
-        if (job) {
-          const replacement = Array.from(
-            state.inFlightElements.get(job.cacheKey) ?? [],
-          ).find((element) => element.isConnected);
-          if (replacement) {
-            job.element = replacement;
-            batch.push(job);
-            continue;
-          }
+      if (!job) {
+        continue;
+      }
+      if (!job.element?.isConnected) {
+        const replacement = Array.from(
+          state.inFlightElements.get(job.cacheKey) ?? [],
+        ).find((element) => element.isConnected);
+        if (replacement) {
+          job.element = replacement;
+        } else {
           state.inFlightText.delete(job.cacheKey);
           state.inFlightElements.delete(job.cacheKey);
+          continue;
         }
+      }
+      if (!predicate(job)) {
+        deferred.push(job);
         continue;
       }
       batch.push(job);
     }
+    if (deferred.length > 0) {
+      state.remoteLlmQueue = deferred.concat(state.remoteLlmQueue);
+    }
     return batch;
+  };
+
+  const findLiveTitleElementsByText = (config, text) => {
+    const target = normalizeTitle(text).toLowerCase();
+    if (!target) {
+      return [];
+    }
+    const found = [];
+    const seen = new Set();
+    for (const selector of config.titleScan.selectorCandidates) {
+      let elements = [];
+      try {
+        elements = document.querySelectorAll(selector);
+      } catch {
+        continue;
+      }
+      for (const element of elements) {
+        if (!(element instanceof HTMLElement) || seen.has(element)) {
+          continue;
+        }
+        if (normalizeTitle(element.textContent || "").toLowerCase() !== target) {
+          continue;
+        }
+        seen.add(element);
+        found.push(element);
+      }
+    }
+    return found;
   };
 
   const applyRemoteVerdict = (config, job, verdict, meta) => {
@@ -1240,7 +1288,13 @@
       ],
     };
     state.judgeCache.set(job.cacheKey, finalResult);
-    for (const waiter of state.inFlightElements.get(job.cacheKey) ?? []) {
+
+    const targets = new Set(state.inFlightElements.get(job.cacheKey) ?? []);
+    // 虚拟列表会换 DOM；结果回来时再按标题文本找一遍当前页上的节点，避免“已经刷过去才框”。
+    for (const element of findLiveTitleElementsByText(config, job.text)) {
+      targets.add(element);
+    }
+    for (const waiter of targets) {
       const waiterText = normalizeTitle(waiter.textContent || "").toLowerCase();
       if (waiter.isConnected && waiterText === job.cacheKey) {
         addLlmConfirmedMatch(config, waiter, job.text, finalResult);
@@ -1250,12 +1304,13 @@
       ms: meta.callMs,
       queueMs: meta.queueMs,
       batchSize: meta.batchSize,
+      lane: meta.lane,
       related: finalResult.isBayAreaRentingRelated,
       title: job.text.slice(0, 40),
     });
   };
 
-  const runRemoteBatch = async (config, batch) => {
+  const runRemoteBatch = async (config, batch, lane) => {
     if (batch.length === 0) {
       return;
     }
@@ -1279,6 +1334,7 @@
           callMs,
           queueMs,
           batchSize: batch.length,
+          lane,
         });
       }
     } catch (e) {
@@ -1302,26 +1358,61 @@
     state.remoteLlmCoalesceTimer = 0;
   };
 
+  const launchRemoteBatch = (config, batch, lane) => {
+    if (batch.length === 0) {
+      return false;
+    }
+    state.remoteLlmActive += 1;
+    void (async () => {
+      try {
+        await runRemoteBatch(config, batch, lane);
+      } finally {
+        state.remoteLlmActive -= 1;
+        // 上一批结束立刻继续泵，而不是干等固定节拍
+        pumpRemoteJudgeQueue(config);
+      }
+    })();
+    return true;
+  };
+
   const pumpRemoteJudgeQueue = (config) => {
     pruneRemoteJudgeQueue(config);
-    const maxConcurrent = config.judgement.remoteLlm.maxConcurrent;
-    const batchSize = config.judgement.remoteLlm.batchSize;
-    const coalesceMs = config.judgement.remoteLlm.coalesceMs;
+    const {
+      maxConcurrent,
+      urgentBatchSize,
+      prefetchBatchSize,
+      urgentReservedSlots,
+      coalesceMs,
+    } = config.judgement.remoteLlm;
 
     while (
       state.remoteLlmActive < maxConcurrent &&
       state.remoteLlmQueue.length > 0
     ) {
-      // 每次只取此刻最值得判的标题；滚动后优先级会自动反映新视窗和新方向
+      // 每次重排：滚动后视窗标题瞬间变成紧急，必须插队，不能卡在旧预取后面。
       state.remoteLlmQueue.sort(
         (a, b) => getRemoteJobPriority(a) - getRemoteJobPriority(b),
       );
-      const topPriority = getRemoteJobPriority(state.remoteLlmQueue[0]);
-      const urgent = topPriority < 0;
-      const fullEnough = state.remoteLlmQueue.length >= batchSize;
 
-      // 预取任务可等几十毫秒凑成一批；可见标题不等。
-      if (!urgent && !fullEnough && coalesceMs > 0) {
+      const hasUrgent = state.remoteLlmQueue.some((job) =>
+        isUrgentRemoteJob(job),
+      );
+      if (hasUrgent) {
+        clearRemoteCoalesceTimer();
+        const urgentBatch = takeRemoteJobs(isUrgentRemoteJob, urgentBatchSize);
+        if (!launchRemoteBatch(config, urgentBatch, "urgent")) {
+          break;
+        }
+        continue;
+      }
+
+      // 预取永远不占满全部槽；留给随时可能进视窗的紧急标题。
+      const freeSlots = maxConcurrent - state.remoteLlmActive;
+      if (freeSlots <= urgentReservedSlots) {
+        return;
+      }
+
+      if (state.remoteLlmQueue.length < prefetchBatchSize && coalesceMs > 0) {
         if (!state.remoteLlmCoalesceTimer) {
           state.remoteLlmCoalesceTimer = window.setTimeout(() => {
             state.remoteLlmCoalesceTimer = 0;
@@ -1332,20 +1423,13 @@
       }
 
       clearRemoteCoalesceTimer();
-      const batch = takeNextRemoteBatch(config);
-      if (batch.length === 0) {
+      const prefetchBatch = takeRemoteJobs(
+        (job) => !isUrgentRemoteJob(job),
+        prefetchBatchSize,
+      );
+      if (!launchRemoteBatch(config, prefetchBatch, "prefetch")) {
         break;
       }
-
-      state.remoteLlmActive += 1;
-      void (async () => {
-        try {
-          await runRemoteBatch(config, batch);
-        } finally {
-          state.remoteLlmActive -= 1;
-          pumpRemoteJudgeQueue(config);
-        }
-      })();
     }
   };
 
@@ -1390,7 +1474,7 @@
   };
 
   /**
-   * 快路径：通过严格地理门控的标题入队，可见优先微批发送 4o-mini。
+   * 快路径：通过严格地理门控的标题入队；紧急小批与预取大表分轨并发，不串行堵死。
    * 检测阶段零 layout（纯字符串规则预筛）；rect 相关工作全部推迟到渲染帧。
    */
   const observeTitleForPrefetch = (config, element) => {
