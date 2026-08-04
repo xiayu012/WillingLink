@@ -16,33 +16,16 @@ const batchSchema = z.object({
       index: z.number().int().min(0),
       related: z.boolean(),
       confidence: z.number().min(0).max(1),
-      reason: z.string(),
+      reason: z.string().max(24),
     })
   ),
 });
 
-const SYSTEM_PROMPT = `你是小红书标题分类器，判断标题是否属于「美国湾区租房/找室友交易帖」。
-
-判定标准：related=true 仅当标题明确表达了具体的住房交易意图——
-即有人在「出租/转租/求租/找房/找室友/合租/subletting/room available/roommate wanted」等，
-正在提供或寻找一个具体的房源/床位/室友名额。
-
-即使标题提到了湾区地名（San Jose、Cupertino、Fremont 等）或含有"房""租"等字，
-只要没有具体的住房交易意图，也必须判为 related=false，包括但不限于：
-- 经验分享、攻略、总结、科普、政策解读、注意事项、吐槽、生活记录
-- 团购、拼邮、拼团、代购、拼车、顺风车
-- 二手物品买卖/置换（家具、日用品等，即使可能用于新家）
-- 招聘、兼职、找工作
-- 社交活动、聚会、约练、相亲、交友
-- 美食探店、旅游观光、购物分享
-- 房价行情讨论、买房投资讨论（买卖房产不是「租房」）
-
-只有标题本身清楚表明"我有房/床位要租出去"或"我在找房/找室友"这类具体交易请求时才判 true。
-如果无法确定，请判为 false（宁可漏检也不要误判）。
-
-confidence 表示你对这次判断把握程度的高低，不是"相关程度"的强弱。
-
-为每个标题输出 index / related / confidence / reason，reason 用一句话说明关键依据。`;
+// 油猴脚本已先用离线地理索引硬门控；这里只判交易意图，提示词尽量短以压延迟。
+const SYSTEM_PROMPT = `地点已确认为旧金山湾区核心五县。只判断标题是否在提供或寻找具体住房/床位/室友名额。
+true：出租、转租、求租、找房、合租、找室友。
+false：攻略避雷、拼邮拼车、二手、招聘、社交、买房房价、普通生活。
+不确定则 false。reason 不超过 12 字。`;
 
 export async function classifyFeedTitles(
   titles: string[]
@@ -52,7 +35,7 @@ export async function classifyFeedTitles(
   }
 
   const userPrompt = titles
-    .map((title, index) => `${index}. ${title.slice(0, 200)}`)
+    .map((title, index) => `${index}. ${title.slice(0, 120)}`)
     .join("\n");
 
   try {
@@ -62,6 +45,7 @@ export async function classifyFeedTitles(
       system: SYSTEM_PROMPT,
       prompt: userPrompt,
       temperature: 0,
+      maxOutputTokens: Math.min(48 + titles.length * 28, 360),
     });
 
     return object.results.map((item) => ({

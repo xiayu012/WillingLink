@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.13.0
+// @version      0.13.1
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.13.0";
+  const SCRIPT_VERSION = "0.13.1";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -52,17 +52,24 @@
       minConfidenceToHighlight: 0.6,
       /** true = 只有 LLM 判定过的标题才高亮；规则只做预筛，不再乐观抢跑 */
       requireLlmConfirm: true,
-      /** 信息流候选逐条请求 Vercel 后端，由服务端调用 OpenAI gpt-4o-mini。 */
+      /**
+       * 信息流候选请求 Vercel 后端，由服务端调用 OpenAI gpt-4o-mini。
+       * 远程固定 RTT/冷启动成本高：优先微批摊销，并用更大预取区抢在进视窗前判完。
+       */
       remoteLlm: {
         enable: true,
         model: "gpt-4o-mini",
         timeoutMs: 12_000,
-        /** 网络请求可并行；严格地理门控后候选很少，四通道兼顾首屏延迟与服务端负载。 */
-        maxConcurrent: 4,
+        /** 每个请求是一批标题；两路并发兼顾吞吐，又避免打爆网关。 */
+        maxConcurrent: 2,
+        /** 单次请求最多并入的标题数；远端比本地更能吃批。 */
+        batchSize: 8,
+        /** 仅预取任务可短暂攒批；视窗内标题立刻发、不为此等。 */
+        coalesceMs: 40,
         /** 只保留有限的待判任务；快速滚动时淘汰最远、已断开和身后的标题 */
-        maxPendingJobs: 24,
-        /** 队列被裁剪的候选滚回视窗前，可提前重新进入判定队列 */
-        prefetchAheadViewport: 1.5,
+        maxPendingJobs: 36,
+        /** 更大前瞻：滚到时尽量已经命中缓存 */
+        prefetchAheadViewport: 3,
         prefetchBehindViewport: 0.5,
       },
       rule: {
@@ -429,6 +436,7 @@
     remoteLlmPrefetchObserver: null,
     remoteLlmObservedElements: new WeakSet(),
     remoteLlmPumpRafId: 0,
+    remoteLlmCoalesceTimer: 0,
     feedRegistrationTimer: 0,
     lastScrollY: window.scrollY,
     scrollDirection: 1,
@@ -1027,17 +1035,20 @@
     };
   };
 
-  // ---- 互联网 4o-mini 通道：严格地理门控后逐标题请求，不攒批 ----
-  const callRemoteLlmJudge = async (config, titleText) => {
+  // ---- 互联网 4o-mini 通道：微批摊销固定 RTT，可见标题优先立刻发 ----
+  const callRemoteLlmJudgeBatch = async (config, titles) => {
     const baseUrl = config.ingest?.baseUrl?.trim() ?? "";
     if (!baseUrl) {
       throw new Error("未配置 ingest.baseUrl");
+    }
+    if (titles.length === 0) {
+      return [];
     }
     const endpoint = `${baseUrl.replace(/\/$/, "")}/api/xhs/title-judge`;
     const { status, responseText } = await gmHttpPost(
       endpoint,
       { "Content-Type": "application/json" },
-      JSON.stringify({ titles: [titleText] }),
+      JSON.stringify({ titles }),
       config.judgement.remoteLlm.timeoutMs,
     );
 
@@ -1047,14 +1058,7 @@
     } catch {
       throw new Error(`4o-mini 响应不是 JSON: ${responseText.slice(0, 120)}`);
     }
-    const item = Array.isArray(data?.results) ? data.results[0] : null;
-    if (
-      status < 200 ||
-      status >= 300 ||
-      data?.ok !== true ||
-      !item ||
-      typeof item.related !== "boolean"
-    ) {
+    if (status < 200 || status >= 300 || data?.ok !== true) {
       const detail =
         typeof data?.error === "string"
           ? data.error
@@ -1062,29 +1066,58 @@
       throw new Error(`4o-mini ${status}: ${detail}`);
     }
 
-    return {
-      isBayAreaRentingRelated: item.related,
-      confidence: clamp(Number(item.confidence) || 0.5, 0, 1),
-      reason:
-        typeof item.reason === "string"
-          ? item.reason
-          : "gpt-4o-mini 未提供原因",
-    };
+    const byIndex = new Map();
+    for (const item of Array.isArray(data?.results) ? data.results : []) {
+      if (
+        item &&
+        Number.isInteger(item.index) &&
+        typeof item.related === "boolean"
+      ) {
+        byIndex.set(item.index, item);
+      }
+    }
+
+    return titles.map((_, index) => {
+      const item = byIndex.get(index);
+      if (!item) {
+        return {
+          isBayAreaRentingRelated: false,
+          confidence: 0.1,
+          reason: "模型未返回该项",
+        };
+      }
+      return {
+        isBayAreaRentingRelated: item.related,
+        confidence: clamp(Number(item.confidence) || 0.5, 0, 1),
+        reason:
+          typeof item.reason === "string"
+            ? item.reason
+            : "gpt-4o-mini 未提供原因",
+      };
+    });
   };
 
   const warmupRemoteLlm = async (config) => {
     if (!config.judgement.remoteLlm.enable || !config.ingest?.baseUrl?.trim()) {
       return;
     }
+    const baseUrl = config.ingest.baseUrl.trim().replace(/\/$/, "");
+    const endpoint = `${baseUrl}/api/xhs/title-judge`;
     const startedAt = performance.now();
     try {
-      await callRemoteLlmJudge(config, "预热连接：这不是租房交易帖");
-      logInfo("gpt-4o-mini 通道预热完成", {
+      // 只暖 HTTP/无服务器实例，不烧一轮真 LLM，避免和首屏标题抢网关。
+      await gmHttpPost(
+        endpoint,
+        { "Content-Type": "application/json" },
+        JSON.stringify({ titles: [] }),
+        4_000,
+      );
+      logInfo("gpt-4o-mini 通道连接预热完成", {
         ms: Math.round(performance.now() - startedAt),
       });
     } catch (error) {
       logWarn(
-        "gpt-4o-mini 通道预热失败",
+        "gpt-4o-mini 通道连接预热失败",
         error instanceof Error ? error.message : String(error),
       );
     }
@@ -1173,9 +1206,108 @@
     state.remoteLlmQueue = kept;
   };
 
+  const takeNextRemoteBatch = (config) => {
+    const batchSize = config.judgement.remoteLlm.batchSize;
+    const batch = [];
+    while (batch.length < batchSize && state.remoteLlmQueue.length > 0) {
+      const job = state.remoteLlmQueue.shift();
+      if (!job?.element?.isConnected) {
+        if (job) {
+          const replacement = Array.from(
+            state.inFlightElements.get(job.cacheKey) ?? [],
+          ).find((element) => element.isConnected);
+          if (replacement) {
+            job.element = replacement;
+            batch.push(job);
+            continue;
+          }
+          state.inFlightText.delete(job.cacheKey);
+          state.inFlightElements.delete(job.cacheKey);
+        }
+        continue;
+      }
+      batch.push(job);
+    }
+    return batch;
+  };
+
+  const applyRemoteVerdict = (config, job, verdict, meta) => {
+    const finalResult = {
+      ...verdict,
+      stageTrace: [
+        job.ruleResult,
+        { stageName: "remoteLlmStage", ...verdict },
+      ],
+    };
+    state.judgeCache.set(job.cacheKey, finalResult);
+    for (const waiter of state.inFlightElements.get(job.cacheKey) ?? []) {
+      const waiterText = normalizeTitle(waiter.textContent || "").toLowerCase();
+      if (waiter.isConnected && waiterText === job.cacheKey) {
+        addLlmConfirmedMatch(config, waiter, job.text, finalResult);
+      }
+    }
+    logInfo("gpt-4o-mini 判定", {
+      ms: meta.callMs,
+      queueMs: meta.queueMs,
+      batchSize: meta.batchSize,
+      related: finalResult.isBayAreaRentingRelated,
+      title: job.text.slice(0, 40),
+    });
+  };
+
+  const runRemoteBatch = async (config, batch) => {
+    if (batch.length === 0) {
+      return;
+    }
+    const t0 = performance.now();
+    const oldestEnqueuedAt = Math.min(...batch.map((job) => job.enqueuedAt));
+    try {
+      const verdicts = await callRemoteLlmJudgeBatch(
+        config,
+        batch.map((job) => job.text),
+      );
+      const callMs = Math.round(performance.now() - t0);
+      const queueMs = now() - oldestEnqueuedAt;
+      for (let index = 0; index < batch.length; index += 1) {
+        const job = batch[index];
+        const verdict = verdicts[index] ?? {
+          isBayAreaRentingRelated: false,
+          confidence: 0.1,
+          reason: "模型未返回该项",
+        };
+        applyRemoteVerdict(config, job, verdict, {
+          callMs,
+          queueMs,
+          batchSize: batch.length,
+        });
+      }
+    } catch (e) {
+      logWarn(
+        "gpt-4o-mini 判定失败",
+        e instanceof Error ? e.message : String(e),
+      );
+    } finally {
+      for (const job of batch) {
+        state.inFlightText.delete(job.cacheKey);
+        state.inFlightElements.delete(job.cacheKey);
+      }
+    }
+  };
+
+  const clearRemoteCoalesceTimer = () => {
+    if (!state.remoteLlmCoalesceTimer) {
+      return;
+    }
+    window.clearTimeout(state.remoteLlmCoalesceTimer);
+    state.remoteLlmCoalesceTimer = 0;
+  };
+
   const pumpRemoteJudgeQueue = (config) => {
     pruneRemoteJudgeQueue(config);
     const maxConcurrent = config.judgement.remoteLlm.maxConcurrent;
+    const batchSize = config.judgement.remoteLlm.batchSize;
+    const coalesceMs = config.judgement.remoteLlm.coalesceMs;
+
     while (
       state.remoteLlmActive < maxConcurrent &&
       state.remoteLlmQueue.length > 0
@@ -1184,19 +1316,31 @@
       state.remoteLlmQueue.sort(
         (a, b) => getRemoteJobPriority(a) - getRemoteJobPriority(b),
       );
-      const job = state.remoteLlmQueue.shift();
-      if (!job?.element?.isConnected) {
-        if (job) {
-          state.inFlightText.delete(job.cacheKey);
-          state.inFlightElements.delete(job.cacheKey);
+      const topPriority = getRemoteJobPriority(state.remoteLlmQueue[0]);
+      const urgent = topPriority < 0;
+      const fullEnough = state.remoteLlmQueue.length >= batchSize;
+
+      // 预取任务可等几十毫秒凑成一批；可见标题不等。
+      if (!urgent && !fullEnough && coalesceMs > 0) {
+        if (!state.remoteLlmCoalesceTimer) {
+          state.remoteLlmCoalesceTimer = window.setTimeout(() => {
+            state.remoteLlmCoalesceTimer = 0;
+            pumpRemoteJudgeQueue(config);
+          }, coalesceMs);
         }
-        continue;
+        return;
+      }
+
+      clearRemoteCoalesceTimer();
+      const batch = takeNextRemoteBatch(config);
+      if (batch.length === 0) {
+        break;
       }
 
       state.remoteLlmActive += 1;
       void (async () => {
         try {
-          await job.run();
+          await runRemoteBatch(config, batch);
         } finally {
           state.remoteLlmActive -= 1;
           pumpRemoteJudgeQueue(config);
@@ -1246,7 +1390,7 @@
   };
 
   /**
-   * 快路径：通过严格地理门控的单标题立即送 4o-mini，不攒批、不等防抖。
+   * 快路径：通过严格地理门控的标题入队，可见优先微批发送 4o-mini。
    * 检测阶段零 layout（纯字符串规则预筛）；rect 相关工作全部推迟到渲染帧。
    */
   const observeTitleForPrefetch = (config, element) => {
@@ -1301,53 +1445,15 @@
 
     state.inFlightText.add(cacheKey);
     state.inFlightElements.set(cacheKey, new Set([element]));
-    const job = {
+    state.remoteLlmQueue.push({
       cacheKey,
+      text,
       element,
+      ruleResult,
       ruleConfidence: ruleResult.confidence,
       enqueuedAt: now(),
-      run: async () => {
-        const t0 = performance.now();
-        const queueMs = now() - job.enqueuedAt;
-        try {
-          const verdict = await callRemoteLlmJudge(config, text);
-          const callMs = Math.round(performance.now() - t0);
-          const finalResult = {
-            ...verdict,
-            stageTrace: [
-              ruleResult,
-              { stageName: "remoteLlmStage", ...verdict },
-            ],
-          };
-          state.judgeCache.set(cacheKey, finalResult);
-          for (const waiter of state.inFlightElements.get(cacheKey) ?? []) {
-            const waiterText = normalizeTitle(
-              waiter.textContent || "",
-            ).toLowerCase();
-            if (waiter.isConnected && waiterText === cacheKey) {
-              addLlmConfirmedMatch(config, waiter, text, finalResult);
-            }
-          }
-          logInfo("gpt-4o-mini 判定", {
-            ms: callMs,
-            queueMs,
-            related: finalResult.isBayAreaRentingRelated,
-            title: text.slice(0, 40),
-          });
-        } catch (e) {
-          logWarn(
-            "gpt-4o-mini 判定失败",
-            e instanceof Error ? e.message : String(e),
-          );
-        } finally {
-          state.inFlightText.delete(cacheKey);
-          state.inFlightElements.delete(cacheKey);
-        }
-      },
-    };
-
-    state.remoteLlmQueue.push(job);
-    // 一批卡片通常在同一个 mutation 批次插入；合并到下一帧只做一次 layout + 排序
+    });
+    // 一批卡片通常在同一个 mutation 批次插入；合并到下一帧只做一次 layout + 排序/发微批
     scheduleRemoteJudgePump(config);
   };
 
@@ -3164,7 +3270,7 @@
         scheduleRender(config);
       }
 
-      // 第二遍：逐条请求 4o-mini，兜住 boot 时已在页上的标题和快路径漏项
+      // 第二遍：可见优先微批请求 4o-mini，兜住 boot 时已在页上的标题和快路径漏项
       if (config.judgement.remoteLlm.enable && config.ingest?.baseUrl?.trim()) {
         for (const job of needLlm) {
           dispatchRemoteJudge(config, job.candidate.element, job.candidate.text);
@@ -3253,7 +3359,7 @@
     window.addEventListener("resize", state.resizeHandler);
 
     state.observer = new MutationObserver((mutations) => {
-      // 快路径：新插入子树中符合“核心五县地点 + 住房交易词”的标题立即送 4o-mini。
+      // 快路径：新插入子树中符合“核心五县地点 + 住房交易词”的标题立刻入队微批。
       // 只读 textContent（不触发 layout）；网络和模型推理均不阻塞主线程。
       let shouldAnalyze = !config.judgement.remoteLlm.enable;
       if (config.judgement.remoteLlm.enable) {
@@ -3339,6 +3445,9 @@
     if (state.remoteLlmPumpRafId && !preserveTitleWork) {
       cancelAnimationFrame(state.remoteLlmPumpRafId);
       state.remoteLlmPumpRafId = 0;
+    }
+    if (!preserveTitleWork) {
+      clearRemoteCoalesceTimer();
     }
     if (state.feedRegistrationTimer) {
       window.clearTimeout(state.feedRegistrationTimer);
