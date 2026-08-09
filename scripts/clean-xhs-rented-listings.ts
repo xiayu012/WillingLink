@@ -144,6 +144,10 @@ type AiJudgeConfig = {
   enabled: boolean;
   apiKey: string | null;
   model: string;
+  /** 不设默认值：不同模型能接受的取值不同（新模型常只认默认值），硬编码一个数字
+   * 早晚会在换模型时导致这条判断整批 400、静默退化成更容易错删的正则规则。
+   * 未配置时不传该字段，让 API 用模型自己的默认值。 */
+  temperature: number | undefined;
   minConfidence: number;
 };
 
@@ -338,7 +342,7 @@ function formatAuthorCommentsForPrompt(comments: AuthorComment[]): string {
  * API key 时返回 null，由调用方回退到规则判断。
  */
 async function judgeRentedWithAi(
-  config: Pick<AiJudgeConfig, "apiKey" | "model">,
+  config: Pick<AiJudgeConfig, "apiKey" | "model" | "temperature">,
   context: ListingContext
 ): Promise<AiJudgement | null> {
   if (!config.apiKey) {
@@ -366,7 +370,9 @@ async function judgeRentedWithAi(
       },
       body: JSON.stringify({
         model: config.model,
-        temperature: 0,
+        ...(config.temperature === undefined
+          ? {}
+          : { temperature: config.temperature }),
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: AI_JUDGE_SYSTEM_PROMPT },
@@ -749,6 +755,15 @@ async function main(): Promise<void> {
   const dryRun = envBoolean("XHS_CLEANER_DRY_RUN", false);
   const aiJudgeRequested = envBoolean("XHS_CLEANER_AI_JUDGE", true);
   const aiModel = envString("XHS_CLEANER_AI_MODEL", DEFAULT_AI_MODEL);
+  // 不设默认值，见 AiJudgeConfig 的注释：换模型时不应该带着上一个模型的假设走。
+  const aiTemperatureRaw = process.env.XHS_CLEANER_AI_TEMPERATURE?.trim();
+  const aiTemperature =
+    aiTemperatureRaw && aiTemperatureRaw.length > 0
+      ? Number(aiTemperatureRaw)
+      : undefined;
+  if (aiTemperature !== undefined && !Number.isFinite(aiTemperature)) {
+    throw new Error("XHS_CLEANER_AI_TEMPERATURE must be a number");
+  }
   const aiMinConfidence = envNumber(
     "XHS_CLEANER_AI_MIN_CONFIDENCE",
     DEFAULT_AI_MIN_CONFIDENCE
@@ -778,6 +793,7 @@ async function main(): Promise<void> {
     enabled: aiJudgeRequested && Boolean(openaiApiKey),
     apiKey: openaiApiKey,
     model: aiModel,
+    temperature: aiTemperature,
     minConfidence: aiMinConfidence,
   };
 
