@@ -21,7 +21,7 @@
 
 1. GeoNames 离线索引判断地点。明确外地区或无法确认属于核心五县时直接拒绝。
 2. 核心五县标题必须同时含住房交易词，否则直接拒绝。
-3. 仅剩候选逐条请求 Vercel 后端，由 OpenAI gpt-4o-mini 判断是否确为具体出租、转租或求租交易。
+3. 仅剩候选逐条交给本地 Ollama，判断是否确为具体出租、转租或求租交易。
 
 地理边界是 San Francisco、San Mateo、Santa Clara、Alameda、Contra Costa
 五县。运行时不请求地图服务。
@@ -55,8 +55,7 @@ pnpm xhs:verify-geo-index
 
 ## LLM 配置（仅标题复核）
 
-见脚本 `judgement.remoteLlm`；浏览器不保存 OpenAI 密钥，服务端通过 AI Gateway 调用
-`openai/gpt-4o-mini`。
+见脚本 `judgement.localLlm`；信息流标题只使用本地 Ollama，不回退远端。
 
 ## 调试
 

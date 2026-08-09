@@ -10,9 +10,11 @@ const THINKING_SUFFIX_REGEX = /-thinking$/;
 
 export const myProvider = isTestEnvironment
   ? (() => {
-      const { chatModel, reasoningModel, titleModel } = require(
-        "./models.mock"
-      );
+      const {
+        chatModel,
+        reasoningModel,
+        titleModel,
+      } = require("./models.mock");
       return customProvider({
         languageModels: {
           "chat-model": chatModel,
@@ -48,11 +50,4 @@ export function getTitleModel() {
     return myProvider.languageModel("title-model");
   }
   return gateway.languageModel("anthropic/claude-haiku-4.5");
-}
-
-export function getFeedTitleModel() {
-  if (isTestEnvironment && myProvider) {
-    return myProvider.languageModel("title-model");
-  }
-  return gateway.languageModel("openai/gpt-4o-mini");
 }
