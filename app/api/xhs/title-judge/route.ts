@@ -1,5 +1,7 @@
 import { classifyFeedTitles } from "@/lib/xhs/classify-feed-titles";
 
+export const preferredRegion = "sfo1";
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -34,7 +36,8 @@ export async function POST(request: Request) {
     .slice(0, 20);
 
   if (titles.length === 0) {
-    return jsonWithCors({ ok: false, error: "titles must not be empty" }, 400);
+    // 油猴连接预热会发空 titles：只唤醒实例，不调模型。
+    return jsonWithCors({ ok: true, results: [], warmed: true });
   }
 
   const results = await classifyFeedTitles(titles);

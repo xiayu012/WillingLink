@@ -15,7 +15,7 @@ const expectEqual = (actual, expected, message) => {
 const startIndex = source.indexOf("  const DEFAULT_CONFIG");
 const endIndex = source.indexOf("  const state =");
 const ruleStartIndex = source.indexOf("  const ruleScreenStage");
-const ruleEndIndex = source.indexOf("\n  // ---- 本地 LLM", ruleStartIndex);
+const ruleEndIndex = source.indexOf("\n  // ---- 互联网 4o-mini", ruleStartIndex);
 if (
   startIndex < 0 ||
   endIndex < startIndex ||
