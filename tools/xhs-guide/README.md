@@ -21,7 +21,9 @@
 
 1. GeoNames 离线索引判断地点。明确外地区或无法确认属于核心五县时直接拒绝。
 2. 核心五县标题必须同时含住房交易词，否则直接拒绝。
-3. 仅剩候选逐条请求 Vercel 后端，由 OpenAI gpt-4o-mini 判断是否确为具体出租、转租或求租交易。
+3. 仅剩候选进入单一优先级队列，按批（`judgement.remoteLlm.batchSize`）请求 Vercel 后端，
+   由 OpenAI gpt-4o-mini 判断是否确为具体出租、转租或求租交易。队首标题不等凑批，够几条发几条；
+   `IntersectionObserver` 会在标题进入视窗前 `prefetchAheadViewport` 屏就把它排进队首。
 
 地理边界是 San Francisco、San Mateo、Santa Clara、Alameda、Contra Costa
 五县。运行时不请求地图服务。
