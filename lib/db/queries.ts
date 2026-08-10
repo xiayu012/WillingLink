@@ -11,8 +11,10 @@ import {
   gte,
   inArray,
   isNotNull,
+  like,
   lt,
   or,
+  sql,
   type SQL,
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
@@ -1424,6 +1426,33 @@ export async function appendXhsListingImageUrl(
     duplicated: false,
     listingFound: true,
   };
+}
+
+/**
+ * 删除 ChineseInSFBay / bay123 论坛来源、超过 maxAgeDays 天未更新的房源。
+ * 用 postedAt（无则退回 createdAt）判断"未更新"；小红书来源不受影响，
+ * 它靠 scripts/clean-xhs-rented-listings.ts 按实际出租状态清理，而不是按年龄。
+ */
+export async function deleteExpiredForumListings(
+  maxAgeDays: number
+): Promise<number> {
+  const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000);
+  const deleted = await db
+    .delete(xhsRentalListing)
+    .where(
+      and(
+        or(
+          like(xhsRentalListing.sourceUrl, "%chineseinsfbay.com%"),
+          like(xhsRentalListing.sourceUrl, "%bay123.com%")
+        ),
+        lt(
+          sql`coalesce(${xhsRentalListing.postedAt}, ${xhsRentalListing.createdAt})`,
+          cutoff
+        )
+      )
+    )
+    .returning({ id: xhsRentalListing.id });
+  return deleted.length;
 }
 
 // --- Rental search (AI chat tool) ---
