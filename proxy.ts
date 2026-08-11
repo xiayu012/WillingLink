@@ -27,6 +27,11 @@ export async function proxy(request: NextRequest) {
     return NextResponse.next();
   }
 
+  // Vercel Cron requests use a CRON_SECRET Bearer token, not session cookies.
+  if (pathname.startsWith("/api/cron/")) {
+    return NextResponse.next();
+  }
+
   const token = await getToken({
     req: request,
     secret: process.env.AUTH_SECRET,
