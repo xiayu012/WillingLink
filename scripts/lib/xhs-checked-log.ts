@@ -119,6 +119,39 @@ export function recordCheckedResult(
   };
 }
 
+/** 全部在冷却时，最早一条会重新变为可检查的时间戳（毫秒）；没有则返回 null。 */
+export function nextCooldownReadyAt(
+  log: CheckedLog,
+  activeIds: readonly string[],
+  cooldownMs: number,
+  now: number
+): number | null {
+  let earliestReadyAt: number | null = null;
+
+  for (const id of activeIds) {
+    const entry = log[id];
+    if (!entry) {
+      continue;
+    }
+
+    const lastCheckedAt = Date.parse(entry.lastCheckedAt);
+    if (!Number.isFinite(lastCheckedAt)) {
+      continue;
+    }
+
+    const readyAt = lastCheckedAt + cooldownMs;
+    if (readyAt <= now) {
+      continue;
+    }
+
+    if (earliestReadyAt === null || readyAt < earliestReadyAt) {
+      earliestReadyAt = readyAt;
+    }
+  }
+
+  return earliestReadyAt;
+}
+
 export function summarizeCheckedLog(
   log: CheckedLog,
   activeIds: readonly string[]

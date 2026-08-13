@@ -8,6 +8,7 @@ import {
   forgetChecked,
   isWithinCooldown,
   loadCheckedLog,
+  nextCooldownReadyAt,
   priorityTimestamp,
   pruneCheckedLog,
   recordCheckedResult,
@@ -25,6 +26,11 @@ const DEFAULT_MAX_DELAY_SECONDS = 171;
 const DEFAULT_COOLDOWN_HOURS = 18;
 const DEFAULT_BLOCK_PAUSE_MIN_MINUTES = 60;
 const DEFAULT_BLOCK_PAUSE_MAX_MINUTES = 180;
+const DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 30;
+const DEFAULT_DB_RETRY_ATTEMPTS = 5;
+const DEFAULT_DB_RETRY_BASE_MS = 3000;
+const IDLE_POLL_MIN_MS = 60_000;
+const IDLE_POLL_MAX_MS = 30 * 60 * 1000;
 const ERROR_BACKOFF_THRESHOLD = 3;
 const PAGE_TIMEOUT_MS = 45_000;
 const CONTENT_TIMEOUT_MS = 20_000;
@@ -51,6 +57,12 @@ const RENTED_PATTERNS = [
   /(?:房子|房间|房間|房源|卧室|臥室).{0,12}(?:没有了|沒了|没了|暂无|暫無)/u,
   // 标题/正文里常见的短标签，如「【已租】」「[已租]」，"已"后面只跟单字"租"就结束
   /(?:^|[[【(（])\s*已\s*租\s*(?:[\]】)）]|$)/u,
+] as const;
+
+/** 标题里的短标签误判空间小，可在进 AI 前直接判定，省 API 费用也避免模型漏看。 */
+const TITLE_RENTED_PATTERNS = [
+  /(?:^|[[【(（])\s*已\s*(?:租|出)\s*(?:[\]】)）]|$)/u,
+  /已\s*(?:出租|租出|租掉|租满|被租)/u,
 ] as const;
 
 const QUESTION_OR_UNCERTAIN_PATTERN =
@@ -95,6 +107,7 @@ type ListingRow = {
   id: string;
   sourceUrl: string;
   title: string | null;
+  createdAt: Date;
 };
 
 type ElementTexts = {
@@ -210,6 +223,67 @@ function envString(name: string, fallback: string): string {
   return rawValue.trim();
 }
 
+/** 与其它脚本一致：去掉 .env 里可能包上的引号，避免 CONNECT_TIMEOUT。 */
+function normalizePostgresUrl(url: string): string {
+  const trimmed = url.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function formatListingCreatedAt(createdAt: Date): string {
+  return createdAt.toISOString().slice(0, 10);
+}
+
+function isRetryableDbError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const code = (error as { code?: string }).code;
+  return (
+    code === "CONNECT_TIMEOUT" ||
+    code === "CONNECTION_CLOSED" ||
+    code === "ECONNRESET" ||
+    code === "ECONNREFUSED" ||
+    code === "ETIMEDOUT" ||
+    code === "ENOTFOUND"
+  );
+}
+
+async function withDbRetry<T>(
+  label: string,
+  attempts: number,
+  baseDelayMs: number,
+  operation: () => Promise<T>
+): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableDbError(error) || attempt === attempts) {
+        throw error;
+      }
+
+      const waitMs = baseDelayMs * attempt;
+      console.warn(
+        `[db] ${label} 失败 (${attempt}/${attempts})，${Math.round(waitMs / 1000)}s 后重试:`,
+        error
+      );
+      await delay(waitMs);
+    }
+  }
+
+  throw lastError;
+}
+
 function randomInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
@@ -259,6 +333,30 @@ function findRentedSignalByRule(texts: ElementTexts): DeleteSignal | null {
         pattern: pattern.source,
       };
     }
+  }
+
+  return null;
+}
+
+/** 标题短标签误判成本低，优先于 AI；正文仍交给 AI/正则，避免正文里的"出租"描述误删。 */
+function findObviousRentedInTitle(title: string): DeleteSignal | null {
+  const text = normalizeVisibleText(title);
+  if (text.length === 0) {
+    return null;
+  }
+
+  for (const pattern of TITLE_RENTED_PATTERNS) {
+    const match = pattern.exec(text);
+    if (!match || match.index === undefined) {
+      continue;
+    }
+
+    return {
+      kind: "rented",
+      element: "title",
+      snippet: snippetAround(text, match.index, match[0].length),
+      pattern: pattern.source,
+    };
   }
 
   return null;
@@ -409,14 +507,21 @@ async function judgeRentedWithAi(
 }
 
 /**
- * AI 是主判断：AI 明确给出结论（无论是否已出租）就直接采信；
- * 只有 AI 未启用/请求失败/置信度不够时，才回退到正则规则判断。
+ * 删除判定优先级：
+ * 1. 标题里明确的 [已出]/[已租] 等短标签（确定性高，不调 AI）
+ * 2. AI 主判（启用时）：只有带逐字证据且置信度够才删；AI 说未出租或证据不够 → 保留
+ * 3. 全文正则：仅在 AI 未启用或 API 完全失败时作为兜底，避免 AI 否决后又被正则误删
  */
 async function resolveDeleteSignal(
   texts: ElementTexts,
   context: ListingContext,
   aiConfig: AiJudgeConfig
 ): Promise<DeleteSignal | null> {
+  const titleSignal = findObviousRentedInTitle(context.title);
+  if (titleSignal) {
+    return titleSignal;
+  }
+
   if (aiConfig.enabled) {
     const judgement = await judgeRentedWithAi(aiConfig, context);
     if (judgement) {
@@ -431,7 +536,7 @@ async function resolveDeleteSignal(
         );
         if (!quoteVerified) {
           console.warn(
-            `[ai] AI 判断已出租但引用的原文核对不到，视为推测过头，忽略该结论：${judgement.evidenceQuote || "(空)"}`
+            `[ai] AI 判断已出租但引用的原文核对不到，视为推测过头，保留：${judgement.evidenceQuote || "(空)"}`
           );
         } else if (judgement.confidence >= aiConfig.minConfidence) {
           return {
@@ -439,12 +544,20 @@ async function resolveDeleteSignal(
             reason: judgement.reason,
             confidence: judgement.confidence,
           };
+        } else {
+          console.warn(
+            `[ai] 置信度 ${judgement.confidence.toFixed(2)} 低于阈值 ${aiConfig.minConfidence}，保留`
+          );
         }
-        // 引用没通过校验，或置信度不够，交给规则再确认一次
-      } else {
-        return null;
       }
+
+      return null;
     }
+
+    console.warn(
+      "[ai] 判断失败，AI 启用时不回退正文正则（仅保留标题短标签路径）"
+    );
+    return null;
   }
 
   return findRentedSignalByRule(texts);
@@ -652,27 +765,56 @@ async function readListingPage(
 
 function loadCandidates(sql: postgres.Sql): Promise<ListingRow[]> {
   return sql<ListingRow[]>`
-    SELECT id, "sourceUrl", title
+    SELECT id, "sourceUrl", title, "createdAt"
     FROM "XhsRentalListing"
     WHERE (
       "sourceUrl" ILIKE ${XHS_URL_PATTERN}
       OR "sourceUrl" ILIKE ${XHSLINK_URL_PATTERN}
     )
       AND "sourceUrl" NOT LIKE 'pending:%'
-    ORDER BY random()
   `;
 }
+
+function computeIdleSleepMs(
+  log: CheckedLog,
+  activeIds: readonly string[],
+  cooldownMs: number,
+  now: number
+): { sleepMs: number; nextReadyAt: number | null } {
+  const nextReadyAt = nextCooldownReadyAt(log, activeIds, cooldownMs, now);
+  if (nextReadyAt === null) {
+    return { sleepMs: IDLE_POLL_MAX_MS, nextReadyAt: null };
+  }
+
+  const waitMs = nextReadyAt - now + 5000;
+  return {
+    sleepMs: Math.min(IDLE_POLL_MAX_MS, Math.max(IDLE_POLL_MIN_MS, waitMs)),
+    nextReadyAt,
+  };
+}
+
+type FetchScheduledOptions = {
+  sql: postgres.Sql;
+  log: CheckedLog;
+  cooldownMs: number;
+  dbRetryAttempts: number;
+  dbRetryBaseMs: number;
+};
 
 /**
  * 拉取数据库全量候选，用本地记录裁剪掉已不存在的 id、过滤掉冷却期内的，
  * 再按"最久未查看"升序排列（从未查看过的排最前面）。
  */
 async function fetchScheduledCandidates(
-  sql: postgres.Sql,
-  log: CheckedLog,
-  cooldownMs: number
+  options: FetchScheduledOptions
 ): Promise<ScheduledCandidates> {
-  const dbRows = await loadCandidates(sql);
+  const { sql, log, cooldownMs, dbRetryAttempts, dbRetryBaseMs } = options;
+  const dbRows = await withDbRetry(
+    "拉取候选",
+    dbRetryAttempts,
+    dbRetryBaseMs,
+    () => loadCandidates(sql)
+  );
   const activeIds = dbRows.map((row) => row.id);
   const activeIdSet = new Set(activeIds);
   const prunedLog = pruneCheckedLog(log, activeIdSet);
@@ -768,6 +910,18 @@ async function main(): Promise<void> {
     "XHS_CLEANER_AI_MIN_CONFIDENCE",
     DEFAULT_AI_MIN_CONFIDENCE
   );
+  const dbConnectTimeoutSeconds = envNumber(
+    "XHS_CLEANER_DB_CONNECT_TIMEOUT_SECONDS",
+    DEFAULT_DB_CONNECT_TIMEOUT_SECONDS
+  );
+  const dbRetryAttempts = envNumber(
+    "XHS_CLEANER_DB_RETRY_ATTEMPTS",
+    DEFAULT_DB_RETRY_ATTEMPTS
+  );
+  const dbRetryBaseMs = envNumber(
+    "XHS_CLEANER_DB_RETRY_BASE_MS",
+    DEFAULT_DB_RETRY_BASE_MS
+  );
 
   if (minDelaySeconds > maxDelaySeconds) {
     throw new Error(
@@ -799,7 +953,10 @@ async function main(): Promise<void> {
 
   const cooldownMs = cooldownHours * 60 * 60 * 1000;
 
-  const sql = postgres(postgresUrl, { max: 1 });
+  const sql = postgres(normalizePostgresUrl(postgresUrl), {
+    max: 1,
+    connect_timeout: dbConnectTimeoutSeconds,
+  });
   const context = await createBrowserContext(headless);
 
   let checkedLog = await loadCheckedLog(logPath);
@@ -846,6 +1003,9 @@ async function main(): Promise<void> {
   console.log(
     `[ai] enabled=${aiConfig.enabled}, model=${aiConfig.model}, minConfidence=${aiConfig.minConfidence}`
   );
+  console.log(
+    `[db] connectTimeout=${dbConnectTimeoutSeconds}s, retry=${dbRetryAttempts}x base=${dbRetryBaseMs}ms`
+  );
   console.log(`[browser] 使用持久化 profile：${PROFILE_DIR}`);
   console.log(`[log] 使用本地记录文件：${logPath}`);
 
@@ -872,23 +1032,38 @@ async function main(): Promise<void> {
       }
 
       if (candidates.length === 0) {
-        const scheduled = await fetchScheduledCandidates(
+        const scheduled = await fetchScheduledCandidates({
           sql,
-          checkedLog,
-          cooldownMs
-        );
+          log: checkedLog,
+          cooldownMs,
+          dbRetryAttempts,
+          dbRetryBaseMs,
+        });
         checkedLog = scheduled.log;
         candidates = scheduled.candidates;
 
         const summary = summarizeCheckedLog(checkedLog, scheduled.activeIds);
         const cooldownSkipped = scheduled.totalActive - candidates.length;
+        const now = Date.now();
+        const { sleepMs, nextReadyAt } = computeIdleSleepMs(
+          checkedLog,
+          scheduled.activeIds,
+          cooldownMs,
+          now
+        );
+        const nextReadyText = nextReadyAt
+          ? new Date(nextReadyAt).toISOString()
+          : "无";
         console.log(
-          `[db] 候选总数=${scheduled.totalActive}，可查看=${candidates.length}，冷却中=${cooldownSkipped}，从未查看=${summary.neverChecked}，最早查看=${summary.oldestCheckedAt ?? "无"}`
+          `[db] 候选总数=${scheduled.totalActive}，可查看=${candidates.length}，冷却中=${cooldownSkipped}，从未查看=${summary.neverChecked}，最早查看=${summary.oldestCheckedAt ?? "无"}，下一条可检查于=${nextReadyText}`
         );
         await persistLog();
 
         if (candidates.length === 0) {
-          await delay(30 * 60 * 1000);
+          console.log(
+            `[idle] 全部在冷却，${Math.round(sleepMs / 1000)}s 后重新拉取`
+          );
+          await delay(sleepMs);
           continue;
         }
       }
@@ -902,7 +1077,7 @@ async function main(): Promise<void> {
       const page = await context.newPage();
       try {
         console.log(
-          `[check] ${checkedInWindow + 1}/${dailyLimit} ${row.id} ${row.sourceUrl}`
+          `[check] ${checkedInWindow + 1}/${dailyLimit} ${row.id} 入库于 ${formatListingCreatedAt(row.createdAt)} ${row.sourceUrl}`
         );
         const { signal } = await readListingPage(page, row.sourceUrl, aiConfig);
         checkedInWindow += 1;
