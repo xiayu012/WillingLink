@@ -1432,11 +1432,17 @@ export async function appendXhsListingImageUrl(
  * 删除 ChineseInSFBay / bay123 论坛来源、超过 maxAgeDays 天未更新的房源。
  * 用 postedAt（无则退回 createdAt）判断"未更新"；小红书来源不受影响，
  * 它靠 scripts/clean-xhs-rented-listings.ts 按实际出租状态清理，而不是按年龄。
+ *
+ * cutoff 必须走 ISO 字符串 + ::timestamptz：把 Date 直接塞进 lt(sql`...`, date)
+ * 时，左边是裸 SQL 表达式，Drizzle 不会按列类型序列化参数，运行时会抛
+ * "Received an instance of Date"。
  */
 export async function deleteExpiredForumListings(
   maxAgeDays: number
 ): Promise<number> {
-  const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000);
+  const cutoffIso = new Date(
+    Date.now() - maxAgeDays * 24 * 60 * 60 * 1000
+  ).toISOString();
   const deleted = await db
     .delete(xhsRentalListing)
     .where(
@@ -1445,10 +1451,7 @@ export async function deleteExpiredForumListings(
           like(xhsRentalListing.sourceUrl, "%chineseinsfbay.com%"),
           like(xhsRentalListing.sourceUrl, "%bay123.com%")
         ),
-        lt(
-          sql`coalesce(${xhsRentalListing.postedAt}, ${xhsRentalListing.createdAt})`,
-          cutoff
-        )
+        sql`coalesce(${xhsRentalListing.postedAt}, ${xhsRentalListing.createdAt}) < ${cutoffIso}::timestamptz`
       )
     )
     .returning({ id: xhsRentalListing.id });
