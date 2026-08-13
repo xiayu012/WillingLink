@@ -6,9 +6,7 @@ import postgres from "postgres";
 import {
   type CheckedLog,
   forgetChecked,
-  isWithinCooldown,
   loadCheckedLog,
-  nextCooldownReadyAt,
   priorityTimestamp,
   pruneCheckedLog,
   recordCheckedResult,
@@ -23,14 +21,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DAILY_LIMIT = 800;
 const DEFAULT_MIN_DELAY_SECONDS = 45;
 const DEFAULT_MAX_DELAY_SECONDS = 171;
-const DEFAULT_COOLDOWN_HOURS = 18;
 const DEFAULT_BLOCK_PAUSE_MIN_MINUTES = 60;
 const DEFAULT_BLOCK_PAUSE_MAX_MINUTES = 180;
 const DEFAULT_DB_CONNECT_TIMEOUT_SECONDS = 30;
 const DEFAULT_DB_RETRY_ATTEMPTS = 5;
 const DEFAULT_DB_RETRY_BASE_MS = 3000;
-const IDLE_POLL_MIN_MS = 60_000;
-const IDLE_POLL_MAX_MS = 30 * 60 * 1000;
+const EMPTY_DB_POLL_MS = 30 * 60 * 1000;
 const ERROR_BACKOFF_THRESHOLD = 3;
 const PAGE_TIMEOUT_MS = 45_000;
 const CONTENT_TIMEOUT_MS = 20_000;
@@ -775,40 +771,21 @@ function loadCandidates(sql: postgres.Sql): Promise<ListingRow[]> {
   `;
 }
 
-function computeIdleSleepMs(
-  log: CheckedLog,
-  activeIds: readonly string[],
-  cooldownMs: number,
-  now: number
-): { sleepMs: number; nextReadyAt: number | null } {
-  const nextReadyAt = nextCooldownReadyAt(log, activeIds, cooldownMs, now);
-  if (nextReadyAt === null) {
-    return { sleepMs: IDLE_POLL_MAX_MS, nextReadyAt: null };
-  }
-
-  const waitMs = nextReadyAt - now + 5000;
-  return {
-    sleepMs: Math.min(IDLE_POLL_MAX_MS, Math.max(IDLE_POLL_MIN_MS, waitMs)),
-    nextReadyAt,
-  };
-}
-
 type FetchScheduledOptions = {
   sql: postgres.Sql;
   log: CheckedLog;
-  cooldownMs: number;
   dbRetryAttempts: number;
   dbRetryBaseMs: number;
 };
 
 /**
- * 拉取数据库全量候选，用本地记录裁剪掉已不存在的 id、过滤掉冷却期内的，
- * 再按"最久未查看"升序排列（从未查看过的排最前面）。
+ * 拉取数据库全量候选，裁剪掉已不存在的 id，再按"最久远查看过"升序排列
+ * （从未查看过的排最前面，刚查过的排最后面）。
  */
 async function fetchScheduledCandidates(
   options: FetchScheduledOptions
 ): Promise<ScheduledCandidates> {
-  const { sql, log, cooldownMs, dbRetryAttempts, dbRetryBaseMs } = options;
+  const { sql, log, dbRetryAttempts, dbRetryBaseMs } = options;
   const dbRows = await withDbRetry(
     "拉取候选",
     dbRetryAttempts,
@@ -818,13 +795,8 @@ async function fetchScheduledCandidates(
   const activeIds = dbRows.map((row) => row.id);
   const activeIdSet = new Set(activeIds);
   const prunedLog = pruneCheckedLog(log, activeIdSet);
-  const now = Date.now();
 
-  const eligible = dbRows.filter(
-    (row) => !isWithinCooldown(prunedLog, row.id, cooldownMs, now)
-  );
-
-  const sorted = eligible
+  const sorted = dbRows
     .map((row, index) => ({
       row,
       index,
@@ -879,10 +851,6 @@ async function main(): Promise<void> {
   const maxDelaySeconds = envNumber(
     "XHS_CLEANER_MAX_DELAY_SECONDS",
     DEFAULT_MAX_DELAY_SECONDS
-  );
-  const cooldownHours = envNumber(
-    "XHS_CLEANER_COOLDOWN_HOURS",
-    DEFAULT_COOLDOWN_HOURS
   );
   const blockPauseMinMinutes = envNumber(
     "XHS_CLEANER_BLOCK_PAUSE_MIN_MINUTES",
@@ -951,8 +919,6 @@ async function main(): Promise<void> {
     minConfidence: aiMinConfidence,
   };
 
-  const cooldownMs = cooldownHours * 60 * 60 * 1000;
-
   const sql = postgres(normalizePostgresUrl(postgresUrl), {
     max: 1,
     connect_timeout: dbConnectTimeoutSeconds,
@@ -998,7 +964,7 @@ async function main(): Promise<void> {
   });
 
   console.log(
-    `[start] dailyLimit=${dailyLimit}, delay=${minDelaySeconds}-${maxDelaySeconds}s, cooldown=${cooldownHours}h, blockPause=${blockPauseMinMinutes}-${blockPauseMaxMinutes}min, headless=${headless}, dryRun=${dryRun}`
+    `[start] dailyLimit=${dailyLimit}, delay=${minDelaySeconds}-${maxDelaySeconds}s, blockPause=${blockPauseMinMinutes}-${blockPauseMaxMinutes}min, headless=${headless}, dryRun=${dryRun}`
   );
   console.log(
     `[ai] enabled=${aiConfig.enabled}, model=${aiConfig.model}, minConfidence=${aiConfig.minConfidence}`
@@ -1035,7 +1001,6 @@ async function main(): Promise<void> {
         const scheduled = await fetchScheduledCandidates({
           sql,
           log: checkedLog,
-          cooldownMs,
           dbRetryAttempts,
           dbRetryBaseMs,
         });
@@ -1043,27 +1008,20 @@ async function main(): Promise<void> {
         candidates = scheduled.candidates;
 
         const summary = summarizeCheckedLog(checkedLog, scheduled.activeIds);
-        const cooldownSkipped = scheduled.totalActive - candidates.length;
-        const now = Date.now();
-        const { sleepMs, nextReadyAt } = computeIdleSleepMs(
-          checkedLog,
-          scheduled.activeIds,
-          cooldownMs,
-          now
-        );
-        const nextReadyText = nextReadyAt
-          ? new Date(nextReadyAt).toISOString()
+        const nextRow = candidates[0];
+        const nextLastCheckedAt = nextRow
+          ? (checkedLog[nextRow.id]?.lastCheckedAt ?? "从未查看")
           : "无";
         console.log(
-          `[db] 候选总数=${scheduled.totalActive}，可查看=${candidates.length}，冷却中=${cooldownSkipped}，从未查看=${summary.neverChecked}，最早查看=${summary.oldestCheckedAt ?? "无"}，下一条可检查于=${nextReadyText}`
+          `[db] 候选总数=${scheduled.totalActive}，从未查看=${summary.neverChecked}，最久远查看=${summary.oldestCheckedAt ?? "无"}，下一条=${nextRow?.id ?? "无"}（上次查看=${nextLastCheckedAt}）`
         );
         await persistLog();
 
         if (candidates.length === 0) {
           console.log(
-            `[idle] 全部在冷却，${Math.round(sleepMs / 1000)}s 后重新拉取`
+            `[idle] 数据库无候选，${Math.round(EMPTY_DB_POLL_MS / 1000)}s 后重新拉取`
           );
-          await delay(sleepMs);
+          await delay(EMPTY_DB_POLL_MS);
           continue;
         }
       }
