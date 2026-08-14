@@ -1639,6 +1639,34 @@ export async function updateListingEmbedding(
   `;
 }
 
+/**
+ * 写入 LLM 提取的结构化列（入库 after() 阶段 / 回填脚本共用的落库口径）。
+ * 只更新六个结构化列，绝不碰正则/用户提供的文本字段。
+ */
+export async function updateListingStructuredFields(
+  id: string,
+  fields: {
+    bedroomsNum: number | null;
+    city: string | null;
+    petFriendly: boolean | null;
+    couplesOk: boolean | null;
+    utilitiesIncluded: boolean | null;
+    parkingIncluded: boolean | null;
+  }
+): Promise<void> {
+  await client`
+    UPDATE "XhsRentalListing"
+    SET
+      "bedroomsNum"       = ${fields.bedroomsNum},
+      "city"              = ${fields.city},
+      "petFriendly"       = ${fields.petFriendly},
+      "couplesOk"         = ${fields.couplesOk},
+      "utilitiesIncluded" = ${fields.utilitiesIncluded},
+      "parkingIncluded"   = ${fields.parkingIncluded}
+    WHERE id = ${id}::uuid
+  `;
+}
+
 export async function searchXhsRentalListings({
   bedrooms,
   bathrooms,

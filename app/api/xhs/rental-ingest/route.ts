@@ -3,11 +3,13 @@ import { after } from "next/server";
 
 import { classifyRentalPostIntent } from "@/lib/ai/classify-rental-post";
 import { embedText } from "@/lib/ai/embeddings";
+import { extractListingFields } from "@/lib/ai/extract-listing-fields";
 import {
   createXhsRentalListing,
   createXhsRentalOther,
   createXhsRentalWanted,
   updateListingEmbedding,
+  updateListingStructuredFields,
 } from "@/lib/db/queries";
 import {
   composeListingEmbeddingDoc,
@@ -31,6 +33,34 @@ function jsonWithCors(body: unknown, status = 200) {
 
 export function OPTIONS() {
   return new Response(null, { status: 204, headers: corsHeaders });
+}
+
+/**
+ * Extract the six LLM-only structured columns (bedroomsNum / city / booleans)
+ * and store them, at ingest time. Without this the columns stay NULL until the
+ * manual backfill script (scripts/backfill-listing-fields.ts) runs — which is
+ * how ~97% of the table ended up unfilled. Failures are logged but never fail
+ * the ingest; the backfill script remains the catch-up path.
+ */
+async function extractStructuredFieldsSafe(
+  id: string,
+  rawText: string
+): Promise<boolean> {
+  try {
+    const fields = await extractListingFields(rawText);
+    await updateListingStructuredFields(id, {
+      bedroomsNum: fields.bedroomsNum,
+      city: fields.city,
+      petFriendly: fields.petFriendly,
+      couplesOk: fields.couplesOk,
+      utilitiesIncluded: fields.utilitiesIncluded,
+      parkingIncluded: fields.parkingIncluded,
+    });
+    return true;
+  } catch (error) {
+    console.error("[rental-ingest] field extraction failed for", id, error);
+    return false;
+  }
 }
 
 /**
@@ -238,15 +268,20 @@ export async function POST(request: Request) {
     return jsonWithCors({ ok: false, error: "Failed to save" }, 500);
   }
 
-  // Embed at ingest so the listing becomes searchable via pgvector, but do it
-  // in after() rather than blocking the response: embedding is a Voyage API
-  // round-trip and failure is non-fatal (embedding stays NULL and
-  // scripts/embed-listings.ts backfills it). Keeping it off the critical path
-  // shaves that round-trip off every ingest POST the userscript makes.
-  // Duplicates already have an embedding from their first ingest.
+  // Embed + LLM-extract structured columns at ingest, both in after() rather
+  // than blocking the response: each is an API round-trip and failure is
+  // non-fatal (embedding stays NULL → scripts/embed-listings.ts; structured
+  // columns stay NULL → scripts/backfill-listing-fields.ts). Keeping them off
+  // the critical path shaves the round-trips off every ingest POST the
+  // userscript makes. Duplicates were already processed on first ingest.
   const embeddingScheduled = !row.duplicate;
   if (embeddingScheduled) {
-    after(() => embedListingSafe(row.id, listingFields));
+    after(() =>
+      Promise.allSettled([
+        embedListingSafe(row.id, listingFields),
+        extractStructuredFieldsSafe(row.id, rawText),
+      ])
+    );
   }
 
   return jsonWithCors({

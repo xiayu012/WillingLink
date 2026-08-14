@@ -11,10 +11,7 @@ import { generateObject } from "ai";
 import { z } from "zod";
 
 import { getTitleModel } from "@/lib/ai/providers";
-import {
-  parseListingFields,
-  type ParsedListingFields,
-} from "@/lib/xhs/parse-rental-text";
+import { parseListingFields } from "@/lib/xhs/parse-rental-text";
 
 // ── Zod schema returned by the LLM ───────────────────────────────────────────
 

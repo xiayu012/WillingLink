@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.13.3
+// @version      0.13.4
 // @description  小红书多标题识别高亮 + 详情页复制正文指引
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -2753,27 +2753,46 @@
     state.detailCopyButton.style.opacity = disabled ? "0.6" : "1";
   };
 
-  /** 尽力抓取可选字段；抓不到就不放进 payload（不强求） */
+  /**
+   * 尽力抓取可选字段；抓不到就不放进 payload（不强求）。
+   *
+   * 标题只允许来自两种可信来源：全局唯一的 #detail-title，或正文元素
+   * （state.detailContentElement）所在的详情容器内部。绝不能在整个
+   * document 上查 ".title" / "h1"：详情页是叠在瀑布流上的弹层，全局
+   * querySelector 会命中背后信息流卡片的标题，造成"标题是别的帖子、
+   * 正文是本帖"的错位入库（库里已出现过漂流广告标题配租房正文）。
+   * 抓不到就不发 title，服务端会从 rawText 首行推断——宁缺毋错。
+   */
   const gatherOptionalListingFieldsForIngest = () => {
     const out = {};
-    const titleSelectors = [
-      "#detail-title",
-      ".note-content .title",
-      ".title",
-      "header h1",
-      "h1",
-    ];
-    for (const selector of titleSelectors) {
-      try {
-        const el = document.querySelector(selector);
-        const t = el?.textContent?.replace(/\s+/g, " ")?.trim();
-        if (t && t.length > 0 && t.length < 400) {
-          out.title = t;
-          break;
+    const cleanText = (el) =>
+      el?.textContent?.replace(/\s+/g, " ")?.trim() ?? "";
+
+    // 1) 详情页专属 id，全局唯一，最可信
+    let title = cleanText(document.querySelector("#detail-title"));
+
+    // 2) 否则仅在正文所在的详情容器内找标题
+    if (!title && state.detailContentElement instanceof HTMLElement) {
+      const scope =
+        state.detailContentElement.closest(
+          "#noteContainer, .note-container, .note-detail-mask, article",
+        ) ?? state.detailContentElement.parentElement;
+      if (scope) {
+        for (const selector of [".note-content .title", ".title", "h1"]) {
+          try {
+            title = cleanText(scope.querySelector(selector));
+          } catch {
+            /* ignore invalid selector */
+          }
+          if (title) {
+            break;
+          }
         }
-      } catch {
-        /* ignore invalid selector */
       }
+    }
+
+    if (title && title.length < 400) {
+      out.title = title;
     }
     return out;
   };

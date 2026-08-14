@@ -3,7 +3,8 @@
  * that are missing the new structured columns (bedroomsNum, city, petFriendly, etc.).
  *
  * Usage:
- *   pnpm exec tsx scripts/backfill-listing-fields.ts
+ *   pnpm exec tsx scripts/backfill-listing-fields.ts             # all rows
+ *   pnpm exec tsx scripts/backfill-listing-fields.ts --limit 5  # smoke test
  *
  * Processes in batches of 10 to avoid overwhelming the LLM API.
  * Safe to re-run: only updates rows where ALL six new fields are NULL.
@@ -16,13 +17,17 @@ if (process.env.POSTGRES_URL?.startsWith('"')) {
 }
 
 import postgres from "postgres";
-import { generateObject } from "ai";
+import { generateObject, type LanguageModel } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { z } from "zod";
 
 const client = postgres(process.env.POSTGRES_URL!);
 
 const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+// @ai-sdk/openai ships its own stable @ai-sdk/provider while the root project
+// pins a beta; the two are runtime-compatible but nominally distinct to TS.
+const extractModel = openai("gpt-4o-mini") as unknown as LanguageModel;
 
 const extractSchema = z.object({
   bedroomsNum: z.number().int().nullable(),
@@ -35,7 +40,7 @@ const extractSchema = z.object({
 
 async function extractFields(rawText: string) {
   const { object } = await generateObject({
-    model: openai("gpt-4o-mini"),
+    model: extractModel,
     schema: extractSchema,
     system: `You are a data extractor for US Bay Area rental listings (Chinese/English).
 Extract only these 6 fields. Return null for anything you cannot confidently determine.
@@ -60,6 +65,10 @@ async function sleep(ms: number) {
 async function main() {
   console.log("🔍 Fetching rows missing structured fields...");
 
+  const limitArgIdx = process.argv.indexOf("--limit");
+  const limit =
+    limitArgIdx >= 0 ? Number(process.argv[limitArgIdx + 1]) : Number.NaN;
+
   const rows = await client<{ id: string; rawText: string }[]>`
     SELECT id, "rawText"
     FROM "XhsRentalListing"
@@ -70,6 +79,7 @@ async function main() {
       AND "utilitiesIncluded" IS NULL
       AND "parkingIncluded" IS NULL
     ORDER BY "createdAt" DESC
+    ${Number.isFinite(limit) && limit > 0 ? client`LIMIT ${limit}` : client``}
   `;
 
   console.log(`📋 Found ${rows.length} rows to backfill.`);
