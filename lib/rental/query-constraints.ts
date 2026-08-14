@@ -22,13 +22,13 @@
  * constraints from natural language.
  */
 
+import { neighborsOf } from "./cities";
 import {
-  type FlexibleDate,
   checkMoveInFeasibility,
   extractQueryDate,
+  type FlexibleDate,
   parseFlexibleDate,
 } from "./date-availability";
-import { neighborsOf } from "./cities";
 
 export type HardConstraints = {
   rentMin: number | null;
@@ -88,7 +88,7 @@ const CN_NUMERALS: Record<string, number> = {
 };
 
 const PLAUSIBLE_RENT_MIN = 300;
-const PLAUSIBLE_RENT_MAX = 15000;
+const PLAUSIBLE_RENT_MAX = 15_000;
 
 /** Parse a money-ish token ("2500", "2,500", "2k", "2.5k", "$2500") to a number. */
 function parseMoney(raw: string): number | null {
@@ -187,6 +187,40 @@ export function extractHardConstraints(
   };
 }
 
+// ── Strict-mode NL extraction ────────────────────────────────────────────────
+// The strict search path enforces EVERY requirement the user voiced, including
+// boolean lifestyle needs the legacy cascade only biased via keywords. Each
+// extractor fires only on an explicit positive mention and stays null when the
+// user negates it ("不养宠物" is information, not a requirement).
+
+const PET_NEG_RE = /不养|没有?宠物|无宠物|no\s*pets?/i;
+const PET_POS_RE = /宠物|养猫|养狗|带猫|带狗|携宠|有猫|有狗|pet/i;
+const COUPLE_RE = /情侣|夫妻|两口子|couple/i;
+const UTIL_RE = /包水电|水电全?包|含水电|包?水电网|utilit(y|ies)/i;
+const PARKING_NEG_RE = /不需要?(停车|车位)|无需(停车|车位)/i;
+const PARKING_RE = /停车|车位|parking/i;
+
+/**
+ * Recover boolean lifestyle requirements from a free-text query.
+ * Only `true` (explicitly required) or null (unstated / negated) — a tenant
+ * saying "不养宠物" does not require a pet-banning listing.
+ */
+export function extractBooleanPrefs(query: string): {
+  petFriendly: boolean | null;
+  couplesOk: boolean | null;
+  utilitiesIncluded: boolean | null;
+  parkingIncluded: boolean | null;
+} {
+  return {
+    petFriendly:
+      !PET_NEG_RE.test(query) && PET_POS_RE.test(query) ? true : null,
+    couplesOk: COUPLE_RE.test(query) ? true : null,
+    utilitiesIncluded: UTIL_RE.test(query) ? true : null,
+    parkingIncluded:
+      !PARKING_NEG_RE.test(query) && PARKING_RE.test(query) ? true : null,
+  };
+}
+
 /**
  * Build the same canonical constraints from the GPT route's typed params,
  * merged with anything the natural-language query also expresses (so the GPT
@@ -255,10 +289,18 @@ export function rowViolates(
   c: HardConstraints,
   ref: Date = new Date()
 ): boolean {
-  if (c.rentMax != null && row.rentNumeric != null && row.rentNumeric > c.rentMax) {
+  if (
+    c.rentMax != null &&
+    row.rentNumeric != null &&
+    row.rentNumeric > c.rentMax
+  ) {
     return true;
   }
-  if (c.rentMin != null && row.rentNumeric != null && row.rentNumeric < c.rentMin) {
+  if (
+    c.rentMin != null &&
+    row.rentNumeric != null &&
+    row.rentNumeric < c.rentMin
+  ) {
     return true;
   }
   if (
@@ -270,15 +312,19 @@ export function rowViolates(
   }
   if (
     c.moveIn.kind !== "unknown" &&
-    checkMoveInFeasibility(parseFlexibleDate(row.availableFrom), c.moveIn, ref) ===
-      "infeasible"
+    checkMoveInFeasibility(
+      parseFlexibleDate(row.availableFrom),
+      c.moveIn,
+      ref
+    ) === "infeasible"
   ) {
     return true;
   }
   if (c.petFriendly === true && row.petFriendly !== true) return true;
   if (c.petFriendly === false && row.petFriendly === true) return true;
   if (c.couplesOk === true && row.couplesOk !== true) return true;
-  if (c.utilitiesIncluded === true && row.utilitiesIncluded !== true) return true;
+  if (c.utilitiesIncluded === true && row.utilitiesIncluded !== true)
+    return true;
   if (c.parkingIncluded === true && row.parkingIncluded !== true) return true;
   if (
     c.furnished != null &&
@@ -318,7 +364,12 @@ export function applyBlockTerms<
     .filter((t) => t.length > 0);
   if (terms.length === 0) return rows;
   return rows.filter((row) => {
-    const haystack = [row.title, row.rawText, row.locationText, row.propertyName]
+    const haystack = [
+      row.title,
+      row.rawText,
+      row.locationText,
+      row.propertyName,
+    ]
       .filter((v): v is string => typeof v === "string")
       .join("\n")
       .toLowerCase();

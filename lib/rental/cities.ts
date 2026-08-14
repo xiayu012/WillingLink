@@ -195,3 +195,17 @@ export function cityAliases(entry: CityEntry): string[] {
   // Guarantee the canonical English + Chinese names are present.
   return [...new Set([entry.en, entry.zh, ...terms])];
 }
+
+/**
+ * Cities/metros clearly OUTSIDE the Bay Area. When a query names one of these
+ * and no Bay Area city, the database provably has nothing for it — strict
+ * search should answer "没有" instead of returning an unrelated Bay listing.
+ * (Shared with the eval harness so verdicts and runtime behavior agree.)
+ */
+export const NON_BAY_CITY_RE =
+  /西雅图|seattle|芝加哥|chicago|纽约|new\s*york|nyc|洛杉矶|los\s*angeles|圣地亚哥|san\s*diego|波士顿|boston|奥斯汀|austin|尔湾|irvine|拉斯维加斯|vegas|达拉斯|dallas|休斯顿|houston|费城|philadelphia|亚特兰大|atlanta|凤凰城|phoenix|丹佛|denver|波特兰|portland/i;
+
+/** True when the query targets a non-Bay metro and names no Bay Area city. */
+export function isOutOfBayQuery(query: string): boolean {
+  return !detectCity(query) && NON_BAY_CITY_RE.test(query);
+}

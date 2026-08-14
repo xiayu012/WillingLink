@@ -30,6 +30,22 @@
  * - pickBest reranks top-3 candidates and picks with weighted randomness
  *   (rank-1 = 3× weight) to balance relevance and variety across "换一个".
  * - excludeIds is server-managed (Redis/in-memory); the LLM never sees them.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * STRICT MODE (current default — the cascade above is LEGACY, kept for
+ * rollback via SEARCH_LEGACY_PICK_ONE=1):
+ *
+ * The legacy flow returns ONE listing at a time and auto-relaxes until
+ * something is shown, which trains users into endless "换一个" loops over
+ * loosely-matching results. Strict mode replaces that contract:
+ *
+ *   - Filter the WHOLE pool strictly by every requirement the user voiced
+ *     (city exact, budget, bedrooms, move-in, pet/couple/utilities/parking).
+ *   - Return the top ≤5 matches at once (reranked when Voyage is available,
+ *     else most recent first).
+ *   - If nothing satisfies everything → return an empty list and say so.
+ *     No relaxation, no substitution, no rotation.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 import { tool } from "ai";
@@ -37,28 +53,48 @@ import { after } from "next/server";
 import { z } from "zod";
 import { embedText, rerankDocuments } from "@/lib/ai/embeddings";
 import {
-  type CityEntry,
-  cityAliases,
-  detectCity,
-  detectCityStrict,
-} from "@/lib/rental/cities";
-import {
-  applyHardConstraints,
-  extractHardConstraints,
-  hasAnyConstraint,
-} from "@/lib/rental/query-constraints";
-import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
-import {
   logSearchQuery,
   searchXhsRentalListings,
   vectorSearchXhsRentalListings,
   type XhsRentalSearchResultRow,
 } from "@/lib/db/queries";
+import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
+import {
+  type CityEntry,
+  cityAliases,
+  detectCity,
+  detectCityStrict,
+  isOutOfBayQuery,
+} from "@/lib/rental/cities";
+import {
+  applyBlockTerms,
+  applyHardConstraints,
+  extractBooleanPrefs,
+  extractHardConstraints,
+  hasAnyConstraint,
+  rowViolates,
+} from "@/lib/rental/query-constraints";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const VECTOR_CANDIDATES = 50; // pgvector top-N before rerank
 const LAST_RESORT_LIMIT = 50; // wider pool for Phase 4 last-resort rerank
+
+// ── after() shim ──────────────────────────────────────────────────────────────
+// after() keeps serverless alive until the log write lands, but it THROWS when
+// called outside a Next.js request scope (eval scripts, unit tests). Fall back
+// to a direct fire-and-forget there — in a long-lived script nothing recycles
+// the process before the insert finishes.
+
+function scheduleAfterResponse(cb: () => Promise<unknown>): void {
+  try {
+    after(cb);
+  } catch {
+    cb().catch(() => {
+      // logging is fail-open by design
+    });
+  }
+}
 
 // ── Geo-expansion (deterministic, no LLM) ────────────────────────────────────
 // Normalizes the city mention to its bilingual canonical form ("San Jose
@@ -424,14 +460,404 @@ async function findNextListing(
   return null;
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// STRICT MODE — current default logic. Everything above this banner is the
+// LEGACY "换一个" cascade, kept intact for rollback (SEARCH_LEGACY_PICK_ONE=1).
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** Rollback switch: set SEARCH_LEGACY_PICK_ONE=1 to restore the legacy flow. */
+const LEGACY_PICK_ONE = process.env.SEARCH_LEGACY_PICK_ONE === "1";
+
+const STRICT_MAX_RESULTS = 5;
+const STRICT_POOL_LIMIT = 1000; // whole table today (~750 rows)
+const STRICT_RERANK_CAP = 100; // rerank cost cap when many rows survive
+
+/**
+ * Exact-city membership (no neighbours — strict mode returns only the city the
+ * user actually named). The LLM-normalized `city` column is authoritative when
+ * present; otherwise fall back to Bay-Area-phrase-aware text detection. Rows
+ * whose city cannot be established do NOT count as matches.
+ */
+function rowInCityExact(
+  row: XhsRentalSearchResultRow,
+  city: CityEntry
+): boolean {
+  const col = row.city?.trim().toLowerCase();
+  if (col && col !== "null" && col.length > 0) {
+    return col === city.en.toLowerCase();
+  }
+  const rc = detectCityStrict(
+    `${row.title ?? ""} ${row.locationText ?? ""} ${row.propertyName ?? ""} ${row.rawText}`
+  );
+  return rc ? rc.en === city.en : false;
+}
+
+// Boolean requirements are strict: a listing counts only when the structured
+// column confirms it, or (column unparsed) the text itself affirms it.
+const BOOL_TEXT_POSITIVE: {
+  key: "petFriendly" | "couplesOk" | "utilitiesIncluded" | "parkingIncluded";
+  re: RegExp;
+}[] = [
+  {
+    key: "petFriendly",
+    re: /宠物友好|可养宠|可以养宠|允许宠物|可带宠|接受宠物|pet[-\s]?friendly|pets?\s*(ok|allowed|welcome)/i,
+  },
+  {
+    key: "couplesOk",
+    re: /情侣可|可情侣|接受情侣|情侣友好|欢迎情侣|couples?\s*(ok|welcome|friendly)/i,
+  },
+  {
+    key: "utilitiesIncluded",
+    re: /包水电|水电全?包|含水电|包?水电网|utilit(y|ies)\s*(included|全?包)/i,
+  },
+  {
+    key: "parkingIncluded",
+    re: /有车位|带车位|含车位|免费停车|有停车|可停车|parking\s*(included|available|spot)|free\s*parking/i,
+  },
+];
+
+function satisfiesBooleanPrefs(
+  row: XhsRentalSearchResultRow,
+  prefs: ReturnType<typeof extractBooleanPrefs>
+): boolean {
+  for (const { key, re } of BOOL_TEXT_POSITIVE) {
+    if (prefs[key] !== true) continue; // not required
+    const col = row[key];
+    if (col === true) continue; // confirmed by structured field
+    if (col === false) return false; // explicitly disallowed
+    if (!re.test(row.rawText)) return false; // unparsed AND text silent → out
+  }
+  return true;
+}
+
+// ── Row-field recovery (structured columns are sparse) ───────────────────────
+// The LLM-backfilled columns cover only a fraction of the table (rentNumeric
+// ~13%, bedroomsNum ~3%), so "strict" filtering on columns alone barely cuts
+// anything. Recover the same facts from the ingest text columns.
+
+const PER_DAY_RATE_RE = /日|天|\/\s*day|per\s*day|晚/i;
+const RENT_TOKEN_RE = /\$?\s*(\d+(?:\.\d+)?)\s*(k?)/i;
+
+/** Rent from the free-text `rent` column ("$1800", "1295", "$2.5k"). Nulls out
+ *  per-day rates, zip codes, area codes and other implausible values. */
+function rentFromText(rent: string | null): number | null {
+  if (!rent) return null;
+  if (PER_DAY_RATE_RE.test(rent)) return null; // per-day rate
+  const m = rent.match(RENT_TOKEN_RE);
+  if (!m) return null;
+  const n = m[2] ? Math.round(Number.parseFloat(m[1]) * 1000) : Number(m[1]);
+  // Same plausibility window as the rentNumeric backfill.
+  if (!Number.isFinite(n) || n < 300 || n > 15_000) return null;
+  return n;
+}
+
+/** Unit bedroom count from the `bedrooms` text column ("2", "2B2B", "1bed",
+ *  "studio") with a title-pattern fallback ("一房出租", "3室2厅", "2b1b"). */
+const NBNB_RE = /(\d)\s*b\s*\d\s*b/i;
+const SINGLE_DIGIT_RE = /^\d$/;
+const BED_COL_PREFIX_RE = /^(\d)\s*b/i;
+const STUDIO_COL_RE = /^studio$/i;
+const TITLE_BED_EN_RE = /(\d)\s*(?:bed(?:room)?s?|br)\b/i;
+const TITLE_BED_ZH_RE = /(\d)\s*(?:室|房|居|卧)/;
+const TITLE_BED_CN_NUM_RE = /([一两二三四五])\s*(?:室|房|居|卧)/;
+const BED_CN_NUMERALS: Record<string, number> = {
+  一: 1,
+  两: 2,
+  二: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+};
+
+function bedroomsFromText(
+  bedrooms: string | null,
+  title: string | null
+): number | null {
+  const clamp = (n: number): number | null => (n >= 0 && n <= 5 ? n : null);
+  const t = title ?? "";
+
+  // An explicit "NbNb" in the title is the strongest signal and outranks the
+  // ingest-parsed `bedrooms` column, which is occasionally wrong on exactly
+  // these posts (e.g. title "1B1B" stored as bedrooms="2").
+  let m = t.match(NBNB_RE);
+  if (m) return clamp(Number(m[1]));
+
+  const b = bedrooms?.trim() ?? "";
+  if (SINGLE_DIGIT_RE.test(b)) return clamp(Number(b));
+  m = b.match(BED_COL_PREFIX_RE); // "2B2B", "4B1B（4卧1卫）", "1bed"
+  if (m) return clamp(Number(m[1]));
+  if (STUDIO_COL_RE.test(b)) return 0;
+
+  // Title fallback — unit size only; deliberately NO "单间→studio" mapping
+  // (a "单间" title advertises a room in a shared unit, not a studio).
+  m = t.match(TITLE_BED_EN_RE);
+  if (m) return clamp(Number(m[1]));
+  m = t.match(TITLE_BED_ZH_RE);
+  if (m) return clamp(Number(m[1]));
+  m = t.match(TITLE_BED_CN_NUM_RE);
+  if (m) return clamp(BED_CN_NUMERALS[m[1]] ?? Number.NaN);
+  return null;
+}
+
+/** Shim sparse structured columns with text-recovered values before the
+ *  constraint check, so strict filtering has real teeth on this corpus. */
+function withRecoveredFields(
+  row: XhsRentalSearchResultRow
+): XhsRentalSearchResultRow {
+  return {
+    ...row,
+    rentNumeric: row.rentNumeric ?? rentFromText(row.rent),
+    bedroomsNum: row.bedroomsNum ?? bedroomsFromText(row.bedrooms, row.title),
+  };
+}
+
+// The corpus is supposed to be Bay-Area-only but contains strays (San Diego
+// sublets etc.). A row whose text names a non-Bay metro/campus and no Bay city
+// is provably out of coverage — strict mode never returns it.
+const NON_BAY_LISTING_RE =
+  /西雅图|seattle|纽约|new\s*york|洛杉矶|los\s*angeles|圣地亚哥|san\s*diego|\bucsd\b|\bucla\b|\bucsb\b|\bsdsu\b|尔湾|irvine|波士顿|boston|芝加哥|chicago/i;
+
+function listingOutOfBay(row: XhsRentalSearchResultRow): boolean {
+  const text = `${row.title ?? ""} ${row.locationText ?? ""} ${row.propertyName ?? ""} ${row.rawText}`;
+  if (row.city && row.city.trim().toLowerCase() !== "null") return false;
+  return !detectCityStrict(text) && NON_BAY_LISTING_RE.test(text);
+}
+
+// A handful of scraped rows aren't rental listings at all (event/ad posts).
+// No structured rent/bedrooms AND no rental vocabulary anywhere → not a
+// listing; strict mode never returns it.
+const RENTAL_SIGNAL_RE = /租|rent|room|bed|卧|室|studio|sublease|lease|\$\d/i;
+
+function isNonRentalRow(row: XhsRentalSearchResultRow): boolean {
+  if (row.rent != null || row.bedrooms != null) return false;
+  return !RENTAL_SIGNAL_RE.test(`${row.title ?? ""} ${row.rawText}`);
+}
+
+/**
+ * The strict-match predicate for a query, shared by the runtime search AND the
+ * eval harness (tests/search-eval) so "what counts as a match" can never drift
+ * between the two.
+ *
+ * Semantics: exact city (no neighbours), no provable numeric/date violation
+ * (unparsed fields are lenient — can't prove a violation; sparse columns are
+ * first backfilled from text via withRecoveredFields), every voiced boolean
+ * requirement confirmed by column or text, and no out-of-Bay strays.
+ */
+export function buildStrictPredicate(query: string): {
+  city: CityEntry | null;
+  matches: (row: XhsRentalSearchResultRow) => boolean;
+} {
+  const city = detectCity(query);
+  const boolPrefs = extractBooleanPrefs(query);
+  // Boolean prefs are handled separately (text fallback), so null them out of
+  // the rowViolates constraint set.
+  const coreConstraints = {
+    ...extractHardConstraints(query),
+    petFriendly: null,
+    couplesOk: null,
+    utilitiesIncluded: null,
+    parkingIncluded: null,
+  };
+  return {
+    city,
+    matches: (raw) => {
+      if (isNonRentalRow(raw) || listingOutOfBay(raw)) return false;
+      const row = withRecoveredFields(raw);
+      if (city && !rowInCityExact(row, city)) return false;
+      if (rowViolates(row, coreConstraints)) return false;
+      return satisfiesBooleanPrefs(row, boolPrefs);
+    },
+  };
+}
+
+type StrictSearchResult = {
+  listings: XhsRentalSearchResultRow[];
+  /** How many rows satisfied every requirement (before the ≤5 cut). */
+  totalMatched: number;
+  outOfBay: boolean;
+};
+
+/**
+ * Strict search: filter the whole pool by every voiced requirement, return the
+ * top ≤5. Empty result means "数据库里没有" — the caller reports that honestly
+ * instead of substituting a近似 listing.
+ */
+async function findStrictListings(
+  query: string,
+  blockTerms: string[]
+): Promise<StrictSearchResult> {
+  // The corpus only covers the Bay Area; a Seattle/NYC/... request provably
+  // has no answer here. Refuse early instead of returning unrelated listings.
+  if (isOutOfBayQuery(query)) {
+    return { listings: [], totalMatched: 0, outOfBay: true };
+  }
+
+  const { matches } = buildStrictPredicate(query);
+
+  // Pool: the most recent STRICT_POOL_LIMIT rows — the whole table today
+  // (~750). All strictness is enforced in the app layer via the shared
+  // predicate; SQL alias-matching is deliberately NOT used to narrow the pool,
+  // because a listing whose `city` column is set but whose text never spells
+  // the city name would be silently unreachable.
+  const { results: pool } = await searchXhsRentalListings({
+    limit: STRICT_POOL_LIMIT,
+  });
+
+  const matched = applyBlockTerms(pool.filter(matches), blockTerms);
+
+  if (matched.length <= STRICT_MAX_RESULTS) {
+    return { listings: matched, totalMatched: matched.length, outOfBay: false };
+  }
+
+  // More than 5 qualify → order by relevance (Voyage rerank when available,
+  // most-recent-first otherwise) and cut to 5.
+  const pool2 = matched.slice(0, STRICT_RERANK_CAP);
+  if (process.env.VOYAGE_API_KEY) {
+    try {
+      const topIndices = await rerankDocuments(
+        query,
+        pool2.map((r) => r.rawText),
+        STRICT_MAX_RESULTS
+      );
+      if (topIndices.length > 0) {
+        return {
+          listings: topIndices
+            .map((i) => pool2[i])
+            .filter((r): r is XhsRentalSearchResultRow => Boolean(r)),
+          totalMatched: matched.length,
+          outOfBay: false,
+        };
+      }
+    } catch (err) {
+      console.error("[searchRental] strict rerank failed:", err);
+    }
+  }
+  return {
+    listings: matched.slice(0, STRICT_MAX_RESULTS),
+    totalMatched: matched.length,
+    outOfBay: false,
+  };
+}
+
+/**
+ * Strict-mode tool: same input schema as the legacy tool, but returns a
+ * `listings` ARRAY (≤5) with no relaxation and no per-session rotation.
+ */
+function createStrictSearchRentalTool(chatId: string) {
+  return tool({
+    description:
+      "Strict search over the XhsRentalListing database. " +
+      "Call this for ANY housing/rental request. " +
+      "Returns up to 5 listings that STRICTLY satisfy every requirement the user stated. " +
+      "If nothing satisfies all requirements, `listings` is empty — tell the user honestly that there is no match. " +
+      "The tool never relaxes criteria and never substitutes near-matches.",
+    inputSchema: z.object({
+      query: z
+        .string()
+        .describe(
+          "Full natural language search request with ALL accumulated context. " +
+            "Carry forward location, budget, bedrooms, move-in date, requirements from prior turns. " +
+            "Example: '圣何塞两室一厅，预算2500以下，宠物友好，情侣入住'"
+        ),
+      mustNotContain: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Keywords that disqualify a listing if found in its text (hard negative constraints). " +
+            "Carry forward across turns. Include both Chinese and English variants."
+        ),
+    }),
+    execute: async ({ query, mustNotContain }) => {
+      const startedAt = Date.now();
+      try {
+        const blockTerms = (mustNotContain ?? [])
+          .map((t) => t.trim().toLowerCase())
+          .filter((t) => t.length > 0);
+
+        const result = await findStrictListings(query, blockTerms);
+
+        // 留档（评测抽样数据源）；失败绝不影响搜索。见 legacy execute 内注释。
+        const phase = result.outOfBay
+          ? "STRICT_OUT_OF_BAY"
+          : result.listings.length > 0
+            ? "STRICT_MATCH"
+            : "STRICT_EMPTY";
+        scheduleAfterResponse(() =>
+          logSearchQuery({
+            chatId,
+            query,
+            mustNotContain: mustNotContain ?? null,
+            phase,
+            listingId: result.listings[0]?.id ?? null,
+            relaxed: false,
+            durationMs: Date.now() - startedAt,
+          }).catch((err) => {
+            console.error("[searchRental] logSearchQuery failed:", err);
+          })
+        );
+
+        if (result.outOfBay) {
+          return {
+            listings: [],
+            totalMatched: 0,
+            action:
+              "OUT_OF_BAY: 用户找的城市不在湾区。如实告知：我们目前只收录旧金山湾区的房源，该城市暂无数据。不要展示任何房源。",
+          };
+        }
+
+        if (result.listings.length === 0) {
+          return {
+            listings: [],
+            totalMatched: 0,
+            action:
+              "NO_MATCH: 数据库中没有完全符合用户全部要求的房源。如实告诉用户没有找到，绝不要用近似房源代替。可以指出哪个条件（预算/城市/房型/入住时间等）可能过严，建议用户调整后再搜。",
+          };
+        }
+
+        return {
+          listings: result.listings,
+          totalMatched: result.totalMatched,
+          action:
+            `SHOW_LISTINGS: 找到 ${result.listings.length} 个严格符合要求的房源` +
+            (result.totalMatched > result.listings.length
+              ? `（共 ${result.totalMatched} 个符合，已按相关度取前 ${result.listings.length} 个）`
+              : "") +
+            "。把 listings 数组里的每一个房源都完整展示出来（标准格式），不要遗漏、不要编造。",
+        };
+      } catch (error) {
+        console.error("[searchRental] strict tool error:", error);
+        return {
+          listings: [],
+          totalMatched: 0,
+          action:
+            "SEARCH_FAILED: Tell the user the search hit a temporary error and ask them to retry.",
+        };
+      }
+    },
+  });
+}
+
 // ── Tool factory ──────────────────────────────────────────────────────────────
 
 /**
  * Create the searchRental tool bound to a specific chatId.
- * Call once per chat request; the tool reads/writes seen-listing state
- * automatically so the LLM never needs to track excludeIds.
+ *
+ * Default: STRICT mode — up to 5 listings that satisfy every stated
+ * requirement, empty list when nothing does (the "换一个" flow is deprecated).
+ * Set SEARCH_LEGACY_PICK_ONE=1 to restore the legacy one-at-a-time cascade.
  */
 export function createSearchRentalTool(chatId: string) {
+  if (!LEGACY_PICK_ONE) {
+    return createStrictSearchRentalTool(chatId);
+  }
+  return createLegacySearchRentalTool(chatId);
+}
+
+/**
+ * LEGACY tool (deprecated, kept for rollback): one listing per call, server
+ * tracks seen IDs, auto-relaxes until something is shown ("换一个" flow).
+ */
+function createLegacySearchRentalTool(chatId: string) {
   return tool({
     description:
       "Semantic search over the XhsRentalListing database. " +
@@ -472,7 +898,7 @@ export function createSearchRentalTool(chatId: string) {
         // 用 after() 而非裸 fire-and-forget：serverless 在 execute 返回后可能
         // 立刻冻结/回收函数，未 await 的 insert 会被静默丢弃——而留档正是本功能
         // 的全部意义。after() 让平台等这条写入完成再回收。
-        after(() =>
+        scheduleAfterResponse(() =>
           logSearchQuery({
             chatId,
             query,
