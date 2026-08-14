@@ -203,7 +203,7 @@ export function cityAliases(entry: CityEntry): string[] {
  * (Shared with the eval harness so verdicts and runtime behavior agree.)
  */
 export const NON_BAY_CITY_RE =
-  /西雅图|seattle|芝加哥|chicago|纽约|new\s*york|nyc|洛杉矶|los\s*angeles|圣地亚哥|san\s*diego|波士顿|boston|奥斯汀|austin|尔湾|irvine|拉斯维加斯|vegas|达拉斯|dallas|休斯顿|houston|费城|philadelphia|亚特兰大|atlanta|凤凰城|phoenix|丹佛|denver|波特兰|portland/i;
+  /西雅图|seattle|芝加哥|chicago|纽约|new\s*york|nyc|洛杉矶|los\s*angeles|圣地亚哥|san\s*diego|波士顿|boston|奥斯汀|austin|尔湾|irvine|拉斯维加斯|vegas|达拉斯|dallas|休斯顿|houston|费城|philadelphia|亚特兰大|atlanta|凤凰城|phoenix|丹佛|denver|波特兰|portland|盐湖城|salt\s*lake|\bucla\b|westwood|sawtelle|圣盖博|san\s*gabriel|temple\s*city|上东区?|上西区?|\blic\b|长岛市|佐治亚理工|georgia\s*tech|\busc\b|圣塔莫尼卡|santa\s*monica/i;
 
 /** True when the query targets a non-Bay metro and names no Bay Area city. */
 export function isOutOfBayQuery(query: string): boolean {

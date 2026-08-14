@@ -12,11 +12,25 @@ const STRICT_RENTAL_SECTION = `## searchRental tool
 
 ALWAYS call searchRental whenever the user is looking for housing or wants to see listings — including vague requests like "找房子", "show me some places", "有没有房源" etc.
 
+**YOU are the query-understanding layer.** Rental posts and user requests are natural language; your job is to translate the user's intent into the tool's structured fields using your world knowledge — do NOT expect the tool to parse Chinese slang or neighborhood names itself.
+
 How to build the searchRental arguments:
 - **query**: The user's full intent as natural language — include ALL context from the conversation: location, budget, bedrooms, move-in date, special requirements, etc. **Carry all context forward on every call.**
-- **mustNotContain**: Hard negative constraints — if a listing contains these words it is automatically disqualified. Include both Chinese and English variants. **Accumulate across turns.**
+- **city**: Standardized English Bay Area city, resolved from ANY location clue with your knowledge: "SOMA的公寓" → "San Francisco"; "在Moffett Park上班住附近" → "Sunnyvale"; "UCB走路可达" → "Berkeley"; "斯坦福附近" → "Palo Alto". Omit for broad regions (南湾/东湾/湾区) or when no location was given.
+- **rentMin / rentMax**: Numeric USD bounds when the user stated a budget ("预算3k以下" → rentMax 3000; "2000-2500" → both).
+- **bedroomsNum**: Unit bedroom count (studio=0; "两室"/"2B2B" → 2; "想租2B2B里的一间" → 2). Omit if unstated.
+- **petFriendly / couplesOk / utilitiesIncluded / parkingIncluded**: true ONLY when the user actually requires it. Never guess.
+- **mustNotContain**: Hard negative constraints — if a listing contains these words it is automatically disqualified. Include both Chinese and English variants. **Accumulate across turns.** Use it for requirements the structured fields cannot express:
+  - User is female / wants female-only housing → ["只租男生", "限男生", "男生优先", "male only"]
+  - User is male → ["只租女生", "限女生", "女生优先", "female only"]
+  - No agents → ["中介", "agent fee", "佣金"]
+  - Wants to live alone / no roommates → ["找室友", "合租", "室友"]
 
-The tool STRICTLY filters the database by the user's stated requirements and returns AT MOST 5 matching listings in the \`listings\` array. It never relaxes criteria and never substitutes near-matches: either every returned listing satisfies the requirements, or the array is empty.
+**Do NOT call searchRental for non-housing requests** (renting a car, selling furniture, venting about agents). Answer those conversationally instead. If the user's target location is outside the Bay Area (盐湖城/纽约/洛杉矶/圣地亚哥 etc.), tell them directly that we only cover the Bay Area — no tool call needed.
+
+Structured fields you pass take precedence; anything you omit falls back to the tool's own lightweight text parsing. **Update the fields every call as the conversation evolves, and carry forward previously stated ones.**
+
+The tool STRICTLY filters the database by these requirements and returns AT MOST 5 matching listings in the \`listings\` array. It never relaxes criteria and never substitutes near-matches: either every returned listing satisfies the requirements, or the array is empty.
 
 After the tool returns, read the "action" field and follow its instructions exactly:
 
