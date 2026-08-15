@@ -58,6 +58,7 @@ import {
   vectorSearchXhsRentalListings,
   type XhsRentalSearchResultRow,
 } from "@/lib/db/queries";
+import { verifyListingsAgainstQuery } from "@/lib/ai/verify-listings";
 import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
 import {
   type CityEntry,
@@ -928,19 +929,34 @@ function createStrictSearchRentalTool(chatId: string) {
 
         const result = await findStrictListings(query, blockTerms, params);
 
+        // 终审（路线 C）：一次 LLM 调用对读需求原文与候选原文，剔除言下之意
+        // 矛盾的房源。只做减法、fail-open；剔除决策进 Vercel log 供人工复核。
+        const { kept, cut } = await verifyListingsAgainstQuery(
+          query,
+          result.listings
+        );
+        if (cut.length > 0) {
+          console.log(
+            "[searchRental] verifier cut",
+            JSON.stringify({ query, cut })
+          );
+        }
+
         // 留档（评测抽样数据源）；失败绝不影响搜索。见 legacy execute 内注释。
         const phase = result.outOfBay
           ? "STRICT_OUT_OF_BAY"
-          : result.listings.length > 0
+          : kept.length > 0
             ? "STRICT_MATCH"
-            : "STRICT_EMPTY";
+            : cut.length > 0
+              ? "STRICT_VERIFIER_EMPTY"
+              : "STRICT_EMPTY";
         scheduleAfterResponse(() =>
           logSearchQuery({
             chatId,
             query,
             mustNotContain: mustNotContain ?? null,
             phase,
-            listingId: result.listings[0]?.id ?? null,
+            listingId: kept[0]?.id ?? null,
             relaxed: false,
             durationMs: Date.now() - startedAt,
           }).catch((err) => {
@@ -952,27 +968,30 @@ function createStrictSearchRentalTool(chatId: string) {
           return {
             listings: [],
             totalMatched: 0,
+            verifierCutCount: 0,
             action:
               "OUT_OF_BAY: 用户找的城市不在湾区。如实告知：我们目前只收录旧金山湾区的房源，该城市暂无数据。不要展示任何房源。",
           };
         }
 
-        if (result.listings.length === 0) {
+        if (kept.length === 0) {
           return {
             listings: [],
             totalMatched: 0,
+            verifierCutCount: cut.length,
             action:
               "NO_MATCH: 数据库中没有完全符合用户全部要求的房源。如实告诉用户没有找到，绝不要用近似房源代替。可以指出哪个条件（预算/城市/房型/入住时间等）可能过严，建议用户调整后再搜。",
           };
         }
 
         return {
-          listings: result.listings,
+          listings: kept,
           totalMatched: result.totalMatched,
+          verifierCutCount: cut.length,
           action:
-            `SHOW_LISTINGS: 找到 ${result.listings.length} 个严格符合要求的房源` +
-            (result.totalMatched > result.listings.length
-              ? `（共 ${result.totalMatched} 个符合，已按相关度取前 ${result.listings.length} 个）`
+            `SHOW_LISTINGS: 找到 ${kept.length} 个严格符合要求的房源` +
+            (result.totalMatched > kept.length
+              ? `（共 ${result.totalMatched} 个通过硬性筛选，已按相关度与复核取前 ${kept.length} 个）`
               : "") +
             "。把 listings 数组里的每一个房源都完整展示出来（标准格式），不要遗漏、不要编造。",
         };

@@ -76,7 +76,7 @@ function cleanWantedText(raw: string): string {
 
 type EvalCase = { source: string; query: string };
 
-type Verdict = "PASS" | "DATA_GAP" | "CODE_BUG";
+type Verdict = "PASS" | "DATA_GAP" | "CODE_BUG" | "VERIFIER_CUT";
 
 type EvalResult = {
   query: string;
@@ -198,6 +198,7 @@ async function main() {
     )) as {
       listings?: { id: string; title: string | null; rawText: string }[];
       listing?: { id: string; title: string | null; rawText: string } | null;
+      verifierCutCount?: number;
       action?: string;
     };
     const returned = r.listings ?? (r.listing ? [r.listing] : []);
@@ -222,11 +223,17 @@ async function main() {
 
     // ── 分类（严格模式语义）──
     // 空结果 + 库里确实没有 → DATA_GAP（正确地说了"没有"）
+    // 空结果 + 终审剔空     → VERIFIER_CUT（谓词过了但 LLM 终审判矛盾；
+    //                          剔除理由在 Vercel log，人工抽查那边）
     // 空结果 + 库里明明有   → CODE_BUG
     // 有结果 + 全部满足     → PASS；任何一条违反 → CODE_BUG
     let verdict: Verdict;
     if (returned.length === 0) {
-      verdict = groundTruth.length > 0 ? "CODE_BUG" : "DATA_GAP";
+      if (groundTruth.length === 0) {
+        verdict = "DATA_GAP";
+      } else {
+        verdict = (r.verifierCutCount ?? 0) > 0 ? "VERIFIER_CUT" : "CODE_BUG";
+      }
     } else {
       verdict = violations.length === 0 ? "PASS" : "CODE_BUG";
     }
@@ -249,7 +256,14 @@ async function main() {
       judgeReason: judge?.reason ?? null,
     });
 
-    const mark = verdict === "PASS" ? "✓" : verdict === "DATA_GAP" ? "◌" : "✗";
+    const mark =
+      verdict === "PASS"
+        ? "✓"
+        : verdict === "DATA_GAP"
+          ? "◌"
+          : verdict === "VERIFIER_CUT"
+            ? "◔"
+            : "✗";
     console.log(
       `${mark} [${i + 1}/${cases.length}] ${c.query.slice(0, 40)} → ${
         returned.length > 0
@@ -265,11 +279,13 @@ async function main() {
   const pass = results.filter((r) => r.verdict === "PASS");
   const gaps = results.filter((r) => r.verdict === "DATA_GAP");
   const bugs = results.filter((r) => r.verdict === "CODE_BUG");
+  const verifierCuts = results.filter((r) => r.verdict === "VERIFIER_CUT");
   const badJudge = pass.filter((r) => r.judgeScore === 0);
 
   const summary =
     `搜索评测（严格模式）${new Date().toISOString().slice(0, 10)}：共 ${results.length} 条\n` +
-    `  ✓ PASS ${pass.length}  ◌ DATA_GAP ${gaps.length}（库里没有，正确说了"没有"）  ✗ CODE_BUG ${bugs.length}` +
+    `  ✓ PASS ${pass.length}  ◌ DATA_GAP ${gaps.length}（库里没有，正确说了"没有"）  ` +
+    `◔ VERIFIER_CUT ${verifierCuts.length}（终审剔空，理由见 Vercel log）  ✗ CODE_BUG ${bugs.length}` +
     (JUDGE ? `  LLM判0分（约束过但语义跑偏）：${badJudge.length}` : "");
   console.log(`\n${summary}`);
 
@@ -284,6 +300,7 @@ async function main() {
   for (const section of [
     ["## ✗ CODE_BUG（漏返回 / 返回了不满足严格条件的房源——需要修）", bugs],
     ["## ⚠ LLM 判 0 分（硬约束都过但语义不相关）", badJudge],
+    ["## ◔ VERIFIER_CUT（谓词通过但 LLM 终审全部剔除；剔除理由在运行时日志）", verifierCuts],
     ["## ◌ DATA_GAP（数据库没有满足全部要求的房源，正确回答'没有'）", gaps],
     ["## ✓ PASS", pass],
   ] as const) {

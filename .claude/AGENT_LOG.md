@@ -8,6 +8,55 @@
 
 ---
 
+## 2026-08-15（二） · 路线 C：查询时 LLM 终审（verifier）
+
+用户报告隐含推理失败的典型 case：两个朋友要整租 2B2B，返回了"2b2b 里空出
+一间、神仙室友继续住"的合租帖——结构化列（bedroomsNum=2）全部通过，但言下
+之意矛盾。跟用户讨论了三条路线后，**用户拍板只走路线 C**，并给了明确边界：
+
+- **路线 A（offeredScope/capacity 列 + partySize 参数）彻底不做**；
+  roomType/listingType 两列继续闲置。**别自作主张去做**。
+- **路线 B（入库事实层 JSONB）彻底不做**。
+- verifier 剔除权限**放开**（不采用"只剔确信违反、不确定放行带提示"）：
+  宁缺毋滥，用户明确说接受空结果/更少结果（"用户很愿意多阅读搜索比较失败的"）。
+  唯一保留的宽容规则：帖子对某需求**沉默**不算矛盾，不因沉默剔除。
+- 剔除决策只进 Vercel log（console.log），**不建人工复核管道**，用户自己派人
+  看 log。聊天层 prompt 完全不动（决策 3 被否）。
+- 用户追求"代码优雅、改动少"，钱不敏感（每次搜索 ~$0.005-0.01 可接受）。
+
+### 实现（3 个文件）
+
+- `lib/ai/verify-listings.ts`（新）：`verifyListingsAgainstQuery(query, listings)`
+  —— **一次** generateObject 调用（getTitleModel = gateway claude-haiku-4.5，
+  与入库提取同款），输入用户需求原文 + ≤5 条候选原文（各截 1200 字），输出
+  要剔除的序号+一句话理由。**只做减法 + fail-open**：LLM 挂了原样放行，
+  搜索永不因终审失败。本地无 gateway → 永远 fail-open（console.error），
+  这是预期行为不是 bug。
+- `search-rental.ts` strict execute：findStrictListings 之后过终审；剔除时
+  `console.log("[searchRental] verifier cut", JSON.stringify({query, cut}))`
+  进 Vercel log；新 phase `STRICT_VERIFIER_EMPTY`（谓词有结果但被剔空）；
+  工具结果新增 `verifierCutCount`。
+- `search-eval.ts`：新判定 VERIFIER_CUT（空结果 + groundTruth>0 +
+  verifierCutCount>0），不算 CODE_BUG、不挂门禁。注意：本地跑评测时 verifier
+  fail-open，所以 VERIFIER_CUT 本地恒为 0——verifier 的质量曲线在生产 log 里，
+  不在评测里。
+
+### 验证
+
+- prompt 判断力用用户原始 case 本地验证过（gateway 不通，用 gpt-4o-mini 同
+  prompt 代跑）：正确剔除"神仙室友"合租帖、保留真整租帖，理由准确。
+- 评测门禁（verifier fail-open 下）：181 条 → PASS 166 / DATA_GAP 15 /
+  CODE_BUG 0，与上一节基线一致。
+
+### 遗留
+
+- 生产上 verifier 的真实剔除质量**没有自动评测**（设计如此）：上线后去 Vercel
+  log 搜 `verifier cut` 和 `[verifyListings] fail-open` 抽查。若发现乱剔，
+  第一调整点是 system prompt 的"沉默不算矛盾"边界。
+- gpt/search route（GPT Actions）与 legacy 级联**没接** verifier（范围控制）。
+
+---
+
 ## 2026-08-15 · 租期时长（lease duration）进入严格筛选
 
 用户报告：帖子原文用自然语言写了租期（"一年起租"/"短租到9月"），但搜索"短租
