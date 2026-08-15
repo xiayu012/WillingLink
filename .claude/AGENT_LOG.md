@@ -24,36 +24,60 @@
   看 log。聊天层 prompt 完全不动（决策 3 被否）。
 - 用户追求"代码优雅、改动少"，钱不敏感（每次搜索 ~$0.005-0.01 可接受）。
 
-### 实现（3 个文件）
+### 实现（4 个文件）
 
 - `lib/ai/verify-listings.ts`（新）：`verifyListingsAgainstQuery(query, listings)`
-  —— **一次** generateObject 调用（getTitleModel = gateway claude-haiku-4.5，
-  与入库提取同款），输入用户需求原文 + ≤5 条候选原文（各截 1200 字），输出
-  要剔除的序号+一句话理由。**只做减法 + fail-open**：LLM 挂了原样放行，
-  搜索永不因终审失败。本地无 gateway → 永远 fail-open（console.error），
-  这是预期行为不是 bug。
+  —— **一次** LLM 调用，输入用户需求原文 + ≤5 条候选原文（各截 1200 字），
+  输出要剔除的序号+理由。**只做减法 + fail-open**：任何失败原样放行，
+  搜索永不因终审挂掉。
+- `providers.ts` 新增 `getVerifierModel()` = gateway claude-sonnet-4.5。
 - `search-rental.ts` strict execute：findStrictListings 之后过终审；剔除时
   `console.log("[searchRental] verifier cut", JSON.stringify({query, cut}))`
-  进 Vercel log；新 phase `STRICT_VERIFIER_EMPTY`（谓词有结果但被剔空）；
-  工具结果新增 `verifierCutCount`。
+  进 Vercel log；新 phase `STRICT_VERIFIER_EMPTY`；工具结果新增
+  `verifierCutCount`。
 - `search-eval.ts`：新判定 VERIFIER_CUT（空结果 + groundTruth>0 +
-  verifierCutCount>0），不算 CODE_BUG、不挂门禁。注意：本地跑评测时 verifier
-  fail-open，所以 VERIFIER_CUT 本地恒为 0——verifier 的质量曲线在生产 log 里，
-  不在评测里。
+  verifierCutCount>0），不算 CODE_BUG、不挂门禁。另：SEARCH_FAILED 现在
+  重试一次再定性（181 连发下 Neon/gateway 偶发瞬时故障曾造成 3 个假 CODE_BUG）。
 
-### 验证
+### 调试史（都是真踩过的坑，换模型/改输出格式前必读）
 
-- prompt 判断力用用户原始 case 本地验证过（gateway 不通，用 gpt-4o-mini 同
-  prompt 代跑）：正确剔除"神仙室友"合租帖、保留真整租帖，理由准确。
-- 评测门禁（verifier fail-open 下）：181 条 → PASS 166 / DATA_GAP 15 /
-  CODE_BUG 0，与上一节基线一致。
+1. **haiku 不能胜任终审**：稳定臆造用户属性——查询只说"95134 预算3300"，
+   它反复以"用户有一只已绝育小猫"为由剔除（把候选帖里反复出现的"无宠物"
+   反向脑补成用户有猫），schema 接地（先抽 requirements 清单再判）也压不住。
+   换 sonnet 后消失。**别为省钱降回 haiku。**
+2. **gateway 对 anthropic 的 generateObject 不稳定**：模型会回显工具模板
+   占位符——`{"$PARAMETER_NAME":{…}}`、`{"$parameter":{…}}`、`{"$cuts":[…]}`、
+   甚至把 cuts 数组二次编码成 JSON 字符串，NoObjectGeneratedError 随机出现。
+   拆壳救援写成了九头蛇，最终**放弃 generateObject，改 generateText +
+   prompt 定 JSON 格式 + 自行解析校验**（temperature 0）。
+3. **模型引用原文时输出未转义英文双引号**（`"reason": "帖子要求"一年起租"…"`）
+   → JSON.parse 崩。修复：prompt 要求引用一律用「」+ `repairInnerQuotes`
+   启发式（字符串内 `"` 后面不是 `,}]:` 就转义）。修复后 5 轮 ×3 查询零失败。
+4. **fail-open 曾被击穿**：AI SDK beta 的错误对象让 node util.inspect 自身抛
+   TypeError，`console.error(error)` 在 catch 里再抛、异常逃逸成 SEARCH_FAILED。
+   所以 catch 里只打印 `error.name: error.message`，**永远别把 AI SDK 错误
+   对象直接丢给 console.error**。
+
+### 验证与新基线（2026-08-15，verifier 激活）
+
+- 本地 gateway 已可用：用户在 .env.local 加了 AI_GATEWAY_API_KEY（值带引号，
+  评测脚本的去引号列表已含它；新脚本记得同样处理）。
+- 门禁：181 条 → **PASS 122 / DATA_GAP 15 / VERIFIER_CUT 44 / CODE_BUG 0 /
+  judge-0 2**（judge-0 从 14 → 2，terifier 把语义跑偏的基本剔干净了）。
+  VERIFIER_CUT 数随 LLM 波动（±10 正常），CODE_BUG=0 仍是唯一硬门禁。
+- 抽查 44 个剔空的理由：性别限制、求租帖混入、2b1b≠2b2b、共享卫生间≠独卫、
+  "现室友继续住→无法整租"、湾区帖对科州/成都查询——全部有据，无臆造。
+- 用户原始 case（两人整租 2B2B vs "神仙室友"合租帖）：正确剔除。
 
 ### 遗留
 
-- 生产上 verifier 的真实剔除质量**没有自动评测**（设计如此）：上线后去 Vercel
-  log 搜 `verifier cut` 和 `[verifyListings] fail-open` 抽查。若发现乱剔，
-  第一调整点是 system prompt 的"沉默不算矛盾"边界。
+- 生产上 verifier 的剔除质量**没有自动评测**（设计如此）：Vercel log 搜
+  `verifier cut` 和 `[verifyListings] fail-open` 抽查。乱剔的第一调整点是
+  system prompt 的"沉默不算矛盾"边界；解析失败率上升先看 fail-open 日志里
+  的原始输出片段。
 - gpt/search route（GPT Actions）与 legacy 级联**没接** verifier（范围控制）。
+- 终审延迟：sonnet 一次调用约 3-8 秒，用户未表示介意；若将来要压，
+  可换回结构化输出（等 gateway 模板修好）或减候选截断长度。
 
 ---
 

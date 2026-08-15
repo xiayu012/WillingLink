@@ -29,7 +29,12 @@
 import { config } from "dotenv";
 
 config({ path: ".env.local" });
-for (const k of ["POSTGRES_URL", "VOYAGE_API_KEY", "OPENAI_API_KEY"]) {
+for (const k of [
+  "POSTGRES_URL",
+  "VOYAGE_API_KEY",
+  "OPENAI_API_KEY",
+  "AI_GATEWAY_API_KEY",
+]) {
   if (process.env[k]?.startsWith('"')) {
     process.env[k] = process.env[k]!.slice(1, -1);
   }
@@ -191,16 +196,20 @@ async function main() {
       : listings.filter((row) => pred.matches(row as never));
 
     // ── 执行搜索（严格模式返回 listings 数组，≤5）──
-    const tool = createSearchRentalTool(`eval-${randomUUID()}`);
-    const r = (await (tool as { execute: Function }).execute(
-      { query: c.query },
-      {}
-    )) as {
+    type ToolResult = {
       listings?: { id: string; title: string | null; rawText: string }[];
       listing?: { id: string; title: string | null; rawText: string } | null;
       verifierCutCount?: number;
       action?: string;
     };
+    const tool = createSearchRentalTool(`eval-${randomUUID()}`);
+    const exec = (): Promise<ToolResult> =>
+      (tool as { execute: Function }).execute({ query: c.query }, {});
+    let r = await exec();
+    // 181 连发下 Neon/gateway 偶发瞬时故障；重试一次再定性，免得污染 CODE_BUG。
+    if (r.action?.startsWith("SEARCH_FAILED")) {
+      r = await exec();
+    }
     const returned = r.listings ?? (r.listing ? [r.listing] : []);
 
     // ── 核验：每一个返回的房源都必须满足严格谓词 ──
