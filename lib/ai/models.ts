@@ -1,5 +1,5 @@
 // Curated list of top models from Vercel AI Gateway
-export const DEFAULT_CHAT_MODEL = "xai/grok-4.1-fast-non-reasoning";
+export const DEFAULT_CHAT_MODEL = "openai/gpt-4.1-mini";
 
 export type ChatModel = {
   id: string;
