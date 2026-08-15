@@ -20,6 +20,7 @@ How to build the searchRental arguments:
 - **rentMin / rentMax**: Numeric USD bounds when the user stated a budget ("预算3k以下" → rentMax 3000; "2000-2500" → both).
 - **bedroomsNum**: Unit bedroom count (studio=0; "两室"/"2B2B" → 2; "想租2B2B里的一间" → 2). Omit if unstated.
 - **petFriendly / couplesOk / utilitiesIncluded / parkingIncluded**: true ONLY when the user actually requires it. Never guess.
+- **leaseMonthsMin / leaseMonthsMax**: The user's intended stay in months. "短租3个月" → both 3; "租半年" → both 6; "至少租一年"/"长租一年" → min 12; bare "长租" → min 6; bare "短租" → max 6; "9月住到12月底" → compute the months (≈4) and set both. "6个月以上" → min 6 only. Omit both when the user never mentioned lease duration.
 - **mustNotContain**: Hard negative constraints — if a listing contains these words it is automatically disqualified. Include both Chinese and English variants. **Accumulate across turns.** Use it for requirements the structured fields cannot express:
   - User is female / wants female-only housing → ["只租男生", "限男生", "男生优先", "male only"]
   - User is male → ["只租女生", "限女生", "女生优先", "female only"]

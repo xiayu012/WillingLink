@@ -11,6 +11,7 @@ import { generateObject } from "ai";
 import { z } from "zod";
 
 import { getTitleModel } from "@/lib/ai/providers";
+import { listingLeaseFromText } from "@/lib/rental/lease-duration";
 import { parseListingFields } from "@/lib/xhs/parse-rental-text";
 
 // ── Zod schema returned by the LLM ───────────────────────────────────────────
@@ -135,6 +136,31 @@ const extractedFieldsSchema = z.object({
       "true if parking is available or included. " +
         "false if explicitly no parking. null if not mentioned."
     ),
+
+  leaseMinMonths: z
+    .number()
+    .int()
+    .nullable()
+    .describe(
+      "Minimum lease length in MONTHS the lister REQUIRES (hard floor only). " +
+        "一年起租/至少签一年/租期一年→12; 半年起/最短半年→6; 6个月起租→6; " +
+        "只接受长租/不短租/谢绝短租→6 (unless a longer floor is stated). " +
+        "Preferences are NOT requirements: prefer长租/长租优先/prefer一年起租→null. " +
+        "Tiered long/short pricing (长租$X/短租3个月起$Y) → the smallest acceptable " +
+        "minimum (3). 最多出租一年 is a max, not a min. 长短租皆可/可短租→null. " +
+        "null if not mentioned."
+    ),
+
+  leaseMaxMonths: z
+    .number()
+    .int()
+    .nullable()
+    .describe(
+      "Maximum stay in MONTHS available (hard ceiling only). 最多出租一年→12. " +
+        "Compute from an explicit fixed sublease window: 租期8/24-9/10→1; " +
+        "9/10-10/30短租→2; 起租9/20+租约到2027/2/6→5 (round up, minimum 1). " +
+        "仅限一个月短租→1; 只接受短租→6. null if open-ended, renewable, or unknown."
+    ),
 });
 
 export type ExtractedListingFields = z.infer<typeof extractedFieldsSchema>;
@@ -161,6 +187,8 @@ export type ListingFieldsResult = {
   couplesOk: boolean | null;
   utilitiesIncluded: boolean | null;
   parkingIncluded: boolean | null;
+  leaseMinMonths: number | null;
+  leaseMaxMonths: number | null;
 };
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -174,6 +202,7 @@ export async function extractListingFields(
   rawText: string
 ): Promise<ListingFieldsResult> {
   const regexFallback = parseListingFields(rawText);
+  const leaseFallback = listingLeaseFromText(rawText);
 
   try {
     const { object } = await generateObject({
@@ -210,6 +239,8 @@ Be precise:
       couplesOk: object.couplesOk ?? null,
       utilitiesIncluded: object.utilitiesIncluded ?? null,
       parkingIncluded: object.parkingIncluded ?? null,
+      leaseMinMonths: object.leaseMinMonths ?? leaseFallback.leaseMinMonths,
+      leaseMaxMonths: object.leaseMaxMonths ?? leaseFallback.leaseMaxMonths,
     };
   } catch (err) {
     console.error("[extract-listing-fields] LLM failed, using regex fallback:", err);
@@ -221,6 +252,8 @@ Be precise:
       couplesOk: null,
       utilitiesIncluded: null,
       parkingIncluded: null,
+      leaseMinMonths: leaseFallback.leaseMinMonths,
+      leaseMaxMonths: leaseFallback.leaseMaxMonths,
     };
   }
 }

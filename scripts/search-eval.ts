@@ -175,7 +175,7 @@ async function main() {
     SELECT "id", "title", "rawText", "locationText", "propertyName", "city",
            "rent", "rentNumeric", "bedrooms", "bedroomsNum", "availableFrom",
            "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded",
-           "furnished"
+           "furnished", "leaseMinMonths", "leaseMaxMonths"
     FROM "XhsRentalListing"
   `;
 

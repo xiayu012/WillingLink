@@ -8,6 +8,66 @@
 
 ---
 
+## 2026-08-15 · 租期时长（lease duration）进入严格筛选
+
+用户报告：帖子原文用自然语言写了租期（"一年起租"/"短租到9月"），但搜索"短租
+3个月"之类时没被严格匹配。本会话把租期变成结构化约束，全链路打通。
+
+### 1. 数据模型（区间重叠，偏严格）
+
+- 双方各是一个"可接受居住月数区间"[min,max]（null=无界/未知）：
+  - 房源列 `leaseMinMonths`（起租门槛：一年起租→12，只接受长租/不短租→6）、
+    `leaseMaxMonths`（最长可住：转租窗口按日期折算月数，仅限一个月短租→1）。
+    已 ALTER TABLE 加入 XhsRentalListing（migrations 目录依旧没有对应文件，
+    与上次六列做法一致）。
+  - 查询侧约束 `leaseMonthsMin/leaseMonthsMax`（HardConstraints 新字段）：
+    "短租3个月"→[3,3]，"6个月以上"→[6,∞)，光说"短租"→(?,6]，光说"长租"→[6,?)，
+    "长短租都行"或长短并存→无约束。
+- 违反判定 `leaseConflict`（lib/rental/lease-duration.ts）：两区间可证明不相交
+  才剔除；任一侧 null 宽容放行。**偏严格的关键语义**：偏好不是约束
+  （"prefer 长租"→null），"最多出租一年"只是 max 不是 min。
+
+### 2. 代码位置
+
+- `lib/rental/lease-duration.ts`（新）：查询侧 NL 提取 + 房源侧文本兜底正则 +
+  冲突判定，运行时/评测/入库共用。日期窗口（"9/10-10/30"）正则不管，交给 LLM。
+- 链路接入点：schema.ts、queries.ts（行类型 + 3 处 SELECT + 2 处 mapper +
+  updateListingStructuredFields，改列必须全改）、query-constraints.ts
+  （rowViolates/emptyConstraints/hasAnyConstraint）、search-rental.ts
+  （StrictSearchParams + tool 参数 leaseMonthsMin/Max + withRecoveredFields
+  文本兜底）、extract-listing-fields.ts + rental-ingest route（入库自动提取）、
+  prompts.ts STRICT 段（教聊天 LLM 传参）、gpt/search route（SELECT+mapper）、
+  search-eval.ts（SELECT 补两列）。
+- 回填：`scripts/backfill-listing-fields.ts --lease`（gpt-4o-mini，只处理两列
+  双 NULL 行；重跑幂等但会重复花钱）。2026-08-15 全量 803 行 0 失败。
+
+### 3. 踩过的坑（都已修，防回归）
+
+- LLM 过度提取（违背偏严格）：①"prefer 一年起租"被当硬门槛；②"最多出租一年"
+  同时填了 min=12；③**长短租双档价帖**（"长租一年$1600/短租3个月起$1800"）被
+  拆成 min=12/max=3 的矛盾对（8 行）。修法：prompt 明确三条规则 + SQL 把矛盾行
+  改成 min=LEAST(min,max)/max=NULL + withRecoveredFields 对 min>max 的列对视为
+  无数据（转文本兜底）。
+- 正则误伤防御：`(?<!\d)` 防"2021年"当"1年"；"3月以上"缺"个"时必须带"以上/起"
+  防三月=March；"一年级"负向断言；"一个月大概有12天不在家"这类无租 cue 的
+  不提取。
+- Windows 本地跑 eval：package.json 的 `search-eval` 脚本用了 sh 语法的
+  NODE_OPTIONS 前缀，PowerShell/cmd 跑不了，要在 Git Bash 里
+  `NODE_OPTIONS=--conditions=react-server pnpm exec tsx scripts/search-eval.ts ...`。
+
+### 4. 基线（2026-08-15，回归对照）
+
+- `--source wanted --limit 181`：181 条 → **PASS 166 / DATA_GAP 15 /
+  CODE_BUG 0 / judge-0 13**（盲区构成与上次相同：非租房查询、性别软需求、
+  存量标题错位行）。
+- 租期覆盖：804 行中 min 251 行 / max 166 行非空。定向不变量全过：
+  "长租一年"零 max<12 泄漏；"租期一个月"零 min>1 泄漏；"短租3个月"下
+  124 行一年起租房源全部被剔。
+- 存量标题错位行仍未清洗（"利马是秘鲁首都"这类标题还会出现在结果里，
+  rawText 是对的）——依旧是已知遗留，见 2026-08-14 §3/§8。
+
+---
+
 ## 2026-08-14 · 废弃"换一个"→ 严格模式 → 入库管线修复 → LLM-native 查询理解
 
 涉及 commits：`f20bf1b` → `76893f8` → `650d8b2`（均直接推 main，用户要求）。

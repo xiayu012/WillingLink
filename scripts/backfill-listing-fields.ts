@@ -5,9 +5,12 @@
  * Usage:
  *   pnpm exec tsx scripts/backfill-listing-fields.ts             # all rows
  *   pnpm exec tsx scripts/backfill-listing-fields.ts --limit 5  # smoke test
+ *   pnpm exec tsx scripts/backfill-listing-fields.ts --lease    # 只回填租期两列
  *
  * Processes in batches of 10 to avoid overwhelming the LLM API.
- * Safe to re-run: only updates rows where ALL six new fields are NULL.
+ * Safe to re-run: only updates rows where ALL targeted fields are NULL
+ * (--lease 模式下即 leaseMinMonths/leaseMaxMonths 双 NULL 的行——包括真的
+ * 没提租期的行，重跑会重复花 LLM 调用但结果幂等).
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
@@ -55,6 +58,39 @@ Extract only these 6 fields. Return null for anything you cannot confidently det
   return object;
 }
 
+// ── 租期两列（--lease 模式）──────────────────────────────────────────────────
+
+const leaseSchema = z.object({
+  leaseMinMonths: z.number().int().nullable(),
+  leaseMaxMonths: z.number().int().nullable(),
+});
+
+async function extractLeaseFields(rawText: string) {
+  const { object } = await generateObject({
+    model: extractModel,
+    schema: leaseSchema,
+    system: `You are a data extractor for US Bay Area rental listings (Chinese/English).
+Extract the lease-duration constraints in MONTHS. Return null when not stated.
+- leaseMinMonths: minimum lease the LISTER REQUIRES (hard floor only).
+  一年起租/至少签一年/租期一年→12; 半年起/最短半年→6; 6个月起租→6;
+  只接受长租/不短租/谢绝短租→6 (unless a longer floor is stated).
+  Preferences are NOT requirements: prefer长租/长租优先/prefer一年起租/短租可商→null.
+  最多出租一年 states a MAX, not a min→leave min null.
+  长短租皆可/可短租→null.
+- leaseMaxMonths: maximum stay available (hard ceiling only).
+  最多出租一年/up to 12 months→12. Compute from an explicit fixed sublease window:
+  租期8/24-9/10→1; 9/10-10/30短租→2; 起租2026/9/20、租约到2027/2/6→5
+  (round up, minimum 1). 仅限一个月短租→1; 只接受短租→6.
+  null if open-ended, renewable (年租约可续), or unknown.
+Tiered pricing (长租一年$1600/短租3个月起$1800; 长租6个月起/短租3个月起) means BOTH are
+offered: leaseMinMonths = the SMALLEST acceptable minimum (→3), leaseMaxMonths = null.
+Never return leaseMinMonths > leaseMaxMonths.
+Only state what the text PROVES as a hard constraint; when in doubt return null.`,
+    prompt: rawText.slice(0, 3000),
+  });
+  return object;
+}
+
 const BATCH_SIZE = 10;
 const DELAY_MS = 300;
 
@@ -63,24 +99,38 @@ async function sleep(ms: number) {
 }
 
 async function main() {
-  console.log("🔍 Fetching rows missing structured fields...");
+  const leaseMode = process.argv.includes("--lease");
+  console.log(
+    leaseMode
+      ? "🔍 Fetching rows missing lease-duration fields..."
+      : "🔍 Fetching rows missing structured fields..."
+  );
 
   const limitArgIdx = process.argv.indexOf("--limit");
   const limit =
     limitArgIdx >= 0 ? Number(process.argv[limitArgIdx + 1]) : Number.NaN;
 
-  const rows = await client<{ id: string; rawText: string }[]>`
-    SELECT id, "rawText"
-    FROM "XhsRentalListing"
-    WHERE "bedroomsNum" IS NULL
-      AND "city" IS NULL
-      AND "petFriendly" IS NULL
-      AND "couplesOk" IS NULL
-      AND "utilitiesIncluded" IS NULL
-      AND "parkingIncluded" IS NULL
-    ORDER BY "createdAt" DESC
-    ${Number.isFinite(limit) && limit > 0 ? client`LIMIT ${limit}` : client``}
-  `;
+  const rows = leaseMode
+    ? await client<{ id: string; rawText: string }[]>`
+        SELECT id, "rawText"
+        FROM "XhsRentalListing"
+        WHERE "leaseMinMonths" IS NULL
+          AND "leaseMaxMonths" IS NULL
+        ORDER BY "createdAt" DESC
+        ${Number.isFinite(limit) && limit > 0 ? client`LIMIT ${limit}` : client``}
+      `
+    : await client<{ id: string; rawText: string }[]>`
+        SELECT id, "rawText"
+        FROM "XhsRentalListing"
+        WHERE "bedroomsNum" IS NULL
+          AND "city" IS NULL
+          AND "petFriendly" IS NULL
+          AND "couplesOk" IS NULL
+          AND "utilitiesIncluded" IS NULL
+          AND "parkingIncluded" IS NULL
+        ORDER BY "createdAt" DESC
+        ${Number.isFinite(limit) && limit > 0 ? client`LIMIT ${limit}` : client``}
+      `;
 
   console.log(`📋 Found ${rows.length} rows to backfill.`);
   if (rows.length === 0) {
@@ -98,6 +148,22 @@ async function main() {
 
     for (const row of batch) {
       try {
+        if (leaseMode) {
+          const lease = await extractLeaseFields(row.rawText);
+          await client`
+            UPDATE "XhsRentalListing"
+            SET
+              "leaseMinMonths" = ${lease.leaseMinMonths},
+              "leaseMaxMonths" = ${lease.leaseMaxMonths}
+            WHERE id = ${row.id}::uuid
+          `;
+          process.stdout.write(
+            `  ✓ ${row.id.slice(0, 8)} → leaseMin=${lease.leaseMinMonths ?? "null"} leaseMax=${lease.leaseMaxMonths ?? "null"}\n`
+          );
+          success += 1;
+          await sleep(DELAY_MS);
+          continue;
+        }
         const fields = await extractFields(row.rawText);
         await client`
           UPDATE "XhsRentalListing"

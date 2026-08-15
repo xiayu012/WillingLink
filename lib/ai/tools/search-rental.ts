@@ -66,6 +66,7 @@ import {
   detectCityStrict,
   isOutOfBayQuery,
 } from "@/lib/rental/cities";
+import { listingLeaseFromText } from "@/lib/rental/lease-duration";
 import {
   applyBlockTerms,
   applyHardConstraints,
@@ -604,10 +605,24 @@ function bedroomsFromText(
 function withRecoveredFields(
   row: XhsRentalSearchResultRow
 ): XhsRentalSearchResultRow {
+  // 租期列是后加的：老行/新入库行在 LLM 提取落地前为 null，用保守正则从
+  // 帖子文本兜底（"一年起租"/"6个月起租"/"仅限一个月短租"等清晰硬表述）。
+  // min>max 的自相矛盾提取（多见于长短租双档价帖）不可信 → 视为无数据。
+  const colContradictory =
+    row.leaseMinMonths != null &&
+    row.leaseMaxMonths != null &&
+    row.leaseMinMonths > row.leaseMaxMonths;
+  const lease =
+    colContradictory ||
+    (row.leaseMinMonths == null && row.leaseMaxMonths == null)
+      ? listingLeaseFromText(`${row.title ?? ""}\n${row.rawText}`)
+      : { leaseMinMonths: row.leaseMinMonths, leaseMaxMonths: row.leaseMaxMonths };
   return {
     ...row,
     rentNumeric: row.rentNumeric ?? rentFromText(row.rent),
     bedroomsNum: row.bedroomsNum ?? bedroomsFromText(row.bedrooms, row.title),
+    leaseMinMonths: lease.leaseMinMonths,
+    leaseMaxMonths: lease.leaseMaxMonths,
   };
 }
 
@@ -659,6 +674,8 @@ export type StrictSearchParams = {
   couplesOk?: boolean | null;
   utilitiesIncluded?: boolean | null;
   parkingIncluded?: boolean | null;
+  leaseMonthsMin?: number | null;
+  leaseMonthsMax?: number | null;
 };
 
 /**
@@ -705,6 +722,8 @@ export function buildStrictPredicate(
     rentMin: params.rentMin ?? nl.rentMin,
     rentMax: params.rentMax ?? nl.rentMax,
     bedroomsNum: params.bedroomsNum ?? nl.bedroomsNum,
+    leaseMonthsMin: params.leaseMonthsMin ?? nl.leaseMonthsMin,
+    leaseMonthsMax: params.leaseMonthsMax ?? nl.leaseMonthsMax,
     petFriendly: null,
     couplesOk: null,
     utilitiesIncluded: null,
@@ -874,6 +893,24 @@ function createStrictSearchRentalTool(chatId: string) {
         .nullable()
         .optional()
         .describe("true ONLY if the user requires parking (要车位/停车)."),
+      leaseMonthsMin: z
+        .number()
+        .int()
+        .nullable()
+        .optional()
+        .describe(
+          "Minimum months the user intends to stay. '至少租半年'→6; '长租一年'→12; " +
+            "bare '长租'→6; '短租3个月'→3 (set max too). Omit if unstated."
+        ),
+      leaseMonthsMax: z
+        .number()
+        .int()
+        .nullable()
+        .optional()
+        .describe(
+          "Maximum months the user can stay. '短租3个月'→3; bare '短租'→6; " +
+            "'租期8月底到12月底'→4 (compute from the dates). Omit if open-ended."
+        ),
       mustNotContain: z
         .array(z.string())
         .optional()

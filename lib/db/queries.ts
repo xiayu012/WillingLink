@@ -1523,6 +1523,8 @@ export type XhsRentalSearchResultRow = {
   couplesOk: boolean | null;
   utilitiesIncluded: boolean | null;
   parkingIncluded: boolean | null;
+  leaseMinMonths: number | null;
+  leaseMaxMonths: number | null;
 };
 
 const RENTAL_RESULT_LIMIT = 20;
@@ -1543,7 +1545,7 @@ export async function vectorSearchXhsRentalListings(
               "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
               "roomType", "propertyName", "locationText", "furnished", "contactMethod",
               "imageUrls", "createdAt",
-              "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded"
+              "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded", "leaseMinMonths", "leaseMaxMonths"
             FROM "XhsRentalListing"
             WHERE embedding IS NOT NULL
               AND "id" != ALL(${excludeIds}::uuid[])
@@ -1556,7 +1558,7 @@ export async function vectorSearchXhsRentalListings(
               "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
               "roomType", "propertyName", "locationText", "furnished", "contactMethod",
               "imageUrls", "createdAt",
-              "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded"
+              "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded", "leaseMinMonths", "leaseMaxMonths"
             FROM "XhsRentalListing"
             WHERE embedding IS NOT NULL
             ORDER BY embedding <=> ${vectorLiteral}::vector
@@ -1591,6 +1593,8 @@ export async function vectorSearchXhsRentalListings(
       couplesOk: (row.couplesOk as boolean | null) ?? null,
       utilitiesIncluded: (row.utilitiesIncluded as boolean | null) ?? null,
       parkingIncluded: (row.parkingIncluded as boolean | null) ?? null,
+      leaseMinMonths: (row.leaseMinMonths as number | null) ?? null,
+      leaseMaxMonths: (row.leaseMaxMonths as number | null) ?? null,
     }));
   } catch (error) {
     console.error("Failed to vector search XhsRentalListing:", error);
@@ -1652,6 +1656,8 @@ export async function updateListingStructuredFields(
     couplesOk: boolean | null;
     utilitiesIncluded: boolean | null;
     parkingIncluded: boolean | null;
+    leaseMinMonths: number | null;
+    leaseMaxMonths: number | null;
   }
 ): Promise<void> {
   await client`
@@ -1662,7 +1668,9 @@ export async function updateListingStructuredFields(
       "petFriendly"       = ${fields.petFriendly},
       "couplesOk"         = ${fields.couplesOk},
       "utilitiesIncluded" = ${fields.utilitiesIncluded},
-      "parkingIncluded"   = ${fields.parkingIncluded}
+      "parkingIncluded"   = ${fields.parkingIncluded},
+      "leaseMinMonths"    = ${fields.leaseMinMonths},
+      "leaseMaxMonths"    = ${fields.leaseMaxMonths}
     WHERE id = ${id}::uuid
   `;
 }
@@ -1697,7 +1705,7 @@ export async function searchXhsRentalListings({
         "availableFrom", "leaseEndDate", "listingType", "bedrooms", "bathrooms",
         "roomType", "propertyName", "locationText", "furnished", "contactMethod",
         "imageUrls", "createdAt",
-        "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded",
+        "bedroomsNum", "city", "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded", "leaseMinMonths", "leaseMaxMonths",
         COUNT(*) OVER() AS total_count
       FROM "XhsRentalListing"
       WHERE
@@ -1772,6 +1780,8 @@ export async function searchXhsRentalListings({
       couplesOk: (row.couplesOk as boolean | null) ?? null,
       utilitiesIncluded: (row.utilitiesIncluded as boolean | null) ?? null,
       parkingIncluded: (row.parkingIncluded as boolean | null) ?? null,
+      leaseMinMonths: (row.leaseMinMonths as number | null) ?? null,
+      leaseMaxMonths: (row.leaseMaxMonths as number | null) ?? null,
     }));
 
     return { totalCount, results };

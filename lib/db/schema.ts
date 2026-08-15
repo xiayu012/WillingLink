@@ -265,6 +265,10 @@ export const xhsRentalListing = pgTable("XhsRentalListing", {
   utilitiesIncluded: boolean("utilitiesIncluded"),
   /** 是否有停车位 */
   parkingIncluded: boolean("parkingIncluded"),
+  /** 起租门槛（月）："一年起租"→12，"只接受长租"→6；null=未提及 */
+  leaseMinMonths: integer("leaseMinMonths"),
+  /** 最长可住（月）：转租窗口按日期折算，"仅限一个月短租"→1；null=无上限/未知 */
+  leaseMaxMonths: integer("leaseMaxMonths"),
   /**
    * SHA-256 of rawText (hex). Content-based deduplication for pending:uuid URLs.
    * Partial UNIQUE index at DB level (WHERE contentHash IS NOT NULL).

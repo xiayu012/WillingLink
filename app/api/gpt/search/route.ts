@@ -87,6 +87,7 @@ async function getSqlFallbackCandidates(
             "propertyName", "locationText", city,
             furnished, "contactMethod",
             "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded",
+            "leaseMinMonths", "leaseMaxMonths",
             "imageUrls", "createdAt"
           FROM "XhsRentalListing"
           WHERE id != ALL(${excludeIds}::uuid[])
@@ -102,6 +103,7 @@ async function getSqlFallbackCandidates(
             "propertyName", "locationText", city,
             furnished, "contactMethod",
             "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded",
+            "leaseMinMonths", "leaseMaxMonths",
             "imageUrls", "createdAt"
           FROM "XhsRentalListing"
           ORDER BY "createdAt" DESC
@@ -132,6 +134,8 @@ async function getSqlFallbackCandidates(
     couplesOk: (row.couplesOk as boolean | null) ?? null,
     utilitiesIncluded: (row.utilitiesIncluded as boolean | null) ?? null,
     parkingIncluded: (row.parkingIncluded as boolean | null) ?? null,
+    leaseMinMonths: (row.leaseMinMonths as number | null) ?? null,
+    leaseMaxMonths: (row.leaseMaxMonths as number | null) ?? null,
     imageUrls: Array.isArray(row.imageUrls) ? (row.imageUrls as string[]) : null,
     createdAt: row.createdAt as Date,
   }));

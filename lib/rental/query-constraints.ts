@@ -29,6 +29,7 @@ import {
   type FlexibleDate,
   parseFlexibleDate,
 } from "./date-availability";
+import { extractQueryLeaseRange, leaseConflict } from "./lease-duration";
 
 export type HardConstraints = {
   rentMin: number | null;
@@ -40,6 +41,10 @@ export type HardConstraints = {
   utilitiesIncluded: boolean | null;
   parkingIncluded: boolean | null;
   furnished: string | null;
+  /** 租客可接受的最短居住月数（"至少半年"→6）。null = 未表达。 */
+  leaseMonthsMin: number | null;
+  /** 租客可接受的最长居住月数（"短租3个月"→3）。null = 未表达。 */
+  leaseMonthsMax: number | null;
   /** Requested city (English or Chinese). Soft + neighbour-aware, never strict. */
   city: string | null;
   /** Neighbouring cities that also satisfy `city`. Empty when city is unset. */
@@ -57,6 +62,10 @@ export type ConstrainableRow = {
   parkingIncluded: boolean | null;
   furnished: string | null;
   city: string | null;
+  /** 房源起租门槛（月）："一年起租"→12。null = 未提取/未提及。 */
+  leaseMinMonths: number | null;
+  /** 房源最长可住（月）：转租窗口按日期折算。null = 无上限/未知。 */
+  leaseMaxMonths: number | null;
 };
 
 const EMPTY_MOVE_IN: FlexibleDate = { kind: "unknown" };
@@ -73,6 +82,8 @@ export function emptyConstraints(): HardConstraints {
     utilitiesIncluded: null,
     parkingIncluded: null,
     furnished: null,
+    leaseMonthsMin: null,
+    leaseMonthsMax: null,
     city: null,
     cityNeighbors: [],
   };
@@ -178,12 +189,15 @@ export function extractHardConstraints(
   ref: Date = new Date()
 ): HardConstraints {
   const { rentMin, rentMax } = extractBudget(query);
+  const lease = extractQueryLeaseRange(query);
   return {
     ...emptyConstraints(),
     rentMin,
     rentMax,
     bedroomsNum: extractBedrooms(query),
     moveIn: extractQueryDate(query, ref),
+    leaseMonthsMin: lease.leaseMinMonths,
+    leaseMonthsMax: lease.leaseMaxMonths,
   };
 }
 
@@ -253,6 +267,8 @@ export function constraintsFromParams(
     utilitiesIncluded: params.utilitiesIncluded ?? null,
     parkingIncluded: params.parkingIncluded ?? null,
     furnished: params.furnished ?? null,
+    leaseMonthsMin: nl.leaseMonthsMin,
+    leaseMonthsMax: nl.leaseMonthsMax,
     city,
     cityNeighbors: city ? neighborsOf(city) : [],
   };
@@ -269,6 +285,8 @@ export function hasAnyConstraint(c: HardConstraints): boolean {
     c.utilitiesIncluded != null ||
     c.parkingIncluded != null ||
     c.furnished != null ||
+    c.leaseMonthsMin != null ||
+    c.leaseMonthsMax != null ||
     c.city != null
   );
 }
@@ -317,6 +335,14 @@ export function rowViolates(
       c.moveIn,
       ref
     ) === "infeasible"
+  ) {
+    return true;
+  }
+  if (
+    leaseConflict(
+      { leaseMinMonths: row.leaseMinMonths, leaseMaxMonths: row.leaseMaxMonths },
+      { leaseMinMonths: c.leaseMonthsMin, leaseMaxMonths: c.leaseMonthsMax }
+    )
   ) {
     return true;
   }

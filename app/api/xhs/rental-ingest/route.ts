@@ -55,6 +55,8 @@ async function extractStructuredFieldsSafe(
       couplesOk: fields.couplesOk,
       utilitiesIncluded: fields.utilitiesIncluded,
       parkingIncluded: fields.parkingIncluded,
+      leaseMinMonths: fields.leaseMinMonths,
+      leaseMaxMonths: fields.leaseMaxMonths,
     });
     return true;
   } catch (error) {
