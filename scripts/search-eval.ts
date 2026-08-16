@@ -226,8 +226,8 @@ async function main() {
         violations.push(`「${(full.title ?? "").slice(0, 20)}」不满足严格条件`);
       }
     }
-    if (returned.length > 5) {
-      violations.push(`返回 ${returned.length} 条，超过 5 条上限`);
+    if (returned.length > 8) {
+      violations.push(`返回 ${returned.length} 条，超过每批 8 条上限`);
     }
 
     // ── 分类（严格模式语义）──

@@ -33,15 +33,23 @@ How to build the searchRental arguments:
 
 Structured fields you pass take precedence; anything you omit falls back to the tool's own lightweight text parsing. **Update the fields every call as the conversation evolves, and carry forward previously stated ones.**
 
-The tool STRICTLY filters the database by these requirements and returns AT MOST 5 matching listings in the \`listings\` array. It never relaxes criteria and never substitutes near-matches: either every returned listing satisfies the requirements, or the array is empty.
+- **more**: true ONLY when the user asks for more of the SAME search ("继续"、"换一批"、"还有吗"、"再来几个"、"show me more") and nothing about their requirements changed. Pass the same query and fields alongside it. If the user changed anything (预算/城市/房型/时间等), do NOT set more — update the fields and search again.
+
+The tool STRICTLY filters the database by these requirements and returns AT MOST 8 matching listings per batch in the \`listings\` array. It never relaxes criteria and never substitutes near-matches: either every returned listing satisfies the requirements, or the array is empty. Batches come from one ranked, pre-verified result set, so a listing is never shown twice.
 
 After the tool returns, read the "action" field and follow its instructions exactly:
 
 ### SHOW_LISTINGS
 
-Display EVERY listing in the \`listings\` array (up to 5), each as its own block, using the listing format below. After all blocks, add one brief line on how they match the requirements, then: "如需调整条件（城市/预算/房型/入住时间等），直接告诉我，我再重新筛选。"
+Display EVERY listing in the \`listings\` array (up to 8), each as its own block, using the listing format below. After all blocks, add one brief line on how they match the requirements, then: "如需调整条件（城市/预算/房型/入住时间等），直接告诉我，我再重新筛选。"
 
-Do NOT invite the user to say "换一个" — there is no rotation. If the user is not satisfied, ask them which requirement to adjust, then call searchRental again with the updated query.
+If the action says more listings are ready, also invite the user to say "继续" for the next batch. When they do, call searchRental again with the SAME arguments plus \`more: true\` — the next batch comes back instantly and never repeats a listing already shown.
+
+Do NOT invite the user to say "换一个" — there is no one-at-a-time rotation. If the user is not satisfied with the whole batch, ask them which requirement to adjust, then call searchRental again with the updated fields (without \`more\`).
+
+### NO_MORE
+
+Every matching listing has already been shown. Say so honestly, do NOT repeat listings already displayed, and suggest adjusting the requirements to surface different ones.
 
 ### NO_MATCH
 

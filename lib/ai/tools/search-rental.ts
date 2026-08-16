@@ -41,8 +41,9 @@
  *
  *   - Filter the WHOLE pool strictly by every requirement the user voiced
  *     (city exact, budget, bedrooms, move-in, pet/couple/utilities/parking).
- *   - Return the top ≤5 matches at once (reranked when Voyage is available,
- *     else most recent first).
+ *   - Rank all matches, verify the top-K once, and hand back ≤8 per batch
+ *     (reranked when Voyage is available, else most recent first). "继续/换一批"
+ *     slices the next 8 out of that same cached list — instant, never repeats.
  *   - If nothing satisfies everything → return an empty list and say so.
  *     No relaxation, no substitution, no rotation.
  * ─────────────────────────────────────────────────────────────────────────────
@@ -69,6 +70,11 @@ import {
   isOutOfBayQuery,
 } from "@/lib/rental/cities";
 import { listingLeaseFromText } from "@/lib/rental/lease-duration";
+import {
+  batchFingerprint,
+  loadBatchState,
+  saveBatchState,
+} from "@/lib/rental/result-batches";
 import {
   applyBlockTerms,
   applyHardConstraints,
@@ -471,7 +477,10 @@ async function findNextListing(
 /** Rollback switch: set SEARCH_LEGACY_PICK_ONE=1 to restore the legacy flow. */
 const LEGACY_PICK_ONE = process.env.SEARCH_LEGACY_PICK_ONE === "1";
 
-const STRICT_MAX_RESULTS = 5;
+const STRICT_MAX_RESULTS = 8; // 每批展示上限
+// 一次检索就把 top-K 排好序并整批终审，存进会话缓存，"继续/换一批" 直接切下一批：
+// 瞬间返回，且与已展示的天然不重复（同一份有序列表往后走）。
+const STRICT_BATCH_POOL = STRICT_MAX_RESULTS * 3;
 const STRICT_POOL_LIMIT = 1000; // whole table today (~750 rows)
 const STRICT_RERANK_CAP = 100; // rerank cost cap when many rows survive
 
@@ -888,7 +897,7 @@ async function findStrictListings(
     return { listings: [], totalMatched: 0, outOfBay: false, bottlenecks };
   }
 
-  if (matched.length <= STRICT_MAX_RESULTS) {
+  if (matched.length <= STRICT_BATCH_POOL) {
     return {
       listings: matched,
       totalMatched: matched.length,
@@ -897,15 +906,14 @@ async function findStrictListings(
     };
   }
 
-  // More than 5 qualify → order by relevance (Voyage rerank when available,
-  // most-recent-first otherwise) and cut to 5.
+  // 超过一次缓存量 → 按相关度排序（有 Voyage 用 rerank，否则按最新）取 top-K。
   const pool2 = matched.slice(0, STRICT_RERANK_CAP);
   if (process.env.VOYAGE_API_KEY) {
     try {
       const topIndices = await rerankDocuments(
         query,
         pool2.map((r) => r.rawText),
-        STRICT_MAX_RESULTS
+        STRICT_BATCH_POOL
       );
       if (topIndices.length > 0) {
         return {
@@ -922,7 +930,7 @@ async function findStrictListings(
     }
   }
   return {
-    listings: matched.slice(0, STRICT_MAX_RESULTS),
+    listings: matched.slice(0, STRICT_BATCH_POOL),
     totalMatched: matched.length,
     outOfBay: false,
     bottlenecks: [],
@@ -930,11 +938,59 @@ async function findStrictListings(
 }
 
 /**
- * Strict-mode tool: returns a `listings` ARRAY (≤5) with no relaxation and no
- * per-session rotation. The calling chat model is the query-understanding
- * layer: it passes normalized structured constraints (city from neighborhood
- * knowledge, numeric budget, bedrooms, booleans) alongside the free-text
- * query; regex NL extraction only fills whatever it omits.
+ * "继续/换一批"：从上一轮已排序、已终审的结果里切下一批。命中缓存时不查库、
+ * 不调 LLM，且与已展示的房源天然不重复。缓存缺失/耗尽时返回 null，由调用方
+ * 决定退回完整搜索还是如实告知没有更多。
+ */
+async function serveNextBatch(chatId: string, fingerprint: string) {
+  const state = await loadBatchState(chatId);
+  // 指纹不符 = 用户其实改了条件（模型仍传了 more）→ 不能续用旧排序，重新搜。
+  if (!state || state.fingerprint !== fingerprint) {
+    return null;
+  }
+  const batch = state.listings.slice(
+    state.offset,
+    state.offset + STRICT_MAX_RESULTS
+  );
+  if (batch.length === 0) {
+    const shown = state.offset;
+    return {
+      listings: [],
+      totalMatched: state.totalMatched,
+      remainingInBatchCache: 0,
+      action:
+        `NO_MORE: 已按相关度展示完 ${shown} 个符合要求的房源` +
+        (state.totalMatched > shown
+          ? `（严格筛选共命中 ${state.totalMatched} 个，其余相关度较低）。如实告诉用户已展示完最相关的这些，建议补充或调整条件（预算/城市/房型/入住时间）再搜，以便挑出更贴近的房源。`
+          : "，这就是数据库里全部符合要求的房源。如实告诉用户没有更多了，建议调整条件再搜。") +
+        "不要重复展示已经给过的房源，也不要编造。",
+    };
+  }
+  await saveBatchState(chatId, {
+    ...state,
+    offset: state.offset + batch.length,
+  });
+  const remaining = state.listings.length - (state.offset + batch.length);
+  return {
+    listings: batch,
+    totalMatched: state.totalMatched,
+    remainingInBatchCache: remaining,
+    action:
+      `SHOW_LISTINGS: 这是同一次搜索的下一批，共 ${batch.length} 个（与之前展示过的不重复）。` +
+      "把 listings 数组里的每一个房源都完整展示出来（标准格式），不要遗漏、不要编造。" +
+      (remaining > 0
+        ? `展示完后告诉用户还可以继续说"继续"（还有 ${remaining} 个）。`
+        : "这是最后一批，展示完告知用户已经没有更多了。"),
+  };
+}
+
+/**
+ * Strict-mode tool: returns a `listings` ARRAY (≤8 per batch) with no
+ * relaxation. The calling chat model is the query-understanding layer: it
+ * passes normalized structured constraints (city from neighborhood knowledge,
+ * numeric budget, bedrooms, booleans) alongside the free-text query; regex NL
+ * extraction only fills whatever it omits. "继续/换一批" is served from the
+ * session batch cache (see serveNextBatch), never by re-searching.
  */
 function createStrictSearchRentalTool(chatId: string) {
   return tool({
@@ -1035,13 +1091,35 @@ function createStrictSearchRentalTool(chatId: string) {
           "Keywords that disqualify a listing if found in its text (hard negative constraints). " +
             "Carry forward across turns. Include both Chinese and English variants."
         ),
+      more: z
+        .boolean()
+        .optional()
+        .describe(
+          "true ONLY when the user asks for MORE of the same search ('继续', '换一批', " +
+            "'还有吗', 'show me more') and the requirements have NOT changed. " +
+            "Serves the next batch from the already-ranked result set instantly — " +
+            "never repeats a listing already shown. If anything about the " +
+            "requirements changed, omit it and pass the updated fields instead."
+        ),
     }),
-    execute: async ({ query, mustNotContain, ...params }) => {
+    execute: async ({ query, mustNotContain, more, ...params }) => {
       const startedAt = Date.now();
       try {
         const blockTerms = (mustNotContain ?? [])
           .map((t) => t.trim().toLowerCase())
           .filter((t) => t.length > 0);
+
+        const fingerprint = batchFingerprint(query, params, blockTerms);
+
+        // "继续/换一批"：直接从上一轮排好序、终审过的结果里切下一批。
+        // 不查库、不调 LLM，且不可能与已展示的重复。
+        if (more) {
+          const nextBatch = await serveNextBatch(chatId, fingerprint);
+          if (nextBatch) {
+            return nextBatch;
+          }
+          // 缓存缺失/过期，或条件其实变了 → 退回一次完整搜索。
+        }
 
         const result = await findStrictListings(query, blockTerms, params);
 
@@ -1131,16 +1209,31 @@ function createStrictSearchRentalTool(chatId: string) {
           };
         }
 
-        return {
+        // 整份终审结果存进会话缓存，本轮只展示第一批；"继续/换一批" 从这里
+        // 顺序切下去，不会重复也不必重搜。
+        const batch = kept.slice(0, STRICT_MAX_RESULTS);
+        await saveBatchState(chatId, {
+          fingerprint,
+          query,
           listings: kept,
+          offset: batch.length,
           totalMatched: result.totalMatched,
+        });
+
+        return {
+          listings: batch,
+          totalMatched: result.totalMatched,
+          remainingInBatchCache: kept.length - batch.length,
           verifierCutCount: cut.length,
           action:
-            `SHOW_LISTINGS: 找到 ${kept.length} 个严格符合要求的房源` +
-            (result.totalMatched > kept.length
-              ? `（共 ${result.totalMatched} 个通过硬性筛选，已按相关度与复核取前 ${kept.length} 个）`
+            `SHOW_LISTINGS: 找到 ${batch.length} 个严格符合要求的房源` +
+            (result.totalMatched > batch.length
+              ? `（共 ${result.totalMatched} 个通过硬性筛选，已按相关度与复核排序）`
               : "") +
-            "。把 listings 数组里的每一个房源都完整展示出来（标准格式），不要遗漏、不要编造。",
+            "。把 listings 数组里的每一个房源都完整展示出来（标准格式），不要遗漏、不要编造。" +
+            (kept.length > batch.length
+              ? `展示完后告诉用户还可以说"继续"看下一批（还有 ${kept.length - batch.length} 个已备好）。`
+              : ""),
         };
       } catch (error) {
         console.error("[searchRental] strict tool error:", error);

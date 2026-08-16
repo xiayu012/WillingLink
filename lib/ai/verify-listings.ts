@@ -146,10 +146,35 @@ function applyVerdict(
   return { kept, cut };
 }
 
+/** 单次调用的候选上限——超过就分块并行，避免长输入拖慢首屏。 */
+const VERIFY_CHUNK_SIZE = 8;
+
 /**
- * 一次 LLM 调用终审全部候选（≤5 条）。任何失败都 fail-open 原样放行。
+ * 终审一次检索备好的全部候选（top-K，目前 24 条）。整批一起审而不是每批一次，
+ * 是为了让"继续/换一批"能直接从缓存瞬间出下一批；超过一块就**并行**发多次
+ * 调用，总 token 不变而延迟只等最慢的一块（串行 24 条要 14s，并行约 5s）。
+ * 任何失败都 fail-open 原样放行。
  */
 export async function verifyListingsAgainstQuery(
+  query: string,
+  listings: XhsRentalSearchResultRow[]
+): Promise<VerifierResult> {
+  if (listings.length <= VERIFY_CHUNK_SIZE) {
+    return await verifyChunk(query, listings);
+  }
+  const chunks: XhsRentalSearchResultRow[][] = [];
+  for (let i = 0; i < listings.length; i += VERIFY_CHUNK_SIZE) {
+    chunks.push(listings.slice(i, i + VERIFY_CHUNK_SIZE));
+  }
+  const results = await Promise.all(chunks.map((c) => verifyChunk(query, c)));
+  // 分块顺序即原顺序，flatMap 后相关度排序保持不变。
+  return {
+    kept: results.flatMap((r) => r.kept),
+    cut: results.flatMap((r) => r.cut),
+  };
+}
+
+async function verifyChunk(
   query: string,
   listings: XhsRentalSearchResultRow[]
 ): Promise<VerifierResult> {
