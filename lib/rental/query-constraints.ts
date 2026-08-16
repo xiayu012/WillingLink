@@ -98,6 +98,41 @@ const CN_NUMERALS: Record<string, number> = {
   五: 5,
 };
 
+// ── 偏好/备选上下文守卫 ──────────────────────────────────────────────────────
+// 硬筛选只接受硬性要求。"Studio（最优先）"、"最好有车位"、"1b1b或studio都行"
+// 这类带优先级/备选/弹性的提法不是可证明的硬约束——落在这种上下文里的匹配
+// 一律不产生过滤，偏好交给语义 rerank 与 LLM 终审去体现。
+const SOFT_CONTEXT_RE =
+  /最优先|优先|首选|其次|备选|最好|最理想|理想|prefer|ideal|都可|都行|均可|皆可|或/i;
+const SOFT_WINDOW = 14;
+
+function inSoftContext(query: string, index: number, length: number): boolean {
+  const ctx = query.slice(
+    Math.max(0, index - SOFT_WINDOW),
+    index + length + SOFT_WINDOW
+  );
+  return SOFT_CONTEXT_RE.test(ctx);
+}
+
+/** re 在 query 里是否存在一次不落在偏好上下文中的（=硬性的）命中。 */
+function hasHardMention(query: string, re: RegExp): boolean {
+  const g = new RegExp(
+    re.source,
+    re.flags.includes("g") ? re.flags : `${re.flags}g`
+  );
+  let m: RegExpExecArray | null = g.exec(query);
+  while (m) {
+    if (!inSoftContext(query, m.index, m[0].length)) {
+      return true;
+    }
+    if (m.index === g.lastIndex) {
+      g.lastIndex++;
+    }
+    m = g.exec(query);
+  }
+  return false;
+}
+
 const PLAUSIBLE_RENT_MIN = 300;
 const PLAUSIBLE_RENT_MAX = 15_000;
 
@@ -152,30 +187,52 @@ export function extractBudget(query: string): {
   return { rentMin: null, rentMax: null };
 }
 
-/** Extract a requested bedroom count (studio = 0). Returns null if unstated. */
-export function extractBedrooms(query: string): number | null {
-  const clamp = (n: number): number | null => (n >= 0 && n <= 5 ? n : null);
-
+// 房型候选提取器（全局扫描）。"单间"故意不映射 studio——那是"合租房里的
+// 一间"，不是对整套户型的硬要求。
+const BEDROOM_MATCHERS: {
+  re: RegExp;
+  toValue: (m: RegExpExecArray) => number;
+}[] = [
   // "2b2b" / "2B1B" shorthand → first number is bedrooms (avoids matching bath)
-  let m = query.match(/(\d)\s*b\s*\d\s*b/i);
-  if (m) return clamp(Number(m[1]));
-
+  { re: /(\d)\s*b\s*\d\s*b/gi, toValue: (m) => Number(m[1]) },
   // "2 bedroom" / "2bed" / "2br"
-  m = query.match(/(\d)\s*(?:bed(?:room)?s?|br)\b/i);
-  if (m) return clamp(Number(m[1]));
-
-  // Chinese digit + 室/房/居/卧 (厅 deliberately excluded)
-  m = query.match(/(\d)\s*(?:室|房|居|卧)/);
-  if (m) return clamp(Number(m[1]));
-
+  { re: /(\d)\s*(?:bed(?:room)?s?|br)\b/gi, toValue: (m) => Number(m[1]) },
+  // digit + 室/房/居/卧 (厅 deliberately excluded)
+  { re: /(\d)\s*(?:室|房|居|卧)/g, toValue: (m) => Number(m[1]) },
   // Chinese numeral + 室/房/居/卧
-  m = query.match(/([一两二三四五])\s*(?:室|房|居|卧)/);
-  if (m) return clamp(CN_NUMERALS[m[1]] ?? Number.NaN);
+  {
+    re: /([一两二三四五])\s*(?:室|房|居|卧)/g,
+    toValue: (m) => CN_NUMERALS[m[1]] ?? Number.NaN,
+  },
+  { re: /\bstudio\b|开间/gi, toValue: () => 0 },
+];
 
-  // Studio
-  if (/\bstudio\b|单间|开间/i.test(query)) return 0;
-
-  return null;
+/**
+ * Extract a requested bedroom count (studio = 0). Returns null if unstated.
+ *
+ * 只在"表达唯一且非偏好"时才构成硬约束：落在偏好上下文里的提法
+ * （"Studio（最优先）"）被忽略；剩余候选值不唯一（"studio或1b1b"）说明
+ * 用户接受多种 → 不过滤，让 rerank/终审体现偏好。
+ */
+export function extractBedrooms(query: string): number | null {
+  const values = new Set<number>();
+  for (const { re, toValue } of BEDROOM_MATCHERS) {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null = re.exec(query);
+    while (m) {
+      if (!inSoftContext(query, m.index, m[0].length)) {
+        const n = toValue(m);
+        if (Number.isFinite(n) && n >= 0 && n <= 5) {
+          values.add(n);
+        }
+      }
+      if (m.index === re.lastIndex) {
+        re.lastIndex++;
+      }
+      m = re.exec(query);
+    }
+  }
+  return values.size === 1 ? [...values][0] : null;
 }
 
 /**
@@ -217,7 +274,8 @@ const PARKING_RE = /停车|车位|parking/i;
 /**
  * Recover boolean lifestyle requirements from a free-text query.
  * Only `true` (explicitly required) or null (unstated / negated) — a tenant
- * saying "不养宠物" does not require a pet-banning listing.
+ * saying "不养宠物" does not require a pet-banning listing. 落在偏好上下文的
+ * 提法（"最好有车位"）同样不构成硬约束。
  */
 export function extractBooleanPrefs(query: string): {
   petFriendly: boolean | null;
@@ -227,11 +285,15 @@ export function extractBooleanPrefs(query: string): {
 } {
   return {
     petFriendly:
-      !PET_NEG_RE.test(query) && PET_POS_RE.test(query) ? true : null,
-    couplesOk: COUPLE_RE.test(query) ? true : null,
-    utilitiesIncluded: UTIL_RE.test(query) ? true : null,
+      !PET_NEG_RE.test(query) && hasHardMention(query, PET_POS_RE)
+        ? true
+        : null,
+    couplesOk: hasHardMention(query, COUPLE_RE) ? true : null,
+    utilitiesIncluded: hasHardMention(query, UTIL_RE) ? true : null,
     parkingIncluded:
-      !PARKING_NEG_RE.test(query) && PARKING_RE.test(query) ? true : null,
+      !PARKING_NEG_RE.test(query) && hasHardMention(query, PARKING_RE)
+        ? true
+        : null,
   };
 }
 

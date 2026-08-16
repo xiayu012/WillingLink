@@ -151,6 +151,16 @@ export function detectCityStrict(text: string): CityEntry | null {
 }
 
 /**
+ * 查询里提到的所有不同城市（先中和"湾区"短语）。严格搜索用它区分
+ * "只说了一个城市"（硬约束）和"列了多个备选"（弹性，不做硬过滤——
+ * 用哪个城市由 rerank/终审按用户原文把握）。
+ */
+export function detectCities(text: string): CityEntry[] {
+  const neutralized = text.replace(BAY_AREA_PHRASE_RE, " ");
+  return CITY_TABLE.filter((entry) => entry.re.test(neutralized));
+}
+
+/**
  * The ≤3 neighbouring cities for a city named in English or Chinese.
  * Returns [] when the city isn't in the table (unknown → no expansion).
  */

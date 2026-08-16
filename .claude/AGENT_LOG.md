@@ -8,7 +8,61 @@
 
 ---
 
-## 2026-08-15（二） · 路线 C：查询时 LLM 终审（verifier）
+## 2026-08-15（三） · 治本：偏好不得成为硬约束 + 空结果必须说得出原因
+
+用户报的 case：求租帖写"房型优先级：1. Studio（最优先）2. 合租，最好有独立
+卫浴……短租长租都可"，系统答"数据库没有"，但库里明明有大量合租房源。
+根因是**优先级/备选表达被当成死命令**：`extractBedrooms` 见到 `studio` 就返回
+0，把所有非 studio 行筛光。用户要求"治本，不只针对这个例子"。
+
+### 1. 根因抽象（改这块前先对齐）
+
+严格筛选此前隐含一个错误前提：**从查询里抽出来的信号 = 硬性要求**。真实用户
+语言里大量是"最优先/最好/其次/或者/都可以"这类**偏好与备选**，它们不是可证明
+的硬约束。一个偏好被误当硬条件，就会把用户明明接受的房源全部筛掉——表现为
+"库里有但说没有"。**新规则：偏好永不进入硬筛选，只由 rerank 与终审体现。**
+
+### 2. 三层一起改（缺一层就漏）
+
+- **聊天 LLM（生产主路径）** `prompts.ts` STRICT 段最前面加了"硬性要求 vs
+  偏好"总规则 + 四个反例；`search-rental.ts` 里 city/bedroomsNum/parking 的
+  参数描述同步注明"列了备选/说'最好'就不要填"。
+- **正则兜底** `query-constraints.ts`：新增 `SOFT_CONTEXT_RE` + `inSoftContext`
+  （命中点前后 14 字符窗口内出现优先/最好/或/都可 等词 → 该次命中作废）与
+  `hasHardMention`。`extractBedrooms` 改为**全局扫描收集候选值**：候选去重后
+  **只有唯一值才构成约束**（"studio或1b1b" → null）；`extractBooleanPrefs`
+  四个布尔全部走 `hasHardMention`（"最好有车位" 不再是硬条件）。
+  另：`单间` 不再映射 studio=0（那是合租房里的一间，不是整套户型要求）。
+- **城市** `cities.ts` 新增 `detectCities`（复数）；strict 谓词只在查询提到
+  **恰好一个**城市时才硬锁城市，列了多个备选（"Palo Alto / Menlo Park / MTV"）
+  不过滤。副作用修好一个老问题："旧金山湾区找房"以前被硬锁成 San Francisco，
+  现在按湾区全域处理。
+
+### 3. 另一半：空结果必须说得出原因（否则永远在打地鼠）
+
+即使规则修好了，将来任何一个条件过严仍会回到"静默说没有"。所以给两条空结果
+路径都加了如实解释，**严格契约不变（绝不返回近似房源）**：
+
+- **硬筛选筛空** → `buildStrictPredicate` 新增可选第三参 `omit: StrictField`
+  与返回值 `active: StrictField[]`；`findStrictListings` 在 matched=0 时逐个
+  "只放宽这一条"重跑谓词，算出 `bottlenecks: [{field,label,wouldMatch}]`。
+  纯内存过滤（≤9 次 × ~800 行），零额外 LLM/DB 成本。NO_MATCH 的 action 里
+  直接写"放宽「房型」→ 29 个"，并 `console.log("[searchRental] no match,
+  bottlenecks")` 进 Vercel log。**评测调用 `buildStrictPredicate(query)` 的
+  一参签名保持兼容，谓词语义零漂移。**
+- **终审剔空**（谓词有结果、被 verifier 全剔）→ 返回 `cutReasons`（标题+理由），
+  action 变成"有 N 个通过硬性条件但复核发现矛盾，用 cutReasons 说明各自卡在
+  哪"。这条以前完全没有解释，用户只看到"没有"。
+
+### 4. 验证
+
+- 提取器回归 18/18：`房型优先级：1. Studio（最优先）2. 合租`→null、
+  `1b1b或者studio都可以`→null、`最好有车位`→null，同时
+  `圣何塞两室一厅`→2、`找个studio`→0、`要有车位`→true 全部保持不变。
+- 用户原 case：修前 0 条（totalMatched=0），修后 totalMatched=27、返回 2 条。
+- 瓶颈诊断实测：聊天层误传 bedroomsNum=0 时，输出"放宽「城市」→108；
+  放宽「房型」→29"——即便上游再犯错，用户也能立刻知道卡在哪。
+- 门禁见下一节数字（本节改动后重跑）。
 
 用户报告隐含推理失败的典型 case：两个朋友要整租 2B2B，返回了"2b2b 里空出
 一间、神仙室友继续住"的合租帖——结构化列（bedroomsNum=2）全部通过，但言下

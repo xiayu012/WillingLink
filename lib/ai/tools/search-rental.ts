@@ -63,6 +63,7 @@ import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
 import {
   type CityEntry,
   cityAliases,
+  detectCities,
   detectCity,
   detectCityStrict,
   isOutOfBayQuery,
@@ -666,6 +667,37 @@ function isNonRentalRow(row: XhsRentalSearchResultRow): boolean {
  * means Sunnyvale — knowledge no regex table can carry. Regex NL extraction
  * remains the fallback for anything the model omits.
  */
+/** 严格谓词里可以单独放宽的约束维度。 */
+export type StrictField =
+  | "city"
+  | "rent"
+  | "bedrooms"
+  | "lease"
+  | "moveIn"
+  | "petFriendly"
+  | "couplesOk"
+  | "utilitiesIncluded"
+  | "parkingIncluded";
+
+const BOOL_FIELDS = [
+  "petFriendly",
+  "couplesOk",
+  "utilitiesIncluded",
+  "parkingIncluded",
+] as const;
+
+const FIELD_LABEL: Record<StrictField, string> = {
+  city: "城市",
+  rent: "预算",
+  bedrooms: "房型",
+  lease: "租期",
+  moveIn: "入住时间",
+  petFriendly: "宠物友好",
+  couplesOk: "情侣入住",
+  utilitiesIncluded: "包水电",
+  parkingIncluded: "车位",
+};
+
 export type StrictSearchParams = {
   city?: string | null;
   rentMin?: number | null;
@@ -694,46 +726,92 @@ export type StrictSearchParams = {
  */
 export function buildStrictPredicate(
   query: string,
-  params: StrictSearchParams = {}
+  params: StrictSearchParams = {},
+  omit: StrictField | null = null
 ): {
   city: CityEntry | null;
+  /** 实际生效的约束维度——零结果时逐个试放宽，定位瓶颈。 */
+  active: StrictField[];
   matches: (row: XhsRentalSearchResultRow) => boolean;
 } {
   // City: LLM-normalized param wins; resolve it through CITY_TABLE so aliases
   // and text-detection fallbacks keep working. A param city NOT in the table
   // (e.g. "Tracy") degrades to a soft, column-only match via rowViolates.
+  // NL 兜底只在查询提到恰好一个城市时才构成硬约束——列了多个备选
+  // （"Palo Alto / Menlo Park / MTV"）说明用户接受多地，不做硬过滤。
   const paramCity = params.city?.trim() || null;
-  const city = paramCity
+  const queryCities = paramCity ? [] : detectCities(query);
+  const namedCity = paramCity
     ? (detectCity(paramCity) ?? null)
-    : detectCity(query);
-  const unknownCity = paramCity && !city ? paramCity : null;
+    : queryCities.length === 1
+      ? queryCities[0]
+      : null;
+  const namedUnknownCity = paramCity && !namedCity ? paramCity : null;
 
   const nl = extractHardConstraints(query);
   const nlBool = extractBooleanPrefs(query);
-  const boolPrefs = {
+  const rentMin = params.rentMin ?? nl.rentMin;
+  const rentMax = params.rentMax ?? nl.rentMax;
+  const bedroomsNum = params.bedroomsNum ?? nl.bedroomsNum;
+  const leaseMin = params.leaseMonthsMin ?? nl.leaseMonthsMin;
+  const leaseMax = params.leaseMonthsMax ?? nl.leaseMonthsMax;
+  const bools = {
     petFriendly: params.petFriendly ?? nlBool.petFriendly,
     couplesOk: params.couplesOk ?? nlBool.couplesOk,
     utilitiesIncluded: params.utilitiesIncluded ?? nlBool.utilitiesIncluded,
     parkingIncluded: params.parkingIncluded ?? nlBool.parkingIncluded,
   };
+
+  const active: StrictField[] = [];
+  if (namedCity || namedUnknownCity) {
+    active.push("city");
+  }
+  if (rentMin != null || rentMax != null) {
+    active.push("rent");
+  }
+  if (bedroomsNum != null) {
+    active.push("bedrooms");
+  }
+  if (leaseMin != null || leaseMax != null) {
+    active.push("lease");
+  }
+  if (nl.moveIn.kind !== "unknown") {
+    active.push("moveIn");
+  }
+  for (const key of BOOL_FIELDS) {
+    if (bools[key] === true) {
+      active.push(key);
+    }
+  }
+
+  const kept = (f: StrictField): boolean => omit !== f;
+  const city = kept("city") ? namedCity : null;
+  const boolPrefs = {
+    petFriendly: kept("petFriendly") ? bools.petFriendly : null,
+    couplesOk: kept("couplesOk") ? bools.couplesOk : null,
+    utilitiesIncluded: kept("utilitiesIncluded") ? bools.utilitiesIncluded : null,
+    parkingIncluded: kept("parkingIncluded") ? bools.parkingIncluded : null,
+  };
   // Boolean prefs are handled separately (text fallback), so null them out of
   // the rowViolates constraint set.
   const coreConstraints = {
     ...nl,
-    rentMin: params.rentMin ?? nl.rentMin,
-    rentMax: params.rentMax ?? nl.rentMax,
-    bedroomsNum: params.bedroomsNum ?? nl.bedroomsNum,
-    leaseMonthsMin: params.leaseMonthsMin ?? nl.leaseMonthsMin,
-    leaseMonthsMax: params.leaseMonthsMax ?? nl.leaseMonthsMax,
+    rentMin: kept("rent") ? rentMin : null,
+    rentMax: kept("rent") ? rentMax : null,
+    bedroomsNum: kept("bedrooms") ? bedroomsNum : null,
+    leaseMonthsMin: kept("lease") ? leaseMin : null,
+    leaseMonthsMax: kept("lease") ? leaseMax : null,
+    moveIn: kept("moveIn") ? nl.moveIn : { kind: "unknown" as const },
     petFriendly: null,
     couplesOk: null,
     utilitiesIncluded: null,
     parkingIncluded: null,
-    city: unknownCity,
+    city: kept("city") ? namedUnknownCity : null,
     cityNeighbors: [],
   };
   return {
     city,
+    active,
     matches: (raw) => {
       if (isNonRentalRow(raw) || listingOutOfBay(raw)) return false;
       const row = withRecoveredFields(raw);
@@ -744,11 +822,18 @@ export function buildStrictPredicate(
   };
 }
 
+/**
+ * 零结果时"只放宽这一条就能匹配到的房源数"。用于如实告诉用户是哪个条件
+ * 卡住了——绝不自动放宽、绝不用近似房源替代（严格契约不变）。
+ */
+type Bottleneck = { field: StrictField; label: string; wouldMatch: number };
+
 type StrictSearchResult = {
   listings: XhsRentalSearchResultRow[];
   /** How many rows satisfied every requirement (before the ≤5 cut). */
   totalMatched: number;
   outOfBay: boolean;
+  bottlenecks: Bottleneck[];
 };
 
 /**
@@ -768,10 +853,10 @@ async function findStrictListings(
     isOutOfBayQuery(query) ||
     (params.city && !detectCity(params.city) && NON_BAY_LISTING_RE.test(params.city))
   ) {
-    return { listings: [], totalMatched: 0, outOfBay: true };
+    return { listings: [], totalMatched: 0, outOfBay: true, bottlenecks: [] };
   }
 
-  const { matches } = buildStrictPredicate(query, params);
+  const { matches, active } = buildStrictPredicate(query, params);
 
   // Pool: the most recent STRICT_POOL_LIMIT rows — the whole table today
   // (~750). All strictness is enforced in the app layer via the shared
@@ -784,8 +869,32 @@ async function findStrictListings(
 
   const matched = applyBlockTerms(pool.filter(matches), blockTerms);
 
+  // 零结果时定位瓶颈：逐个"只放宽这一条"重跑谓词，看各自能解锁多少房源。
+  // 纯内存过滤（≤9 次 × ~800 行），无额外 LLM / DB 成本。让"没有房源"永远
+  // 说得出原因——过严筛选不再静默失败。
+  if (matched.length === 0) {
+    const bottlenecks: Bottleneck[] = [];
+    for (const field of active) {
+      const relaxed = buildStrictPredicate(query, params, field);
+      const wouldMatch = applyBlockTerms(
+        pool.filter(relaxed.matches),
+        blockTerms
+      ).length;
+      if (wouldMatch > 0) {
+        bottlenecks.push({ field, label: FIELD_LABEL[field], wouldMatch });
+      }
+    }
+    bottlenecks.sort((a, b) => b.wouldMatch - a.wouldMatch);
+    return { listings: [], totalMatched: 0, outOfBay: false, bottlenecks };
+  }
+
   if (matched.length <= STRICT_MAX_RESULTS) {
-    return { listings: matched, totalMatched: matched.length, outOfBay: false };
+    return {
+      listings: matched,
+      totalMatched: matched.length,
+      outOfBay: false,
+      bottlenecks: [],
+    };
   }
 
   // More than 5 qualify → order by relevance (Voyage rerank when available,
@@ -805,6 +914,7 @@ async function findStrictListings(
             .filter((r): r is XhsRentalSearchResultRow => Boolean(r)),
           totalMatched: matched.length,
           outOfBay: false,
+          bottlenecks: [],
         };
       }
     } catch (err) {
@@ -815,6 +925,7 @@ async function findStrictListings(
     listings: matched.slice(0, STRICT_MAX_RESULTS),
     totalMatched: matched.length,
     outOfBay: false,
+    bottlenecks: [],
   };
 }
 
@@ -851,7 +962,8 @@ function createStrictSearchRentalTool(chatId: string) {
         .describe(
           "Standardized English Bay Area city name the user wants, resolved with your world knowledge: " +
             "'SOMA公寓' → 'San Francisco'; '在Moffett Park上班想住附近' → 'Sunnyvale'; '伯克利' → 'Berkeley'. " +
-            "Omit when the user named no location or only a broad region (南湾/东湾/湾区)."
+            "Omit when the user named no location, only a broad region (南湾/东湾/湾区), " +
+            "or listed multiple acceptable cities ('MTV或Sunnyvale都行' → omit)."
         ),
       rentMin: z
         .number()
@@ -872,7 +984,8 @@ function createStrictSearchRentalTool(chatId: string) {
         .optional()
         .describe(
           "Bedroom count of the UNIT the user wants (studio=0, 一室/1B1B=1, 两室/2B2B=2). " +
-            "For '想租2B2B里的一间' pass 2. Omit if unstated."
+            "For '想租2B2B里的一间' pass 2. HARD requirement only — omit when the user " +
+            "lists alternatives or preferences ('Studio最优先，合租也行' → omit)."
         ),
       petFriendly: z
         .boolean()
@@ -893,7 +1006,10 @@ function createStrictSearchRentalTool(chatId: string) {
         .boolean()
         .nullable()
         .optional()
-        .describe("true ONLY if the user requires parking (要车位/停车)."),
+        .describe(
+          "true ONLY if the user REQUIRES parking (要车位/停车). " +
+            "'最好有车位' is a preference — omit."
+        ),
       leaseMonthsMin: z
         .number()
         .int()
@@ -974,13 +1090,44 @@ function createStrictSearchRentalTool(chatId: string) {
           };
         }
 
+        // 终审剔空：硬性条件其实筛出了房源，是逐条复核后发现都与需求矛盾。
+        // 把理由如实交给模型转述，否则用户只看到"没有"，误以为库里没数据。
+        if (kept.length === 0 && result.listings.length > 0) {
+          return {
+            listings: [],
+            totalMatched: result.totalMatched,
+            verifierCutCount: cut.length,
+            cutReasons: cut.map((c) => ({ title: c.title, reason: c.reason })),
+            action:
+              `NO_MATCH: 有 ${result.totalMatched} 个房源通过了硬性条件（城市/预算/房型/租期等），` +
+              "但逐条复核后发现都与用户要求矛盾。绝不要展示这些房源。如实告诉用户没有完全符合的，" +
+              "并用 cutReasons 里的理由具体说明它们分别卡在哪（如超预算、只出租合租房里的一间、限男生），" +
+              "再问用户是否愿意放宽相应要求。",
+          };
+        }
+
         if (kept.length === 0) {
+          // 瓶颈是算出来的事实，不是让模型猜：直接告诉它放宽哪一条能解锁多少
+          // 房源。仍然不返回任何近似房源——严格契约不变。
+          const hint = result.bottlenecks
+            .map((b) => `放宽「${b.label}」→ ${b.wouldMatch} 个`)
+            .join("；");
+          if (result.bottlenecks.length > 0) {
+            console.log(
+              "[searchRental] no match, bottlenecks",
+              JSON.stringify({ query, bottlenecks: result.bottlenecks })
+            );
+          }
           return {
             listings: [],
             totalMatched: 0,
             verifierCutCount: cut.length,
+            bottlenecks: result.bottlenecks,
             action:
-              "NO_MATCH: 数据库中没有完全符合用户全部要求的房源。如实告诉用户没有找到，绝不要用近似房源代替。可以指出哪个条件（预算/城市/房型/入住时间等）可能过严，建议用户调整后再搜。",
+              "NO_MATCH: 数据库中没有完全符合用户全部要求的房源。如实告诉用户没有找到，绝不要用近似房源代替。" +
+              (hint
+                ? `已算出各条件的松紧程度（${hint}）——据此明确告诉用户是哪个条件卡住了、放宽后大约有多少房源，并询问是否要放宽它再搜。`
+                : "建议用户调整条件后再搜。"),
           };
         }
 
