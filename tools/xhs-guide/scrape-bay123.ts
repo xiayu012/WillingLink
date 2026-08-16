@@ -595,7 +595,8 @@ function canonicalThreadUrl(url: string): string {
 
 async function scrapeThreadLinks(
   page: Page,
-  maxPages: number
+  maxPages: number,
+  knownUrls: Set<string>
 ): Promise<ThreadCandidate[]> {
   const links = new Map<string, ThreadCandidate>();
 
@@ -627,14 +628,32 @@ async function scrapeThreadLinks(
           .filter((item) => item.title && item.url)
       );
 
+      const pageThreads: ThreadCandidate[] = [];
       for (const item of found) {
         const url = canonicalThreadUrl(item.url);
-        links.set(url, { title: item.title, url, board: board.label });
+        pageThreads.push({ title: item.title, url, board: board.label });
+      }
+
+      if (pageThreads.length === 0) {
+        console.log(`[bay123] ${board.label} 第 ${pageNo} 页: 无帖，停止翻页`);
+        break;
+      }
+
+      const newOnPage = pageThreads.filter((item) => !knownUrls.has(item.url));
+      for (const item of newOnPage) {
+        links.set(item.url, item);
       }
 
       console.log(
-        `[bay123] ${board.label} 第 ${pageNo} 页: +${found.length}（累计 ${links.size}）`
+        `[bay123] ${board.label} 第 ${pageNo} 页: 列表${pageThreads.length} 新${newOnPage.length}（累计新帖 ${links.size}）`
       );
+
+      // 整页 URL 都已入库：后面更旧，停止该版翻页。单条顶帖夹在新帖中间不会误停。
+      if (newOnPage.length === 0) {
+        console.log(`[bay123] ${board.label} 整页已入库，停止翻页`);
+        break;
+      }
+
       await sleep(REQUEST_DELAY_MS);
     }
   }
@@ -738,17 +757,6 @@ async function main() {
     const context = await browser.newContext();
     const page = await context.newPage();
 
-    console.log("[bay123] 正在抓取列表页链接...");
-    const allThreads = await scrapeThreadLinks(page, options.maxPages);
-    const threads = allThreads.slice(0, options.maxThreads);
-    if (allThreads.length > threads.length) {
-      console.log(
-        `[bay123] 候选 ${allThreads.length} 条，按上限截断到 ${threads.length} 条（--max-threads 可调）`
-      );
-    } else {
-      console.log(`[bay123] 找到候选帖子 ${threads.length} 条`);
-    }
-
     const existingRows = (await sql`
       select
         "id",
@@ -787,6 +795,21 @@ async function main() {
       existingBySourceUrl.set(row.sourceUrl, row.id);
     }
     console.log(`[bay123] 已有库存 ${existingRows.length} 条，用于去重`);
+
+    console.log("[bay123] 正在抓取列表页链接...");
+    const allThreads = await scrapeThreadLinks(
+      page,
+      options.maxPages,
+      new Set(existingBySourceUrl.keys())
+    );
+    const threads = allThreads.slice(0, options.maxThreads);
+    if (allThreads.length > threads.length) {
+      console.log(
+        `[bay123] 候选 ${allThreads.length} 条，按上限截断到 ${threads.length} 条（--max-threads 可调）`
+      );
+    } else {
+      console.log(`[bay123] 找到候选帖子 ${threads.length} 条`);
+    }
 
     const mergeImagesAndPostedAt = async (
       listingId: string,

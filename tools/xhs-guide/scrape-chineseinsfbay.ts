@@ -528,7 +528,10 @@ async function uploadImageUrls(
   return uploaded;
 }
 
-async function scrapeThreadLinks(maxPages: number): Promise<ThreadCandidate[]> {
+async function scrapeThreadLinks(
+  maxPages: number,
+  knownUrls: Set<string>
+): Promise<ThreadCandidate[]> {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -541,17 +544,21 @@ async function scrapeThreadLinks(maxPages: number): Promise<ThreadCandidate[]> {
     await page.waitForTimeout(1000);
 
     const candidates = await page.evaluate(() => {
-      const anchors = Array.from(
-        document.querySelectorAll<HTMLAnchorElement>("a[href]")
+      const cards = Array.from(
+        document.querySelectorAll<HTMLElement>(".topic_list_detail")
       );
       const out: Array<{ title: string; url: string }> = [];
-      for (const anchor of anchors) {
-        const href = anchor.href ?? "";
-        if (!href.includes("page_viewtopic")) {
+      for (const card of cards) {
+        // 列表开头的持续置顶帖（span.sticky），不是按时间排的新帖
+        if (card.querySelector("span.sticky")) {
           continue;
         }
-        const title = (anchor.textContent ?? "").trim();
-        if (!title) {
+        const anchor = card.querySelector<HTMLAnchorElement>(
+          "a.title[href], a[href*='page_viewtopic']"
+        );
+        const href = anchor?.href ?? "";
+        const title = (anchor?.textContent ?? "").trim();
+        if (!href.includes("page_viewtopic") || !title) {
           continue;
         }
         out.push({ title, url: href });
@@ -559,8 +566,25 @@ async function scrapeThreadLinks(maxPages: number): Promise<ThreadCandidate[]> {
       return out;
     });
 
-    for (const candidate of candidates) {
+    if (candidates.length === 0) {
+      console.log(`[scrape] 第 ${currentPage} 页: 无普通帖，停止翻页`);
+      break;
+    }
+
+    const newOnPage = candidates.filter(
+      (candidate) => !knownUrls.has(candidate.url)
+    );
+    for (const candidate of newOnPage) {
       links.set(candidate.url, candidate);
+    }
+
+    console.log(
+      `[scrape] 第 ${currentPage} 页: 列表${candidates.length} 新${newOnPage.length}（累计新帖 ${links.size}）`
+    );
+
+    if (newOnPage.length === 0) {
+      console.log("[scrape] 整页已入库，停止翻页");
+      break;
     }
   }
 
@@ -650,10 +674,6 @@ async function main() {
       add column if not exists "postedAt" timestamptz
     `;
 
-    console.log("[scrape] 正在抓取列表页链接...");
-    const threads = await scrapeThreadLinks(MAX_PAGES);
-    console.log(`[scrape] 找到候选帖子 ${threads.length} 条`);
-
     const existingRows = (await sql`
       select
         "id",
@@ -696,6 +716,13 @@ async function main() {
       existingBySourceUrl.set(row.sourceUrl, row.id);
     }
 
+    console.log("[scrape] 正在抓取列表页链接...");
+    const threads = await scrapeThreadLinks(
+      MAX_PAGES,
+      new Set(existingBySourceUrl.keys())
+    );
+    console.log(`[scrape] 找到候选帖子 ${threads.length} 条`);
+
     const mergeImagesAndMaybePostedAt = async (
       listingId: string,
       uploaded: string[],
@@ -724,6 +751,13 @@ async function main() {
 
     for (let index = 0; index < threads.length; index += 1) {
       const candidate = threads[index];
+      if (existingBySourceUrl.has(candidate.url)) {
+        console.log(
+          `[scrape] (${index + 1}/${threads.length}) skip(URL已入库): ${candidate.url}`
+        );
+        deduped += 1;
+        continue;
+      }
       console.log(`[scrape] (${index + 1}/${threads.length}) ${candidate.url}`);
 
       let title = candidate.title;
