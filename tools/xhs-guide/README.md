@@ -43,6 +43,31 @@ pnpm xhs:verify-geo-index
 - 高亮右下角 `复制正文` 按钮；点击后复制纯正文。
 - 若 `ingest.enable` 为 true 且填了 `ingest.baseUrl`，复制成功后会 `POST /api/xhs/rental-ingest`（无鉴权）。Body 至少含 `pageUrl`（或 `sourceUrl`）与 `rawText`；其余租房字段可选，脚本仅**尽力**附带 `title`，其它字段可留空由服务端存 `null`。
 
+## AI 评论回复（`commentReply`，0.14.0 起）
+
+复制正文的同时，正文会并行 `POST /api/xhs/comment-reply`。服务端把这段正文当成
+"用户在聊天页发的一条消息"跑一遍项目 AI（同一套 system prompt + searchRental /
+searchWanted 等工具），额外追加一段"输出去评论区"的渠道规则：判断帖子是求租
+（找房源）还是招租（找租客）还是经验帖（不调工具、不提房源），输出纯文本、不带
+Markdown 和网址、最多 3 条房源、400 字以内。
+
+脚本侧：
+
+- 请求期间/就绪后**框选评论输入框**（`.inner-when-not-active`），气泡分别提示
+  「AI 正在写评论回复…」「点这里，自动粘贴 AI 回复」。
+- 人工点一下评论框 → 回复写进剪贴板，并等编辑器（`#content-textarea` 等
+  contenteditable）挂载后自动插入；插入走 `execCommand("insertText")`，Vue 的
+  `input` 监听收得到。自动插入失败也不影响——文字已在剪贴板，Ctrl+V 即可。
+- 回复没写完就点了评论框：记下来，写完立刻粘（占位框那时已经消失，等不到第二次
+  点击）。
+- **发送键始终由人工按**，脚本不自动提交。
+- 剪贴板里的 AI 回复被显式排除在"分享链接捕获"之外，否则回复里万一带小红书链接
+  会把本条房源的 `sourceUrl` 写成别的帖子。
+
+服务端设了 `XHS_API_TOKEN` 时，把同一个值填进脚本 `commentReply.token`（以
+`X-Xhs-Token` 头发送）。这个路由每次调用都会跑一轮带搜索的 agent，比
+`rental-ingest` 贵得多，公开部署建议设上。
+
 ## 数据库（服务端）
 
 1. 在 Neon 执行一次 `db/create_xhs_rental_listing.sql`。

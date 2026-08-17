@@ -8,6 +8,82 @@
 
 ---
 
+## 2026-08-16（二） · 油猴：复制正文 → 项目 AI 写评论 → 点评论框自动粘贴
+
+用户要求：点「复制正文」后把正文发给 Vercel，"像用户使用项目一样"交给项目 AI，
+拿回文字放进剪贴板；油猴框选评论输入框，人工点一下就自动粘贴。
+
+### 1. 服务端 `app/api/xhs/comment-reply/route.ts`（新）
+
+`generateText` + 与聊天页**同一套** `systemPrompt` 和同一批工具
+（searchRental/searchWanted/queryListings/两个 transit），`stopWhen: stepCountIs(5)`。
+每次请求 `randomUUID()` 当 chatId —— searchRental 的批次缓存按它分区，帖子之间
+不串批，也不污染真实用户会话。挂在 `/api/xhs/` 下是因为 `proxy.ts` 只放行这个
+前缀（免 guest-auth 重定向）。输出 `stripMemoryFromDisplay` 去掉 `<memory>` 块。
+
+**踩过的两个坑（改 prompt 前必读）**：
+
+1. **帖子不是第一人称消息**。直接把正文当 user message 发过去，聊天 prompt 的
+   房东/租客推断会失灵：一条"主卧带独卫出租 2000/月"的**招租帖**被当成对方的
+   找房需求去调 searchRental，回出"很遗憾没有符合的房源"——完全说反。
+2. **经验帖会凭空编房源**。正文不是请求时，模型自己脑补了一个查询并输出了
+   数据库里不存在的房源。
+
+修法都在追加的 `COMMENT_CHANNEL_SECTION` 里：先声明"这段文字是一条帖子的正文，
+不是有人在跟你说话"，再给三分支（求租→searchRental / 招租→searchWanted /
+经验帖→**不调工具、一条房源都不许提**）。修后实测三类各自正确，经验帖
+`toolsUsed: []`。另有渠道排版规则（纯文本、无网址、最多 3 条、400 字内），并显式
+写明"覆盖上面的显示每一条"，否则模型会照聊天页规则一次贴 5-8 条。
+`toPlainComment` 再兜一层 Markdown 清理（`**`、`*斜体*`、`_斜体_`、`[]()`、
+`![]()`、`#`、列表符号）——模型仍会零星漏出，尤其 searchWanted 那条 legacy 的
+`*已放宽关键词*` 提示。
+
+鉴权：默认无鉴权（与其它 /api/xhs 一致），设了 `XHS_API_TOKEN` 才校验
+`X-Xhs-Token`。这条路由每次调用跑一整轮带搜索的 agent，比 rental-ingest 贵得多。
+
+### 2. 油猴 0.14.0
+
+复制正文后 `void requestAiCommentReply(config, plainText)` —— **与入库/分享同步
+并行**，不进原有 await 链（AI 要 15-20s）。回复就绪后 `renderDetailHighlight`
+框选 `.inner-when-not-active`；document 级 capture 监听到点它就
+`pasteAiReplyIntoComment`：先写剪贴板（保底 Ctrl+V），再按
+`editorWaitMs` 节奏等 contenteditable 挂载，`execCommand("insertText")` 插入
+（Vue 的 input 监听收得到），失败退 paste 事件、再退硬写 textContent。
+**发送键始终人工按。**
+
+- 回复没到就点了评论框：置 `aiReplyPasteRequested`，就绪后立刻粘。**必须有这条**
+  ——点击后占位框就消失了，等不到第二次点击。
+- **剪贴板互斥**：`isAiReplyClipboardText` 在 `handleCapturedClipboardText` 和
+  `tryAutoUpdateSourceUrl` 两处拦一道。否则 AI 回复里万一带小红书链接，分享捕获
+  会把它当本帖的 sourceUrl 写库（写成别的帖子，且 shareUrlDone 提前置真）。
+
+### 3. 验证
+
+- 路由：本地 dev + 真实 gateway 打了四类正文。求租帖 15-19s、走 searchRental、
+  3 条纯文本；招租帖走 searchWanted；经验帖零工具零房源。
+- 油猴：Playwright 起真 Chromium，`page.route` 伪造
+  `xiaohongshu.com/explore/*` 页面（含题述的 `.inner-when-not-active` 结构）与
+  两个 API，全链路 PASS：正文+title 正确送达 → 评论框出现框选 → 点一下
+  → contenteditable 收到文字且 `input` 事件触发 → 剪贴板同步。脚本在
+  `scratchpad/xhs-flow-test.mjs`（临时文件，未入库；要重跑就照这个思路重写，
+  注意 `require("@playwright/test")`，仓库里没有 `playwright` 这个包）。
+- **Windows 上别用 `curl -d '中文'` 测**：Git Bash → 原生 exe 的 argv 转码会把
+  UTF-8 弄乱，模型收到乱码后会胡答，看起来像 prompt 出问题。用
+  `--data-binary @file.json`。
+- `pnpm search-eval` 门禁**没跑**：本次没碰 `buildStrictPredicate` 与搜索链路的
+  任何代码，新路由只是复用工具。
+
+### 4. 遗留
+
+- searchWanted 仍是 legacy「换一个」逻辑（见 2026-08-14 §8），所以招租帖的评论
+  里会带"已放宽关键词"这类措辞。要治本得照 searchRental 抄 strict 模式。
+- 评论回复质量没有自动评测；线上看 Vercel log 里的 `[comment-reply]`（含 model /
+  toolsUsed / chars / elapsedMs）。
+- `tsc --noEmit -p tsconfig.json` 在这台 Windows 机上 OOM（约 700MB 就崩，与本次
+  改动无关）；单文件 program（临时 tsconfig 只 include 新路由）通过。
+
+---
+
 ## 2026-08-16 · 每批 8 条 + "继续/换一批"瞬间出下一批
 
 用户要求：单批上限 5 → **8**；用户说"继续/换一批"要**瞬间**出下一批，且

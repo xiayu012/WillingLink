@@ -1,8 +1,8 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.13.4
-// @description  小红书多标题识别高亮 + 详情页复制正文指引
+// @version      0.14.0
+// @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
 // @match        https://xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.13.3";
+  const SCRIPT_VERSION = "0.14.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -145,6 +145,38 @@
       carouselDoneCloseHint: "轮播图已到最后一张，点击左上角关闭",
       shareHint: "点击分享按钮复制真实链接",
       pollIntervalMs: 1500,
+    },
+    /**
+     * 复制正文后顺手让项目 AI 写一条评论回复：正文 POST 到
+     * /api/xhs/comment-reply，服务端把它当成"用户在聊天页发的一条消息"跑一遍
+     * （同一套 prompt + searchRental 等工具），回来的文字等用户点评论框时
+     * 写进剪贴板并自动粘进输入框。
+     */
+    commentReply: {
+      enable: true,
+      /** 服务端设了 XHS_API_TOKEN 才需要填；填了会以 X-Xhs-Token 头发送 */
+      token: "",
+      /** 服务端 maxDuration=60s，客户端留出余量 */
+      timeoutMs: 75_000,
+      /** 评论输入框（未激活态占位）的候选选择器，命中第一个可见的 */
+      inputSelectorCandidates: [
+        ".inner-when-not-active",
+        ".not-active.inner-when-not-active",
+        '[class*="inner-when-not-active"]',
+        ".comment-input .inner",
+      ],
+      /** 点开占位框后真正的编辑器；找不到就只放剪贴板，让用户自己 Ctrl+V */
+      editorSelectorCandidates: [
+        "#content-textarea",
+        '.content-edit [contenteditable="true"]',
+        '.comment-input [contenteditable="true"]',
+        '[contenteditable="true"].content-input',
+        "textarea.content-input",
+      ],
+      /** 点击后编辑器是异步挂载的，按这个节奏找几次 */
+      editorWaitMs: [0, 80, 200, 400, 800, 1400, 2200],
+      pendingHint: "AI 正在写评论回复…",
+      readyHint: "点这里，自动粘贴 AI 回复",
     },
     /** 复制成功后 POST 到 Next /api/xhs/rental-ingest。请用 https 根地址，避免 http→https 重定向触发 CORS 预检失败 */
     ingest: {
@@ -478,6 +510,13 @@
     shareUpdateInFlight: false,
     pageClipboardBridgeInjected: false,
     pageClipboardMessageHandler: null,
+    /** "idle" | "pending" | "ready" | "failed" | "pasted" */
+    aiReplyStatus: "idle",
+    aiReplyText: null,
+    /** 回复还没到就点了评论框：到了立刻粘，不再等第二次点击 */
+    aiReplyPasteRequested: false,
+    aiReplyPasting: false,
+    commentClickHandler: null,
   };
 
   const VIDEO_SEEK_STEP_SEC = 5;
@@ -1821,6 +1860,21 @@
         );
       }
     }
+
+    // AI 回复在路上或已就绪时框选评论输入框；点它就把回复粘进去。
+    if (state.aiReplyStatus === "pending" || state.aiReplyStatus === "ready") {
+      const commentInput = findCommentInputElement(config);
+      if (commentInput instanceof HTMLElement) {
+        appendRectHighlight(
+          root,
+          config,
+          commentInput,
+          state.aiReplyStatus === "ready"
+            ? config.commentReply.readyHint
+            : config.commentReply.pendingHint,
+        );
+      }
+    }
   };
 
   const extractXhsUrlFromText = (text) => {
@@ -1898,6 +1952,9 @@
 
   const handleCapturedClipboardText = async (config, text, reason) => {
     if (state.shareUrlDone || state.shareUpdateInFlight) {
+      return;
+    }
+    if (isAiReplyClipboardText(text)) {
       return;
     }
     const sourceUrl = extractXhsUrlFromText(text);
@@ -2030,7 +2087,11 @@
     try {
       const clip = await readClipboardText();
       clipPreview = clip?.slice(0, 80) ?? "";
-      sourceUrl = extractXhsUrlFromText(clip);
+      // 剪贴板里是我们自己放的 AI 回复时不解析，免得把回复里的链接
+      // 当成本帖的分享链接回填
+      sourceUrl = isAiReplyClipboardText(clip)
+        ? null
+        : extractXhsUrlFromText(clip);
       if (sourceUrl) {
         logInfo("从剪贴板解析到分享链接", {
           reason,
@@ -2195,6 +2256,343 @@
     });
     document.body.append(button);
     logInfo("同步分享链接按钮已显示", { listingId: state.listingId });
+  };
+
+  // ───────────────────────── AI 评论回复 ─────────────────────────
+  // 复制正文 → 正文发给 Vercel 上的项目 AI（跟用户在聊天页发消息走同一套
+  // prompt 和工具）→ 回来的文字等用户点评论输入框时进剪贴板并自动粘贴。
+  // 请求与入库、分享同步并行，不阻塞原有链路。
+
+  const showAiReplyToast = (text, tone) => {
+    document.getElementById("xhs-guide-ai-reply-toast")?.remove();
+
+    const palette = {
+      pending: { bg: "#6b7280", fg: "#ffffff" },
+      ok: { bg: "#16a34a", fg: "#ffffff" },
+      warn: { bg: "#f59e0b", fg: "#111827" },
+      error: { bg: "#dc2626", fg: "#ffffff" },
+    };
+    const color = palette[tone] ?? palette.pending;
+
+    const toast = document.createElement("div");
+    toast.id = "xhs-guide-ai-reply-toast";
+    toast.textContent = text;
+    toast.style.position = "fixed";
+    toast.style.right = "20px";
+    toast.style.bottom = "280px";
+    toast.style.zIndex = "2147483647";
+    toast.style.background = color.bg;
+    toast.style.color = color.fg;
+    toast.style.fontSize = "13px";
+    toast.style.fontWeight = "700";
+    toast.style.padding = "10px 14px";
+    toast.style.borderRadius = "10px";
+    toast.style.pointerEvents = "none";
+    toast.style.boxShadow = "none";
+    toast.style.maxWidth = "320px";
+    document.body.append(toast);
+
+    window.setTimeout(() => {
+      toast.remove();
+    }, tone === "pending" ? 2600 : 3200);
+  };
+
+  /**
+   * 我们自己写进剪贴板的 AI 回复绝不能被分享链接捕获路径当成"用户复制了原帖
+   * 链接"。AI 回复里万一出现任何小红书链接，就会把本条房源的 sourceUrl 写成
+   * 别的帖子。所以剪贴板文本与当前 AI 回复完全一致时直接忽略。
+   */
+  const isAiReplyClipboardText = (text) =>
+    typeof state.aiReplyText === "string" &&
+    state.aiReplyText.length > 0 &&
+    typeof text === "string" &&
+    text.trim() === state.aiReplyText.trim();
+
+  const findVisibleBySelectors = (selectors) => {
+    for (const selector of selectors) {
+      let nodes;
+      try {
+        nodes = document.querySelectorAll(selector);
+      } catch {
+        logWarn("评论区选择器无效", selector);
+        continue;
+      }
+      for (const node of nodes) {
+        if (!(node instanceof HTMLElement)) {
+          continue;
+        }
+        const rect = node.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          return node;
+        }
+      }
+    }
+    return null;
+  };
+
+  /** 未激活态的评论占位框（"说点什么..."），用来框选提示 */
+  const findCommentInputElement = (config) =>
+    findVisibleBySelectors(config.commentReply.inputSelectorCandidates);
+
+  /** 点开之后真正可写的编辑器；小红书用的是 contenteditable，不是 textarea */
+  const findCommentEditorElement = (config) => {
+    const known = findVisibleBySelectors(
+      config.commentReply.editorSelectorCandidates,
+    );
+    if (known) {
+      return known;
+    }
+    return findVisibleBySelectors(['[contenteditable="true"]', "textarea"]);
+  };
+
+  const isCommentInputTarget = (config, target) => {
+    if (!(target instanceof Element)) {
+      return false;
+    }
+    for (const selector of config.commentReply.inputSelectorCandidates) {
+      try {
+        if (target.closest(selector)) {
+          return true;
+        }
+      } catch {
+        /* 选择器无效已在别处告警 */
+      }
+    }
+    return false;
+  };
+
+  /**
+   * 往 Vue 控制的输入区写字。直接改 value/textContent 框架收不到，所以：
+   * textarea 走原生 setter + input 事件；contenteditable 走 execCommand
+   * （它会自然触发 beforeinput/input，v-model 能收到），失败再退 paste 事件，
+   * 最后才硬写 textContent。三条路都失败也无所谓——文字已经在剪贴板里。
+   */
+  const insertTextIntoEditor = (editor, text) => {
+    editor.focus();
+
+    if (
+      editor instanceof HTMLTextAreaElement ||
+      editor instanceof HTMLInputElement
+    ) {
+      const proto =
+        editor instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      if (setter) {
+        setter.call(editor, text);
+      } else {
+        editor.value = text;
+      }
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      editor.dispatchEvent(new Event("change", { bubbles: true }));
+      return editor.value.includes(text.slice(0, 12));
+    }
+
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.collapse(false);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    const probe = text.slice(0, 12);
+    const inserted = () => (editor.textContent || "").includes(probe);
+
+    try {
+      document.execCommand("insertText", false, text);
+    } catch {
+      /* 老浏览器或被禁用，走下面的兜底 */
+    }
+    if (inserted()) {
+      return true;
+    }
+
+    try {
+      const transfer = new DataTransfer();
+      transfer.setData("text/plain", text);
+      editor.dispatchEvent(
+        new ClipboardEvent("paste", {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: transfer,
+        }),
+      );
+    } catch {
+      /* ClipboardEvent 构造受限时忽略 */
+    }
+    if (inserted()) {
+      return true;
+    }
+
+    editor.textContent = text;
+    editor.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    return inserted();
+  };
+
+  const pasteAiReplyIntoComment = async (config) => {
+    const text = state.aiReplyText;
+    if (!text || state.aiReplyPasting) {
+      return;
+    }
+    state.aiReplyPasting = true;
+    state.aiReplyPasteRequested = false;
+    try {
+      // 先进剪贴板：自动插入失败时用户至少能自己 Ctrl+V
+      try {
+        await copyPlainText(text);
+      } catch (error) {
+        logWarn(
+          "AI 回复写剪贴板失败",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+
+      let elapsed = 0;
+      for (const targetMs of config.commentReply.editorWaitMs) {
+        if (targetMs > elapsed) {
+          await sleep(targetMs - elapsed);
+          elapsed = targetMs;
+        }
+        const editor = findCommentEditorElement(config);
+        if (!editor) {
+          continue;
+        }
+        if (insertTextIntoEditor(editor, text)) {
+          state.aiReplyStatus = "pasted";
+          logInfo("AI 回复已粘进评论框", {
+            chars: text.length,
+            waitedMs: elapsed,
+          });
+          showAiReplyToast("✓ AI 回复已粘贴，检查后自己点发送", "ok");
+          renderDetailHighlight(config);
+          return;
+        }
+      }
+
+      logWarn("未能自动插入评论框，文字已在剪贴板", { chars: text.length });
+      showAiReplyToast("AI 回复已复制，请在评论框 Ctrl+V", "warn");
+    } finally {
+      state.aiReplyPasting = false;
+    }
+  };
+
+  const ensureCommentClickListener = (config) => {
+    if (!config.commentReply?.enable || state.commentClickHandler) {
+      return;
+    }
+    state.commentClickHandler = (event) => {
+      if (state.aiReplyStatus !== "ready" && state.aiReplyStatus !== "pending") {
+        return;
+      }
+      if (!isCommentInputTarget(config, event.target)) {
+        return;
+      }
+      // 回复还没写完就点了：记下来，写完立刻粘（此时占位框已消失，
+      // 再等一次点击就等不到了）
+      if (state.aiReplyStatus === "pending") {
+        state.aiReplyPasteRequested = true;
+        showAiReplyToast("AI 还在写，写完自动粘贴", "pending");
+        return;
+      }
+      void pasteAiReplyIntoComment(config);
+    };
+    document.addEventListener("click", state.commentClickHandler, true);
+  };
+
+  const teardownCommentCapture = () => {
+    if (state.commentClickHandler) {
+      document.removeEventListener("click", state.commentClickHandler, true);
+    }
+    state.commentClickHandler = null;
+    state.aiReplyStatus = "idle";
+    state.aiReplyText = null;
+    state.aiReplyPasteRequested = false;
+    state.aiReplyPasting = false;
+    document.getElementById("xhs-guide-ai-reply-toast")?.remove();
+  };
+
+  const requestAiCommentReply = async (config, plainText) => {
+    if (!config.commentReply?.enable || state.aiReplyStatus === "pending") {
+      return;
+    }
+    const baseUrl = config.ingest?.baseUrl?.trim();
+    if (!baseUrl) {
+      return;
+    }
+
+    state.aiReplyStatus = "pending";
+    state.aiReplyText = null;
+    state.aiReplyPasteRequested = false;
+    showAiReplyToast(config.commentReply.pendingHint, "pending");
+    ensureCommentClickListener(config);
+    renderDetailHighlight(config);
+
+    const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/comment-reply`;
+    const headers = { "Content-Type": "application/json" };
+    const token = config.commentReply.token?.trim();
+    if (token) {
+      headers["X-Xhs-Token"] = token;
+    }
+    const body = JSON.stringify({
+      rawText: plainText,
+      sourceUrl: window.location.href,
+      ...gatherOptionalListingFieldsForIngest(),
+    });
+    const startedAt = now();
+
+    try {
+      const { status, responseText } = await gmHttpPost(
+        url,
+        headers,
+        body,
+        config.commentReply.timeoutMs,
+      );
+      let data = {};
+      try {
+        data = JSON.parse(responseText || "{}");
+      } catch {
+        data = {};
+      }
+      const text = typeof data.text === "string" ? data.text.trim() : "";
+
+      if (status >= 200 && status < 300 && data.ok && text) {
+        state.aiReplyText = text;
+        state.aiReplyStatus = "ready";
+        logInfo("AI 评论回复已就绪", {
+          version: SCRIPT_VERSION,
+          chars: text.length,
+          model: data.model,
+          toolsUsed: data.toolsUsed,
+          elapsedMs: now() - startedAt,
+          preview: text.slice(0, 80),
+        });
+        renderDetailHighlight(config);
+        if (state.aiReplyPasteRequested) {
+          void pasteAiReplyIntoComment(config);
+          return;
+        }
+        showAiReplyToast(config.commentReply.readyHint, "ok");
+        return;
+      }
+
+      state.aiReplyStatus = "failed";
+      logWarn("AI 评论回复失败", { status, data });
+      showAiReplyToast("AI 评论回复失败，见控制台", "error");
+    } catch (error) {
+      state.aiReplyStatus = "failed";
+      const message = error instanceof Error ? error.message : String(error);
+      logWarn("AI 评论回复请求异常", message);
+      showAiReplyToast(
+        message.includes("timeout") ? "AI 评论回复超时" : "AI 评论回复请求异常",
+        "error",
+      );
+    } finally {
+      if (state.aiReplyStatus === "pending") {
+        state.aiReplyStatus = "failed";
+      }
+      renderDetailHighlight(config);
+    }
   };
 
   const findCarouselRootFromArrow = (arrow) => {
@@ -3046,6 +3444,8 @@
       });
       state.bodyCopied = true;
       removeDetailCopyButton();
+      // 与入库/分享同步并行：AI 写评论回复要十几秒，不能卡住原有链路
+      void requestAiCommentReply(config, plainText);
       if (state.listingId && !state.shareUrlDone) {
         setCopyButtonStatus(config.detailCopy.pendingShareText, true);
         showPendingShareToast(state.listingId);
@@ -3335,6 +3735,7 @@
     renderDetailHighlight(config);
     ensureShareClickListener(config);
     ensureSyncShareButton(config);
+    ensureCommentClickListener(config);
     if (isMediaCaptureReady()) {
       ensureCarouselObserver(config);
     }
@@ -3517,6 +3918,7 @@
     state.listingId = null;
     state.shareUrlDone = false;
     teardownShareCapture();
+    teardownCommentCapture();
     state.pageClipboardBridgeInjected = false;
     teardownCarouselCapture();
     state.uploadedCarouselSrcs.clear();
