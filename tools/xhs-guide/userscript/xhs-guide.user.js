@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.15.0
+// @version      0.16.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.15.0";
+  const SCRIPT_VERSION = "0.16.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -144,6 +144,13 @@
       carouselArrowHint: "手动点右侧箭头翻页，每张主图会上传到后端",
       carouselDoneCloseHint: "轮播图已到最后一张，点击左上角关闭",
       shareHint: "点击分享按钮复制真实链接",
+      /** 分享弹层里的「复制链接」项：点了分享按钮之后才出现，出现了就框它 */
+      shareCopyLinkSelectorCandidates: [
+        ".xhs-note-share-popup-action-item",
+        '[class*="share-popup-action-item"]',
+      ],
+      shareCopyLinkLabel: "复制链接",
+      shareCopyLinkHint: "点这里复制链接",
       pollIntervalMs: 1500,
     },
     /**
@@ -766,6 +773,68 @@
     "ArrowLeft",
     "ArrowRight",
   ]);
+
+  // ---------------------------------------------------------------------------
+  // 「No. N」计数器：点开一个**被框选的**信息流标题就 +1。
+  //
+  // 只在 handleTitleClickDismiss 里加——那个函数遍历的就是当前命中的候选，
+  // 没被框中的标题根本进不到那一步。计数存 localStorage（xiaohongshu.com 这个
+  // 源下），刷新和重开浏览器都还在，不设上限。
+  // ---------------------------------------------------------------------------
+  const HIGHLIGHT_CLICK_COUNT_KEY = "xhs-guide-highlight-click-count";
+
+  const readHighlightClickCount = () => {
+    try {
+      const parsed = Number.parseInt(
+        window.localStorage.getItem(HIGHLIGHT_CLICK_COUNT_KEY) ?? "0",
+        10,
+      );
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    } catch {
+      // 隐私模式/被禁用时 localStorage 会抛，计数退化成本次会话内的数字
+      return 0;
+    }
+  };
+
+  const ensureClickCounterBadge = () => {
+    let badge = document.getElementById("xhs-guide-click-counter");
+    if (badge) {
+      return badge;
+    }
+    badge = document.createElement("div");
+    badge.id = "xhs-guide-click-counter";
+    badge.style.position = "fixed";
+    badge.style.top = "6px";
+    badge.style.left = "50%";
+    badge.style.transform = "translateX(-50%)";
+    badge.style.zIndex = "2147483646";
+    badge.style.pointerEvents = "none";
+    badge.style.color = "#2563eb";
+    badge.style.fontSize = "15px";
+    badge.style.fontWeight = "700";
+    badge.style.letterSpacing = "0.02em";
+    // 小红书顶栏是白底，蓝字直接放上去够清楚；给一层浅底防止滚到图片上看不清
+    badge.style.background = "rgba(255, 255, 255, 0.88)";
+    badge.style.padding = "2px 10px";
+    badge.style.borderRadius = "10px";
+    document.body.append(badge);
+    return badge;
+  };
+
+  const renderClickCounter = () => {
+    ensureClickCounterBadge().textContent = `No. ${readHighlightClickCount()}`;
+  };
+
+  const bumpHighlightClickCount = () => {
+    const next = readHighlightClickCount() + 1;
+    try {
+      window.localStorage.setItem(HIGHLIGHT_CLICK_COUNT_KEY, String(next));
+    } catch {
+      /* 存不了就只更新显示 */
+    }
+    ensureClickCounterBadge().textContent = `No. ${next}`;
+    logInfo("框选标题点击计数", { count: next });
+  };
 
   const createScreenBlocker = () => {
     let root = null;
@@ -1870,6 +1939,47 @@
     return href.includes("share_new") || href.includes("link_c");
   };
 
+  /**
+   * 分享弹层里的「复制链接」项。
+   *
+   * 不需要记"用户点没点过分享按钮"：这个元素**只有弹层打开后才存在且可见**，
+   * 找得到就说明分享按钮已经点过了，框选自然接上去。弹层里还有下载图片等
+   * 同类项，所以要按标签文字（或 #link_b 图标）认准这一个。
+   */
+  const findShareCopyLinkElement = (config) => {
+    const label = config.detailCopy.shareCopyLinkLabel;
+    for (const selector of config.detailCopy.shareCopyLinkSelectorCandidates) {
+      let nodes;
+      try {
+        nodes = document.querySelectorAll(selector);
+      } catch {
+        logWarn("分享弹层选择器无效", selector);
+        continue;
+      }
+      for (const node of nodes) {
+        if (!(node instanceof HTMLElement)) {
+          continue;
+        }
+        const text = node.textContent?.replace(/\s+/g, "") ?? "";
+        const byIcon = [...node.querySelectorAll("use")].some((use) => {
+          const href =
+            use.getAttribute("href") ??
+            use.getAttributeNS("http://www.w3.org/1999/xlink", "href") ??
+            "";
+          return href.includes("link_b");
+        });
+        if (!(text.includes(label) || byIcon)) {
+          continue;
+        }
+        const rect = node.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0 && isElementVisible(node)) {
+          return node;
+        }
+      }
+    }
+    return null;
+  };
+
   /** 页面上可能有多个隐藏的 .share-wrapper，需选可见且尺寸有效的 */
   const findDetailShareElement = () => {
     const tryElements = (elements) => {
@@ -2035,14 +2145,26 @@
       !state.shareUrlDone &&
       (state.listingId || state.bodyCopied)
     ) {
-      const share = findDetailShareElement();
-      if (share instanceof HTMLElement) {
+      // 分享弹层开着就框「复制链接」，否则框分享按钮——弹层元素的有无本身
+      // 就是"分享按钮点没点过"的信号。
+      const copyLink = findShareCopyLinkElement(config);
+      if (copyLink instanceof HTMLElement) {
         appendRectHighlight(
           root,
           config,
-          share,
-          config.detailCopy.shareHint,
+          copyLink,
+          config.detailCopy.shareCopyLinkHint,
         );
+      } else {
+        const share = findDetailShareElement();
+        if (share instanceof HTMLElement) {
+          appendRectHighlight(
+            root,
+            config,
+            share,
+            config.detailCopy.shareHint,
+          );
+        }
       }
     }
   };
@@ -3857,13 +3979,13 @@
     button.style.zIndex = "2147483647";
     button.style.pointerEvents = "auto";
     button.style.border = "none";
-    button.style.borderRadius = "30px";
-    button.style.padding = "30px 42px";
-    button.style.fontSize = "42px";
+    button.style.borderRadius = "15px";
+    button.style.padding = "15px 21px";
+    button.style.fontSize = "21px";
     button.style.fontWeight = "600";
     button.style.background = "#ff2442";
     button.style.color = "#ffffff";
-    button.style.boxShadow = "0 18px 54px rgba(0, 0, 0, 0.25)";
+    button.style.boxShadow = "0 9px 27px rgba(0, 0, 0, 0.25)";
     button.style.cursor = "pointer";
     button.addEventListener("click", () => {
       void handleCopyButtonClick(config);
@@ -3910,6 +4032,7 @@
         continue;
       }
       void reportTitleClick(config, candidate.text);
+      bumpHighlightClickCount();
       dismissTitleCandidate(config, candidate);
       return;
     }
@@ -4323,6 +4446,7 @@
     }
 
     void warmupRemoteLlm(config);
+    renderClickCounter();
     switchModeByUrl(config);
     state.currentUrl = window.location.href;
     state.routeTimer = window.setInterval(() => {

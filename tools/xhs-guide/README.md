@@ -37,6 +37,14 @@ pnpm xhs:verify-geo-index
 
 地名来自 GeoNames `cities15000` 与美国邮编数据，采用 CC BY 4.0 许可。
 
+## 「No. N」计数器（0.16.0 起）
+
+页面最上方居中的蓝色小徽标，统计**点开过多少个被框选的标题**。只在信息流里
+点中高亮候选才 +1（挂在 `handleTitleClickDismiss` 里，没被框中的标题根本走不到
+那一步）；计数存在 `localStorage` 的 `xhs-guide-highlight-click-count`，属于
+xiaohongshu.com 这个源，刷新、重开浏览器都还在，不设上限也不会自动清零。
+要归零就在控制台 `localStorage.removeItem("xhs-guide-highlight-click-count")`。
+
 ## 详情页复制模式
 
 - URL 命中 `detailCopy.pathKeywords` 时进入详情模式。
@@ -73,9 +81,11 @@ searchWanted 写在 action 里的）、删掉重复条目、删掉结尾散文�
 
 脚本侧的框选是**一条单线程流水线，一次只亮一个，点过就换下一个**：
 
-    复制正文 →（等待遮罩）→ 评论输入框 → 发送按钮 → 分享按钮
+    复制正文 →（等待遮罩）→ 评论输入框 → 发送按钮 → 分享按钮 → 弹层里的「复制链接」
 
-回复里没有房源时，中间两步整段跳过，直接走到分享按钮。
+回复里没有房源时，中间两步整段跳过，直接走到分享按钮。最后一步不靠记状态：
+分享弹层里的 `.xhs-note-share-popup-action-item`（认「复制链接」标签或 `#link_b`
+图标）**只有点开弹层才存在且可见**，找得到就说明分享按钮已经点过了。
 
 - 请求期间/就绪后**框选评论输入框**（`.inner-when-not-active`），气泡分别提示
   「AI 正在写评论回复…」「点这里，自动粘贴 AI 回复」。
