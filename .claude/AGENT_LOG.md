@@ -183,6 +183,60 @@ contenteditable 用 Selection/Range 真改 DOM（文本节点 + `<br>`，光标�
 新增断言：编辑器收到**冒泡的 InputEvent(insertText)**、全程**没有 paste 事件**、
 innerText 里换行没丢（否则三条房源会挤成一行）。
 
+### 7. 第四轮 → 油猴 0.15.0：终审换模型 + 没房源就跳过 + 改压缩 + 等待遮罩
+
+用户四条：①`getVerifierModel()` 换成 gpt-4.1-mini；②回复说"没搜到符合房源"时
+不要进剪贴板、不要框评论框和发送键，直接进分享那一步；③上一轮拼出来的
+`Santa Clara｜1室1卫｜有车位` 信息太少，要用 gpt-4.1-mini 把项目 AI 那一大段
+**缩写**成 260 字符；④等服务器返回期间盖满全屏、点不穿、拦滚动、正中巨大
+"WAIT"，并做成长期可复用的轮子。
+
+**终审模型**（providers.ts）：sonnet-4.5 → `DEFAULT_CHAT_MODEL`。历史结论是
+"haiku 会臆造用户属性所以必须 sonnet 级"，这次是用户明确要求换（成本 + 与聊天层
+统一），已在函数注释里写清风险与回滚方式。**如果线上开始出现"剔除理由臆造用户
+属性"，第一嫌疑就是这里。**
+
+门禁（181 条，2026-08-17）：**PASS 158 / DATA_GAP 15 / VERIFIER_CUT 8 /
+CODE_BUG 0 / judge-0 11**，对比 sonnet 基线 153/15/13/0/**4**。读法很清楚——
+4.1-mini **剔得比 sonnet 松**：终审剔空从 13 降到 8、PASS 升到 158（用户看到
+空结果的概率下降），代价是语义跑偏的 judge-0 从 4 涨到 11（放行了更多边缘房源）。
+CODE_BUG=0 所以门禁过，但**这是"宽松换召回"的交易，不是纯赚**；哪天用户抱怨
+"推的房源不对路"，把这里换回 sonnet 是第一手段。另有 3 次
+`[verifyListings] fail-open`（输出解析不了 → 整批放行），sonnet 时代也有，
+量级相当，暂不处理。
+
+**"扩充"改成"缩写"（第三次调整，方向反过来了，别再折腾）**：上一轮为了防编造
+把条目区改成确定性拼装，结果信息量太少——库里的结构化列本来就稀疏，拼出来只有
+城市/房型/车位几个词。现在改成：第一遍 agent **放开写**（channel section 明说
+"这一步不用担心太长，后面有专门一步压长度，你写得越全压完留下的越多"），超过
+285 code points 才过一遍 `condenseComment`（gpt-4.1-mini，不带工具）压到 260。
+**关键区别**：压缩只做减法，不会编造；上一轮失败的是**扩写**，压力一上来必然
+无中生有。所以 `condenseComment` 在草稿本来就短于上限时**直接返回，绝不叫模型
+往长里写**。确定性拼装 `buildToTargetLength` 保留，降级为"模型一个字没写但条目
+在手上"时的兜底。实测信息量回来了（"走路1分钟到Apple Park""包水电家具""押金
+1个月"这类细节进了评论）。
+
+**没房源就跳过**：服务端返回 `hasListings`，判据是最终文本的形状——固定开场白
++ 含「｜」的条目行都在才算有货（不能只看 material 有没有行：模型可能查到了却
+判定不合适，如实说"没有"）。油猴收到 `hasListings === false` 就置
+`aiReplyStatus = "skipped"`，不写剪贴板、不挂评论阶段，`commentStage` 直接
+返回 none → 分享按钮立刻亮。
+
+**等待遮罩 `createScreenBlocker()`**（userscript，通用轮子）：`show(text)` /
+`hide()` / `isVisible()`，自己持有 DOM，**不放进 `#xhs-guide-overlay-root`**
+——那层每次 `renderDetailHighlight` 都 `replaceChildren()`，放进去会被抹掉，而且
+它是 `pointer-events:none`（为了让框选不挡点击），跟这层要"接住一切输入"正相反。
+拦截四件事：指针事件自己吃掉（点不穿）、window 上 `passive:false` 拦 wheel/
+touchmove（落在遮罩上浏览器仍会滚祖先容器）、翻页类按键、html/body 双 overflow
+hidden。字号 `clamp(96px, 26vw, 520px)`。`requestAiCommentReply` 开头 show，
+finally 里 hide（成功/失败/没房源都收），teardown 也 hide。
+
+实测：求职帖草稿够全时不触发压缩（208/105 字符），过长时压到 295→260 段。
+Playwright 两个场景全 PASS：①happy path 增加遮罩断言（盖满、
+`elementFromPoint` 命中遮罩、body overflow=hidden、字号 >90px、回复到手后自动
+消失并还原 overflow）；②新场景 `hasListings:false` —— 剪贴板仍是帖子正文、
+评论框和发送键都不框、分享按钮直接亮。
+
 ---
 
 ## 2026-08-16 · 每批 8 条 + "继续/换一批"瞬间出下一批

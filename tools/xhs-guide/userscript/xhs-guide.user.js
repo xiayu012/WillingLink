@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.14.2
+// @version      0.15.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.14.2";
+  const SCRIPT_VERSION = "0.15.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -184,6 +184,8 @@
       pendingHint: "AI 正在写评论回复…",
       readyHint: "点这里，自动粘贴 AI 回复",
       sendHint: "检查后点发送",
+      /** 等服务器返回期间盖满全屏的字 */
+      waitText: "WAIT",
     },
     /** 复制成功后 POST 到 Next /api/xhs/rental-ingest。请用 https 根地址，避免 http→https 重定向触发 CORS 预检失败 */
     ingest: {
@@ -737,6 +739,145 @@
     });
 
   const normalizeTitle = (text) => text.replace(/\s+/g, " ").trim();
+
+  // ---------------------------------------------------------------------------
+  // 通用全屏遮罩（可复用轮子）
+  //
+  // 用途：任何"这段时间别让用户碰页面"的场景——等远端返回、等入库、等上传。
+  // 与 #xhs-guide-overlay-root 那层框选遮罩分开：那层每次 render 都
+  // replaceChildren()，且 pointer-events:none 是为了让框选不挡点击；这层正相反，
+  // 要**接住**所有输入。
+  //
+  // 用法：
+  //   screenBlocker.show("WAIT");   // 可随时改字：show("上传中")
+  //   screenBlocker.hide();
+  //
+  // 拦截范围：指针事件（自己吃掉，点不穿）、滚轮/触摸滚动、翻页类按键，
+  // 外加 html/body 的 overflow:hidden 双保险。hide() 全部还原。
+  // ---------------------------------------------------------------------------
+  const SCROLL_KEYS = new Set([
+    " ",
+    "PageUp",
+    "PageDown",
+    "Home",
+    "End",
+    "ArrowUp",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+  ]);
+
+  const createScreenBlocker = () => {
+    let root = null;
+    let label = null;
+    let savedBodyOverflow = "";
+    let savedHtmlOverflow = "";
+
+    const swallow = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    const swallowScrollKey = (event) => {
+      if (SCROLL_KEYS.has(event.key)) {
+        swallow(event);
+      }
+    };
+
+    const build = () => {
+      const node = document.createElement("div");
+      node.id = "xhs-guide-screen-blocker";
+      node.style.position = "fixed";
+      node.style.inset = "0";
+      node.style.width = "100vw";
+      node.style.height = "100vh";
+      node.style.zIndex = "2147483647";
+      node.style.pointerEvents = "auto";
+      node.style.background = "rgba(0, 0, 0, 0.78)";
+      node.style.display = "flex";
+      node.style.alignItems = "center";
+      node.style.justifyContent = "center";
+      node.style.cursor = "wait";
+      node.style.userSelect = "none";
+      node.style.touchAction = "none";
+      node.style.overscrollBehavior = "none";
+
+      const text = document.createElement("div");
+      // 夸张大：随视窗缩放，小屏也不至于溢出
+      text.style.fontSize = "clamp(96px, 26vw, 520px)";
+      text.style.lineHeight = "1";
+      text.style.fontWeight = "900";
+      text.style.letterSpacing = "0.06em";
+      text.style.color = "#ffffff";
+      text.style.textAlign = "center";
+      text.style.pointerEvents = "none";
+      node.append(text);
+
+      return { node, text };
+    };
+
+    return {
+      show(message = "WAIT") {
+        if (!root) {
+          const built = build();
+          root = built.node;
+          label = built.text;
+          for (const type of [
+            "wheel",
+            "touchmove",
+            "pointerdown",
+            "pointerup",
+            "mousedown",
+            "mouseup",
+            "click",
+            "dblclick",
+            "contextmenu",
+          ]) {
+            root.addEventListener(type, swallow, {
+              capture: true,
+              passive: false,
+            });
+          }
+          // 滚轮/触摸即使落在遮罩上，浏览器仍会滚动祖先容器，必须在 window 上
+          // 以 passive:false 拦一道；键盘翻页同理。
+          window.addEventListener("wheel", swallow, {
+            capture: true,
+            passive: false,
+          });
+          window.addEventListener("touchmove", swallow, {
+            capture: true,
+            passive: false,
+          });
+          window.addEventListener("keydown", swallowScrollKey, true);
+
+          savedBodyOverflow = document.body.style.overflow;
+          savedHtmlOverflow = document.documentElement.style.overflow;
+          document.body.style.overflow = "hidden";
+          document.documentElement.style.overflow = "hidden";
+
+          document.body.append(root);
+        }
+        label.textContent = message;
+      },
+
+      hide() {
+        if (!root) {
+          return;
+        }
+        window.removeEventListener("wheel", swallow, true);
+        window.removeEventListener("touchmove", swallow, true);
+        window.removeEventListener("keydown", swallowScrollKey, true);
+        document.body.style.overflow = savedBodyOverflow;
+        document.documentElement.style.overflow = savedHtmlOverflow;
+        root.remove();
+        root = null;
+        label = null;
+      },
+
+      isVisible: () => Boolean(root),
+    };
+  };
+
+  const screenBlocker = createScreenBlocker();
 
   // ---- 信息流标题点击上报：点一次记一次，方便在 Vercel runtime log 里对比「点击」vs「入库」----
   const reportTitleClick = async (config, title) => {
@@ -2667,6 +2808,7 @@
       document.removeEventListener("click", state.commentClickHandler, true);
     }
     state.commentClickHandler = null;
+    screenBlocker.hide();
     state.aiReplyStatus = "idle";
     state.aiReplyText = null;
     state.aiReplyPasteRequested = false;
@@ -2693,6 +2835,9 @@
     showAiReplyToast(config.commentReply.pendingHint, "pending");
     ensureCommentClickListener(config);
     renderDetailHighlight(config);
+    // 等服务器写回剪贴板之前，整屏挡住：这段时间点什么都是白点，滚出去还会
+    // 让评论框离开视窗，框选就白框了。
+    screenBlocker.show(config.commentReply.waitText);
 
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/comment-reply`;
     const headers = { "Content-Type": "application/json" };
@@ -2721,6 +2866,20 @@
         data = {};
       }
       const text = typeof data.text === "string" ? data.text.trim() : "";
+
+      // 服务端说这条回复里没有房源（没搜到 / 经验帖）：那就没什么可粘的，
+      // 别占剪贴板、别框评论框和发送键，直接跳到分享那一步。
+      if (status >= 200 && status < 300 && data.ok && data.hasListings === false) {
+        state.aiReplyStatus = "skipped";
+        logInfo("AI 回复里没有房源，跳过评论步骤", {
+          toolsUsed: data.toolsUsed,
+          elapsedMs: now() - startedAt,
+          preview: text.slice(0, 80),
+        });
+        showAiReplyToast("没有匹配房源，跳过评论", "warn");
+        renderDetailHighlight(config);
+        return;
+      }
 
       if (status >= 200 && status < 300 && data.ok && text) {
         state.aiReplyText = text;
@@ -2768,6 +2927,8 @@
       if (state.aiReplyStatus === "pending") {
         state.aiReplyStatus = "failed";
       }
+      // 无论成功、失败、还是没房源，等待都到此为止
+      screenBlocker.hide();
       renderDetailHighlight(config);
     }
   };

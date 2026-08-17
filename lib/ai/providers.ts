@@ -5,6 +5,7 @@ import {
   wrapLanguageModel,
 } from "ai";
 import { isTestEnvironment } from "../constants";
+import { DEFAULT_CHAT_MODEL } from "./models";
 
 const THINKING_SUFFIX_REGEX = /-thinking$/;
 
@@ -60,12 +61,17 @@ export function getFeedTitleModel() {
 }
 
 /**
- * 搜索终审（verify-listings）：判断密集型任务，haiku 会臆造用户属性
- * （把候选帖里的"无宠物"反向脑补成"用户有猫"），必须用 sonnet 级模型。
+ * 搜索终审（verify-listings）。
+ *
+ * 历史：haiku 稳定臆造用户属性（把候选帖里的"无宠物"反向脑补成"用户有猫"
+ * 去剔除），所以曾锁死 sonnet-4.5。2026-08-16 用户要求换成项目默认的
+ * gpt-4.1-mini（成本 + 与聊天层统一）。**这是判断密集型任务，换模型必须跑
+ * `pnpm search-eval -- --source wanted --limit 181` 并确认 CODE_BUG=0**；
+ * 若发现剔除理由开始臆造用户属性，第一嫌疑就是这里，改回 sonnet 即可。
  */
 export function getVerifierModel() {
   if (isTestEnvironment && myProvider) {
     return myProvider.languageModel("title-model");
   }
-  return gateway.languageModel("anthropic/claude-sonnet-4.5");
+  return gateway.languageModel(DEFAULT_CHAT_MODEL);
 }

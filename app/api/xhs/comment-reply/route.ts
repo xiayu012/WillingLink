@@ -49,12 +49,12 @@ const COMMENT_CHANNEL_SECTION = `## 本次输入是一条帖子，输出去评�
 
 - **纯文本**：不要任何 Markdown —— 不要 \`**\`、\`#\`、\`-\`、表格、\`[文字](链接)\`、\`![](图片)\`。需要分隔就用换行和「｜」。
 - **不要输出任何网址**：评论区里链接点不动，贴出来只是噪音。想让对方看原帖或更多房源，就请对方私信。
-- **最多 3 条**：无论工具返回几条房源（searchRental）或几个求租者（searchWanted），都只挑最匹配的 3 条写进评论（这条覆盖上面"显示每一条"的要求）。每条压缩成 **1 行**：标题｜租金｜房型｜位置｜可入住时间，条与条之间空一行。**不要**逐字段分行（"期望位置: ……""预算: ……"），**不要**贴原文简介。
+- **最多 3 条**：无论工具返回几条房源（searchRental）或几个求租者（searchWanted），都只挑最匹配的 3 条写进评论（这条覆盖上面"显示每一条"的要求）。每条一段：标题｜租金｜房型｜位置｜可入住时间｜这条为什么值得看，条与条之间空一行。**不要**逐字段分行（"期望位置: ……""预算: ……"），**不要**贴原文简介。
+- **每条都要写足信息**：租金、房型、具体位置、可入住时间、包水电/车位/家具这些只要工具给了就写进去。**这一步不用担心太长**，后面有专门一步负责压到评论区的长度——你写得越全，压完留下的信息越多；你写得干瘪，压完就只剩几个词。
 - **开场白只有固定的一行**：\`看看这些怎么样：\`——一字不改，不要在它前面加任何话，也不要换成别的说法。房源和求租者都用这一行开头。
 - 缺的字段**直接不写**，别写"价格未知""可入住时间未知""月租面议"——评论区字数金贵，占位词纯属浪费，"面议"更是帖子没说过的话。
 - **三条必须是三个不同的**：库里有重复入库的近似帖，标题或地址一样的只留一条，凑不满就少写一条。
 - **不要结尾**：最后一条写完就结束。禁止任何总结句、点评句、邀请私信、祝福语（"这些房源都在……""通勤方便""可以私信我""祝你早日找到理想的家"这类一句都不许有）。
-- **全文 260 个字符左右**（240-280，含标点换行）。写不下就少放一条，而不是把每条压成半句。
 - **工具 action 里的引导语一律不要照抄**："已放宽关键词""找不到完全符合要求的，先给你看一条""如仍不满意，可告诉我具体要求，我再为您调整""换一个"——这些是聊天页话术，评论区没有下一轮，照抄会露馅。同样不要暴露"数据库""工具""搜索结果""action"这类系统内部说法，像一个真人邻居在回帖。
 - 没有匹配上、或者这是经验帖不该推荐时：**不要写那行固定开场白**，只用一两句如实说明，**绝不编造**。`;
 
@@ -359,6 +359,63 @@ function pickRows(draft: string, rows: MaterialRow[]): MaterialRow[] {
   return ordered.slice(0, 3);
 }
 
+const CONDENSE_SYSTEM = `你是评论区文案编辑。把给你的草稿**压缩**成一条要发到小红书评论区的纯文本评论。
+
+- **全文 ${TARGET_CODE_POINTS} 个字符左右**（${MIN_CODE_POINTS}-${MAX_CODE_POINTS}，含标点换行）。这是压缩，不是重写：把每条的关键信息（租金、房型、具体位置、可入住时间、包水电/车位/家具等亮点）尽量塞进去，删的是虚词和客套，不是事实。
+- 第一行固定是：看看这些怎么样：
+- 之后每条一行：标题（长标题可截短）｜租金｜房型｜位置｜可入住时间｜亮点，条与条之间空一行。最多 3 条。
+- **绝不新增草稿和素材里没有的事实**，一个租金、一个地址、一条设施都不许编。草稿信息不够就短，短了没关系。
+- **绝不重复同一条**：标题或位置相同的算同一条，只留一条。
+- 缺的字段直接不写，不要写"未知""面议""待定""rent unknown"这类占位词。
+- **禁止任何结尾句**：不写总结、不写"符合您的需求"、不写"可继续告诉我是否调整条件"、不写邀请私信和祝福。最后一条写完立刻结束。
+- 纯文本，不要 Markdown、不要网址、不要"数据库/工具/搜索结果"这类系统说法。
+
+只输出压缩后的评论正文，不要解释。`;
+
+/**
+ * 压缩到 260 上下。
+ *
+ * 这一步只做**减法**：第一遍带工具的 agent 已经把房源写得很全，这里把它压到
+ * 评论区长度。历史上试过反过来用——让模型拿着素材"扩写到 260 字"，素材只有
+ * 1 条时它直接编出两条不存在的房源（连"社区配备游泳池"都编了）。**扩写必然
+ * 编造，压缩不会**，所以草稿比目标短时直接返回，绝不叫模型往长里写。
+ * fail-open：出任何问题都退回草稿。
+ */
+async function condenseComment(
+  draft: string,
+  material: MaterialRow[],
+  modelId: string
+): Promise<{ text: string; condensed: boolean }> {
+  if (codePoints(draft) <= MAX_CODE_POINTS) {
+    return { text: draft, condensed: false };
+  }
+
+  try {
+    const { text } = await generateText({
+      model: getLanguageModel(modelId),
+      system: CONDENSE_SYSTEM,
+      messages: [
+        {
+          role: "user",
+          content: `草稿（${codePoints(draft)} 个字符）：\n${draft}\n\n素材（工具查到的真实字段，只用来核对事实，不要照抄字段名）：\n${
+            material.length > 0 ? JSON.stringify(material.slice(0, 3)) : "（无）"
+          }`,
+        },
+      ],
+    });
+    const cleaned = ensureFixedOpening(
+      stripChatPageBoilerplate(toPlainComment(text))
+    );
+    return cleaned
+      ? { text: cleaned, condensed: true }
+      : { text: draft, condensed: false };
+  } catch (error) {
+    const name = error instanceof Error ? error.name : "UnknownError";
+    console.log("[comment-reply] condense failed", name);
+    return { text: draft, condensed: false };
+  }
+}
+
 /**
  * 把条目行按真实字段拼到 260 上下——**确定性拼装，不过 LLM**。
  *
@@ -527,16 +584,31 @@ export async function POST(request: Request) {
       return jsonWithCors({ ok: false, error: "Model returned no text" }, 502);
     }
 
-    // 第一遍常常把 8 条房源压成 90 字。工具查到的字段还在手上，直接按真实字段
-    // 拼到 260 上下——扩的是已有事实，一个字都不是生成的。
-    const { text, rebuilt } =
-      style === "comment"
-        ? buildToTargetLength(draft, material)
-        : { text: draft, rebuilt: false };
+    // 正常路径：第一遍写得很全 → 这里压到 260。模型一个字没写但条目在手上时
+    // （实测 searchWanted 出现过）退回确定性拼装，别让油猴空手而归。
+    let text = draft;
+    let condensed = false;
+    let rebuilt = false;
+
+    if (style === "comment") {
+      if (draft) {
+        const condenseResult = await condenseComment(draft, material, modelId);
+        text = condenseResult.text;
+        condensed = condenseResult.condensed;
+      } else {
+        const built = buildToTargetLength(draft, material);
+        text = built.text;
+        rebuilt = built.rebuilt;
+      }
+    }
 
     if (!text) {
       return jsonWithCors({ ok: false, error: "Model returned no text" }, 502);
     }
+
+    // 油猴要据此决定后面还走不走评论那一步：没房源就别占剪贴板、别框评论框，
+    // 直接跳到分享。判据用最终文本的形状——固定开场白 + 条目行都在才算有货。
+    const hasListings = text.startsWith(FIXED_OPENING) && text.includes("｜");
 
     const toolsUsed = [
       ...new Set(
@@ -552,8 +624,10 @@ export async function POST(request: Request) {
         model: modelId,
         style,
         toolsUsed,
+        hasListings,
         chars: codePoints(text),
         draftChars: codePoints(draft),
+        condensed,
         rebuilt,
         elapsedMs: Date.now() - startedAt,
         sourceUrl: optString(payload.sourceUrl),
@@ -566,7 +640,9 @@ export async function POST(request: Request) {
       model: modelId,
       style,
       toolsUsed,
+      hasListings,
       chars: codePoints(text),
+      condensed,
       rebuilt,
       elapsedMs: Date.now() - startedAt,
     });
