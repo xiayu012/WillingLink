@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.14.1
+// @version      0.14.2
 // @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.14.1";
+  const SCRIPT_VERSION = "0.14.2";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -2454,9 +2454,33 @@
    * （它会自然触发 beforeinput/input，v-model 能收到），失败再退 paste 事件，
    * 最后才硬写 textContent。三条路都失败也无所谓——文字已经在剪贴板里。
    */
+  /**
+   * 把文字写进评论编辑器。
+   *
+   * **不模拟 paste / Ctrl+V**：合成的 ClipboardEvent 是 untrusted，小红书的
+   * 编辑器可以直接忽略；execCommand 也已废弃。这里按元素类型分两条路，写完都
+   * 补一对**冒泡的 beforeinput/input InputEvent**——Vue/React 都是靠 input 事件
+   * 感知值变化的，只改 value / innerText 而不发事件，框里看着有字、组件的数据
+   * 仍是空，点发送等于发了个空评论。
+   */
+  const dispatchInputEvents = (editor, text) => {
+    for (const type of ["beforeinput", "input"]) {
+      editor.dispatchEvent(
+        new InputEvent(type, {
+          bubbles: true,
+          cancelable: type === "beforeinput",
+          inputType: "insertText",
+          data: text,
+        }),
+      );
+    }
+  };
+
   const insertTextIntoEditor = (editor, text) => {
     editor.focus();
 
+    // 1) input / textarea：必须走原型链上的原生 value setter，React 把
+    //    element.value 劫持成了自己的 tracker，直接赋值它认不出来。
     if (
       editor instanceof HTMLTextAreaElement ||
       editor instanceof HTMLInputElement
@@ -2471,50 +2495,59 @@
       } else {
         editor.value = text;
       }
-      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      editor.selectionStart = editor.value.length;
+      editor.selectionEnd = editor.value.length;
+      dispatchInputEvents(editor, text);
       editor.dispatchEvent(new Event("change", { bubbles: true }));
       return editor.value.includes(text.slice(0, 12));
     }
 
+    // 2) contenteditable：用 Selection/Range 真的改 DOM（插入文本节点、
+    //    换行用 <br>），再把光标放到末尾，最后发 input 事件。
     const selection = window.getSelection();
     const range = document.createRange();
     range.selectNodeContents(editor);
-    range.collapse(false);
     selection?.removeAllRanges();
     selection?.addRange(range);
+    range.deleteContents();
 
-    const probe = text.slice(0, 12);
-    const inserted = () => (editor.textContent || "").includes(probe);
+    const fragment = document.createDocumentFragment();
+    const lines = text.split("\n");
+    lines.forEach((line, index) => {
+      if (index > 0) {
+        fragment.append(document.createElement("br"));
+      }
+      if (line.length > 0) {
+        fragment.append(document.createTextNode(line));
+      }
+    });
+    range.insertNode(fragment);
 
+    const caret = document.createRange();
+    caret.selectNodeContents(editor);
+    caret.collapse(false);
+    selection?.removeAllRanges();
+    selection?.addRange(caret);
+
+    dispatchInputEvents(editor, text);
+    return (editor.textContent || "").includes(text.slice(0, 12));
+  };
+
+  /**
+   * 在真实用户手势里读剪贴板。
+   *
+   * `navigator.clipboard.readText()` 只在用户手势里才被允许，而且必须**同步
+   * 调用**——await 一次之后手势就过期了。所以在 pointerdown/click 回调的第一行
+   * 就把它调起来，只把返回的 Promise 传下去等。读不到就退回 state 里的文字
+   * （回复到手时已经用 GM_setClipboard 写进剪贴板，两边内容一致）。
+   */
+  const readClipboardInGesture = () => {
     try {
-      document.execCommand("insertText", false, text);
+      const promise = navigator.clipboard?.readText?.();
+      return promise instanceof Promise ? promise.catch(() => "") : null;
     } catch {
-      /* 老浏览器或被禁用，走下面的兜底 */
+      return null;
     }
-    if (inserted()) {
-      return true;
-    }
-
-    try {
-      const transfer = new DataTransfer();
-      transfer.setData("text/plain", text);
-      editor.dispatchEvent(
-        new ClipboardEvent("paste", {
-          bubbles: true,
-          cancelable: true,
-          clipboardData: transfer,
-        }),
-      );
-    } catch {
-      /* ClipboardEvent 构造受限时忽略 */
-    }
-    if (inserted()) {
-      return true;
-    }
-
-    editor.textContent = text;
-    editor.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    return inserted();
   };
 
   /**
@@ -2524,9 +2557,8 @@
    * 不等插入结果：用户要的是"点一次就消失"。插入失败也不算断链——文字已经在
    * 剪贴板里，Ctrl+V 一样能发。
    */
-  const pasteAiReplyIntoComment = async (config, anchor) => {
-    const text = state.aiReplyText;
-    if (!text || state.aiReplyPasting) {
+  const pasteAiReplyIntoComment = async (config, anchor, clipboardPromise) => {
+    if (!state.aiReplyText || state.aiReplyPasting) {
       return;
     }
     state.aiReplyPasting = true;
@@ -2536,15 +2568,15 @@
     renderDetailHighlight(config);
 
     try {
-      // 先进剪贴板：自动插入失败时用户至少能自己 Ctrl+V
-      try {
-        await copyPlainText(text);
-      } catch (error) {
-        logWarn(
-          "AI 回复写剪贴板失败",
-          error instanceof Error ? error.message : String(error),
-        );
-      }
+      // 手势里读到的剪贴板优先，但**必须确认就是这次的 AI 回复**：剪贴板里
+      // 上一秒还是帖子正文（复制正文那步写的），万一我们的写入失败，直接用
+      // 剪贴板就会把整篇正文粘进评论区。对不上就用本地那份。
+      const fromClipboard = clipboardPromise ? await clipboardPromise : "";
+      const text =
+        typeof fromClipboard === "string" &&
+        isAiReplyClipboardText(fromClipboard)
+          ? fromClipboard
+          : state.aiReplyText;
 
       let elapsed = 0;
       let sawEditor = false;
@@ -2610,6 +2642,9 @@
       if (!inputBox) {
         return;
       }
+      // 手势里第一时间发起剪贴板读取，await 之后就不算手势了
+      const clipboardPromise =
+        state.aiReplyStatus === "ready" ? readClipboardInGesture() : null;
       // 回复还没写完就点了：记下来，写完立刻粘（此时占位框已消失，
       // 再等一次点击就等不到了）
       if (state.aiReplyStatus === "pending") {
@@ -2618,13 +2653,17 @@
         showAiReplyToast("AI 还在写，写完自动粘贴", "pending");
         return;
       }
-      void pasteAiReplyIntoComment(config, inputBox);
+      void pasteAiReplyIntoComment(config, inputBox, clipboardPromise);
     };
+    // pointerdown 比 click 早一拍，编辑器挂载和我们的插入能更早开始；两个事件
+    // 都挂上，谁先到谁干活（pasteAiReplyIntoComment 自带 aiReplyPasting 互斥）。
+    document.addEventListener("pointerdown", state.commentClickHandler, true);
     document.addEventListener("click", state.commentClickHandler, true);
   };
 
   const teardownCommentCapture = () => {
     if (state.commentClickHandler) {
+      document.removeEventListener("pointerdown", state.commentClickHandler, true);
       document.removeEventListener("click", state.commentClickHandler, true);
     }
     state.commentClickHandler = null;
@@ -2686,6 +2725,17 @@
       if (status >= 200 && status < 300 && data.ok && text) {
         state.aiReplyText = text;
         state.aiReplyStatus = "ready";
+        // 回复到手就写进剪贴板：点评论框那一刻要用
+        // navigator.clipboard.readText() 在手势里读回来，剪贴板里必须已经是它。
+        // 这时分享按钮还没轮到（要等评论发出去），不会跟分享链接抢剪贴板。
+        try {
+          await copyPlainText(text);
+        } catch (error) {
+          logWarn(
+            "AI 回复写剪贴板失败",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
         logInfo("AI 评论回复已就绪", {
           version: SCRIPT_VERSION,
           chars: text.length,
@@ -2696,7 +2746,7 @@
         });
         renderDetailHighlight(config);
         if (state.aiReplyPasteRequested) {
-          void pasteAiReplyIntoComment(config, state.aiReplyPasteAnchor);
+          void pasteAiReplyIntoComment(config, state.aiReplyPasteAnchor, null);
           return;
         }
         showAiReplyToast(config.commentReply.readyHint, "ok");

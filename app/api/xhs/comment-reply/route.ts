@@ -84,25 +84,54 @@ function stripChatPageBoilerplate(text: string): string {
     lines.splice(firstIdx, 1);
   }
 
-  // 库里有重复入库的近似帖，模型偶尔会把同一条房源写两遍；一模一样的行留一条。
+  // 同一条写两遍要去掉，两种来源都见过：库里有重复入库的近似帖；补字数那一遍
+  // 会把唯一一条素材改写成三条凑长度。所以判重看**「｜」前的标题**，不是整行
+  // ——重复行往往只是后半段措辞不同。
   const seen = new Set<string>();
 
-  return lines
+  const kept = lines
     .filter((line) => !CHAT_PAGE_TAIL_RE.test(line))
     .filter((line) => {
-      const key = line.trim();
-      if (key.length === 0) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) {
         return true;
       }
+      const key = trimmed.includes("｜")
+        ? trimmed.slice(0, trimmed.indexOf("｜")).trim()
+        : trimmed;
       if (seen.has(key)) {
         return false;
       }
       seen.add(key);
       return true;
-    })
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+    });
+
+  return stripTrailingProse(kept).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/**
+ * 删掉结尾的总结句。
+ *
+ * 用户要的是"最后一条房源写完就结束"，但模型总忍不住补一句
+ * "这些房源符合您对水电网煤全包、有停车位……的需求。可继续告诉我是否调整条件。"
+ * 这种话千变万化，穷举关键词是打地鼠，所以改判结构：条目行一定含「｜」，
+ * 从末尾往前，**在出现过条目行之后**的无「｜」行一律是散文收尾，删掉。
+ * 只从尾部删，中间不动，避免误伤。
+ */
+function stripTrailingProse(lines: string[]): string[] {
+  if (!lines.some((line) => line.includes("｜"))) {
+    return lines;
+  }
+  const out = [...lines];
+  while (out.length > 0) {
+    const last = out.at(-1)?.trim() ?? "";
+    if (last.length === 0 || !last.includes("｜")) {
+      out.pop();
+      continue;
+    }
+    break;
+  }
+  return out;
 }
 
 /** 只要真的在列条目（用「｜」分隔的行），就保证开头是那句固定开场白。 */
@@ -111,6 +140,283 @@ function ensureFixedOpening(text: string): string {
     return text;
   }
   return `${FIXED_OPENING}\n\n${text}`;
+}
+
+const TARGET_CODE_POINTS = 260;
+const MIN_CODE_POINTS = 235;
+const MAX_CODE_POINTS = 285;
+
+const codePoints = (text: string) => [...text].length;
+
+/**
+ * 把工具真正查到的条目摘出来当"素材库"。
+ *
+ * 补字数这一步必须有素材：模型第一遍常常把 8 条房源压成 90 字。素材里全是库里
+ * 的真实字段，凑字数就是把这些已有信息铺开，不是无中生有。
+ */
+const MATERIAL_FIELDS = [
+  "title",
+  "rent",
+  "deposit",
+  "bedrooms",
+  "bathrooms",
+  "roomType",
+  "locationText",
+  "propertyName",
+  "city",
+  "availableFrom",
+  "leaseEndDate",
+  "furnished",
+  "listingType",
+  "petFriendly",
+  "couplesOk",
+  "utilitiesIncluded",
+  "parkingIncluded",
+  "preferredLocations",
+  "budgetText",
+  "moveInDate",
+  "leaseDuration",
+  "wantedType",
+  "occupation",
+  "householdSize",
+  "requirements",
+] as const;
+
+type MaterialRow = Record<string, unknown>;
+
+function collectMaterial(steps: { toolResults: unknown[] }[]): MaterialRow[] {
+  const rows: MaterialRow[] = [];
+
+  for (const step of steps) {
+    for (const toolResult of step.toolResults) {
+      const output = (toolResult as { output?: unknown }).output;
+      if (!output || typeof output !== "object") {
+        continue;
+      }
+      const items =
+        (output as { listings?: unknown }).listings ??
+        (output as { wanted?: unknown }).wanted;
+      if (!Array.isArray(items)) {
+        continue;
+      }
+      for (const item of items.slice(0, 6)) {
+        if (!item || typeof item !== "object") {
+          continue;
+        }
+        const row: MaterialRow = {};
+        for (const field of MATERIAL_FIELDS) {
+          const value = (item as Record<string, unknown>)[field];
+          if (value !== null && value !== undefined && value !== "") {
+            row[field] = value;
+          }
+        }
+        if (Object.keys(row).length > 0) {
+          rows.push(row);
+        }
+      }
+    }
+  }
+
+  return rows;
+}
+
+/**
+ * 这些列里存的是给机器看的值，直接印进评论区就是一行天书（真出现过
+ * "｜rent""｜yes"）。列本身还带着历史脏数据（见 AGENT_LOG 的入库现实），
+ * 所以取值时统一挡一道。
+ */
+const JUNK_VALUES = new Set([
+  "null",
+  "undefined",
+  "yes",
+  "no",
+  "true",
+  "false",
+  "unknown",
+  "n/a",
+  "none",
+  "rent",
+  "wanted",
+  "listing",
+  "待定",
+  "未知",
+  "面议",
+]);
+
+const str = (value: unknown): string | null => {
+  if (typeof value === "number") {
+    return String(value);
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.replace(/\s+/g, " ").trim();
+  if (trimmed.length === 0 || JUNK_VALUES.has(trimmed.toLowerCase())) {
+    return null;
+  }
+  return trimmed;
+};
+
+/** 金额类字段必须带数字，否则就是脏数据（"rent"、"面议"这种）。 */
+const money = (value: unknown): string | null => {
+  const text = str(value);
+  return text && /\d/.test(text) ? text : null;
+};
+
+const cut = (value: string | null, max: number) =>
+  value && [...value].length > max ? `${[...value].slice(0, max).join("")}…` : value;
+
+/** 房型：兼容房源（bedrooms/bathrooms/roomType）和求租（wantedType）两种行。 */
+function shapeSegment(row: MaterialRow): string | null {
+  const bed = str(row.bedrooms);
+  const bath = str(row.bathrooms);
+  const room = str(row.roomType) ?? str(row.wantedType);
+  const size = [bed && `${bed}室`, bath && `${bath}卫`].filter(Boolean).join("");
+  return [size, room].filter(Boolean).join(" ") || null;
+}
+
+function tagSegment(row: MaterialRow): string | null {
+  const tags = [
+    row.utilitiesIncluded === true && "包水电",
+    row.parkingIncluded === true && "有车位",
+    row.petFriendly === true && "宠物友好",
+    row.couplesOk === true && "情侣可",
+  ].filter((tag): tag is string => typeof tag === "string");
+  return tags.length > 0 ? tags.join(" ") : null;
+}
+
+/**
+ * 一条目的可选片段，按重要性排序。凑字数时从前往后逐轮加，加到接近目标长度
+ * 为止——**每一段都是库里的真实字段**，没有任何生成成分。
+ */
+const SEGMENT_BUILDERS: ((row: MaterialRow) => string | null)[] = [
+  (row) => {
+    // 房源写租金，求租帖写预算——标签不同，别把求租者的预算说成租金。
+    const rent = money(row.rent);
+    const budget = rent ? null : money(row.budgetText);
+    const value = rent ?? budget;
+    if (!value) {
+      return null;
+    }
+    if (/[$￥刀元月]|\/mo/i.test(value)) {
+      return value;
+    }
+    return budget ? `预算${value}` : `租金${value}`;
+  },
+  shapeSegment,
+  // 截断上限放宽：真正的长度闸门是下面按预算逐段加的循环，加不下就整段不加，
+  // 不该在这里先切成 "San Jose, Palo Alto, Mount…" 那样的半截地名。
+  (row) =>
+    cut(str(row.locationText) ?? str(row.preferredLocations) ?? str(row.city), 60),
+  (row) => {
+    const from = str(row.availableFrom) ?? str(row.moveInDate);
+    return from && (/入住|起租|可租/.test(from) ? from : `${from}可入住`);
+  },
+  tagSegment,
+  (row) => {
+    const lease = str(row.leaseDuration);
+    if (lease) {
+      return /租/.test(lease) ? lease : `租期${lease}`;
+    }
+    const until = str(row.leaseEndDate);
+    return until && `租至${until}`;
+  },
+  (row) => {
+    // 押金列里也有 "1-month security deposit" 这类叙述，读起来像半句英文；
+    // 只收真正的金额。
+    const deposit = money(row.deposit);
+    return deposit && /[$￥刀元]|^\d[\d,.]*$/.test(deposit)
+      ? `押金${deposit}`
+      : null;
+  },
+  // propertyName 不进评论：这一列在库里大多不是小区名，而是 "Center"、
+  // "single family house"、"for rent in Sunnyvale 94087" 这类碎片，印出来是噪音。
+  (row) => cut(str(row.requirements), 30),
+];
+
+const titleKey = (row: MaterialRow) => cut(str(row.title), 10) ?? "";
+
+/** 草稿里已经挑好的条目优先；对不上就按工具给的相关度顺序取前几条。 */
+function pickRows(draft: string, rows: MaterialRow[]): MaterialRow[] {
+  const seen = new Set<string>();
+  const unique = rows.filter((row) => {
+    const key = titleKey(row) || JSON.stringify(row).slice(0, 40);
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+
+  const inDraft = unique.filter((row) => {
+    const head = str(row.title)?.slice(0, 8);
+    return head ? draft.includes(head) : false;
+  });
+
+  // 草稿挑中的排前面，不够 3 条再按工具给的相关度顺序补齐——补进来的同样是
+  // 过了严格筛选和终审的行，不是凑数用的次品。
+  const ordered = [...inDraft, ...unique.filter((row) => !inDraft.includes(row))];
+  return ordered.slice(0, 3);
+}
+
+/**
+ * 把条目行按真实字段拼到 260 上下——**确定性拼装，不过 LLM**。
+ *
+ * 两条都是实测逼出来的：
+ * 1. 试过让 gpt-4.1-mini 拿着素材"改写到 260 字"，它在素材只有 1 条时直接**编出
+ *    两条不存在的房源**（连租金和"社区配备游泳池"都编了）。凑字数的压力必然压过
+ *    "不许编造"的指令，这条路堵死。
+ * 2. 只在字数越界时才接管也不行：模型自己写的行里混着 "rent unknown""月租面议"
+ *    "month-to-month" 这种从脏字段直译过来的垃圾，长度恰好达标时就原样发出去了。
+ *
+ * 所以**只要工具真的查到了条目，条目区就一律由这里拼**：模型负责判断帖子类型、
+ * 调对工具、挑中哪几条（pickRows 沿用它的选择），排版和取值归我们。每加一段都是
+ * 库里有的值，加到接近上限为止；素材不够就短——短了没关系，编造不行。
+ */
+function buildToTargetLength(
+  draft: string,
+  rows: MaterialRow[]
+): { text: string; rebuilt: boolean } {
+  const picked = pickRows(draft, rows);
+  if (picked.length === 0) {
+    // 经验帖、无匹配：本来就没条目可列，模型那两句如实回答原样返回。
+    return { text: draft, rebuilt: false };
+  }
+
+  const titles = picked.map((row) => cut(str(row.title), 40) ?? "房源");
+  const segments = picked.map((row) =>
+    SEGMENT_BUILDERS.map((build) => build(row)).filter(
+      (segment): segment is string => Boolean(segment)
+    )
+  );
+  const taken = picked.map(() => 0);
+
+  const render = () =>
+    [
+      FIXED_OPENING,
+      ...titles.map((title, index) =>
+        [title, ...segments[index].slice(0, taken[index])].join("｜")
+      ),
+    ].join("\n\n");
+
+  // 轮流给每条加一段，长度均匀，不会第一条很详细后面两条光秃秃
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    for (let index = 0; index < picked.length; index += 1) {
+      if (taken[index] >= segments[index].length) {
+        continue;
+      }
+      taken[index] += 1;
+      if (codePoints(render()) > MAX_CODE_POINTS) {
+        taken[index] -= 1;
+        return { text: render(), rebuilt: true };
+      }
+      progressed = true;
+    }
+  }
+
+  return { text: render(), rebuilt: true };
 }
 
 /** 模型偶尔仍会漏出 Markdown 记号；粘进评论框前做一次无损清理。 */
@@ -208,12 +514,25 @@ export async function POST(request: Request) {
       "";
 
     const stripped = stripMemoryFromDisplay(rawAnswer);
-    const text =
+    const draft =
       style === "comment"
-        ? ensureFixedOpening(
-            stripChatPageBoilerplate(toPlainComment(stripped))
-          )
+        ? ensureFixedOpening(stripChatPageBoilerplate(toPlainComment(stripped)))
         : stripped;
+
+    const material = style === "comment" ? collectMaterial(result.steps) : [];
+
+    // 模型偶尔调完工具就收工、一个字不写（实测 searchWanted 那条路出现过）。
+    // 条目都在手上，没必要因此让油猴拿不到回复：直接按真实字段拼一条。
+    if (!draft && material.length === 0) {
+      return jsonWithCors({ ok: false, error: "Model returned no text" }, 502);
+    }
+
+    // 第一遍常常把 8 条房源压成 90 字。工具查到的字段还在手上，直接按真实字段
+    // 拼到 260 上下——扩的是已有事实，一个字都不是生成的。
+    const { text, rebuilt } =
+      style === "comment"
+        ? buildToTargetLength(draft, material)
+        : { text: draft, rebuilt: false };
 
     if (!text) {
       return jsonWithCors({ ok: false, error: "Model returned no text" }, 502);
@@ -233,7 +552,9 @@ export async function POST(request: Request) {
         model: modelId,
         style,
         toolsUsed,
-        chars: [...text].length,
+        chars: codePoints(text),
+        draftChars: codePoints(draft),
+        rebuilt,
         elapsedMs: Date.now() - startedAt,
         sourceUrl: optString(payload.sourceUrl),
       })
@@ -245,7 +566,8 @@ export async function POST(request: Request) {
       model: modelId,
       style,
       toolsUsed,
-      chars: [...text].length,
+      chars: codePoints(text),
+      rebuilt,
       elapsedMs: Date.now() - startedAt,
     });
   } catch (error) {

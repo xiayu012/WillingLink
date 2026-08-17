@@ -125,6 +125,64 @@
 `toolsUsed: []`。Playwright 全链路重跑 PASS，新增断言覆盖顺序（评论阶段分享
 按钮不许亮 / 点完输入框它自己消失 / 发送后才亮分享）与"没粘到别的可编辑元素上"。
 
+### 6. 第三轮 → 油猴 0.14.2：条目区改成确定性拼装 + 按要求换插入机制
+
+用户四条：①结尾那句"这些房源符合您对……的需求。可继续告诉我是否调整条件。"
+彻底删掉；②AI 明明查到很多房源信息，拿去**扩充**到 260 code points；③别用
+sonnet，就用项目默认的 gpt-4.1-mini；④粘贴不许模拟 paste/Ctrl+V，要在真实
+click/pointerdown 里调 `navigator.clipboard.readText()`，分别处理 input/textarea
+与 contenteditable，并 dispatch 冒泡 InputEvent，禁止只改 value/innerText。
+
+**结尾句**（`stripTrailingProse`）：这种话千变万化，穷举关键词是打地鼠。改判
+**结构**——条目行一定含「｜」，从末尾往前，出现过条目行之后的无「｜」行一律是
+散文收尾，删掉。只从尾部删，中间不动。
+
+**凑字数：两次都被现实打脸，最后落在"条目区一律确定性拼装"**（重要，别再往回改）：
+
+1. 先做的是"再过一遍 gpt-4.1-mini，拿着素材改写到 260 字"。素材只有 1 条时它
+   **直接编出两条不存在的房源**，连租金和"社区配备游泳池、烧烤区"都编了。
+   凑字数的压力必然压过"不许编造"，这条路彻底堵死。
+2. 改成"只在字数越界时才由服务端接管"也不行：模型自己写的行里混着
+   `rent unknown`、`月租面议`、`month-to-month`、`｜yes` 这种从脏列直译的垃圾，
+   长度**恰好达标时就原样发出去了**。
+3. 现行：`collectMaterial` 从 `result.steps[].toolResults[].output.listings/wanted`
+   摘真实字段 → `pickRows`（草稿挑中的优先，不够 3 条按工具相关度补齐）→
+   `buildToTargetLength` 按 `SEGMENT_BUILDERS` 优先级**轮流**给每条加一段，加到
+   逼近 285 就停。模型只负责判断帖子类型、调对工具、挑哪几条；**排版和取值归
+   代码**。素材不够就短（招租帖只有 1 条求租者时 79 字）——短了没关系，编造不行。
+   经验帖/无匹配没有 material，原样返回模型那两句。
+
+脏数据是这一步的主要敌人（AGENT_LOG 2026-08-14 §3 早有记录）：`JUNK_VALUES`
+挡掉 yes/no/null/rent/wanted/面议/未知 这类值；金额字段必须含数字（`money()`）；
+押金还要有货币符号，否则 `1-month security deposit` 会印成"押金1-month…"；
+`propertyName` 整列不进评论（存的多是 `Center`、`single family house`、
+`for rent in Sunnyvale 94087` 这种碎片）；求租行的钱写"预算"不写"租金"。
+
+**模型**：写手一直就是 `DEFAULT_CHAT_MODEL`（openai/gpt-4.1-mini），没有任何
+sonnet 覆盖，`XHS_COMMENT_REPLY_MODEL` 也没设。链路里唯一的 sonnet 是
+searchRental 终审的 `getVerifierModel()`——那是主产品搜索共用的，换掉会砸搜索
+质量（见调试史 §1），**没动**，已在回话里跟用户说明。
+
+**插入机制**（按用户指定重写 `insertTextIntoEditor`）：不再有 `execCommand`、
+不再合成 ClipboardEvent（untrusted，小红书可以直接忽略）。input/textarea 走
+原型链原生 value setter（React 劫持了 element.value，直接赋值它认不出来）；
+contenteditable 用 Selection/Range 真改 DOM（文本节点 + `<br>`，光标置末尾）。
+两条路都补发**冒泡的 beforeinput/input InputEvent**。剪贴板读取
+`readClipboardInGesture()` 在 pointerdown/click 回调**第一行同步调起**（await
+一次手势就过期了），只把 Promise 传下去等；读回来的内容必须过
+`isAiReplyClipboardText` 才用——剪贴板上一秒还是帖子正文，读串了会把整篇正文
+粘进评论区。回复到手时就 `GM_setClipboard` 写进剪贴板（此时分享步骤还没轮到，
+不抢剪贴板），readText 才读得到。监听同时挂 pointerdown 和 click，靠
+`aiReplyPasting` 互斥。
+
+**另一个真实故障**：模型偶尔调完 searchWanted 就收工、一个字不写，之前直接
+502。现在只要 material 有行就照样拼一条回去，只有"既没文字又没条目"才 502。
+
+实测：求租帖 249/270、三条互不重复、无脏字段、无结尾句；招租帖 79（素材只有
+1 条）；经验帖 48、`toolsUsed: []`、不加固定开场白。Playwright 重跑 PASS，
+新增断言：编辑器收到**冒泡的 InputEvent(insertText)**、全程**没有 paste 事件**、
+innerText 里换行没丢（否则三条房源会挤成一行）。
+
 ---
 
 ## 2026-08-16 · 每批 8 条 + "继续/换一批"瞬间出下一批
