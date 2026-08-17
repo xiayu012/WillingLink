@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.16.0
+// @version      0.17.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.16.0";
+  const SCRIPT_VERSION = "0.17.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -188,6 +188,13 @@
         ".comment-input button.submit",
         "button.submit",
       ],
+      /**
+       * 复制正文后先问 /api/xhs/post-intent：这条帖子是不是「租客在求租」。
+       * 只有 seeker 才继续跑那套贵的评论生成，其余（招租帖、经验帖）直接跳到
+       * 分享那一步。正则快路径命中时服务端一次模型都不用调。
+       */
+      intentGate: true,
+      intentTimeoutMs: 20_000,
       pendingHint: "AI 正在写评论回复…",
       readyHint: "点这里，自动粘贴 AI 回复",
       sendHint: "检查后点发送",
@@ -536,6 +543,9 @@
     aiReplyPasting: false,
     /** 人工点过发送按钮：这一步完成后才轮到分享按钮的框选 */
     commentSent: false,
+    /** 人工点过分享弹层里的「复制链接」：点完这一框就该收了 */
+    shareCopyLinkClicked: false,
+    shareCopyLinkHandler: null,
     commentClickHandler: null,
   };
 
@@ -2146,8 +2156,11 @@
       (state.listingId || state.bodyCopied)
     ) {
       // 分享弹层开着就框「复制链接」，否则框分享按钮——弹层元素的有无本身
-      // 就是"分享按钮点没点过"的信号。
-      const copyLink = findShareCopyLinkElement(config);
+      // 就是"分享按钮点没点过"的信号。点过「复制链接」之后这一阶段就收框：
+      // 链接已经进剪贴板，剩下的写库是后台的事，不该继续杵一个红框在那。
+      const copyLink = state.shareCopyLinkClicked
+        ? null
+        : findShareCopyLinkElement(config);
       if (copyLink instanceof HTMLElement) {
         appendRectHighlight(
           root,
@@ -2155,7 +2168,7 @@
           copyLink,
           config.detailCopy.shareCopyLinkHint,
         );
-      } else {
+      } else if (!state.shareCopyLinkClicked) {
         const share = findDetailShareElement();
         if (share instanceof HTMLElement) {
           appendRectHighlight(
@@ -2514,6 +2527,47 @@
       version: SCRIPT_VERSION,
       listingId: state.listingId,
     });
+  };
+
+  /**
+   * 「复制链接」点一次就收框。
+   *
+   * 单独挂一个监听而不是并进分享那个 handler：分享的点击捕获只在
+   * `listingId && !shareUrlDone` 时才挂，而「复制链接」的框可能在 listingId
+   * 还没回来时就已经画出来了（条件里有 `state.bodyCopied`），并进去会漏。
+   */
+  const ensureShareCopyLinkListener = (config) => {
+    if (state.shareCopyLinkHandler) {
+      return;
+    }
+    state.shareCopyLinkHandler = (event) => {
+      if (state.shareCopyLinkClicked) {
+        return;
+      }
+      const hit = closestBySelectors(
+        event.target,
+        config.detailCopy.shareCopyLinkSelectorCandidates,
+      );
+      if (!hit) {
+        return;
+      }
+      const text = hit.textContent?.replace(/\s+/g, "") ?? "";
+      if (!text.includes(config.detailCopy.shareCopyLinkLabel)) {
+        return;
+      }
+      state.shareCopyLinkClicked = true;
+      logInfo("已点击复制链接，收起分享步骤的框选");
+      renderDetailHighlight(config);
+    };
+    document.addEventListener("click", state.shareCopyLinkHandler, true);
+  };
+
+  const teardownShareCopyLinkListener = () => {
+    if (state.shareCopyLinkHandler) {
+      document.removeEventListener("click", state.shareCopyLinkHandler, true);
+    }
+    state.shareCopyLinkHandler = null;
+    state.shareCopyLinkClicked = false;
   };
 
   const ensureSyncShareButton = (config) => {
@@ -2940,6 +2994,57 @@
     document.getElementById("xhs-guide-ai-reply-toast")?.remove();
   };
 
+  /**
+   * 便宜的岔路口：这条帖子是不是租客在求租。
+   *
+   * 返回 true 才值得往下跑评论生成。**判不出来时返回 true**（网络挂了、
+   * 服务端报错）——宁可多花一次，也不要因为一次抖动就把功能静默关掉；何况
+   * comment-reply 自己也会按帖子类型分支，最后还有 hasListings 兜一道。
+   */
+  const isSeekerPost = async (config, plainText) => {
+    if (!config.commentReply.intentGate) {
+      return true;
+    }
+    const baseUrl = config.ingest?.baseUrl?.trim();
+    if (!baseUrl) {
+      return true;
+    }
+    const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/post-intent`;
+    const headers = { "Content-Type": "application/json" };
+    const token = config.commentReply.token?.trim();
+    if (token) {
+      headers["X-Xhs-Token"] = token;
+    }
+    const startedAt = now();
+
+    try {
+      const { status, responseText } = await gmHttpPost(
+        url,
+        headers,
+        JSON.stringify({ rawText: plainText }),
+        config.commentReply.intentTimeoutMs,
+      );
+      const data = JSON.parse(responseText || "{}");
+      if (status < 200 || status >= 300 || !data.ok) {
+        logWarn("求租判定失败，按求租帖继续", { status, data });
+        return true;
+      }
+      logInfo("帖子类型判定", {
+        intent: data.intent,
+        confidence: data.confidence,
+        source: data.source,
+        elapsedMs: now() - startedAt,
+      });
+      return data.isSeeker === true;
+    } catch (error) {
+      logWarn(
+        "求租判定异常，按求租帖继续",
+        error instanceof Error ? error.message : String(error),
+      );
+      return true;
+    }
+  };
+
   const requestAiCommentReply = async (config, plainText) => {
     if (!config.commentReply?.enable || state.aiReplyStatus === "pending") {
       return;
@@ -2954,12 +3059,24 @@
     state.aiReplyPasteRequested = false;
     state.aiReplyPasteAnchor = null;
     state.commentSent = false;
+    state.shareCopyLinkClicked = false;
     showAiReplyToast(config.commentReply.pendingHint, "pending");
     ensureCommentClickListener(config);
     renderDetailHighlight(config);
     // 等服务器写回剪贴板之前，整屏挡住：这段时间点什么都是白点，滚出去还会
     // 让评论框离开视窗，框选就白框了。
     screenBlocker.show(config.commentReply.waitText);
+
+    // 岔路口：不是租客求租的帖子（招租帖、经验帖）没有评论可写，直接跳到
+    // 分享那一步，省掉后面一整轮带搜索的 agent。
+    if (!(await isSeekerPost(config, plainText))) {
+      state.aiReplyStatus = "skipped";
+      screenBlocker.hide();
+      logInfo("不是求租帖，跳过评论步骤，直接进分享");
+      showAiReplyToast("不是求租帖，跳过评论", "warn");
+      renderDetailHighlight(config);
+      return;
+    }
 
     const url = `${baseUrl.replace(/\/$/, "")}/api/xhs/comment-reply`;
     const headers = { "Content-Type": "application/json" };
@@ -4192,6 +4309,7 @@
 
   const refreshDetailMode = (config) => {
     ensureDetailCopyButton(config);
+    ensureShareCopyLinkListener(config);
     state.detailContentElement = findDetailContentElement(config);
     renderDetailHighlight(config);
     ensureShareClickListener(config);
@@ -4379,6 +4497,7 @@
     state.listingId = null;
     state.shareUrlDone = false;
     teardownShareCapture();
+    teardownShareCopyLinkListener();
     teardownCommentCapture();
     state.pageClipboardBridgeInjected = false;
     teardownCarouselCapture();

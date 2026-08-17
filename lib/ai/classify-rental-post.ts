@@ -90,8 +90,14 @@ function ruleBasedClassify(rawText: string): RentalPostClassification | null {
   return null;
 }
 
+/**
+ * @param options.model 覆盖分类模型。入库路径保持默认（getTitleModel）不动；
+ *   油猴的 post-intent 只是决定"这条帖子要不要走后面那套贵的评论生成"，用最便宜
+ *   的模型足够，所以那条路由传 getFeedTitleModel()。
+ */
 export async function classifyRentalPostIntent(
-  rawText: string
+  rawText: string,
+  options?: { model?: Parameters<typeof generateObject>[0]["model"] }
 ): Promise<RentalPostClassification> {
   const ruleResult = ruleBasedClassify(rawText);
   if (ruleResult && ruleResult.confidence >= 0.82) {
@@ -100,7 +106,7 @@ export async function classifyRentalPostIntent(
 
   try {
     const { object } = await generateObject({
-      model: getTitleModel(),
+      model: options?.model ?? getTitleModel(),
       schema: classificationSchema,
       system: `你是美国湾区租房帖分类器。判断发帖人是「求租者」「招租者」还是「非交易帖」。
 

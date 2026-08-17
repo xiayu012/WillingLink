@@ -265,6 +265,33 @@ Playwright 新增两处：详情页测试补"点分享→框选转到复制链�
 点**被框选**的 +1 并写进 localStorage、刷新后仍在，另外校验徽标颜色
 `rgb(37,99,235)`、字号 15px、贴顶、居中。
 
+### 9. 第六轮 → 油猴 0.17.0：复制链接点完收框 + 求租帖才跑评论
+
+用户两条：①点了「复制链接」红框要消失；②复制正文后**用最便宜的 llm 判断正文**，
+不是租客求租就跳过评论、直接从分享按钮那步开始框选。
+
+**收框**：`state.shareCopyLinkClicked` 一置，分享阶段（复制链接框 + 分享按钮框）
+全部不画。监听**单独挂**（`ensureShareCopyLinkListener`，在 `refreshDetailMode`
+里确保）而不是并进 `shareDocClickHandler`——后者只在 `listingId && !shareUrlDone`
+时才挂，而复制链接的框在 `bodyCopied` 阶段（listingId 还没回来）就可能画出来了，
+并进去会漏点。链接已进剪贴板，写库是后台的事，不该继续杵个红框。
+
+**求租岔路口** `app/api/xhs/post-intent`（新路由）：**复用入库那套
+`classifyRentalPostIntent`**，只是给它加了个可选 `options.model`，这条路由传
+`getFeedTitleModel()`（gpt-4o-mini，全项目最便宜）。入库路径的默认模型没动。
+选它而不是新写一个分类器，是因为它自带正则快路径——实测求租帖 **source: rule、
+4ms、一次模型都没调**；招租帖/经验帖才落到 gpt-4o-mini（1.3-1.6s）。
+
+油猴在 `requestAiCommentReply` 开头分叉：非 seeker 就 `aiReplyStatus = "skipped"`、
+收遮罩、直接渲染成分享阶段，**comment-reply 一次都不调**（省的是大头：那条路由
+每次跑一整轮带搜索的 agent）。**判不出来时按求租帖继续**——宁可多花一次，也不要
+因为一次网络抖动把功能静默关掉；何况 comment-reply 自己也按帖子类型分支，最后
+还有 `hasListings` 兜一道。
+
+实测三类帖子分类全对（seeker/lister/other）。Playwright 三个场景：happy path 补
+"点复制链接后框消失、分享阶段不再有任何框"；新写招租帖场景断言
+**comment-reply 调用次数为 0** 且直接框分享按钮；no-listings 场景照旧。
+
 ---
 
 ## 2026-08-16 · 每批 8 条 + "继续/换一批"瞬间出下一批
