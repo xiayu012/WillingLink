@@ -49,10 +49,69 @@ const COMMENT_CHANNEL_SECTION = `## 本次输入是一条帖子，输出去评�
 
 - **纯文本**：不要任何 Markdown —— 不要 \`**\`、\`#\`、\`-\`、表格、\`[文字](链接)\`、\`![](图片)\`。需要分隔就用换行和「｜」。
 - **不要输出任何网址**：评论区里链接点不动，贴出来只是噪音。想让对方看原帖或更多房源，就请对方私信。
-- **最多 3 条**房源：即使 searchRental 返回了 8 条，也只挑最匹配的 3 条写进评论（这条覆盖上面"显示每一条"的要求）。每条压缩成 1-2 行（标题｜租金｜房型｜位置｜可入住时间），房源之间空一行。
-- 全文控制在 400 字以内，开头一句话说明你是看到帖子来帮忙的，结尾一句话邀请对方私信详聊。
-- 不要暴露系统内部说法（"数据库""工具""搜索结果""action"），也不要出现"换一个""如仍不满意，我再为您调整"这类聊天页话术——评论区没有下一轮，像一个真人邻居在回帖。
-- 没有匹配上就如实说现在没有合适的、请对方留言需求，**绝不编造房源**。`;
+- **最多 3 条**：无论工具返回几条房源（searchRental）或几个求租者（searchWanted），都只挑最匹配的 3 条写进评论（这条覆盖上面"显示每一条"的要求）。每条压缩成 **1 行**：标题｜租金｜房型｜位置｜可入住时间，条与条之间空一行。**不要**逐字段分行（"期望位置: ……""预算: ……"），**不要**贴原文简介。
+- **开场白只有固定的一行**：\`看看这些怎么样：\`——一字不改，不要在它前面加任何话，也不要换成别的说法。房源和求租者都用这一行开头。
+- 缺的字段**直接不写**，别写"价格未知""可入住时间未知""月租面议"——评论区字数金贵，占位词纯属浪费，"面议"更是帖子没说过的话。
+- **三条必须是三个不同的**：库里有重复入库的近似帖，标题或地址一样的只留一条，凑不满就少写一条。
+- **不要结尾**：最后一条写完就结束。禁止任何总结句、点评句、邀请私信、祝福语（"这些房源都在……""通勤方便""可以私信我""祝你早日找到理想的家"这类一句都不许有）。
+- **全文 260 个字符左右**（240-280，含标点换行）。写不下就少放一条，而不是把每条压成半句。
+- **工具 action 里的引导语一律不要照抄**："已放宽关键词""找不到完全符合要求的，先给你看一条""如仍不满意，可告诉我具体要求，我再为您调整""换一个"——这些是聊天页话术，评论区没有下一轮，照抄会露馅。同样不要暴露"数据库""工具""搜索结果""action"这类系统内部说法，像一个真人邻居在回帖。
+- 没有匹配上、或者这是经验帖不该推荐时：**不要写那行固定开场白**，只用一两句如实说明，**绝不编造**。`;
+
+/** 固定开场白：用户要求一字不差，所以不靠模型自觉，落地时兜一道。 */
+const FIXED_OPENING = "看看这些怎么样：";
+
+/**
+ * 聊天页话术的兜底清理。
+ *
+ * prompt 里已经禁了，但 searchWanted（仍是旧的"换一个"级联）会把
+ * "已放宽关键词…先给你看一条""如仍不满意，可告诉我具体要求，我再为您调整"
+ * 这类引导语直接写进 action 字段，模型照抄的概率很高——两条指令打架时它听
+ * 工具的。这些话在评论区一句都不成立，所以按字面删掉，不指望模型自觉。
+ *
+ * 注意只删"放宽/先给你看一条"这种级联话术；"目前没有完全符合的房源"是我们
+ * 要保留的如实回答，不能一起删掉。
+ */
+const RELAXED_LEAD_RE = /放宽|先给你看一条/;
+const CHAT_PAGE_TAIL_RE =
+  /如仍不满意|如需换一个|我再重新筛选|再为您调整|如需调整条件/;
+
+function stripChatPageBoilerplate(text: string): string {
+  const lines = text.split("\n");
+
+  const firstIdx = lines.findIndex((line) => line.trim().length > 0);
+  if (firstIdx >= 0 && RELAXED_LEAD_RE.test(lines[firstIdx])) {
+    lines.splice(firstIdx, 1);
+  }
+
+  // 库里有重复入库的近似帖，模型偶尔会把同一条房源写两遍；一模一样的行留一条。
+  const seen = new Set<string>();
+
+  return lines
+    .filter((line) => !CHAT_PAGE_TAIL_RE.test(line))
+    .filter((line) => {
+      const key = line.trim();
+      if (key.length === 0) {
+        return true;
+      }
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** 只要真的在列条目（用「｜」分隔的行），就保证开头是那句固定开场白。 */
+function ensureFixedOpening(text: string): string {
+  if (!text.includes("｜") || text.startsWith(FIXED_OPENING)) {
+    return text;
+  }
+  return `${FIXED_OPENING}\n\n${text}`;
+}
 
 /** 模型偶尔仍会漏出 Markdown 记号；粘进评论框前做一次无损清理。 */
 function toPlainComment(text: string): string {
@@ -149,7 +208,12 @@ export async function POST(request: Request) {
       "";
 
     const stripped = stripMemoryFromDisplay(rawAnswer);
-    const text = style === "comment" ? toPlainComment(stripped) : stripped;
+    const text =
+      style === "comment"
+        ? ensureFixedOpening(
+            stripChatPageBoilerplate(toPlainComment(stripped))
+          )
+        : stripped;
 
     if (!text) {
       return jsonWithCors({ ok: false, error: "Model returned no text" }, 502);
@@ -169,7 +233,7 @@ export async function POST(request: Request) {
         model: modelId,
         style,
         toolsUsed,
-        chars: text.length,
+        chars: [...text].length,
         elapsedMs: Date.now() - startedAt,
         sourceUrl: optString(payload.sourceUrl),
       })
@@ -181,6 +245,7 @@ export async function POST(request: Request) {
       model: modelId,
       style,
       toolsUsed,
+      chars: [...text].length,
       elapsedMs: Date.now() - startedAt,
     });
   } catch (error) {

@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.14.0
+// @version      0.14.1
 // @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.14.0";
+  const SCRIPT_VERSION = "0.14.1";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -173,10 +173,17 @@
         '[contenteditable="true"].content-input',
         "textarea.content-input",
       ],
-      /** 点击后编辑器是异步挂载的，按这个节奏找几次 */
-      editorWaitMs: [0, 80, 200, 400, 800, 1400, 2200],
+      /** 点击后编辑器是异步挂载的，按这个节奏一直试到插进去为止 */
+      editorWaitMs: [0, 60, 150, 300, 600, 1000, 1600, 2400, 3200],
+      /** 粘完之后要框选的发送按钮 */
+      sendSelectorCandidates: [
+        "button.btn.submit",
+        ".comment-input button.submit",
+        "button.submit",
+      ],
       pendingHint: "AI 正在写评论回复…",
       readyHint: "点这里，自动粘贴 AI 回复",
+      sendHint: "检查后点发送",
     },
     /** 复制成功后 POST 到 Next /api/xhs/rental-ingest。请用 https 根地址，避免 http→https 重定向触发 CORS 预检失败 */
     ingest: {
@@ -515,7 +522,11 @@
     aiReplyText: null,
     /** 回复还没到就点了评论框：到了立刻粘，不再等第二次点击 */
     aiReplyPasteRequested: false,
+    /** 那次点击的占位框，用来限定编辑器搜索范围 */
+    aiReplyPasteAnchor: null,
     aiReplyPasting: false,
+    /** 人工点过发送按钮：这一步完成后才轮到分享按钮的框选 */
+    commentSent: false,
     commentClickHandler: null,
   };
 
@@ -1849,20 +1860,12 @@
       );
     }
 
-    if (!state.shareUrlDone && (state.listingId || state.bodyCopied)) {
-      const share = findDetailShareElement();
-      if (share instanceof HTMLElement) {
-        appendRectHighlight(
-          root,
-          config,
-          share,
-          config.detailCopy.shareHint,
-        );
-      }
-    }
+    // 评论阶段（输入框 → 发送按钮）走完之前不亮分享按钮：一次只框一个，
+    // 顺序就是用户要走的顺序。评论链路没开或失败时 stage 直接是 none，
+    // 分享按钮照旧亮，原有链路不受影响。
+    const stage = commentStage(config);
 
-    // AI 回复在路上或已就绪时框选评论输入框；点它就把回复粘进去。
-    if (state.aiReplyStatus === "pending" || state.aiReplyStatus === "ready") {
+    if (stage === "input") {
       const commentInput = findCommentInputElement(config);
       if (commentInput instanceof HTMLElement) {
         appendRectHighlight(
@@ -1872,6 +1875,32 @@
           state.aiReplyStatus === "ready"
             ? config.commentReply.readyHint
             : config.commentReply.pendingHint,
+        );
+      }
+    } else if (stage === "send") {
+      const sendButton = findCommentSendElement(config);
+      if (sendButton instanceof HTMLElement) {
+        appendRectHighlight(
+          root,
+          config,
+          sendButton,
+          config.commentReply.sendHint,
+        );
+      }
+    }
+
+    if (
+      stage === "none" &&
+      !state.shareUrlDone &&
+      (state.listingId || state.bodyCopied)
+    ) {
+      const share = findDetailShareElement();
+      if (share instanceof HTMLElement) {
+        appendRectHighlight(
+          root,
+          config,
+          share,
+          config.detailCopy.shareHint,
         );
       }
     }
@@ -2334,32 +2363,90 @@
   const findCommentInputElement = (config) =>
     findVisibleBySelectors(config.commentReply.inputSelectorCandidates);
 
-  /** 点开之后真正可写的编辑器；小红书用的是 contenteditable，不是 textarea */
-  const findCommentEditorElement = (config) => {
+  /** 粘完之后要框选的发送按钮 */
+  const findCommentSendElement = (config) =>
+    findVisibleBySelectors(config.commentReply.sendSelectorCandidates);
+
+  /**
+   * 当前该框选哪一步。评论链路没开、还没请求、请求失败时一律 none —— 让分享
+   * 按钮照旧亮，AI 出问题不能把原有的入库/分享链路挡死。
+   */
+  const commentStage = (config) => {
+    if (!config.commentReply?.enable || state.commentSent) {
+      return "none";
+    }
+    if (state.aiReplyStatus === "pending" || state.aiReplyStatus === "ready") {
+      return "input";
+    }
+    if (state.aiReplyStatus === "pasted") {
+      return "send";
+    }
+    return "none";
+  };
+
+  const isEditableElement = (node) =>
+    node instanceof HTMLTextAreaElement ||
+    node instanceof HTMLInputElement ||
+    (node instanceof HTMLElement && node.isContentEditable);
+
+  /**
+   * 点开之后真正可写的编辑器。顺序有讲究：
+   * 1. `document.activeElement` —— 用户刚点过输入框，光标就在里面，这是最准的
+   *    一手信息，比任何选择器都可靠；
+   * 2. 配置的选择器；
+   * 3. 评论区容器内任意可编辑元素。
+   * 第 3 步**必须限定在容器里**：详情页别处（搜索框等）也有 contenteditable，
+   * 全局兜底会把评论粘到别的框里去。
+   */
+  const findCommentEditorElement = (config, scope) => {
+    const active = document.activeElement;
+    if (isEditableElement(active) && (!scope || scope.contains(active))) {
+      return active;
+    }
+
     const known = findVisibleBySelectors(
       config.commentReply.editorSelectorCandidates,
     );
     if (known) {
       return known;
     }
-    return findVisibleBySelectors(['[contenteditable="true"]', "textarea"]);
+
+    if (scope instanceof HTMLElement) {
+      for (const node of scope.querySelectorAll(
+        '[contenteditable="true"], textarea',
+      )) {
+        const rect = node.getBoundingClientRect();
+        if (node instanceof HTMLElement && rect.width > 0 && rect.height > 0) {
+          return node;
+        }
+      }
+    }
+    return null;
   };
 
-  const isCommentInputTarget = (config, target) => {
+  const closestBySelectors = (target, selectors) => {
     if (!(target instanceof Element)) {
-      return false;
+      return null;
     }
-    for (const selector of config.commentReply.inputSelectorCandidates) {
+    for (const selector of selectors) {
       try {
-        if (target.closest(selector)) {
-          return true;
+        const hit = target.closest(selector);
+        if (hit instanceof HTMLElement) {
+          return hit;
         }
       } catch {
         /* 选择器无效已在别处告警 */
       }
     }
-    return false;
+    return null;
   };
+
+  /** 编辑器挂载后占位框会被换掉，所以点击当下就把容器记下来当搜索范围 */
+  const COMMENT_SCOPE_SELECTOR =
+    ".comment-input, .content-edit, .interaction-container, .interactions, .comments-container, .comment-wrapper, .note-scroller, #noteContainer";
+
+  const resolveCommentScope = (element) =>
+    element?.closest(COMMENT_SCOPE_SELECTOR) ?? element?.parentElement ?? null;
 
   /**
    * 往 Vue 控制的输入区写字。直接改 value/textContent 框架收不到，所以：
@@ -2430,13 +2517,24 @@
     return inserted();
   };
 
-  const pasteAiReplyIntoComment = async (config) => {
+  /**
+   * 点一下输入框就当"光标一定在里面了"，立刻开始粘。
+   *
+   * 输入框那一步在点击当下就消费掉（status → pasted，框选立刻换到发送按钮），
+   * 不等插入结果：用户要的是"点一次就消失"。插入失败也不算断链——文字已经在
+   * 剪贴板里，Ctrl+V 一样能发。
+   */
+  const pasteAiReplyIntoComment = async (config, anchor) => {
     const text = state.aiReplyText;
     if (!text || state.aiReplyPasting) {
       return;
     }
     state.aiReplyPasting = true;
     state.aiReplyPasteRequested = false;
+    const scope = resolveCommentScope(anchor);
+    state.aiReplyStatus = "pasted";
+    renderDetailHighlight(config);
+
     try {
       // 先进剪贴板：自动插入失败时用户至少能自己 Ctrl+V
       try {
@@ -2449,28 +2547,34 @@
       }
 
       let elapsed = 0;
+      let sawEditor = false;
       for (const targetMs of config.commentReply.editorWaitMs) {
         if (targetMs > elapsed) {
           await sleep(targetMs - elapsed);
           elapsed = targetMs;
         }
-        const editor = findCommentEditorElement(config);
+        const editor = findCommentEditorElement(config, scope);
         if (!editor) {
           continue;
         }
+        sawEditor = true;
         if (insertTextIntoEditor(editor, text)) {
-          state.aiReplyStatus = "pasted";
           logInfo("AI 回复已粘进评论框", {
             chars: text.length,
             waitedMs: elapsed,
+            editor: editor.id || editor.className || editor.tagName,
           });
-          showAiReplyToast("✓ AI 回复已粘贴，检查后自己点发送", "ok");
+          showAiReplyToast("✓ 已粘贴，检查后点发送", "ok");
           renderDetailHighlight(config);
           return;
         }
       }
 
-      logWarn("未能自动插入评论框，文字已在剪贴板", { chars: text.length });
+      logWarn("未能自动插入评论框，文字已在剪贴板", {
+        chars: text.length,
+        sawEditor,
+        scope: scope?.className || scope?.id || null,
+      });
       showAiReplyToast("AI 回复已复制，请在评论框 Ctrl+V", "warn");
     } finally {
       state.aiReplyPasting = false;
@@ -2482,20 +2586,39 @@
       return;
     }
     state.commentClickHandler = (event) => {
+      const target = event.target;
+
+      // 发送按钮点过之后才轮到分享按钮的框选
+      if (
+        state.aiReplyStatus === "pasted" &&
+        !state.commentSent &&
+        closestBySelectors(target, config.commentReply.sendSelectorCandidates)
+      ) {
+        state.commentSent = true;
+        logInfo("评论已发送，进入分享步骤");
+        renderDetailHighlight(config);
+        return;
+      }
+
       if (state.aiReplyStatus !== "ready" && state.aiReplyStatus !== "pending") {
         return;
       }
-      if (!isCommentInputTarget(config, event.target)) {
+      const inputBox = closestBySelectors(
+        target,
+        config.commentReply.inputSelectorCandidates,
+      );
+      if (!inputBox) {
         return;
       }
       // 回复还没写完就点了：记下来，写完立刻粘（此时占位框已消失，
       // 再等一次点击就等不到了）
       if (state.aiReplyStatus === "pending") {
         state.aiReplyPasteRequested = true;
+        state.aiReplyPasteAnchor = inputBox;
         showAiReplyToast("AI 还在写，写完自动粘贴", "pending");
         return;
       }
-      void pasteAiReplyIntoComment(config);
+      void pasteAiReplyIntoComment(config, inputBox);
     };
     document.addEventListener("click", state.commentClickHandler, true);
   };
@@ -2508,7 +2631,9 @@
     state.aiReplyStatus = "idle";
     state.aiReplyText = null;
     state.aiReplyPasteRequested = false;
+    state.aiReplyPasteAnchor = null;
     state.aiReplyPasting = false;
+    state.commentSent = false;
     document.getElementById("xhs-guide-ai-reply-toast")?.remove();
   };
 
@@ -2524,6 +2649,8 @@
     state.aiReplyStatus = "pending";
     state.aiReplyText = null;
     state.aiReplyPasteRequested = false;
+    state.aiReplyPasteAnchor = null;
+    state.commentSent = false;
     showAiReplyToast(config.commentReply.pendingHint, "pending");
     ensureCommentClickListener(config);
     renderDetailHighlight(config);
@@ -2569,7 +2696,7 @@
         });
         renderDetailHighlight(config);
         if (state.aiReplyPasteRequested) {
-          void pasteAiReplyIntoComment(config);
+          void pasteAiReplyIntoComment(config, state.aiReplyPasteAnchor);
           return;
         }
         showAiReplyToast(config.commentReply.readyHint, "ok");
