@@ -342,6 +342,29 @@ Playwright 新增两处：详情页测试补"点分享→框选转到复制链�
   回到"提示词 + 代码重写"那套。
 - 经验帖：`hasListings=false` → 不拼开场白、油猴整段跳过评论，正确。
 
+### 粘贴回归（0.19.0 修）
+
+用户实机报"点评论框一个字都没粘进去，但剪贴板里有"。根因在
+`findCommentEditorElement`：`document.activeElement` 那一级当初加了
+"必须在 scope 里"的条件，而 scope 是**点击那一刻**记下的容器；小红书把占位框
+整个换掉之后它成了游离节点，`scope.contains(active)` 恒假，**真编辑器反而被自己
+的保险丝挡掉**。改成 activeElement 无条件采纳（用户刚点完，焦点在哪就是哪）。
+
+顺带把插入做成"多策略 + 事后验证"：contenteditable 先 Selection/Range 改 DOM
+（补冒泡 beforeinput/input），不行再退 `execCommand("insertText")`（这不是模拟
+paste/Ctrl+V，是浏览器自己的插入命令，派发的是 trusted 事件，Vue 那种自维护
+数据的编辑器更认）；input/textarea 走原生 value setter。**插完等 180ms 再验一次**
+——有些编辑器会自己重渲染把内容抹掉，同步检查通过不等于真进去了。
+
+修的过程中踩了一个坑值得记：兜底找编辑器时我一度放开成"全页面找
+contenteditable，挑离点击处最近的"，结果**把评论粘进了详情页的搜索框**
+（Playwright 立刻抓到）。`COMMENT_SCOPE_SELECTOR` 里原本还有 `#noteContainer`
+和 `.note-scroller` 这种整页级容器，同样会把别处的可编辑元素圈进来，一并删了。
+**兜底一律限定在评论区自己的容器里，宁可找不到也不能粘错地方。**
+
+另：缩写那句现在是「请缩写至260字符左右，**不要带联系方式**」（追催那句同步
+加了"微信/电话/邮箱都不要"）。实测两轮 223/167 字符，均无联系方式泄漏。
+
 ### 会话与身份
 
 两轮（有时三轮）对话全部落在帖主那条 conversation 里，网页打开看得到完整记录。
