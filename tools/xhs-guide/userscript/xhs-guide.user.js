@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.20.0
+// @version      0.20.1
 // @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.20.0";
+  const SCRIPT_VERSION = "0.20.1";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -172,6 +172,8 @@
         '[class*="inner-when-not-active"]',
         ".comment-input .inner",
       ],
+      /** 类名对不上时按这句话认占位框——文案比类名稳 */
+      inputPlaceholderText: "说点什么",
       /** 点开占位框后真正的编辑器；找不到就只放剪贴板，让用户自己 Ctrl+V */
       editorSelectorCandidates: [
         "#content-textarea",
@@ -2687,9 +2689,74 @@
     return null;
   };
 
-  /** 未激活态的评论占位框（"说点什么..."），用来框选提示 */
-  const findCommentInputElement = (config) =>
-    findVisibleBySelectors(config.commentReply.inputSelectorCandidates);
+  /** 占位框只有一句话；命中的文本比它长太多说明框到外层容器了 */
+  const looksLikeCommentPlaceholder = (node, hint) => {
+    if (!(node instanceof HTMLElement)) {
+      return false;
+    }
+    const text = node.textContent?.replace(/\s+/g, "") ?? "";
+    if (!text.includes(hint) || text.length > hint.length + 8) {
+      return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width >= 60 && rect.height >= 16;
+  };
+
+  /**
+   * 未激活态的评论占位框（"说点什么..."）。
+   *
+   * 先按类名找；**找不到就按那几个字找**——小红书的类名和 `data-v-` 哈希会随版本
+   * 变（实测见过 `.not-active.inner-when-not-active` 变成光秃秃的 `.inner`），
+   * 而占位文案基本不动。
+   */
+  const findCommentInputElement = (config) => {
+    const byClass = findVisibleBySelectors(
+      config.commentReply.inputSelectorCandidates,
+    );
+    if (byClass) {
+      return byClass;
+    }
+
+    const hint = config.commentReply.inputPlaceholderText;
+    if (!hint) {
+      return null;
+    }
+    const matches = [...document.querySelectorAll("div, span, p")].filter(
+      (node) => looksLikeCommentPlaceholder(node, hint) && isElementVisible(node),
+    );
+    if (matches.length === 0) {
+      return null;
+    }
+    // 取最外层那个：span 的父 div 才是整条可点的框
+    return (
+      matches.find(
+        (node) => !matches.some((other) => other !== node && other.contains(node)),
+      ) ?? matches[0]
+    );
+  };
+
+  /** 点击是不是落在占位框上：同样先看类名，再看那句话 */
+  const closestCommentInput = (config, target) => {
+    const byClass = closestBySelectors(
+      target,
+      config.commentReply.inputSelectorCandidates,
+    );
+    if (byClass) {
+      return byClass;
+    }
+    const hint = config.commentReply.inputPlaceholderText;
+    if (!hint || !(target instanceof Element)) {
+      return null;
+    }
+    let node = target instanceof HTMLElement ? target : target.parentElement;
+    for (let depth = 0; depth < 4 && node; depth += 1) {
+      if (looksLikeCommentPlaceholder(node, hint)) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  };
 
   /** 粘完之后要框选的发送按钮 */
   const findCommentSendElement = (config) =>
@@ -2926,10 +2993,7 @@
       if (state.aiReplyStatus !== "ready" && state.aiReplyStatus !== "pending") {
         return;
       }
-      const inputBox = closestBySelectors(
-        target,
-        config.commentReply.inputSelectorCandidates,
-      );
+      const inputBox = closestCommentInput(config, target);
       if (!inputBox) {
         return;
       }

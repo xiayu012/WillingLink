@@ -367,6 +367,19 @@ contenteditable，挑离点击处最近的"，结果**把评论粘进了详情�
 另：缩写那句现在是「请缩写至260字符左右，**不要带联系方式**」（追催那句同步
 加了"微信/电话/邮箱都不要"）。实测两轮 223/167 字符，均无联系方式泄漏。
 
+### 占位框按文案认（0.20.1）
+
+用户贴来实机 DOM：`<div data-v-c6e6457a class="inner"><img class="icon"><span>说点什么...</span></div>`
+——**外面那层 `not-active inner-when-not-active` 没了**，`data-v-` 哈希也换了。
+类名写死在配置里迟早会这样。所以加了一级按文案兜底：类名选择器全落空时，扫
+div/span/p 找**只包含「说点什么」这一句**（文本长度不超过它 +8 字符）且可见、
+尺寸够大的元素，多个命中取最外层那个（span 的父 div 才是整条可点的框）。
+点击判定 `closestCommentInput` 同样两级：先类名，再沿祖先链往上 4 层找那句话。
+
+配置项 `commentReply.inputPlaceholderText = "说点什么"`。真要再变，改这一个字符串
+就行，不用碰代码。Playwright 加了一个场景专门跑用户这份 DOM（连容器类名
+`.comment-input` 也换成 `.reds-comment-box`，确保走的是文案那条路）。
+
 ### 会话与身份
 
 两轮（有时三轮）对话全部落在帖主那条 conversation 里，网页打开看得到完整记录。
