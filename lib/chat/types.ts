@@ -27,6 +27,8 @@ export type ExternalIdentity = {
    * 现在全填 null 也能跑，留着是因为以后接第二个小红书号时不用改表。
    */
   accountId?: string | null;
+  /** 该渠道里的昵称（小红书帖主用户名等）。只为好认，不参与判重 */
+  displayName?: string | null;
 };
 
 /** adapter 交给 Chat Engine 的统一输入 */
@@ -51,5 +53,10 @@ export type TurnResult = {
   text: string;
   /** 这一轮用到的工具，便于日志排查 */
   toolsUsed: string[];
+  /**
+   * 工具的原始返回。adapter 偶尔需要看工具到底查到了什么（例如评论回复要用
+   * 真实字段兜底拼装），不给的话它只能自己再调一次工具。
+   */
+  toolOutputs: unknown[];
   elapsedMs: number;
 };

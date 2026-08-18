@@ -1,15 +1,10 @@
-import { randomUUID } from "node:crypto";
 import { geolocation } from "@vercel/functions";
-import { generateText, stepCountIs } from "ai";
 import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
-import { systemPrompt } from "@/lib/ai/prompts";
-import { getLanguageModel } from "@/lib/ai/providers";
-import { findNearestTransit } from "@/lib/ai/tools/find-nearest-transit";
-import { getTransitTime } from "@/lib/ai/tools/get-transit-time";
-import { queryListings } from "@/lib/ai/tools/query-listings";
-import { createSearchRentalTool } from "@/lib/ai/tools/search-rental";
-import { createSearchWantedTool } from "@/lib/ai/tools/search-wanted";
-import { stripMemoryFromDisplay } from "@/lib/utils";
+import { resolveChatIdForUser } from "@/lib/chat/conversation";
+import { runChatTurn } from "@/lib/chat/engine";
+import { ChannelTableMissingError, resolveInternalUserId } from "@/lib/chat/identity";
+import { createGuestUser, saveChat } from "@/lib/db/queries";
+import { generateUUID } from "@/lib/utils";
 
 export const maxDuration = 60;
 export const preferredRegion = "sfo1";
@@ -96,9 +91,11 @@ function stripChatPageBoilerplate(text: string): string {
       if (trimmed.length === 0) {
         return true;
       }
+      // 有分隔符就按标题判重；模型偶尔不写分隔符，那就拿前 20 个字符当标题
+      // ——库里那些重复入库的近似帖，开头往往一模一样，只有后半段措辞不同。
       const key = trimmed.includes("｜")
         ? trimmed.slice(0, trimmed.indexOf("｜")).trim()
-        : trimmed;
+        : [...trimmed].slice(0, 20).join("");
       if (seen.has(key)) {
         return false;
       }
@@ -132,6 +129,28 @@ function stripTrailingProse(lines: string[]): string[] {
     break;
   }
   return out;
+}
+
+/**
+ * 最后一道确定性闸门：缩写那一轮偶尔压不到位（实测回过 363 字符）。
+ * 按空行切块，从**末尾整块整块地丢**，直到落进上限——丢的是整条房源，不会把
+ * 某一条截成半句，也不会动开场白和第一条。模型压不动就少推一条，这是能给的
+ * 最诚实的处理。
+ */
+function trimToBudget(text: string): string {
+  if (codePoints(text) <= MAX_CODE_POINTS) {
+    return text;
+  }
+  const blocks = text
+    .split(/\n\s*\n/)
+    .filter((block) => block.trim().length > 0);
+  while (
+    blocks.length > 2 &&
+    codePoints(blocks.join("\n\n")) > MAX_CODE_POINTS
+  ) {
+    blocks.pop();
+  }
+  return blocks.join("\n\n");
 }
 
 /** 只要真的在列条目（用「｜」分隔的行），就保证开头是那句固定开场白。 */
@@ -184,12 +203,11 @@ const MATERIAL_FIELDS = [
 
 type MaterialRow = Record<string, unknown>;
 
-function collectMaterial(steps: { toolResults: unknown[] }[]): MaterialRow[] {
+function collectMaterial(outputs: unknown[]): MaterialRow[] {
   const rows: MaterialRow[] = [];
 
-  for (const step of steps) {
-    for (const toolResult of step.toolResults) {
-      const output = (toolResult as { output?: unknown }).output;
+  {
+    for (const output of outputs) {
       if (!output || typeof output !== "object") {
         continue;
       }
@@ -359,61 +377,22 @@ function pickRows(draft: string, rows: MaterialRow[]): MaterialRow[] {
   return ordered.slice(0, 3);
 }
 
-const CONDENSE_SYSTEM = `你是评论区文案编辑。把给你的草稿**压缩**成一条要发到小红书评论区的纯文本评论。
-
-- **全文 ${TARGET_CODE_POINTS} 个字符左右**（${MIN_CODE_POINTS}-${MAX_CODE_POINTS}，含标点换行）。这是压缩，不是重写：把每条的关键信息（租金、房型、具体位置、可入住时间、包水电/车位/家具等亮点）尽量塞进去，删的是虚词和客套，不是事实。
-- 第一行固定是：看看这些怎么样：
-- 之后每条一行：标题（长标题可截短）｜租金｜房型｜位置｜可入住时间｜亮点，条与条之间空一行。最多 3 条。
-- **绝不新增草稿和素材里没有的事实**，一个租金、一个地址、一条设施都不许编。草稿信息不够就短，短了没关系。
-- **绝不重复同一条**：标题或位置相同的算同一条，只留一条。
-- 缺的字段直接不写，不要写"未知""面议""待定""rent unknown"这类占位词。
-- **禁止任何结尾句**：不写总结、不写"符合您的需求"、不写"可继续告诉我是否调整条件"、不写邀请私信和祝福。最后一条写完立刻结束。
-- 纯文本，不要 Markdown、不要网址、不要"数据库/工具/搜索结果"这类系统说法。
-
-只输出压缩后的评论正文，不要解释。`;
-
 /**
- * 压缩到 260 上下。
- *
- * 这一步只做**减法**：第一遍带工具的 agent 已经把房源写得很全，这里把它压到
- * 评论区长度。历史上试过反过来用——让模型拿着素材"扩写到 260 字"，素材只有
- * 1 条时它直接编出两条不存在的房源（连"社区配备游泳池"都编了）。**扩写必然
- * 编造，压缩不会**，所以草稿比目标短时直接返回，绝不叫模型往长里写。
- * fail-open：出任何问题都退回草稿。
+ * 缩写指令。**这是发给项目 AI 的一条用户消息**，不是另起炉灶的第二个系统提示词
+ * ——用户要的是"跟项目 AI 聊天说要缩写到 260 字符"，所以它就是同一条会话里的
+ * 下一轮，模型看得见自己上一条回复，也留在聊天记录里。
  */
-async function condenseComment(
-  draft: string,
-  material: MaterialRow[],
-  modelId: string
-): Promise<{ text: string; condensed: boolean }> {
-  if (codePoints(draft) <= MAX_CODE_POINTS) {
-    return { text: draft, condensed: false };
-  }
+function condenseInstruction(currentChars: number): string {
+  return `刚才那条评论 ${currentChars} 个字符，太长了，发不进小红书评论区。请把它压到 ${TARGET_CODE_POINTS} 个字符左右（${MIN_CODE_POINTS}-${MAX_CODE_POINTS}）。
 
-  try {
-    const { text } = await generateText({
-      model: getLanguageModel(modelId),
-      system: CONDENSE_SYSTEM,
-      messages: [
-        {
-          role: "user",
-          content: `草稿（${codePoints(draft)} 个字符）：\n${draft}\n\n素材（工具查到的真实字段，只用来核对事实，不要照抄字段名）：\n${
-            material.length > 0 ? JSON.stringify(material.slice(0, 3)) : "（无）"
-          }`,
-        },
-      ],
-    });
-    const cleaned = ensureFixedOpening(
-      stripChatPageBoilerplate(toPlainComment(text))
-    );
-    return cleaned
-      ? { text: cleaned, condensed: true }
-      : { text: draft, condensed: false };
-  } catch (error) {
-    const name = error instanceof Error ? error.name : "UnknownError";
-    console.log("[comment-reply] condense failed", name);
-    return { text: draft, condensed: false };
-  }
+- **${MIN_CODE_POINTS}-${MAX_CODE_POINTS} 之间才算合格，太短一样不行**：压到 ${TARGET_CODE_POINTS} 附近就停手，别一路砍到只剩几十个字。字数没用满就把每条写细一点（把租金、房型、位置、时间、包水电/车位/家具这些补回去）。
+- 这是压缩不是重写：每条的关键信息尽量留住，删的是虚词和客套。
+- 第一行仍然固定是：${FIXED_OPENING}
+- 之后每条一行，格式仍然是 标题｜租金｜房型｜位置｜可入住时间｜亮点（**保留「｜」分隔**），最多 3 条，条与条之间空一行。
+- **不许新增任何刚才没出现过的事实**，一个租金、一个地址都不许编；写不下就少放一条。
+- 不要重复同一条，不要写"未知""面议"这类占位词。
+- 结尾不要任何总结、点评、邀请私信或祝福，最后一条写完就结束。
+- 只输出压缩后的评论正文。`;
 }
 
 /**
@@ -530,76 +509,110 @@ export async function POST(request: Request) {
     process.env.XHS_COMMENT_REPLY_MODEL?.trim() ??
     DEFAULT_CHAT_MODEL;
 
-  // 每次请求一个独立会话 id：searchRental 的批次缓存按它分区，不同帖子之间
-  // 不会串批，也不会污染真实用户的聊天会话。
-  const chatId = randomUUID();
+  // 帖主身份：油猴从详情页 DOM 里抓的（.author-wrapper 里的 profile 链接和昵称）
+  const authorId = optString(payload.authorId);
+  const authorName = optString(payload.authorName);
+
   const { longitude, latitude, city, country } = geolocation(request);
+  const requestHints = { longitude, latitude, city, country };
   const startedAt = Date.now();
 
   try {
-    const result = await generateText({
-      model: getLanguageModel(modelId),
-      system:
-        style === "comment"
-          ? `${systemPrompt({ requestHints: { longitude, latitude, city, country } })}\n\n${COMMENT_CHANNEL_SECTION}`
-          : systemPrompt({
-              requestHints: { longitude, latitude, city, country },
-            }),
-      messages: [
-        {
-          role: "user",
-          content: rawText.slice(0, MAX_RAW_TEXT_CHARS),
-        },
-      ],
-      stopWhen: stepCountIs(5),
-      tools: {
-        searchRental: createSearchRentalTool(chatId),
-        searchWanted: createSearchWantedTool(chatId),
-        queryListings,
-        findNearestTransit,
-        getTransitTime,
+    // ---- 会话：帖主是一个渠道身份，评论就发生在跟 ta 的那条 conversation 里 ----
+    // 认得出帖主 → 进真实会话（以后 ta 从私信/短信找过来，接的是同一串上下文）；
+    // 认不出（老版本油猴没传） → 建一条一次性会话，行为跟以前一样，不阻塞。
+    let chatId: string;
+    let userId: string;
+    let identified = false;
+    if (authorId) {
+      userId = await resolveInternalUserId({
+        channel: "xhs",
+        externalUserId: authorId,
+        displayName: authorName,
+      });
+      chatId = await resolveChatIdForUser({
+        userId,
+        title: `xhs · ${authorName ?? authorId}`,
+      });
+      identified = true;
+    } else {
+      chatId = generateUUID();
+      const [guest] = await createGuestUser();
+      userId = guest.id;
+      await saveChat({
+        id: chatId,
+        userId,
+        title: "xhs · 匿名帖主",
+        visibility: "private",
+      });
+    }
+
+    // ---- 第一轮：把帖子正文当成这条会话里的一条用户消息 ----
+    const first = await runChatTurn(
+      {
+        chatId,
+        userId,
+        text: rawText.slice(0, MAX_RAW_TEXT_CHARS),
+        channel: "xhs",
       },
-    });
+      {
+        selectedChatModel: modelId,
+        requestHints,
+        extraSystem: style === "comment" ? COMMENT_CHANNEL_SECTION : undefined,
+      }
+    );
 
-    // 工具调用收尾那一步偶尔不带文字，取最后一段非空文本兜底。
-    const rawAnswer =
-      result.text.trim() ||
-      result.steps
-        .map((step) => step.text.trim())
-        .filter(Boolean)
-        .at(-1) ||
-      "";
-
-    const stripped = stripMemoryFromDisplay(rawAnswer);
     const draft =
       style === "comment"
-        ? ensureFixedOpening(stripChatPageBoilerplate(toPlainComment(stripped)))
-        : stripped;
+        ? ensureFixedOpening(stripChatPageBoilerplate(toPlainComment(first.text)))
+        : first.text;
 
-    const material = style === "comment" ? collectMaterial(result.steps) : [];
+    const material = style === "comment" ? collectMaterial(first.toolOutputs) : [];
 
-    // 模型偶尔调完工具就收工、一个字不写（实测 searchWanted 那条路出现过）。
-    // 条目都在手上，没必要因此让油猴拿不到回复：直接按真实字段拼一条。
     if (!draft && material.length === 0) {
       return jsonWithCors({ ok: false, error: "Model returned no text" }, 502);
     }
 
-    // 正常路径：第一遍写得很全 → 这里压到 260。模型一个字没写但条目在手上时
-    // （实测 searchWanted 出现过）退回确定性拼装，别让油猴空手而归。
+    // ---- 第二轮：太长就在**同一条会话里**跟它说"缩写到 260" ----
+    // 这一句和它的回答都会留在聊天记录里，跟人在聊天页说"太长了压一压"没区别。
     let text = draft;
     let condensed = false;
     let rebuilt = false;
+    const toolsUsed = [...first.toolsUsed];
 
     if (style === "comment") {
-      if (draft) {
-        const condenseResult = await condenseComment(draft, material, modelId);
-        text = condenseResult.text;
-        condensed = condenseResult.condensed;
-      } else {
+      if (draft && codePoints(draft) > MAX_CODE_POINTS) {
+        const second = await runChatTurn(
+          {
+            chatId,
+            userId,
+            text: condenseInstruction(codePoints(draft)),
+            channel: "xhs",
+          },
+          {
+            selectedChatModel: modelId,
+            requestHints,
+            extraSystem: COMMENT_CHANNEL_SECTION,
+          }
+        );
+        const shorter = ensureFixedOpening(
+          stripChatPageBoilerplate(toPlainComment(second.text))
+        );
+        if (shorter) {
+          text = shorter;
+          condensed = true;
+          toolsUsed.push(...second.toolsUsed);
+        }
+      } else if (!draft) {
+        // 模型调完工具就收工、一个字没写：条目还在手上，按真实字段拼一条
         const built = buildToTargetLength(draft, material);
         text = built.text;
         rebuilt = built.rebuilt;
       }
+    }
+
+    if (style === "comment") {
+      text = trimToBudget(text);
     }
 
     if (!text) {
@@ -607,23 +620,25 @@ export async function POST(request: Request) {
     }
 
     // 油猴要据此决定后面还走不走评论那一步：没房源就别占剪贴板、别框评论框，
-    // 直接跳到分享。判据用最终文本的形状——固定开场白 + 条目行都在才算有货。
-    const hasListings = text.startsWith(FIXED_OPENING) && text.includes("｜");
-
-    const toolsUsed = [
-      ...new Set(
-        result.steps.flatMap((step) =>
-          step.toolCalls.map((call) => call.toolName)
-        )
-      ),
-    ];
+    // 直接跳到分享。
+    //
+    // 判据只看**固定开场白 + 后面确实有内容行**，不看「｜」：提示词说了没房源
+    // 时不许写那行开场白，所以它就是最可靠的信号。曾经把"含｜"也当必要条件，
+    // 结果模型某次没用分隔符写了三条真房源，hasListings 被判成 false，
+    // 整个评论步骤被白白跳过——排版走样不该等于"没有房源"。
+    const hasListings =
+      text.startsWith(FIXED_OPENING) &&
+      text.slice(FIXED_OPENING.length).trim().length > 0;
 
     console.log(
       "[comment-reply]",
       JSON.stringify({
         model: modelId,
         style,
-        toolsUsed,
+        chatId,
+        identified,
+        authorId,
+        toolsUsed: [...new Set(toolsUsed)],
         hasListings,
         chars: codePoints(text),
         draftChars: codePoints(draft),
@@ -637,9 +652,11 @@ export async function POST(request: Request) {
     return jsonWithCors({
       ok: true,
       text,
+      chatId,
+      identified,
       model: modelId,
       style,
-      toolsUsed,
+      toolsUsed: [...new Set(toolsUsed)],
       hasListings,
       chars: codePoints(text),
       condensed,
@@ -647,6 +664,12 @@ export async function POST(request: Request) {
       elapsedMs: Date.now() - startedAt,
     });
   } catch (error) {
+    if (error instanceof ChannelTableMissingError) {
+      return jsonWithCors(
+        { ok: false, error: error.message, needsMigration: true },
+        501
+      );
+    }
     // AI SDK 的错误对象直接丢给 console.error 会让 util.inspect 自身抛异常
     // （见 .claude/AGENT_LOG.md 的 fail-open 事故），只打名字和消息。
     const name = error instanceof Error ? error.name : "UnknownError";

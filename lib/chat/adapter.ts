@@ -42,6 +42,7 @@ export type InboundMessage = {
   externalUserId: string;
   text: string;
   accountId?: string | null;
+  displayName?: string | null;
   externalMessageId?: string | null;
 };
 
@@ -58,11 +59,12 @@ export async function handleInboundMessage(
     channel: inbound.channel,
     externalUserId: inbound.externalUserId,
     accountId: inbound.accountId ?? null,
+    displayName: inbound.displayName ?? null,
   });
 
   const chatId = await resolveChatIdForUser({
     userId,
-    title: `${inbound.channel} · ${inbound.externalUserId}`,
+    title: `${inbound.channel} · ${inbound.displayName ?? inbound.externalUserId}`,
   });
 
   return await runChatTurn({

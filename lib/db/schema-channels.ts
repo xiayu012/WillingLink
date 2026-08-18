@@ -29,6 +29,8 @@ export const channelIdentity = pgTable(
     externalUserId: varchar("externalUserId", { length: 128 }).notNull(),
     /** 同渠道多账号时区分是哪个客服号收到的；现在可以全是 null */
     accountId: varchar("accountId", { length: 128 }),
+    /** 该渠道里显示的昵称，例如小红书帖主的用户名。只为好认，不参与判重 */
+    displayName: varchar("displayName", { length: 128 }),
     createdAt: timestamp("createdAt").notNull().defaultNow(),
   },
   (table) => ({

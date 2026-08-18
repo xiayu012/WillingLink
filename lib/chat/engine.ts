@@ -207,6 +207,9 @@ export async function runChatTurn(
       result.steps.flatMap((step) => step.toolCalls.map((call) => call.toolName))
     ),
   ];
+  const toolOutputs = result.steps.flatMap((step) =>
+    step.toolResults.map((toolResult) => (toolResult as { output?: unknown }).output)
+  );
 
   console.log(
     "[chat-engine]",
@@ -224,6 +227,7 @@ export async function runChatTurn(
     chatId: turn.chatId,
     text: answer,
     toolsUsed,
+    toolOutputs,
     elapsedMs: Date.now() - startedAt,
   };
 }

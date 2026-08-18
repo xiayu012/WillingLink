@@ -346,6 +346,41 @@ Playwright 新增两处：详情页测试补"点分享→框选转到复制链�
 回复格式（企微被动回复只有 5 秒，必须改成异步推送）。去重（externalMessageId
 判重）和 webhook 渠道的限流**都还没写**，接真实渠道前必须补。
 
+### 5. 同日续：comment-reply 变成第一个真渠道 + 帖主身份入库（油猴 0.18.0）
+
+用户确认已建表并打开开关（我核过：ChannelIdentity 在、三个索引都在、
+Message_v2 第 2 段没跑，符合预期；**但 `.env.local` 里没有
+CHANNEL_ADAPTERS_ENABLED**，多半只设在 Vercel，本地联调要自己带）。
+然后要求把 `/api/xhs/comment-reply` 也当成一个渠道：建 chat、全程进聊天记录、
+**缩写动作改成在同一条会话里跟项目 AI 说"压到 260"**，拿最后那条回复进剪贴板。
+
+- 帖主身份：油猴从 `.author-wrapper` 里抓 `/user/profile/<id>` 和 `.username`，
+  随请求送到服务端 → `ChannelIdentity(xhs, <id>, displayName)` → 内部 user →
+  `resolveChatIdForUser`。**同一个帖主的第二条、第三条帖子会落进同一条会话**
+  （实测三次调用 chatId 都是 a673939a），以后 ta 从私信/短信找过来接的是同一串
+  上下文。给 ChannelIdentity 加了 `displayName` 列（SQL 文件同步更新，已 ALTER
+  到线上；表当时是空的，零风险）。
+- 抓不到帖主（老版本油猴）→ 建一次性 guest 会话，行为与以前一致，不阻塞。
+- 缩写变成第二轮对话：`condenseInstruction()` 是一条**用户消息**，不再是第二个
+  system prompt。实测库里就是四条：帖子正文 → 长草稿 → "刚才那条 464 字符，
+  压到 260" → 压完的版本。
+- `CONDENSE_SYSTEM` / `condenseComment()` 删除；`collectMaterial` 改吃
+  `TurnResult.toolOutputs`（engine 新增的字段，adapter 想知道工具查到什么时不用
+  再调一次工具）。
+
+**两个实测踩到的坑**：
+
+1. `hasListings` 曾要求正文含「｜」。模型某次没用分隔符写了三条真房源 →
+   判成 false → 油猴把整个评论步骤跳过了。**排版走样不等于没有房源**，改成只看
+   "固定开场白 + 后面有内容"。
+2. 缩写那一轮压不到位（回过 363 字符，也回过 105 字符）。指令里补了"235-285
+   才算合格，太短一样不行"，再加确定性闸门 `trimToBudget()`：按空行整块丢尾巴，
+   丢的是整条房源，不会把某条截成半句。修完实测 243-265。
+
+（另：`.env.local` 里有个 `XHSXHS_API_TOKEN`，代码里没人读，看着像
+`XHS_API_TOKEN` 打错了 —— 也就是说共享密钥现在其实没生效。已在回话里提醒。）
+
+
 ---
 
 ## 2026-08-16 · 每批 8 条 + "继续/换一批"瞬间出下一批

@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.17.0
+// @version      0.18.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.17.0";
+  const SCRIPT_VERSION = "0.18.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -200,6 +200,17 @@
       sendHint: "检查后点发送",
       /** 等服务器返回期间盖满全屏的字 */
       waitText: "WAIT",
+      /** 帖主身份：从详情页作者区抓 profile 链接和昵称，随请求一起送去入库 */
+      authorLinkSelectorCandidates: [
+        '.author-wrapper a.name[href*="/user/profile/"]',
+        '.author-wrapper a[href*="/user/profile/"]',
+        'a.name[href*="/user/profile/"]',
+      ],
+      authorNameSelectorCandidates: [
+        ".author-wrapper .username",
+        ".author-wrapper .name .username",
+        ".username",
+      ],
     },
     /** 复制成功后 POST 到 Next /api/xhs/rental-ingest。请用 https 根地址，避免 http→https 重定向触发 CORS 预检失败 */
     ingest: {
@@ -2995,6 +3006,42 @@
   };
 
   /**
+   * 详情页的帖主身份。
+   *
+   * `/user/profile/<id>` 里那个 id 就是这个人在小红书的唯一标识，跟昵称一起送
+   * 到服务端存进 ChannelIdentity——以后这个人从私信或短信找过来，认得出是同一个
+   * 人，接的是同一条会话。抓不到就不发，服务端会退回一次性会话，不影响主流程。
+   */
+  const gatherAuthorIdentity = (config) => {
+    const out = {};
+    const link = findVisibleBySelectors(
+      config.commentReply.authorLinkSelectorCandidates,
+    ) ?? document.querySelector(
+      config.commentReply.authorLinkSelectorCandidates[0],
+    );
+    const href = link?.getAttribute("href") ?? "";
+    const matched = href.match(/\/user\/profile\/([0-9a-zA-Z]+)/);
+    if (matched) {
+      out.authorId = matched[1];
+    }
+
+    for (const selector of config.commentReply.authorNameSelectorCandidates) {
+      let node;
+      try {
+        node = document.querySelector(selector);
+      } catch {
+        continue;
+      }
+      const name = node?.textContent?.replace(/\s+/g, " ").trim();
+      if (name && name.length <= 60) {
+        out.authorName = name;
+        break;
+      }
+    }
+    return out;
+  };
+
+  /**
    * 便宜的岔路口：这条帖子是不是租客在求租。
    *
    * 返回 true 才值得往下跑评论生成。**判不出来时返回 true**（网络挂了、
@@ -3084,11 +3131,14 @@
     if (token) {
       headers["X-Xhs-Token"] = token;
     }
+    const author = gatherAuthorIdentity(config);
     const body = JSON.stringify({
       rawText: plainText,
       sourceUrl: window.location.href,
       ...gatherOptionalListingFieldsForIngest(),
+      ...author,
     });
+    logInfo("帖主身份", author);
     const startedAt = now();
 
     try {
@@ -3138,6 +3188,8 @@
           version: SCRIPT_VERSION,
           chars: text.length,
           model: data.model,
+          chatId: data.chatId,
+          identified: data.identified,
           toolsUsed: data.toolsUsed,
           elapsedMs: now() - startedAt,
           preview: text.slice(0, 80),

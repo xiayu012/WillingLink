@@ -49,7 +49,7 @@ export async function findUserIdByIdentity(
 ): Promise<string | null> {
   try {
     const rows = await db
-      .select({ userId: channelIdentity.userId })
+      .select({ userId: channelIdentity.userId, displayName: channelIdentity.displayName })
       .from(channelIdentity)
       .where(
         and(
@@ -58,7 +58,23 @@ export async function findUserIdByIdentity(
         )
       )
       .limit(1);
-    return rows[0]?.userId ?? null;
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+    // 昵称会改（小红书改名很常见），看到新的就更新；没拿到就别覆盖成空
+    if (identity.displayName && identity.displayName !== row.displayName) {
+      await db
+        .update(channelIdentity)
+        .set({ displayName: identity.displayName })
+        .where(
+          and(
+            eq(channelIdentity.channel, identity.channel),
+            eq(channelIdentity.externalUserId, identity.externalUserId)
+          )
+        );
+    }
+    return row.userId;
   } catch (error) {
     if (isMissingTable(error)) {
       throw new ChannelTableMissingError();
@@ -82,6 +98,7 @@ export async function resolveInternalUserId(
     channel: identity.channel,
     externalUserId: identity.externalUserId,
     accountId: identity.accountId ?? null,
+    displayName: identity.displayName ?? null,
   });
 
   console.log(
@@ -89,6 +106,7 @@ export async function resolveInternalUserId(
     JSON.stringify({
       channel: identity.channel,
       externalUserId: identity.externalUserId,
+      displayName: identity.displayName ?? null,
       userId: guest.id,
     })
   );
@@ -112,6 +130,7 @@ export async function linkIdentity(
       channel: identity.channel,
       externalUserId: identity.externalUserId,
       accountId: identity.accountId ?? null,
+      displayName: identity.displayName ?? null,
     })
     .onConflictDoNothing();
 }

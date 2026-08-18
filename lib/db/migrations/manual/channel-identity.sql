@@ -14,8 +14,12 @@ CREATE TABLE IF NOT EXISTS "ChannelIdentity" (
   "channel" varchar(32) NOT NULL,
   "externalUserId" varchar(128) NOT NULL,
   "accountId" varchar(128),
+  "displayName" varchar(128),
   "createdAt" timestamp DEFAULT now() NOT NULL
 );
+
+-- 已经建过表的环境补这一列（2026-08-18 加的：小红书帖主昵称）
+ALTER TABLE "ChannelIdentity" ADD COLUMN IF NOT EXISTS "displayName" varchar(128);
 
 CREATE UNIQUE INDEX IF NOT EXISTS "ChannelIdentity_channel_external_unique"
   ON "ChannelIdentity" ("channel", "externalUserId");
