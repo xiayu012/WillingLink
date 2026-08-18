@@ -294,6 +294,60 @@ Playwright 新增两处：详情页测试补"点分享→框选转到复制链�
 
 ---
 
+## 2026-08-18 · 多渠道聊天骨架：抽出 Chat Engine + 外部身份映射（半成品）
+
+用户给了一份跟别的 AI 讨论出的架构方案，要求"中等程度看着办"：项目还是小型创业
+起步阶段，**现在只要显而易见的半成品**，以后基于它再开发细节。核心诉求：网页、
+小红书私信、Twilio 短信、企业微信共用**同一套**聊天记录与上下文。
+
+### 1. 做了什么
+
+- `lib/chat/engine.ts`：`buildTurnSetup()`（模型/系统提示词/工具的**唯一**来源）
+  + `runChatTurn()`（非流式整轮，给 webhook 型渠道用）。
+- `lib/chat/identity.ts`：外部身份 → 内部 user，没见过就建 guest 绑上去；
+  `linkIdentity()` 留给以后的身份合并。
+- `lib/chat/conversation.ts`：内部 user → chatId（取最近一条，没有就建）。
+  **跨渠道上下文就靠这里**：没有"某渠道的会话"这个概念。
+- `lib/chat/adapter.ts`：`handleInboundMessage()`（身份→会话→引擎）+ 总开关
+  + 错误翻译。三个 adapter 路由（xhs/messages、twilio/messages、wecom/messages）
+  各自只做字段翻译，聊天逻辑一行都没有。
+- `lib/db/schema-channels.ts` + `lib/db/migrations/manual/channel-identity.sql`。
+
+### 2. 关键的克制（改这块前先想清楚再动）
+
+- **网页 `/api/chat` 没有搬进 Chat Engine 跑**，只改成从 `buildTurnSetup()` 拿
+  配置。SSE、resumable stream、标题生成、工具审批续跑都还在原地——搬过去收益小
+  风险大。**收敛配置才是这次的重点**：以后换模型/加工具改一处，网页和所有渠道
+  同时生效，不会再出现 `/api/chat` 与 `comment-reply` 各写一份然后慢慢漂移。
+- **ChannelIdentity 故意不并进 `lib/db/schema.ts`**。drizzle 的
+  `db.select().from(x)` 按 schema 定义查列，**库里没表/没列会直接报错**——并进去
+  又没跑 SQL，等于把现有聊天打挂。同理 `Message_v2` 的 channel/externalMessageId
+  两列只写在 SQL 注释里，跑完 SQL 才准补进 schema。顺序反了就是生产事故。
+- **adapter 默认关闭**（`CHANNEL_ADAPTERS_ENABLED`）：这些都是无鉴权入口，每次
+  调用跑一轮带搜索的 agent，没上线前不该被扫到就烧钱。表没建时返回 501 并直接
+  写明要跑哪个 SQL 文件。
+- `/api/xhs/comment-reply` **保留不动**：它是一次性的帖子评论生成，无状态、不进
+  聊天记录，跟私信不是一回事（用户方案里也是这么定的）。
+
+### 3. 验证
+
+- 网页聊天**行为不变**：起 dev、拿 guest cookie、真打 `/api/chat`——SSE 正常、
+  标题生成正常、searchRental 被调用、257 个 text-delta。
+- Chat Engine 直连跑了两轮：轮1 走 `channel: "xhs"` 说"我想在 Sunnyvale 找个
+  单间"，轮2 走 `channel: "sms"` 只说"预算 2000 以内"，引擎发出的检索词是
+  **"Sunnyvale 单间 预算2000以内"**（historyCount=2）——跨渠道上下文成立。
+  库里 4 条消息，user/assistant 交替正确。
+- adapter 两个门禁都验过：开关关闭 → 503；开关打开但表没建 → 501 + 迁移提示。
+
+### 4. 下一步（README 里有同一份清单）
+
+建表 SQL → 打开开关 → 接第一个真实渠道（小红书私信，字段名对齐 + 回发消息）→
+消息打 channel 标签（先跑 SQL 第 2 段再补 schema）→ Twilio/企微 补验签与
+回复格式（企微被动回复只有 5 秒，必须改成异步推送）。去重（externalMessageId
+判重）和 webhook 渠道的限流**都还没写**，接真实渠道前必须补。
+
+---
+
 ## 2026-08-16 · 每批 8 条 + "继续/换一批"瞬间出下一批
 
 用户要求：单批上限 5 → **8**；用户说"继续/换一批"要**瞬间**出下一批，且

@@ -14,13 +14,8 @@ import {
 } from "resumable-stream";
 import { auth, type UserType } from "@/app/(auth)/auth";
 import { entitlementsByUserType } from "@/lib/ai/entitlements";
-import { type RequestHints, systemPrompt } from "@/lib/ai/prompts";
-import { getLanguageModel } from "@/lib/ai/providers";
-import { findNearestTransit } from "@/lib/ai/tools/find-nearest-transit";
-import { getTransitTime } from "@/lib/ai/tools/get-transit-time";
-import { createSearchRentalTool } from "@/lib/ai/tools/search-rental";
-import { createSearchWantedTool } from "@/lib/ai/tools/search-wanted";
-import { queryListings } from "@/lib/ai/tools/query-listings";
+import type { RequestHints } from "@/lib/ai/prompts";
+import { buildTurnSetup, CHAT_ENGINE_MAX_STEPS } from "@/lib/chat/engine";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
   createStreamId,
@@ -253,10 +248,6 @@ export async function POST(request: Request) {
           });
         }
 
-        const isReasoningModel =
-          selectedChatModel.includes("reasoning") ||
-          selectedChatModel.includes("thinking");
-
         let rememberedPrefs: string | null = null;
         for (let i = uiMessages.length - 1; i >= 0; i--) {
           const msg = uiMessages[i];
@@ -279,20 +270,24 @@ export async function POST(request: Request) {
           ? extractLanguageFromMemory(rememberedPrefs)
           : null;
 
+        // 模型/提示词/工具从 Chat Engine 拿——网页与各渠道 adapter 共用同一份
+        // 配置，换模型、加工具只改 lib/chat/engine.ts 一处。SSE、resumable
+        // stream、标题生成、工具审批续跑仍然留在这条路由里。
+        const setup = buildTurnSetup({
+          chatId: id,
+          selectedChatModel,
+          requestHints,
+          rememberedPrefs,
+          detectedLanguage,
+        });
+        const { isReasoningModel } = setup;
+
         const result = streamText({
-          model: getLanguageModel(selectedChatModel),
-          system: systemPrompt({
-            selectedChatModel,
-            requestHints,
-            chatId: id,
-            rememberedPrefs,
-            detectedLanguage,
-          }),
+          model: setup.model,
+          system: setup.system,
           messages: await convertToModelMessages(uiMessages),
-          stopWhen: stepCountIs(5),
-          experimental_activeTools: isReasoningModel
-            ? []
-            : ["searchRental", "searchWanted", "queryListings", "findNearestTransit", "getTransitTime"],
+          stopWhen: stepCountIs(CHAT_ENGINE_MAX_STEPS),
+          experimental_activeTools: setup.activeTools,
           experimental_transform: isReasoningModel
             ? undefined
             : smoothStream({ chunking: "word" }),
@@ -303,13 +298,7 @@ export async function POST(request: Request) {
                 },
               }
             : undefined,
-          tools: {
-            searchRental: createSearchRentalTool(id),
-            searchWanted: createSearchWantedTool(id),
-            queryListings,
-            findNearestTransit,
-            getTransitTime,
-          },
+          tools: setup.tools,
           experimental_telemetry: {
             isEnabled: isProductionEnvironment,
             functionId: "stream-text",

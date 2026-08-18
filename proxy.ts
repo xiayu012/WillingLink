@@ -32,6 +32,16 @@ export async function proxy(request: NextRequest) {
     return NextResponse.next();
   }
 
+  // 渠道 adapter（Twilio / 企业微信 / 未来其它）走各平台自己的验签，不是会话
+  // cookie，别被 guest-auth 重定向掉。路由自身默认关闭
+  // （CHANNEL_ADAPTERS_ENABLED），验签在各 adapter 里补。
+  if (
+    pathname.startsWith("/api/twilio/") ||
+    pathname.startsWith("/api/wecom/")
+  ) {
+    return NextResponse.next();
+  }
+
   const token = await getToken({
     req: request,
     secret: process.env.AUTH_SECRET,
