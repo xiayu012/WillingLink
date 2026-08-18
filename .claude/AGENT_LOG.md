@@ -350,17 +350,19 @@ Playwright 新增两处：详情页测试补"点分享→框选转到复制链�
 整个换掉之后它成了游离节点，`scope.contains(active)` 恒假，**真编辑器反而被自己
 的保险丝挡掉**。改成 activeElement 无条件采纳（用户刚点完，焦点在哪就是哪）。
 
-顺带把插入做成"多策略 + 事后验证"：contenteditable 先 Selection/Range 改 DOM
-（补冒泡 beforeinput/input），不行再退 `execCommand("insertText")`（这不是模拟
-paste/Ctrl+V，是浏览器自己的插入命令，派发的是 trusted 事件，Vue 那种自维护
-数据的编辑器更认）；input/textarea 走原生 value setter。**插完等 180ms 再验一次**
-——有些编辑器会自己重渲染把内容抹掉，同步检查通过不等于真进去了。
+插入本身**保持最简**（0.20.0 定稿，别再加兜底）：contenteditable 走
+Selection/Range 改 DOM，input/textarea 走原型链上的原生 value setter，都补一对
+冒泡的 beforeinput/input，完事。找编辑器也只有两级：activeElement → 配置选择器。
+
+我一度加过多策略 + 事后验证 + `execCommand("insertText")`，**用户明确否决**：
+`execCommand` 是浏览器命令，小红书风控可能认得出是自动化；而且兜底越堆越冗余。
+用户的原则是"**简单能成就行，手动试一次能成就行，长期也不指望 100% 成功率**"。
+粘不上时文字还在剪贴板，Ctrl+V 一次即可。**以后不要再往这里加策略。**
 
 修的过程中踩了一个坑值得记：兜底找编辑器时我一度放开成"全页面找
 contenteditable，挑离点击处最近的"，结果**把评论粘进了详情页的搜索框**
-（Playwright 立刻抓到）。`COMMENT_SCOPE_SELECTOR` 里原本还有 `#noteContainer`
-和 `.note-scroller` 这种整页级容器，同样会把别处的可编辑元素圈进来，一并删了。
-**兜底一律限定在评论区自己的容器里，宁可找不到也不能粘错地方。**
+（Playwright 立刻抓到）。这也是"少即是多"的佐证——现在整套容器兜底
+（`COMMENT_SCOPE_SELECTOR` / `resolveCommentScope`）连同那段逻辑一起删干净了。
 
 另：缩写那句现在是「请缩写至260字符左右，**不要带联系方式**」（追催那句同步
 加了"微信/电话/邮箱都不要"）。实测两轮 223/167 字符，均无联系方式泄漏。

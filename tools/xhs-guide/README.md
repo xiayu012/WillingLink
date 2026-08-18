@@ -113,13 +113,16 @@ URL，评论区链接点不动）、删结尾那句"如需调整条件…"（用
 - 人工点一下评论框 → 该框选立刻消失，开始插入。找编辑器的顺序是
   `document.activeElement`（刚点完，光标就在里面）→ 配置选择器 → **限定在评论
   容器内**的兜底，最长等 3.2s。自动插入失败也不影响——文字已在剪贴板，Ctrl+V 即可。
-- 插入机制（**不模拟 paste / Ctrl+V**，合成的 ClipboardEvent 是 untrusted，
-  页面可以直接忽略）：剪贴板在 pointerdown/click 回调里**同步**调
-  `navigator.clipboard.readText()` 读（await 一次手势就过期了），读到的内容要跟
-  本地那份对得上才用；写入时 input/textarea 走原型链上的原生 value setter（React
-  劫持了 `element.value`），contenteditable 用 Selection/Range 真改 DOM（文本节点
-  + `<br>`）；两条路都补发**冒泡的 beforeinput/input InputEvent**，否则框里看着
-  有字、Vue/React 的数据仍是空，点发送等于发了条空评论。
+- 插入机制**刻意保持最简**（不用 `execCommand`，不合成 paste/Ctrl+V —— 浏览器
+  命令和伪造事件都可能被风控认出是自动化）：剪贴板在 pointerdown/click 回调里
+  **同步**调 `navigator.clipboard.readText()` 读（await 一次手势就过期），内容要
+  跟本地那份对得上才用；写入时 input/textarea 走原型链上的原生 value setter
+  （React 劫持了 `element.value`），contenteditable 用 Selection/Range 改 DOM，
+  两条路都补**冒泡的 beforeinput/input InputEvent**，否则框里有字而 Vue/React 的
+  数据仍是空，点发送等于发空评论。找编辑器只有两级：`document.activeElement`
+  （刚点完，焦点在哪就是哪）→ 配置选择器。**没有更多兜底**：全页面搜编辑器既容易
+  粘错框（实测粘进过搜索框），也让脚本越来越不像真人。粘不上就手动 Ctrl+V，
+  本来也不指望 100% 成功。
 - 粘完后框选发送按钮（`button.btn.submit`）；**发送键始终由人工按**，脚本不自动
   提交。点过发送键之后，才轮到分享按钮的框选。
 - 回复没写完就点了评论框：记下来，写完立刻粘（占位框那时已经消失，等不到第二次

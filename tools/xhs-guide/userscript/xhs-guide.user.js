@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.19.0
+// @version      0.20.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.19.0";
+  const SCRIPT_VERSION = "0.20.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -2720,63 +2720,17 @@
   /**
    * 点开之后真正可写的编辑器。
    *
-   * 顺序有讲究，且 **activeElement 不受 scope 限制**：用户刚点过输入框，浏览器
-   * 把焦点放哪儿就是哪儿，这是最硬的一手信息。之前给它加了"必须在 scope 里"的
-   * 条件，结果小红书把占位框整个换掉之后 scope 成了游离节点，真编辑器反而被这
-   * 条判断挡掉，表现就是"点了没反应，但剪贴板里有字"。
-   *
-   * 后面几级兜底才需要限定范围：详情页别处也有 contenteditable（搜索框等），
-   * 全局乱找会把评论粘到别的框里。最后一级按**离点击位置最近**挑，比"页面上
-   * 第一个"靠谱得多。
+   * 只有两级：`document.activeElement`（用户刚点完，焦点在哪就是哪，最准），
+   * 然后是配置里的选择器。**故意不做更多兜底**——全页面搜编辑器既容易粘错框，
+   * 也让脚本行为越来越不像真人。找不到就算了，文字还在剪贴板里，手动 Ctrl+V
+   * 一次就行，本来也不指望 100% 成功。
    */
-  const findCommentEditorElement = (config, scope, anchorRect) => {
+  const findCommentEditorElement = (config) => {
     const active = document.activeElement;
     if (isEditableElement(active)) {
       return active;
     }
-
-    const known = findVisibleBySelectors(
-      config.commentReply.editorSelectorCandidates,
-    );
-    if (known) {
-      return known;
-    }
-
-    const visibleEditors = (root) =>
-      [...root.querySelectorAll('[contenteditable="true"], textarea')].filter(
-        (node) => {
-          if (!(node instanceof HTMLElement)) {
-            return false;
-          }
-          const rect = node.getBoundingClientRect();
-          return rect.width > 40 && rect.height > 10;
-        },
-      );
-
-    // 兜底一律**限定在评论容器里**：详情页别处也有 contenteditable（搜索框等），
-    // 全局乱找会把评论粘到别的框里（实测把回复粘进了搜索框）。容器每次都从当前
-    // DOM 现查，不用点击那一刻记下的节点——占位框会被换掉，那个节点会变成游离的。
-    const roots = [
-      ...(scope instanceof HTMLElement && document.body.contains(scope)
-        ? [scope]
-        : []),
-      ...document.querySelectorAll(COMMENT_SCOPE_SELECTOR),
-    ];
-    const candidates = roots.flatMap((root) => visibleEditors(root));
-    if (candidates.length === 0) {
-      return null;
-    }
-    if (!anchorRect) {
-      return candidates[0];
-    }
-    // 多个的话挑离刚才点击处最近的那个
-    const distance = (node) => {
-      const rect = node.getBoundingClientRect();
-      return Math.hypot(rect.top - anchorRect.top, rect.left - anchorRect.left);
-    };
-    return candidates.reduce((best, node) =>
-      distance(node) < distance(best) ? node : best,
-    );
+    return findVisibleBySelectors(config.commentReply.editorSelectorCandidates);
   };
 
   const readEditorText = (editor) =>
@@ -2784,7 +2738,58 @@
       ? editor.value
       : (editor.innerText ?? editor.textContent ?? "");
 
-  const dispatchInputEvents = (editor, text) => {
+  /**
+   * 写进编辑器。**不用 execCommand，也不合成 paste/Ctrl+V**：那些是浏览器命令
+   * 或伪造事件，小红书的风控认得出来，不值当。这里就是普通的 DOM 操作 + 一对
+   * 冒泡的 beforeinput/input —— Vue/React 靠 input 事件感知值变化，只改 DOM
+   * 不发事件的话框里有字、组件数据仍是空，点发送等于发了条空评论。
+   */
+  const insertTextIntoEditor = (editor, text) => {
+    editor.focus();
+
+    if (
+      editor instanceof HTMLTextAreaElement ||
+      editor instanceof HTMLInputElement
+    ) {
+      const proto =
+        editor instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+      // React 把 element.value 劫持成了自己的 tracker，必须走原型上的原生 setter
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      if (setter) {
+        setter.call(editor, text);
+      } else {
+        editor.value = text;
+      }
+      editor.selectionStart = editor.value.length;
+      editor.selectionEnd = editor.value.length;
+    } else {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      range.deleteContents();
+
+      const fragment = document.createDocumentFragment();
+      text.split("\n").forEach((line, index) => {
+        if (index > 0) {
+          fragment.append(document.createElement("br"));
+        }
+        if (line.length > 0) {
+          fragment.append(document.createTextNode(line));
+        }
+      });
+      range.insertNode(fragment);
+
+      const caret = document.createRange();
+      caret.selectNodeContents(editor);
+      caret.collapse(false);
+      selection?.removeAllRanges();
+      selection?.addRange(caret);
+    }
+
     for (const type of ["beforeinput", "input"]) {
       editor.dispatchEvent(
         new InputEvent(type, {
@@ -2795,107 +2800,8 @@
         }),
       );
     }
-  };
 
-  /** input / textarea：走原型链上的原生 value setter，React 才认得出来 */
-  const insertViaValueSetter = (editor, text) => {
-    const proto =
-      editor instanceof HTMLTextAreaElement
-        ? HTMLTextAreaElement.prototype
-        : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-    if (setter) {
-      setter.call(editor, text);
-    } else {
-      editor.value = text;
-    }
-    editor.selectionStart = editor.value.length;
-    editor.selectionEnd = editor.value.length;
-    dispatchInputEvents(editor, text);
-    editor.dispatchEvent(new Event("change", { bubbles: true }));
-  };
-
-  /** contenteditable：用 Selection/Range 真改 DOM，再补冒泡的 input 事件 */
-  const insertViaDomRange = (editor, text) => {
-    const selection = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-    range.deleteContents();
-
-    const fragment = document.createDocumentFragment();
-    text.split("\n").forEach((line, index) => {
-      if (index > 0) {
-        fragment.append(document.createElement("br"));
-      }
-      if (line.length > 0) {
-        fragment.append(document.createTextNode(line));
-      }
-    });
-    range.insertNode(fragment);
-
-    const caret = document.createRange();
-    caret.selectNodeContents(editor);
-    caret.collapse(false);
-    selection?.removeAllRanges();
-    selection?.addRange(caret);
-
-    dispatchInputEvents(editor, text);
-  };
-
-  /**
-   * 浏览器自己的插入命令。**不是模拟 paste，也不是模拟 Ctrl+V** —— 它由浏览器
-   * 执行真实插入并派发 trusted 的 input 事件，Vue 那种自己维护数据的编辑器认它
-   * 的概率比手工改 DOM 更高。放最后一级，前面两种都没生效时才用。
-   */
-  const insertViaExecCommand = (editor, text) => {
-    const selection = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-    document.execCommand("insertText", false, text);
-  };
-
-  /**
-   * 插入并**验证**。有些编辑器会在我们改完 DOM 之后自己重渲染一遍，把内容抹掉，
-   * 所以插完等一小会儿再看还在不在——同步检查通过不代表真的进去了。
-   */
-  const insertTextIntoEditor = async (editor, text) => {
-    const probe = text.slice(0, 12);
-    const strategies =
-      editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement
-        ? [["value-setter", insertViaValueSetter]]
-        : [
-            ["dom-range", insertViaDomRange],
-            ["exec-command", insertViaExecCommand],
-          ];
-
-    for (const [name, run] of strategies) {
-      editor.focus();
-      try {
-        run(editor, text);
-      } catch (error) {
-        logWarn("插入失败", {
-          strategy: name,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        continue;
-      }
-      if (!readEditorText(editor).includes(probe)) {
-        logWarn("插入后没看到文字", { strategy: name });
-        continue;
-      }
-      // 等一帧多一点，看看会不会被编辑器自己的重渲染抹掉
-      await sleep(180);
-      if (readEditorText(editor).includes(probe)) {
-        logInfo("插入成功", { strategy: name });
-        return true;
-      }
-      logWarn("插入的文字被编辑器抹掉了，换下一种", { strategy: name });
-    }
-    return false;
+    return readEditorText(editor).includes(text.slice(0, 12));
   };
 
   const closestBySelectors = (target, selectors) => {
@@ -2914,16 +2820,6 @@
     }
     return null;
   };
-
-  /** 编辑器挂载后占位框会被换掉，所以点击当下就把容器记下来当搜索范围 */
-  // 只列**评论区自己的**容器。别放 #noteContainer / .note-scroller 这种整页级的
-  // ——找编辑器时会连详情页别处的 contenteditable（搜索框等）一起圈进来，实测
-  // 把回复粘到了别的框里。
-  const COMMENT_SCOPE_SELECTOR =
-    ".comment-input, .content-edit, .interaction-container, .interactions, .comments-container, .comment-wrapper";
-
-  const resolveCommentScope = (element) =>
-    element?.closest(COMMENT_SCOPE_SELECTOR) ?? element?.parentElement ?? null;
 
 
   /**
@@ -2956,9 +2852,6 @@
     }
     state.aiReplyPasting = true;
     state.aiReplyPasteRequested = false;
-    const scope = resolveCommentScope(anchor);
-    // 占位框马上会被编辑器换掉，位置先记下来：兜底时按"离点击处最近"挑编辑器
-    const anchorRect = anchor?.getBoundingClientRect?.() ?? null;
     state.aiReplyStatus = "pasted";
     renderDetailHighlight(config);
 
@@ -2980,12 +2873,12 @@
           await sleep(targetMs - elapsed);
           elapsed = targetMs;
         }
-        const editor = findCommentEditorElement(config, scope, anchorRect);
+        const editor = findCommentEditorElement(config);
         if (!editor) {
           continue;
         }
         sawEditor = true;
-        if (await insertTextIntoEditor(editor, text)) {
+        if (insertTextIntoEditor(editor, text)) {
           logInfo("AI 回复已粘进评论框", {
             chars: text.length,
             waitedMs: elapsed,
@@ -2997,15 +2890,13 @@
         }
       }
 
-      logWarn("未能自动插入评论框，文字已在剪贴板", {
+      logWarn("未能自动插入评论框，文字已在剪贴板，手动 Ctrl+V 即可", {
         chars: text.length,
         sawEditor,
-        scope: scope?.className || scope?.id || null,
         activeElement:
           document.activeElement instanceof HTMLElement
             ? `${document.activeElement.tagName}.${document.activeElement.className}`
             : null,
-        contentEditableCount: document.querySelectorAll('[contenteditable="true"]').length,
       });
       showAiReplyToast("AI 回复已复制，请在评论框 Ctrl+V", "warn");
     } finally {
