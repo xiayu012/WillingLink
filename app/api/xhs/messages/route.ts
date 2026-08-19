@@ -1,10 +1,10 @@
 import {
-  adaptersEnabled,
   checkToken,
   handleInboundMessage,
   jsonWithCors,
   toErrorResponse,
 } from "@/lib/chat/adapter";
+import { redactContactInfo } from "@/lib/chat/redact-contact";
 
 export const maxDuration = 60;
 export const preferredRegion = "sfo1";
@@ -21,24 +21,24 @@ export function OPTIONS() {
 }
 
 /**
- * 小红书**私信** adapter —— 三个 adapter 里最完整的一个，另外两个照着抄。
+ * 小红书私信 adapter。
  *
- * 与 `/api/xhs/comment-reply` 的分工（别搞混）：
- * - comment-reply：一次性的"帖子评论生成"，无状态，不进聊天记录。**保留**。
- * - 这条：真正的私信聊天，进同一套 Chat + Message_v2，跨渠道共用上下文。
+ * MVP 只认两个字段：
+ *   { "id": "<小红书用户 id>", "text": "<对方说的话>" }
  *
- * 上线前还要做的（现在故意留白）：
- * - 小红书那边怎么把私信推过来（集简云/自建轮询/官方回调），以及回复怎么发回去
- * - webhook 重投去重（externalMessageId 已经在链路里传，判重逻辑还没写）
- * - 限流：网页那条走 entitlements，这里还没有
+ * 拿到之后走的是公共链路（`lib/chat/adapter.ts`）：外部身份 → 内部 user →
+ * **那个人唯一的一条 conversation** → Chat Engine。所以同一个 id 第二次发消息
+ * 接的是同一串上下文；这个人如果还从帖子评论（comment-reply）来过，也是同一条会话。
+ *
+ * 这一层唯一的渠道策略：**出站剔除联系方式**。项目 AI 的回答里常带着房源原文
+ * 里的微信号和电话（库里就是这么存的），发进私信既像营销号，也等于替房东在平台
+ * 外导流。剔除只作用于**发出去的那份**，会话记录里仍是完整原文，网页上照常能看。
+ *
+ * 还没做（等接真实上游时补）：webhook 重投去重（`externalMessageId` 链路已通，
+ * 判重逻辑没写）、限流（网页那条走 entitlements，这里没有）、把回复真正发回
+ * 小红书（现在只是同步返回，由调用方负责投递）。
  */
 export async function POST(request: Request) {
-  if (!adaptersEnabled()) {
-    return jsonWithCors(
-      { ok: false, error: "Channel adapters disabled (set CHANNEL_ADAPTERS_ENABLED=1)" },
-      503
-    );
-  }
   if (!checkToken(request)) {
     return jsonWithCors({ ok: false, error: "Unauthorized" }, 401);
   }
@@ -50,33 +50,39 @@ export async function POST(request: Request) {
     return jsonWithCors({ ok: false, error: "Invalid JSON" }, 400);
   }
 
-  // 小红书侧字段名以后接通了再对齐，这里先用最直白的三个
-  const externalUserId =
-    typeof payload.userId === "string" ? payload.userId.trim() : "";
+  const id = typeof payload.id === "string" ? payload.id.trim() : "";
   const text = typeof payload.text === "string" ? payload.text.trim() : "";
 
-  if (!externalUserId || !text) {
-    return jsonWithCors(
-      { ok: false, error: "userId and text are required" },
-      400
-    );
+  if (!(id && text)) {
+    return jsonWithCors({ ok: false, error: "id and text are required" }, 400);
   }
 
   try {
     const result = await handleInboundMessage({
       channel: "xhs",
-      externalUserId,
+      externalUserId: id,
       text,
-      accountId: typeof payload.accountId === "string" ? payload.accountId : null,
-      externalMessageId:
-        typeof payload.messageId === "string" ? payload.messageId : null,
     });
+
+    const { text: reply, hits } = redactContactInfo(result.text);
+
+    console.log(
+      "[xhs/messages]",
+      JSON.stringify({
+        id,
+        chatId: result.chatId,
+        toolsUsed: result.toolsUsed,
+        redacted: hits,
+        chars: reply.length,
+        elapsedMs: result.elapsedMs,
+      })
+    );
 
     return jsonWithCors({
       ok: true,
+      id,
       chatId: result.chatId,
-      reply: result.text,
-      toolsUsed: result.toolsUsed,
+      reply,
       elapsedMs: result.elapsedMs,
     });
   } catch (error) {

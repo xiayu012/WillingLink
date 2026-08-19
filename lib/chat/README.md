@@ -19,7 +19,8 @@ Twilio  /api/twilio/messages → Twilio adapter ├→ handleInboundMessage → 
 | `identity.ts` | 外部身份 → 内部 user，没见过就建 guest 并绑定 | 可用，需先建表 |
 | `conversation.ts` | 内部 user → chatId（取最近一条，没有就新建） | 可用，策略以后可换 |
 | `adapter.ts` | adapter 公共骨架 + 总开关 + 错误翻译 | 可用 |
-| `app/api/xhs/messages` | 小红书私信 adapter，三个里最完整 | 骨架，字段待对齐 |
+| `redact-contact.ts` | 出站剔除联系方式（渠道自选，Engine 不管） | 可用 |
+| `app/api/xhs/messages` | 小红书私信 adapter，**已接通** | MVP：只收 `{id, text}` |
 | `app/api/twilio/messages` | 短信 adapter | 骨架，缺验签与 TwiML |
 | `app/api/wecom/messages` | 企微 adapter | 骨架，缺验签/解密/异步推送 |
 
@@ -40,8 +41,10 @@ Twilio  /api/twilio/messages → Twilio adapter ├→ handleInboundMessage → 
    第 1 段。不跑这步，adapter 会返回 501 并明确告诉你差什么。
 2. **打开开关**：`CHANNEL_ADAPTERS_ENABLED=1`（默认关闭，因为这些是无鉴权入口，
    每次调用都会跑一轮带搜索的 agent）。
-3. **接第一个真实渠道**（小红书私信）：把 `app/api/xhs/messages` 里的字段名换成
-   上游真正发过来的，补消息回发。
+3. ~~接第一个真实渠道（小红书私信）~~ **已接通**（2026-08-18）：
+   `POST /api/xhs/messages`，body 只有 `{ "id": "<小红书用户id>", "text": "…" }`，
+   返回 `{ ok, id, chatId, reply }`。出站过一遍 `redactContactInfo`。
+   还缺：把 reply 真正投递回小红书（现在由调用方负责）、webhook 去重、限流。
 4. **消息打渠道标签**：跑 SQL 第 2 段，然后把 `channel` / `externalMessageId`
    两列补进 `lib/db/schema.ts` 的 `message` 定义，`runChatTurn` 里存消息时带上。
    顺序不能反：drizzle 会按 schema 定义查列，库里没列会直接报错。
