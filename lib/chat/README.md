@@ -20,7 +20,8 @@ Twilio  /api/twilio/messages → Twilio adapter ├→ handleInboundMessage → 
 | `conversation.ts` | 内部 user → chatId（取最近一条，没有就新建） | 可用，策略以后可换 |
 | `adapter.ts` | adapter 公共骨架 + 总开关 + 错误翻译 | 可用 |
 | `redact-contact.ts` | 出站剔除联系方式（渠道自选，Engine 不管） | 可用 |
-| `app/api/xhs/messages` | 小红书私信 adapter，**已接通** | MVP：只收 `{id, text}` |
+| `app/api/xhs/messages` | 小红书私信 adapter，**已接通** | MVP：收 `{id, text}`，异步投递 |
+| `jijyun.ts` | 出站投递到集简云 webhook | 可用，URL 走环境变量 |
 | `app/api/twilio/messages` | 短信 adapter | 骨架，缺验签与 TwiML |
 | `app/api/wecom/messages` | 企微 adapter | 骨架，缺验签/解密/异步推送 |
 
@@ -42,9 +43,17 @@ Twilio  /api/twilio/messages → Twilio adapter ├→ handleInboundMessage → 
 2. **打开开关**：`CHANNEL_ADAPTERS_ENABLED=1`（默认关闭，因为这些是无鉴权入口，
    每次调用都会跑一轮带搜索的 agent）。
 3. ~~接第一个真实渠道（小红书私信）~~ **已接通**（2026-08-18）：
-   `POST /api/xhs/messages`，body 只有 `{ "id": "<小红书用户id>", "text": "…" }`，
-   返回 `{ ok, id, chatId, reply }`。出站过一遍 `redactContactInfo`。
-   还缺：把 reply 真正投递回小红书（现在由调用方负责）、webhook 去重、限流。
+   **两次单向消息**，不是一问一答——集简云调我们只等 30 秒，而一轮带搜索的对话
+   要 15-30 秒，同步返回必然压线。
+
+   ```
+   集简云 --POST {id,text}--> /api/xhs/messages   立刻 202（不带正文，实测 26ms）
+   我们   --POST {id,text}--> JIJYUN_WEBHOOK_URL  想好了再发
+   ```
+
+   AI 那段活在 `after()` 里跑（响应发出之后继续，仍算在 maxDuration=60 内）。
+   出站过一遍 `redactContactInfo`。失败也会投递一条 `ok:false`，免得那头空等。
+   还缺：webhook 去重、限流。
 4. **消息打渠道标签**：跑 SQL 第 2 段，然后把 `channel` / `externalMessageId`
    两列补进 `lib/db/schema.ts` 的 `message` 定义，`runChatTurn` 里存消息时带上。
    顺序不能反：drizzle 会按 schema 定义查列，库里没列会直接报错。

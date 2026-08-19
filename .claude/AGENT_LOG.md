@@ -389,6 +389,41 @@ div/span/p 找**只包含「说点什么」这一句**（文本长度不超过�
 
 ---
 
+## 2026-08-18（四）· /api/xhs/messages 改成两次单向消息 + 出站投递集简云
+
+用户说调用方集简云**超时只有 30 秒**，而一轮带搜索的对话要 15-30 秒，同步返回
+必然压线。所以拆开：
+
+```
+集简云 --POST {id,text}--> /api/xhs/messages   立刻 202，不带正文（实测 26ms）
+我们   --POST {id,text}--> JIJYUN_WEBHOOK_URL  算完再发
+```
+
+- AI 那段放进 `next/server` 的 `after()`：响应发出之后才跑，仍算在
+  maxDuration=60 的预算里。**注意 `after()` 在请求作用域外会抛**（AGENT_LOG
+  更早那次评测脚本事故就是这个），这里在 route handler 内没问题。
+- 失败也投递一条 `{ok:false,error}`——不然集简云那头永远在等，不知道这条黄了。
+- `lib/chat/jijyun.ts`（新）。**webhook URL 必须走环境变量**：这个仓库
+  `xiayu012/willinglink` 是**公开**的（用 GitHub API 确认过），而该 webhook
+  无鉴权，写死在代码里等于谁都能往用户的自动化流程灌消息。没配就跳过投递并
+  在日志里说明。
+
+### 两个踩到的坑
+
+1. **`.env.local` 没有结尾换行**，我 `>>` 追加时把新变量粘到了上一行末尾，
+   写出 `CHANNEL_ADAPTERS_ENABLED=1JIJYUN_WEBHOOK_URL=...`——既毁了原变量的值，
+   新变量也不生效。已修好。**以后往 .env 追加前先确认结尾有换行。**
+2. **用户给的集简云 webhook 现在返回 401** `{"message":"Invalid authentication
+   credentials"}`——不是我们的代码：直接 `curl -X POST <URL> -H
+   "Content-Type: application/json"` 一样 401。用户说"没有鉴权"，实际那头要么
+   流程没发布、要么 URL 里的 token 换过、要么确实需要某个头。代码这边已经就绪，
+   URL 一改就能通（只是个环境变量，不用动代码）。
+
+本地用一个假 webhook（node http server）验过全链路：ack 26-33ms、
+`Content-Type: application/json`、body 是 `{ok,id,text,chatId}`、内容已剔联系方式。
+
+---
+
 ## 2026-08-18（三）· 半成品用起来了：/api/xhs/messages MVP + 出站剔联系方式
 
 用户要求把之前那套骨架接上：`/api/xhs/messages` **只收 `{id, text}`**，text 交给
