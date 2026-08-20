@@ -36,6 +36,19 @@ import type { InboundTurn, TurnResult } from "./types";
 
 export const CHAT_ENGINE_MAX_STEPS = 5;
 
+/**
+ * 发给模型的历史条数上限（webhook 渠道专用，网页那条不受影响）。
+ *
+ * `getMessagesByChatId` 返回**全量**历史，而这里的会话是跨渠道合并的，只会越攒
+ * 越长——实测有会话已经 29 条 / 34K 字符，另一条 135K 字符。每来一句"在吗"都要
+ * 把这一整坨连同 ~15KB 系统提示词重新喂给模型，光读输入就是几十秒的主因。
+ *
+ * 留最近 20 条（约 10 个来回）：租房对话的有效上下文就在最近几轮，再往前的
+ * 房源列表对当前这句话没有帮助。**完整历史仍然进库**，网页上照常看得到，
+ * 被截断的只是每次喂给模型的那一份。
+ */
+export const CHAT_ENGINE_HISTORY_LIMIT = 20;
+
 export type TurnSetup = {
   model: ReturnType<typeof getLanguageModel>;
   system: string;
@@ -136,7 +149,9 @@ export async function runChatTurn(
     throw new Error("runChatTurn: empty text");
   }
 
-  const history = await getMessagesByChatId({ id: turn.chatId });
+  const fullHistory = await getMessagesByChatId({ id: turn.chatId });
+  // 只把最近这些条喂给模型；全量仍在库里（见 CHAT_ENGINE_HISTORY_LIMIT）
+  const history = fullHistory.slice(-CHAT_ENGINE_HISTORY_LIMIT);
 
   const userMessage: DBMessage = {
     id: generateUUID(),
@@ -170,6 +185,7 @@ export async function runChatTurn(
     extraSystem: options?.extraSystem,
   });
 
+  const modelStartedAt = Date.now();
   const result = await generateText({
     model: setup.model,
     system: setup.system,
@@ -177,6 +193,7 @@ export async function runChatTurn(
     stopWhen: stepCountIs(CHAT_ENGINE_MAX_STEPS),
     tools: setup.tools,
   });
+  const modelMs = Date.now() - modelStartedAt;
 
   const answer = stripMemoryFromDisplay(
     result.text.trim() ||
@@ -219,6 +236,9 @@ export async function runChatTurn(
       toolsUsed,
       chars: answer.length,
       historyCount: history.length,
+      historyTotal: fullHistory.length,
+      steps: result.steps.length,
+      modelMs,
       elapsedMs: Date.now() - startedAt,
     })
   );
