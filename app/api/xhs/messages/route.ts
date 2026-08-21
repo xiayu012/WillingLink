@@ -7,7 +7,11 @@ import {
 import { deliverToJijyun } from "@/lib/chat/jijyun";
 import { redactContactInfo } from "@/lib/chat/redact-contact";
 
-export const maxDuration = 60;
+// 60 秒撞过墙：2026-08-20 23:19 一次真实请求被 Vercel 硬杀（Task timed out after
+// 60 seconds），函数连"投递失败"的兜底日志都没来得及写，表现就是用户收不到任何
+// 回复。Pro 套餐单函数上限 300 秒，这里留够余量给"多步工具调用 + 一次慢响应"
+// 叠加的情况，而不是指望每次都卡在 60 秒内。
+export const maxDuration = 120;
 export const preferredRegion = "sfo1";
 
 export function OPTIONS() {
