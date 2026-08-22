@@ -13,6 +13,7 @@
  * `redactContactInfo`，然后用下面 mustDrop 的那几类正则去搜剔后文本。
  */
 import { redactContactInfo } from "../lib/chat/redact-contact";
+import { wantsContactCollection } from "../lib/chat/xhs-dm";
 
 type Case = {
   name: string;
@@ -148,6 +149,68 @@ for (const c of cases) {
     console.log(`✅ ${c.name}`);
   }
 }
+// ---------------------------------------------------------------------------
+// collect_contact 的判定。正反都要钉：漏判则留资组件不挂（白问一轮），
+// 误判则模型只是在解释「平台不让发房东联系方式」也去挂组件（用户看着莫名其妙）。
+// ---------------------------------------------------------------------------
+
+const collectCases: { name: string; input: string; expect: boolean }[] = [
+  {
+    name: "留个联系方式",
+    input: "方便留个联系方式吗？我把房源整理给您",
+    expect: true,
+  },
+  {
+    name: "填写您的联系方式",
+    input: "请填写一下您的联系方式，我发详细信息给您",
+    expect: true,
+  },
+  { name: "留下电话", input: "您留下电话，我让房东联系您", expect: true },
+  {
+    name: "把微信发给我",
+    input: "把您的微信发给我，我推给您几套",
+    expect: true,
+  },
+  {
+    name: "提交联系方式",
+    input: "提交联系方式后即可查看多个房东联系方式",
+    expect: true,
+  },
+  {
+    name: "解释平台限制(不算)",
+    input: "小红书平台不让私聊发送房东的联系方式，请理解",
+    expect: false,
+  },
+  {
+    name: "说明付费获得(不算)",
+    input: "价钱是6.88人民币，可获得多个房东的联系方式",
+    expect: false,
+  },
+  {
+    name: "普通房源回复(不算)",
+    input: "为您找到3套Sunnyvale房源，租金$2000起，均可短租",
+    expect: false,
+  },
+  {
+    name: "纯问候(不算)",
+    input: "我在线，有什么湾区租房需求请告诉我",
+    expect: false,
+  },
+];
+
+for (const c of collectCases) {
+  const got = wantsContactCollection(c.input);
+  if (got === c.expect) {
+    console.log(`✅ collect: ${c.name}`);
+  } else {
+    failed++;
+    console.log(`❌ collect: ${c.name}`);
+    console.log(`   输入: ${c.input}`);
+    console.log(`   期望 ${c.expect}，实际 ${got}`);
+  }
+}
+
+const total = cases.length + collectCases.length;
 console.log(
-  `\n${failed === 0 ? "✅ 全部通过" : `❌ ${failed}/${cases.length} 条不通过`}`
+  `\n${failed === 0 ? "✅ 全部通过" : `❌ ${failed}/${total} 条不通过`}`
 );

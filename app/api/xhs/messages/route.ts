@@ -6,6 +6,7 @@ import {
 } from "@/lib/chat/adapter";
 import { deliverToJijyun } from "@/lib/chat/jijyun";
 import { redactContactInfo } from "@/lib/chat/redact-contact";
+import { wantsContactCollection, XHS_DM_EXTRA_SYSTEM } from "@/lib/chat/xhs-dm";
 
 // 60 秒撞过墙：2026-08-20 23:19 一次真实请求被 Vercel 硬杀（Task timed out after
 // 60 seconds），函数连"投递失败"的兜底日志都没来得及写，表现就是用户收不到任何
@@ -73,7 +74,11 @@ export async function POST(request: Request) {
         channel: "xhs",
         externalUserId: id,
         text,
+        extraSystem: XHS_DM_EXTRA_SYSTEM,
       });
+
+      // 判意图看**原文**：剔除那一层会按标点切碎重组，判完再剔才不会误伤
+      const collectContact = wantsContactCollection(result.text);
       const { text: reply, hits } = redactContactInfo(result.text);
 
       console.log(
@@ -83,18 +88,25 @@ export async function POST(request: Request) {
           chatId: result.chatId,
           toolsUsed: result.toolsUsed,
           redacted: hits,
+          collectContact,
           chars: reply.length,
           elapsedMs: Date.now() - startedAt,
         })
       );
 
-      await deliverToJijyun({ id, text: reply, chatId: result.chatId });
+      await deliverToJijyun({
+        id,
+        text: reply,
+        collectContact,
+        chatId: result.chatId,
+      });
     } catch (error) {
       // AI SDK 的错误对象别直接丢给 console.error（见 AGENT_LOG 的 fail-open 事故）
       const name = error instanceof Error ? error.name : "UnknownError";
       const message = error instanceof Error ? error.message : String(error);
       console.log("[xhs/messages] failed", `${name}: ${message}`);
-      // 也要投递失败结果：不然集简云那头就一直等着，永远不知道这条黄了
+      // 也要投递失败结果：不然集简云那头就一直等着，永远不知道这条黄了。
+      // 这条没有正文，自然也谈不上收联系方式，collect_contact 走默认的 false。
       await deliverToJijyun({ id, text: "", ok: false, error: name });
     }
   });

@@ -19,7 +19,8 @@ Twilio  /api/twilio/messages → Twilio adapter ├→ handleInboundMessage → 
 | `identity.ts` | 外部身份 → 内部 user，没见过就建 guest 并绑定 | 可用，需先建表 |
 | `conversation.ts` | 内部 user → chatId（取最近一条，没有就新建） | 可用，策略以后可换 |
 | `adapter.ts` | adapter 公共骨架 + 总开关 + 错误翻译 | 可用 |
-| `redact-contact.ts` | 出站剔除联系方式（渠道自选，Engine 不管） | 可用 |
+| `redact-contact.ts` | 出站剔除联系方式与外链（渠道自选，Engine 不管） | 可用，`pnpm redact-eval` 守着 |
+| `xhs-dm.ts` | 小红书私信的渠道提示词 + 「要不要收联系方式」识别 | 可用，两者必须同步改 |
 | `app/api/xhs/messages` | 小红书私信 adapter，**已接通** | MVP：收 `{id, text}`，异步投递 |
 | `jijyun.ts` | 出站投递到集简云 webhook | 可用，URL 走环境变量 |
 | `app/api/twilio/messages` | 短信 adapter | 骨架，缺验签与 TwiML |

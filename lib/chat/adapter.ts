@@ -1,8 +1,8 @@
 import "server-only";
 
+import { resolveChatIdForUser } from "./conversation";
 import { runChatTurn } from "./engine";
 import { ChannelTableMissingError, resolveInternalUserId } from "./identity";
-import { resolveChatIdForUser } from "./conversation";
 import type { ChannelId, TurnResult } from "./types";
 
 /**
@@ -44,6 +44,12 @@ export type InboundMessage = {
   accountId?: string | null;
   displayName?: string | null;
   externalMessageId?: string | null;
+  /**
+   * 该渠道追加的提示词，拼在项目通用 system prompt 后面（见 `buildTurnSetup`）。
+   * **渠道自己的运营话术放这里**，不要塞进通用 prompt——网页那条不该看到
+   * "叫对方填联系方式"这种只对小红书成立的规则。
+   */
+  extraSystem?: string;
 };
 
 /**
@@ -67,13 +73,16 @@ export async function handleInboundMessage(
     title: `${inbound.channel} · ${inbound.displayName ?? inbound.externalUserId}`,
   });
 
-  return await runChatTurn({
-    chatId,
-    userId,
-    text: inbound.text,
-    channel: inbound.channel,
-    externalMessageId: inbound.externalMessageId ?? null,
-  });
+  return await runChatTurn(
+    {
+      chatId,
+      userId,
+      text: inbound.text,
+      channel: inbound.channel,
+      externalMessageId: inbound.externalMessageId ?? null,
+    },
+    inbound.extraSystem ? { extraSystem: inbound.extraSystem } : undefined
+  );
 }
 
 /** 把 adapter 里几种常见失败翻译成统一响应，省得每个渠道各写一遍 */

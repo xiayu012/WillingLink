@@ -14,6 +14,12 @@ export type JijyunDelivery = {
   id: string;
   /** 已经剔过联系方式的回复；失败时为空字符串 */
   text: string;
+  /**
+   * 这一轮有没有在叫对方留联系方式（`wantsContactCollection` 判的）。
+   * 集简云那边按它决定要不要挂留资组件，所以**必须每次都出现在 body 里**，
+   * 不能靠"没有这个字段就是 false"——下游取不到字段的行为不归我们控制。
+   */
+  collectContact?: boolean;
   chatId?: string;
   ok?: boolean;
   error?: string;
@@ -31,11 +37,18 @@ export async function deliverToJijyun(
     return { delivered: false, detail: "JIJYUN_WEBHOOK_URL not set" };
   }
 
+  // 集简云那边的字段名是 snake_case；`collect_contact` **默认 false 且总是带上**
+  const { collectContact = false, ...rest } = payload;
+
   try {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ok: true, ...payload }),
+      body: JSON.stringify({
+        ok: true,
+        ...rest,
+        collect_contact: collectContact,
+      }),
     });
     // 集简云成功时回 {"Code":200,"Data":null,"Msg":"成功"}
     const detail = (await response.text()).slice(0, 200);
@@ -46,6 +59,7 @@ export async function deliverToJijyun(
         id: payload.id,
         chatId: payload.chatId,
         chars: payload.text.length,
+        collectContact,
         status: response.status,
         detail,
       })
@@ -53,7 +67,10 @@ export async function deliverToJijyun(
     return { delivered, status: response.status, detail };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.log("[jijyun] 投递异常", JSON.stringify({ id: payload.id, message }));
+    console.log(
+      "[jijyun] 投递异常",
+      JSON.stringify({ id: payload.id, message })
+    );
     return { delivered: false, detail: message };
   }
 }

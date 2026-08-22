@@ -8,6 +8,53 @@
 
 ---
 
+## 2026-08-22（六）· 小红书私信加渠道提示词 + `collect_contact` 字段
+
+用户要三件事，串起来是一条：**让模型在合适的时候引导对方留联系方式，并把这个
+状态告诉集简云**，好让那边挂留资组件。
+
+1. **`lib/chat/xhs-dm.ts`（新）** —— 渠道提示词 `XHS_DM_EXTRA_SYSTEM` 和识别器
+   `wantsContactCollection` **放同一个文件**。识别器认的就是这段提示词引导出来
+   的话，拆开放迟早漂移，而漂移的表现是 `collect_contact` 恒为 false、不报错、
+   不留日志，属于最难查的一类。提示词内容是用户口述原话，**没有改写**——那是
+   运营策略（几时要联系方式、6.88/0.99 定价、为什么不能直接给房东电话）。
+2. **`extraSystem` 打通到渠道**：`InboundMessage` 加了这个可选字段，
+   `handleInboundMessage` 透传给 `runChatTurn`。渠道话术只对小红书生效，网页那条
+   不该看到"叫对方填联系方式"这种规则。
+3. **`collect_contact` 进 body**：`JijyunDelivery.collectContact`（驼峰）在
+   `deliverToJijyun` 里转成集简云要的 snake_case，**默认 false 且每次都带**——
+   不能指望下游"取不到字段就当 false"。失败投递那条也带，走默认值。
+
+### 识别为什么用正则不用模型
+
+文本是**我们自己的提示词**引导出来的，措辞高度可预期；上一轮刚因为多绕一跳吃过
+延迟的亏，不值得为一个布尔值再加一次模型调用。真兜不住了再换最便宜的模型。
+
+**最容易踩的坑：把「解释为什么给不了房东联系方式」误判成「在要对方的联系方式」**
+——提示词里恰好写了"平台不让私聊发送房东的联系方式"，模型大概率原样复述。
+所以动词和名词之间只放行「你的/您的/一下/个」，中间插进「房东的」就匹配不上。
+`redact-eval` 里这两条负例（解释平台限制、说明付费获得）是钉子，别删。
+
+### 判定时机
+
+`wantsContactCollection` 吃的是**剔除之前的原文**：`redactContactInfo` 会按标点
+切碎重组，判完再剔才不会误伤。route 里两行的先后顺序不能调换。
+
+### 实测
+
+本地假 webhook 收到的真实 body（三种情况都带字段）：
+
+    {"ok":true,"id":"u1","text":"普通房源回复","chatId":"c1","collect_contact":false}
+    {"ok":true,"id":"u2","text":"方便留个联系方式吗","chatId":"c2","collect_contact":true}
+    {"ok":false,"id":"u3","text":"","error":"TimeoutError","collect_contact":false}
+
+### 遗留
+
+集简云那边还没配「收到 `collect_contact: true` 就挂留资组件」的分支——本次只动
+我们这一侧，那边是用户自己的流程。
+
+---
+
 ## 2026-08-21（五）· 出站剔除补上 URL/外链，加 `pnpm redact-eval` 门禁
 
 用户反馈私信发出去的内容还带着联系方式和 `([原帖](url))` 链接。查小红书私信
