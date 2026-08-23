@@ -13,7 +13,11 @@
  * `redactContactInfo`，然后用下面 mustDrop 的那几类正则去搜剔后文本。
  */
 import { redactContactInfo } from "../lib/chat/redact-contact";
-import { wantsContactCollection } from "../lib/chat/xhs-dm";
+import {
+  insertListingSeparators,
+  LISTING_SEPARATOR,
+  wantsContactCollection,
+} from "../lib/chat/xhs-dm";
 
 type Case = {
   name: string;
@@ -210,7 +214,80 @@ for (const c of collectCases) {
   }
 }
 
-const total = cases.length + collectCases.length;
+// ---------------------------------------------------------------------------
+// 房源分割线。要钉的是「插在哪」：只在房源之间，开头的引导语和结尾的总结句
+// 前面都不能插——两头的判断（上一行是字段 && 下一行是字段）缺一就会误插。
+// ---------------------------------------------------------------------------
+
+const SEP = LISTING_SEPARATOR;
+const twoListings = [
+  "以下是符合要求的房源：",
+  "南湾west SJ SFH 4b3b整租招租",
+  "- 租金: $5000/月",
+  "- 房型: 4 室 / 3 卫",
+  "Sunnyvale主卧独立卫浴9/1起",
+  "- 租金: $1800/月",
+  "- 房型: 1 室 / 1 卫",
+  "这些房源都在您预算内，需要我再筛吗？",
+].join("\n");
+
+const sepChecks: { name: string; pass: boolean; detail?: string }[] = [];
+
+sepChecks.push({
+  name: "分割符正好15字符",
+  pass: SEP.length === 15,
+  detail: `实际 ${SEP.length}`,
+});
+
+const sepOut = insertListingSeparators(twoListings);
+const sepLines = sepOut.split("\n");
+sepChecks.push({
+  name: "两条房源之间插且只插一条",
+  pass: sepLines.filter((l) => l === SEP).length === 1,
+  detail: `实际 ${sepLines.filter((l) => l === SEP).length} 条`,
+});
+sepChecks.push({
+  name: "插在第二条标题正上方",
+  pass: sepLines[sepLines.indexOf(SEP) + 1] === "Sunnyvale主卧独立卫浴9/1起",
+  detail: sepLines[sepLines.indexOf(SEP) + 1],
+});
+sepChecks.push({
+  name: "引导语前不插",
+  pass: sepLines[0] === "以下是符合要求的房源：",
+  detail: sepLines[0],
+});
+sepChecks.push({
+  name: "结尾总结句前不插",
+  pass: sepLines.at(-2) !== SEP,
+  detail: sepLines.at(-2),
+});
+sepChecks.push({
+  name: "单条房源不插",
+  pass: !insertListingSeparators(
+    "房源一览：\n某房源标题\n- 租金: $1000\n- 房型: 1 室"
+  ).includes(SEP),
+});
+sepChecks.push({
+  name: "重复跑不叠加(幂等)",
+  pass: insertListingSeparators(sepOut) === sepOut,
+});
+sepChecks.push({
+  name: "纯问候不动",
+  pass:
+    insertListingSeparators("我在线，有什么需求告诉我") ===
+    "我在线，有什么需求告诉我",
+});
+
+for (const c of sepChecks) {
+  if (c.pass) {
+    console.log(`✅ sep: ${c.name}`);
+  } else {
+    failed++;
+    console.log(`❌ sep: ${c.name}${c.detail ? ` — ${c.detail}` : ""}`);
+  }
+}
+
+const total = cases.length + collectCases.length + sepChecks.length;
 console.log(
   `\n${failed === 0 ? "✅ 全部通过" : `❌ ${failed}/${total} 条不通过`}`
 );

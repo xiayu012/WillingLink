@@ -13,7 +13,7 @@
  * 内容是用户口述的原话，没有改写：这是运营策略（什么时候要联系方式、定价多少、
  * 为什么不能直接给房东电话），不是我能替他决定的东西。
  */
-export const XHS_DM_EXTRA_SYSTEM = `你运转在小红书。你账号是企业专业号。租客会咨询你房源信息，当你觉得"火候"差不多了就叫对方填写联系方式。我这样做是因为小红书平台不让私聊发送房东的联系方式。还有一些FAQ告诉你：价钱是6.88人民币或0.99美金，可获得多个房东的联系方式。需要租客自己联系房东，我不是中介，我只是替代租客做网络搜索。我无法联系房东，因为我是商业电话号，如果我主动发信息多了，我怕被运营商封号`;
+export const XHS_DM_EXTRA_SYSTEM = `你运转在小红书。你账号是企业专业号。租客会咨询你房源信息，当你觉得"火候"差不多了就叫对方填写联系方式。 还有一些FAQ只在对方问了才回答：价钱是6.88人民币或0.99美金，可获得多个房东的联系方式。需要租客自己联系房东，我不是中介，我只是替代租客做网络搜索。我无法主动联系房东，因为我是商业电话号`;
 
 /**
  * 「这句话是在叫对方留联系方式吗」。
@@ -22,10 +22,9 @@ export const XHS_DM_EXTRA_SYSTEM = `你运转在小红书。你账号是企业�
  * 正则零延迟零成本且结果稳定；上一轮已经因为多绕一跳吃过延迟的亏，没必要为一个
  * 布尔值再加一次模型调用。真哪天发现措辞太散兜不住，再换最便宜的模型也不迟。
  *
- * **关键是别把「解释为什么给不了房东联系方式」误判成「在要对方的联系方式」**
- * ——提示词里恰好写了「平台不让私聊发送房东的联系方式」，模型很可能原样复述。
- * 所以动词和名词之间只放行「你的/您的/一下/个」这几个词，中间一旦插进「房东的」
- * 就匹配不上：
+ * **关键是别把「提到房东的联系方式」误判成「在要对方的联系方式」**——上面 FAQ
+ * 里就写着「可获得多个房东的联系方式」，模型答 FAQ 时会原样复述。所以动词和
+ * 名词之间只放行「你的/您的/一下/个」这几个词，中间一旦插进「房东的」就匹配不上：
  *
  *   ✅ 方便留个联系方式吗          → true
  *   ✅ 请填写一下您的联系方式      → true
@@ -54,4 +53,72 @@ const COLLECT_CONTACT_PATTERNS: RegExp[] = [
  */
 export function wantsContactCollection(text: string): boolean {
   return COLLECT_CONTACT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/** 房源之间的分割线：15 个 em dash（U+2014） */
+export const LISTING_SEPARATOR = "—".repeat(15);
+
+/**
+ * 字段行：`- 租金: $1250`。用 ASCII `-*•`，**不含 em dash**，所以分割线本身
+ * 不会被当成字段行——重复调用这个函数是安全的。
+ */
+const FIELD_LINE = /^[ \t]*[-*•]/;
+
+function neighborKind(
+  lines: string[],
+  from: number,
+  step: -1 | 1
+): "field" | "text" | "none" {
+  for (let i = from + step; i >= 0 && i < lines.length; i += step) {
+    const line = lines[i];
+    if (line.trim().length === 0 || line === LISTING_SEPARATOR) {
+      continue;
+    }
+    return FIELD_LINE.test(line) ? "field" : "text";
+  }
+  return "none";
+}
+
+/**
+ * 房源与房源之间插一条分割线。
+ *
+ * 模型输出的形状是固定的：一行标题（不带 `-`），跟着若干 `- 字段: 值`，如此循环，
+ * 前面常有一句引导语、后面常有一句总结。所以「新房源的标题」＝**上一行是字段行、
+ * 下一行也是字段行**的那种非字段行：
+ *
+ *     南湾地区，预算5000美元每月…以下是符合要求的房源：   ← 引导语（上一行不是字段）
+ *     南湾west SJ SFH 4b3b整租招租                      ← 第一条，前面不插
+ *     - 租金: …
+ *     - 房型: …
+ *     ———————————————                                  ← 插在这
+ *     Sunnyvale主卧独立卫浴9/1起available
+ *     - 租金: …
+ *     这些房源都在您预算内，需要我再筛吗？                ← 总结句（下一行不是字段）
+ *
+ * 两头的判断缺一不可：只看上一行，结尾的总结句会被误当成标题；只看下一行，
+ * 开头的引导语会被误判。
+ *
+ * **在剔除之后跑**：`redactContactInfo` 会整行删掉 `- 联系: …`、还会合并空行，
+ * 先插分割线的话行号结构会被它改掉。
+ */
+export function insertListingSeparators(text: string): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
+
+  for (const [i, line] of lines.entries()) {
+    const isTitle =
+      line.trim().length > 0 &&
+      !FIELD_LINE.test(line) &&
+      neighborKind(lines, i, -1) === "field" &&
+      neighborKind(lines, i, 1) === "field";
+
+    // `out.at(-1)` 那半句是为了幂等：`neighborKind` 会跳过已有的分割线去看真正的
+    // 邻居，所以对已经插过的文本再跑一遍，标题仍然判为 true，不拦就会叠第二条。
+    if (isTitle && out.at(-1) !== LISTING_SEPARATOR) {
+      out.push(LISTING_SEPARATOR);
+    }
+    out.push(line);
+  }
+
+  return out.join("\n");
 }
