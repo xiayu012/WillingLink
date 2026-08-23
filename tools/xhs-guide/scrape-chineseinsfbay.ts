@@ -536,10 +536,12 @@ async function scrapeThreadLinks(
   const context = await browser.newContext();
   const page = await context.newPage();
   const links = new Map<string, ThreadCandidate>();
+  const forumBase = FORUM_URL.replace(/\.html$/, "");
+  let offset = 0;
 
   for (let currentPage = 1; currentPage <= maxPages; currentPage += 1) {
     const targetUrl =
-      currentPage === 1 ? FORUM_URL : `${FORUM_URL}/page_${currentPage}.html`;
+      currentPage === 1 ? FORUM_URL : `${forumBase}/start_${offset}.html`;
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForTimeout(1000);
 
@@ -563,15 +565,17 @@ async function scrapeThreadLinks(
         }
         out.push({ title, url: href });
       }
-      return out;
+      return { threads: out, cardCount: cards.length };
     });
 
-    if (candidates.length === 0) {
+    offset += candidates.cardCount;
+
+    if (candidates.threads.length === 0) {
       console.log(`[scrape] 第 ${currentPage} 页: 无普通帖，停止翻页`);
       break;
     }
 
-    const newOnPage = candidates.filter(
+    const newOnPage = candidates.threads.filter(
       (candidate) => !knownUrls.has(candidate.url)
     );
     for (const candidate of newOnPage) {
@@ -579,7 +583,7 @@ async function scrapeThreadLinks(
     }
 
     console.log(
-      `[scrape] 第 ${currentPage} 页: 列表${candidates.length} 新${newOnPage.length}（累计新帖 ${links.size}）`
+      `[scrape] 第 ${currentPage} 页: 列表${candidates.threads.length} 新${newOnPage.length}（累计新帖 ${links.size}）`
     );
 
     if (newOnPage.length === 0) {
