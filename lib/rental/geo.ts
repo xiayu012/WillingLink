@@ -20,7 +20,12 @@
  * 里外"这种判断，不是导航。别拿它去算步行路线。
  */
 
-import { CITY_TABLE, cityByName, detectCityStrict } from "./cities";
+import {
+  aliasPattern,
+  CITY_TABLE,
+  cityByName,
+  detectCityStrict,
+} from "./cities";
 
 export type GeoPoint = { lat: number; lng: number };
 
@@ -422,19 +427,20 @@ const LANDMARKS: {
   },
 ];
 
-const LANDMARK_INDEX: {
-  alias: string;
-  label: string;
-  point: [number, number];
-}[] = LANDMARKS.flatMap(
-  (l) =>
-    l.aliases.map((alias) => ({
-      alias: alias.toLowerCase(),
-      label: l.label,
-      point: l.point,
-    }))
-  // 长别名优先，"apple park" 不会被 "apple" 抢走
+// 长别名优先（"apple park" 不会被 "apple" 抢走），且**必须走词边界**。
+// 裸子串匹配会把 "San Fran|cisco|" 读成 San Jose 的 Cisco 园区——差 70 公里。
+// 这不是假想：第一版就是 includes()，用户的 key 一接上、拿 SF 的公寓名一测
+// 就跑去了南湾。同类地雷还有 "AI intel|ligent|"→Intel、"re|scu|e"→SCU。
+// aliasPattern 与城市表共用（cities.ts），两边的边界规则永远一致。
+const LANDMARK_ALIASES = LANDMARKS.flatMap((l) =>
+  l.aliases.map((alias) => ({ alias, label: l.label, point: l.point }))
 ).sort((a, b) => b.alias.length - a.alias.length);
+
+/** 捕获组 i+1 ↔ LANDMARK_ALIASES[i]，与 cities.ts 的扫描器同款结构。 */
+const LANDMARK_SCAN_RE = new RegExp(
+  LANDMARK_ALIASES.map(({ alias }) => `(${aliasPattern(alias)})`).join("|"),
+  "i"
+);
 
 // ── 距离 ─────────────────────────────────────────────────────────────────────
 
@@ -466,10 +472,17 @@ export function zipPointIn(text: string): ResolvedPlace | null {
 
 /** 文本里第一个已知地标/雇主/校园。 */
 export function landmarkPointIn(text: string): ResolvedPlace | null {
-  const hay = text.toLowerCase();
-  for (const { alias, label, point } of LANDMARK_INDEX) {
-    if (hay.includes(alias)) {
-      return { lat: point[0], lng: point[1], label, source: "landmark" };
+  const m = text.match(LANDMARK_SCAN_RE);
+  if (!m) return null;
+  for (let i = 1; i < m.length; i++) {
+    if (m[i] !== undefined) {
+      const hit = LANDMARK_ALIASES[i - 1];
+      return {
+        lat: hit.point[0],
+        lng: hit.point[1],
+        label: hit.label,
+        source: "landmark",
+      };
     }
   }
   return null;
@@ -548,6 +561,7 @@ const BAY_BOUNDS = {
 
 type GoogleGeocodeResponse = {
   status: string;
+  error_message?: string;
   results: {
     formatted_address: string;
     geometry: { location: { lat: number; lng: number } };
@@ -583,6 +597,14 @@ export async function geocodePlace(
     });
     if (res.ok) {
       const data = (await res.json()) as GoogleGeocodeResponse;
+      // Google 对配置问题回 HTTP 200 + status:"REQUEST_DENIED"。静默 null 会
+      // 让"key 配错了"和"这个地方查不到"看起来一模一样——实测就踩过（key 有效
+      // 但项目没开 Billing，一整轮测试全是 null，肉眼看不出原因）。
+      if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
+        console.error(
+          `[geocodePlace] ${data.status}: ${data.error_message ?? "(no message)"}`
+        );
+      }
       const hit = data.status === "OK" ? data.results[0] : null;
       const loc = hit?.geometry.location;
       if (

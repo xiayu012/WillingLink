@@ -80,9 +80,37 @@ San Jose / Santa Clara 的房源。Genesis AI 在 **Palo Alto**，差了二三�
 `步行到meta`（2.5km）→ NO_MATCH 并给出"放宽「距离」→ 155 个"；
 `靠近某个没人听过的XYZ公司` → LOCATION_UNKNOWN，带结果 + 反问。
 
+### 事后补丁：地标匹配的子串碰撞（**已上线过的真缺陷**）
+
+用户配好 GOOGLE_MAPS_API_KEY 之后拿真实公寓名一测，第一条就炸了：
+
+    "Rincon Green apartments San Francisco"  →  Cisco (San Jose)
+                              ↑↑↑↑↑  San Fran|cisco|
+
+第一版 `landmarkPointIn` 用的是**裸 `includes()`**。后果：**任何提到
+San Francisco 的"靠近…"查询都会被定位到 70 公里外的南湾 Cisco 园区**。
+同类地雷：`AI intel|ligent|`→Intel、`re|scu|e`→SCU、`meta`/`amd`/`sfo` 全都是。
+
+修法：地标别名改走 `aliasPattern`（从 cities.ts 导出，ASCII 加词边界、CJK 不加），
+和城市表共用同一条规则，两边永不漂移。回归用例：San Francisco→城市而非 Cisco、
+AI intelligent→无匹配、rescue→无匹配，同时 meta / apple / TikTok / UCB 照常命中。
+
+**教训：这个 bug 上一轮通过了 181 条门禁**——因为门禁的语料里恰好没有"靠近某处
++ 提到 San Francisco"的组合。地名匹配这类东西必须单独写碰撞用例，别指望端到端
+评测覆盖到。cities.ts 当初就是因为同样的理由才做的最长别名优先 + 词边界，
+geo.ts 第一版没有沿用，是纯粹的疏忽。
+
+顺带把 Google 的配置错误改成**打日志**：它对 `REQUEST_DENIED` 回的是
+HTTP 200 + status 字段，静默 null 会让"key 配错了"和"这个地方查不到"长得一模一样。
+实测就是靠打印原始响应才发现是项目没开 Billing。
+
 ### 门禁
 
-`search-eval --source wanted --limit 181`：
+`search-eval --source wanted --limit 181`（地标修复后重跑）：
+**PASS 153 / DATA_GAP 21 / VERIFIER_CUT 7 / CODE_BUG 0 / judge-0 2**
+（修复前 154/20/7/0/5——judge-0 从 5 降到 2，正是碰撞修掉的语义跑偏。）
+
+上一轮（加距离层、修复前）：
 **PASS 154 / DATA_GAP 20 / VERIFIER_CUT 7 / CODE_BUG 0**（本轮改动前 155/19/7/0，
 持平）。`search-recall-eval`：**recall 71.1% → 77.2%，precision 27.0% → 34.4%，
 falseEmpty 1**。
@@ -93,9 +121,11 @@ falseEmpty 1**。
 
 ### 遗留 / 需要用户配合
 
-- **`GOOGLE_MAPS_API_KEY` 还没有**（`.env.local` 里没有这个键，
-  `find-nearest-transit.ts` 里那套 geocode 代码因此一直是死的）。没有它，
-  静态表覆盖不到的地点（新公司、小众楼盘）只能走 LOCATION_UNKNOWN 反问用户。
+- **`GOOGLE_MAPS_API_KEY` 已配置，但项目没开 Billing**，所以 geocoding 仍然
+  全线 `REQUEST_DENIED`（Google 即使只用每月免费 $200 额度也要求先绑卡）。
+  在用户开通结算之前，静态表覆盖不到的地点（新公司、小众楼盘）走
+  LOCATION_UNKNOWN 反问用户。开通后 `geocodePlace` 自动生效，无需改代码。
+  **判断是否通了：打日志的那行会打出 status，`OK` 即通。**
   **"Genesis AI → Palo Alto" 是我手工加进 LANDMARKS 的，那是针对这一个 case
   的补丁，不是通解。** 拿到 key 之后 `geocodePlace` 自动生效，无需改代码。
 - 房源侧的 `lat`/`lng` 仍然只有 4%。有了 key 之后值得写个 backfill 把

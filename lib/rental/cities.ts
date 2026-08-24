@@ -727,9 +727,15 @@ function escapeRe(s: string): string {
   return s.replace(RE_SPECIAL_RE, "\\$&");
 }
 
-/** One alias → a pattern that tolerates flexible whitespace between words and
- *  requires word boundaries for ASCII (so "SF" never matches "transfer"). */
-function aliasPattern(alias: string): string {
+/**
+ * One alias → a pattern that tolerates flexible whitespace between words and
+ * requires word boundaries for ASCII (so "SF" never matches "transfer").
+ *
+ * Exported because geo.ts needs the exact same rule for landmark aliases —
+ * it learned the hard way that a bare substring match reads "San Fran*cisco*"
+ * as the Cisco campus in San Jose, 70km away.
+ */
+export function aliasPattern(alias: string): string {
   const body = escapeRe(alias.trim()).replace(WS_RE, "\\s*");
   return ASCII_ONLY_RE.test(alias) ? `\\b${body}\\b` : body;
 }
