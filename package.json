@@ -20,6 +20,7 @@
     "xhs:generate-geo-index": "node tools/xhs-guide/geo/generate-geo-index.mjs",
     "xhs:verify-geo-index": "node tools/xhs-guide/geo/verify-geo-index.mjs",
     "search-eval": "NODE_OPTIONS=--conditions=react-server tsx scripts/search-eval.ts",
+    "search-recall-eval": "NODE_OPTIONS=--conditions=react-server tsx scripts/search-recall-eval.ts",
     "redact-eval": "tsx scripts/redact-eval.ts"
   },
   "dependencies": {

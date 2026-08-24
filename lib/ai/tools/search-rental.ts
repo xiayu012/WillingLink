@@ -39,8 +39,11 @@
  * something is shown, which trains users into endless "换一个" loops over
  * loosely-matching results. Strict mode replaces that contract:
  *
+ *   - Understand the request ONCE via planQuery (lib/rental/query-plan.ts),
+ *     which yields a QueryPlan whose city/bedroom constraints are SETS.
  *   - Filter the WHOLE pool strictly by every requirement the user voiced
- *     (city exact, budget, bedrooms, move-in, pet/couple/utilities/parking).
+ *     (city set, budget ceiling, bedroom set, move-in deadline, lease window,
+ *     pet/couple/utilities/parking — cutting only provable violations).
  *   - Rank all matches, verify the top-K once, and hand back ≤8 per batch
  *     (reranked when Voyage is available, else most recent first). "继续/换一批"
  *     slices the next 8 out of that same cached list — instant, never repeats.
@@ -53,36 +56,42 @@ import { tool } from "ai";
 import { after } from "next/server";
 import { z } from "zod";
 import { embedText, rerankDocuments } from "@/lib/ai/embeddings";
+import { verifyListingsAgainstQuery } from "@/lib/ai/verify-listings";
 import {
   logSearchQuery,
   searchXhsRentalListings,
   vectorSearchXhsRentalListings,
   type XhsRentalSearchResultRow,
 } from "@/lib/db/queries";
-import { verifyListingsAgainstQuery } from "@/lib/ai/verify-listings";
 import { getSeenListingIds, markListingAsSeen } from "@/lib/db/seen-listings";
 import {
   type CityEntry,
   cityAliases,
-  detectCities,
+  cityByName,
   detectCity,
   detectCityStrict,
-  isOutOfBayQuery,
 } from "@/lib/rental/cities";
 import { listingLeaseFromText } from "@/lib/rental/lease-duration";
+import {
+  applyBlockTerms,
+  applyHardConstraints,
+  emptyConstraints,
+  extractHardConstraints,
+  hasAnyConstraint,
+  rowViolates,
+} from "@/lib/rental/query-constraints";
+import {
+  type BoolRequirementKey,
+  planQuery,
+  planSummary,
+  type QueryPlan,
+  rerankQueryFor,
+} from "@/lib/rental/query-plan";
 import {
   batchFingerprint,
   loadBatchState,
   saveBatchState,
 } from "@/lib/rental/result-batches";
-import {
-  applyBlockTerms,
-  applyHardConstraints,
-  extractBooleanPrefs,
-  extractHardConstraints,
-  hasAnyConstraint,
-  rowViolates,
-} from "@/lib/rental/query-constraints";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -485,31 +494,50 @@ const STRICT_POOL_LIMIT = 1000; // whole table today (~750 rows)
 const STRICT_RERANK_CAP = 100; // rerank cost cap when many rows survive
 
 /**
- * Exact-city membership (no neighbours — strict mode returns only the city the
- * user actually named). The LLM-normalized `city` column is authoritative when
- * present; otherwise fall back to Bay-Area-phrase-aware text detection. Rows
- * whose city cannot be established do NOT count as matches.
+ * Which city a listing actually sits in. The LLM-normalized `city` column is
+ * authoritative when present; otherwise fall back to Bay-Area-phrase-aware
+ * text detection over every location-bearing field. Returns null when the city
+ * cannot be established at all.
  */
-function rowInCityExact(
-  row: XhsRentalSearchResultRow,
-  city: CityEntry
-): boolean {
-  const col = row.city?.trim().toLowerCase();
-  if (col && col !== "null" && col.length > 0) {
-    return col === city.en.toLowerCase();
+function resolveRowCity(row: XhsRentalSearchResultRow): string | null {
+  const col = row.city?.trim();
+  if (col && col.toLowerCase() !== "null" && col.length > 0) {
+    return cityByName(col)?.en ?? col;
   }
   const rc = detectCityStrict(
     `${row.title ?? ""} ${row.locationText ?? ""} ${row.propertyName ?? ""} ${row.rawText}`
   );
-  return rc ? rc.en === city.en : false;
+  return rc?.en ?? null;
 }
 
-// Boolean requirements are strict: a listing counts only when the structured
-// column confirms it, or (column unparsed) the text itself affirms it.
-const BOOL_TEXT_POSITIVE: {
-  key: "petFriendly" | "couplesOk" | "utilitiesIncluded" | "parkingIncluded";
-  re: RegExp;
-}[] = [
+/**
+ * Membership in the plan's acceptable-city SET (no neighbour expansion —
+ * strict mode returns only cities the user actually named or that their region
+ * word covers). Rows whose city cannot be established do NOT count as matches:
+ * a listing that never says where it is cannot be shown as an answer to
+ * "I want to live in Dublin".
+ */
+function rowInAnyCity(
+  row: XhsRentalSearchResultRow,
+  cities: readonly string[]
+): boolean {
+  const rowCity = resolveRowCity(row);
+  if (!rowCity) return false;
+  const lower = rowCity.toLowerCase();
+  return cities.some((c) => c.trim().toLowerCase() === lower);
+}
+
+// Boolean requirements cut only on a PROVABLE violation — an explicit "no
+// pets"/"no parking" in the column or the text. Silence is NOT a violation.
+//
+// 这条以前是反的（列没确认且正文没肯定 → 剔除），召回评测一跑就现形：
+// "养猫人…有停车位" 那条查询库里有 5 个 LLM 认可的房源，谓词一个不剩，
+// 因为绝大多数帖子根本不会专门写"允许养宠物/有车位"。沉默不是矛盾——这既是
+// CLAUDE.md 写的"只剔除可证明违反的"，也和终审 prompt 里那条"帖子对某需求
+// 沉默不算矛盾"一致，之前两处标准打架。
+// 代价（确认过的房源和沉默的房源混在一起）由 rankByPlanSignals 在排序上补：
+// 确认满足的排前面，沉默的排后面，而不是把沉默的藏起来。
+const BOOL_TEXT_POSITIVE: { key: BoolRequirementKey; re: RegExp }[] = [
   {
     key: "petFriendly",
     re: /宠物友好|可养宠|可以养宠|允许宠物|可带宠|接受宠物|pet[-\s]?friendly|pets?\s*(ok|allowed|welcome)/i,
@@ -528,18 +556,96 @@ const BOOL_TEXT_POSITIVE: {
   },
 ];
 
+/** Text that explicitly REFUSES a requirement — the only text-level violation. */
+const BOOL_TEXT_NEGATIVE: { key: BoolRequirementKey; re: RegExp }[] = [
+  {
+    key: "petFriendly",
+    re: /不(?:可|能|允许|接受)养?宠物?|禁止养?宠物|无宠物家庭|不养宠物|no\s*pets?\b|pets?\s*not\s*allowed/i,
+  },
+  {
+    key: "couplesOk",
+    re: /不接受情侣|仅限一人|只租一人|限一人入住|单人入住|no\s*couples?/i,
+  },
+  {
+    key: "utilitiesIncluded",
+    re: /水电(?:费)?(?:自理|另算|另付|不含|不包)|不包水电|utilities?\s*not\s*included/i,
+  },
+  {
+    key: "parkingIncluded",
+    re: /(?:没有|无|不含|不提供|不带)(?:车位|停车位|停车)|车位(?:自理|另租|另付|需另外)|no\s*parking/i,
+  },
+];
+
+/** True unless the listing PROVABLY refuses one of the required booleans. */
 function satisfiesBooleanPrefs(
   row: XhsRentalSearchResultRow,
-  prefs: ReturnType<typeof extractBooleanPrefs>
+  prefs: Record<BoolRequirementKey, boolean | null>
 ): boolean {
-  for (const { key, re } of BOOL_TEXT_POSITIVE) {
+  for (const { key, re } of BOOL_TEXT_NEGATIVE) {
     if (prefs[key] !== true) continue; // not required
-    const col = row[key];
-    if (col === true) continue; // confirmed by structured field
-    if (col === false) return false; // explicitly disallowed
-    if (!re.test(row.rawText)) return false; // unparsed AND text silent → out
+    if (row[key] === false) return false; // structured column says no
+    if (row[key] === true) continue; // structured column says yes
+    if (re.test(row.rawText)) return false; // text says no
   }
   return true;
+}
+
+/** How many of the required booleans this listing positively CONFIRMS. */
+function confirmedCount(
+  row: XhsRentalSearchResultRow,
+  prefs: Record<BoolRequirementKey, boolean | null>
+): number {
+  let n = 0;
+  for (const { key, re } of BOOL_TEXT_POSITIVE) {
+    if (prefs[key] !== true) continue;
+    if (row[key] === true || re.test(row.rawText)) n++;
+  }
+  return n;
+}
+
+const ANCHOR_MIN_CHARS = 4;
+const ANCHOR_WEIGHT = 3; // 点名的小区命中 > 任何单个布尔确认
+
+/** Does the listing name one of the complexes/landmarks the user asked for? */
+function anchorHits(row: XhsRentalSearchResultRow, anchors: string[]): number {
+  if (anchors.length === 0) return 0;
+  const hay =
+    `${row.title ?? ""} ${row.propertyName ?? ""} ${row.locationText ?? ""} ${row.rawText}`.toLowerCase();
+  let n = 0;
+  for (const a of anchors) {
+    // 太短的锚点（"tt"、"sj"）当子串搜会命中一堆无关文本，只留够长的。
+    const t = a.trim().toLowerCase();
+    if (t.length >= ANCHOR_MIN_CHARS && hay.includes(t)) n++;
+  }
+  return n;
+}
+
+/**
+ * Stable re-sort by the two plan signals the semantic reranker cannot judge:
+ * how many of the user's boolean requirements the listing positively CONFIRMS,
+ * and whether it names a complex/landmark the user asked for by name.
+ *
+ * Relevance order inside each tier is untouched — this only breaks ties.
+ * It is also the other half of making the boolean filter lenient: listings
+ * that stay silent on a requirement remain reachable, they just rank below the
+ * ones that say yes out loud. Ranking, never filtering.
+ */
+function rankByPlanSignals(
+  rows: XhsRentalSearchResultRow[],
+  plan: QueryPlan
+): XhsRentalSearchResultRow[] {
+  const needsBool = BOOL_FIELDS.some((k) => plan.requires[k] === true);
+  if (!(needsBool || plan.anchors.length > 0)) return rows;
+  return rows
+    .map((row, i) => ({
+      row,
+      i,
+      score:
+        confirmedCount(row, plan.requires) +
+        ANCHOR_WEIGHT * anchorHits(row, plan.anchors),
+    }))
+    .sort((a, b) => b.score - a.score || a.i - b.i)
+    .map((x) => x.row);
 }
 
 // ── Row-field recovery (structured columns are sparse) ───────────────────────
@@ -627,7 +733,10 @@ function withRecoveredFields(
     colContradictory ||
     (row.leaseMinMonths == null && row.leaseMaxMonths == null)
       ? listingLeaseFromText(`${row.title ?? ""}\n${row.rawText}`)
-      : { leaseMinMonths: row.leaseMinMonths, leaseMaxMonths: row.leaseMaxMonths };
+      : {
+          leaseMinMonths: row.leaseMinMonths,
+          leaseMaxMonths: row.leaseMaxMonths,
+        };
   return {
     ...row,
     rentNumeric: row.rentNumeric ?? rentFromText(row.rent),
@@ -640,8 +749,11 @@ function withRecoveredFields(
 // The corpus is supposed to be Bay-Area-only but contains strays (San Diego
 // sublets etc.). A row whose text names a non-Bay metro/campus and no Bay city
 // is provably out of coverage — strict mode never returns it.
+// 匹兹堡（中文写法一律指宾州）和 \bpittsburgh\b 在这里，湾区的 Pittsburg
+// （无 h）不在——门禁第一轮就抓到一条"🏙️匹兹堡转租|The Julian 2b2b"混进了
+// 东湾查询的结果里。温哥华/列治文同理，中文别名才是无歧义的那个。
 const NON_BAY_LISTING_RE =
-  /西雅图|seattle|纽约|new\s*york|洛杉矶|los\s*angeles|圣地亚哥|san\s*diego|\bucsd\b|\bucla\b|\bucsb\b|\bsdsu\b|尔湾|irvine|波士顿|boston|芝加哥|chicago/i;
+  /西雅图|seattle|纽约|new\s*york|洛杉矶|los\s*angeles|圣地亚哥|san\s*diego|\bucsd\b|\bucla\b|\bucsb\b|\bsdsu\b|尔湾|irvine|波士顿|boston|芝加哥|chicago|匹兹堡|\bpittsburgh\b|\bcmu\b|温哥华|vancouver|多伦多|toronto/i;
 
 function listingOutOfBay(row: XhsRentalSearchResultRow): boolean {
   const col = row.city?.trim();
@@ -669,14 +781,7 @@ function isNonRentalRow(row: XhsRentalSearchResultRow): boolean {
   return !RENTAL_SIGNAL_RE.test(`${row.title ?? ""} ${row.rawText}`);
 }
 
-/**
- * Structured constraints the CALLING LLM (chat model) passes alongside the
- * free-text query. This is the LLM-native path: the chat model already
- * understands that "SOMA"/"Mission" mean San Francisco and "Moffett Park"
- * means Sunnyvale — knowledge no regex table can carry. Regex NL extraction
- * remains the fallback for anything the model omits.
- */
-/** 严格谓词里可以单独放宽的约束维度。 */
+/** 严格谓词里可以单独放宽的约束维度（零结果时逐个试放宽，定位瓶颈）。 */
 export type StrictField =
   | "city"
   | "rent"
@@ -707,124 +812,99 @@ const FIELD_LABEL: Record<StrictField, string> = {
   parkingIncluded: "车位",
 };
 
-export type StrictSearchParams = {
-  city?: string | null;
-  rentMin?: number | null;
-  rentMax?: number | null;
-  bedroomsNum?: number | null;
-  petFriendly?: boolean | null;
-  couplesOk?: boolean | null;
-  utilitiesIncluded?: boolean | null;
-  parkingIncluded?: boolean | null;
-  leaseMonthsMin?: number | null;
-  leaseMonthsMax?: number | null;
-};
-
 /**
- * The strict-match predicate for a query, shared by the runtime search AND the
- * eval harness (tests/search-eval) so "what counts as a match" can never drift
- * between the two.
+ * The strict-match predicate for a QueryPlan — the SINGLE definition of "what
+ * counts as a match", shared by the runtime search AND the eval harness
+ * (scripts/search-eval.ts) so the two can never drift.
  *
- * Constraint sources, in priority order: typed params from the calling LLM
- * (semantic understanding — neighborhood→city etc.), then regex NL extraction
- * filling the gaps. Enforcement stays 偏严格, not absolutist: only PROVABLE
- * violations cut a row (unparsed fields are lenient; sparse columns are first
- * backfilled from text via withRecoveredFields), boolean requirements need
- * column or text confirmation, and out-of-Bay strays never surface. Ranking
- * relevance is the semantic reranker's job, not the filter's.
+ * The plan is built once by `planQuery` (lib/rental/query-plan.ts); this
+ * function is pure and synchronous so the bottleneck loop below can re-run it
+ * a dozen times for free.
+ *
+ * Enforcement stays 偏严格, not absolutist: only PROVABLE violations cut a row.
+ * Unparsed fields are lenient (sparse columns are first backfilled from text
+ * via withRecoveredFields); a listing that stays SILENT on a required boolean
+ * is kept, not cut — silence is not a contradiction, same rule the verifier
+ * uses. Out-of-Bay strays never surface. City and bedrooms are SETS: a user who
+ * named three acceptable cities gets all three, which is the whole point of the
+ * plan layer.
+ *
+ * Ranking relevance remains the reranker's job, never the filter's —
+ * `plan.prefers` and `plan.anchors` deliberately have no effect here; they act
+ * in rerankQueryFor and rankByPlanSignals instead.
  */
 export function buildStrictPredicate(
-  query: string,
-  params: StrictSearchParams = {},
+  plan: QueryPlan,
   omit: StrictField | null = null
 ): {
-  city: CityEntry | null;
+  cities: string[];
   /** 实际生效的约束维度——零结果时逐个试放宽，定位瓶颈。 */
   active: StrictField[];
   matches: (row: XhsRentalSearchResultRow) => boolean;
 } {
-  // City: LLM-normalized param wins; resolve it through CITY_TABLE so aliases
-  // and text-detection fallbacks keep working. A param city NOT in the table
-  // (e.g. "Tracy") degrades to a soft, column-only match via rowViolates.
-  // NL 兜底只在查询提到恰好一个城市时才构成硬约束——列了多个备选
-  // （"Palo Alto / Menlo Park / MTV"）说明用户接受多地，不做硬过滤。
-  const paramCity = params.city?.trim() || null;
-  const queryCities = paramCity ? [] : detectCities(query);
-  const namedCity = paramCity
-    ? (detectCity(paramCity) ?? null)
-    : queryCities.length === 1
-      ? queryCities[0]
-      : null;
-  const namedUnknownCity = paramCity && !namedCity ? paramCity : null;
-
-  const nl = extractHardConstraints(query);
-  const nlBool = extractBooleanPrefs(query);
-  const rentMin = params.rentMin ?? nl.rentMin;
-  const rentMax = params.rentMax ?? nl.rentMax;
-  const bedroomsNum = params.bedroomsNum ?? nl.bedroomsNum;
-  const leaseMin = params.leaseMonthsMin ?? nl.leaseMonthsMin;
-  const leaseMax = params.leaseMonthsMax ?? nl.leaseMonthsMax;
-  const bools = {
-    petFriendly: params.petFriendly ?? nlBool.petFriendly,
-    couplesOk: params.couplesOk ?? nlBool.couplesOk,
-    utilitiesIncluded: params.utilitiesIncluded ?? nlBool.utilitiesIncluded,
-    parkingIncluded: params.parkingIncluded ?? nlBool.parkingIncluded,
-  };
-
   const active: StrictField[] = [];
-  if (namedCity || namedUnknownCity) {
+  if (plan.cities.length > 0) {
     active.push("city");
   }
-  if (rentMin != null || rentMax != null) {
+  // 只有预算上限是硬约束。租客说"预算1500-1900"时，1500 是自我定位不是要求
+  // ——一个 1300 的房源没有违反任何东西，把它筛掉纯属误杀（召回评测里
+  // "养猫人 Emeryville" 那条就死在这上面）。下限留在计划里只影响排序。
+  if (plan.rentMax != null) {
     active.push("rent");
   }
-  if (bedroomsNum != null) {
+  if (plan.bedroomsAnyOf.length > 0) {
     active.push("bedrooms");
   }
-  if (leaseMin != null || leaseMax != null) {
+  if (plan.leaseMonthsMin != null || plan.leaseMonthsMax != null) {
     active.push("lease");
   }
-  if (nl.moveIn.kind !== "unknown") {
+  if (plan.moveIn.kind !== "unknown") {
     active.push("moveIn");
   }
   for (const key of BOOL_FIELDS) {
-    if (bools[key] === true) {
+    if (plan.requires[key] === true) {
       active.push(key);
     }
   }
 
   const kept = (f: StrictField): boolean => omit !== f;
-  const city = kept("city") ? namedCity : null;
+  const cities = kept("city") ? plan.cities : [];
+  const bedrooms = kept("bedrooms") ? plan.bedroomsAnyOf : [];
   const boolPrefs = {
-    petFriendly: kept("petFriendly") ? bools.petFriendly : null,
-    couplesOk: kept("couplesOk") ? bools.couplesOk : null,
-    utilitiesIncluded: kept("utilitiesIncluded") ? bools.utilitiesIncluded : null,
-    parkingIncluded: kept("parkingIncluded") ? bools.parkingIncluded : null,
+    petFriendly: kept("petFriendly") ? plan.requires.petFriendly : null,
+    couplesOk: kept("couplesOk") ? plan.requires.couplesOk : null,
+    utilitiesIncluded: kept("utilitiesIncluded")
+      ? plan.requires.utilitiesIncluded
+      : null,
+    parkingIncluded: kept("parkingIncluded")
+      ? plan.requires.parkingIncluded
+      : null,
   };
-  // Boolean prefs are handled separately (text fallback), so null them out of
-  // the rowViolates constraint set.
+  // City, bedrooms and the booleans are set-valued or need a text fallback, so
+  // they are checked here and nulled out of the rowViolates constraint set.
   const coreConstraints = {
-    ...nl,
-    rentMin: kept("rent") ? rentMin : null,
-    rentMax: kept("rent") ? rentMax : null,
-    bedroomsNum: kept("bedrooms") ? bedroomsNum : null,
-    leaseMonthsMin: kept("lease") ? leaseMin : null,
-    leaseMonthsMax: kept("lease") ? leaseMax : null,
-    moveIn: kept("moveIn") ? nl.moveIn : { kind: "unknown" as const },
-    petFriendly: null,
-    couplesOk: null,
-    utilitiesIncluded: null,
-    parkingIncluded: null,
-    city: kept("city") ? namedUnknownCity : null,
-    cityNeighbors: [],
+    ...emptyConstraints(),
+    rentMax: kept("rent") ? plan.rentMax : null,
+    leaseMonthsMin: kept("lease") ? plan.leaseMonthsMin : null,
+    leaseMonthsMax: kept("lease") ? plan.leaseMonthsMax : null,
+    moveIn: kept("moveIn") ? plan.moveIn : { kind: "unknown" as const },
   };
   return {
-    city,
+    cities,
     active,
     matches: (raw) => {
       if (isNonRentalRow(raw) || listingOutOfBay(raw)) return false;
       const row = withRecoveredFields(raw);
-      if (city && !rowInCityExact(row, city)) return false;
+      if (cities.length > 0 && !rowInAnyCity(row, cities)) return false;
+      // Bedrooms: lenient when the listing's unit size is unknown (偏严格),
+      // otherwise it must be one of the counts the user said they'd take.
+      if (
+        bedrooms.length > 0 &&
+        row.bedroomsNum != null &&
+        !bedrooms.includes(row.bedroomsNum)
+      ) {
+        return false;
+      }
       if (rowViolates(row, coreConstraints)) return false;
       return satisfiesBooleanPrefs(row, boolPrefs);
     },
@@ -852,20 +932,18 @@ type StrictSearchResult = {
  */
 async function findStrictListings(
   query: string,
-  blockTerms: string[],
-  params: StrictSearchParams = {}
+  plan: QueryPlan,
+  blockTerms: string[]
 ): Promise<StrictSearchResult> {
-  // The corpus only covers the Bay Area; a Seattle/NYC/... request provably
-  // has no answer here. Refuse early instead of returning unrelated listings.
-  // Checked on both the query text AND the LLM-normalized city param.
-  if (
-    isOutOfBayQuery(query) ||
-    (params.city && !detectCity(params.city) && NON_BAY_LISTING_RE.test(params.city))
-  ) {
+  // The corpus only covers the Bay Area; a Seattle/NYC/Vancouver request
+  // provably has no answer here. The plan layer decides this (it can read
+  // "🇨🇦Richmond 列治文" as Vancouver, which no regex can); the regex check is
+  // already folded into the plan as the fallback.
+  if (plan.outOfScope) {
     return { listings: [], totalMatched: 0, outOfBay: true, bottlenecks: [] };
   }
 
-  const { matches, active } = buildStrictPredicate(query, params);
+  const { matches, active } = buildStrictPredicate(plan);
 
   // Pool: the most recent STRICT_POOL_LIMIT rows — the whole table today
   // (~750). All strictness is enforced in the app layer via the shared
@@ -876,7 +954,10 @@ async function findStrictListings(
     limit: STRICT_POOL_LIMIT,
   });
 
-  const matched = applyBlockTerms(pool.filter(matches), blockTerms);
+  const matched = rankByPlanSignals(
+    applyBlockTerms(pool.filter(matches), blockTerms),
+    plan
+  );
 
   // 零结果时定位瓶颈：逐个"只放宽这一条"重跑谓词，看各自能解锁多少房源。
   // 纯内存过滤（≤9 次 × ~800 行），无额外 LLM / DB 成本。让"没有房源"永远
@@ -884,7 +965,7 @@ async function findStrictListings(
   if (matched.length === 0) {
     const bottlenecks: Bottleneck[] = [];
     for (const field of active) {
-      const relaxed = buildStrictPredicate(query, params, field);
+      const relaxed = buildStrictPredicate(plan, field);
       const wouldMatch = applyBlockTerms(
         pool.filter(relaxed.matches),
         blockTerms
@@ -907,19 +988,24 @@ async function findStrictListings(
   }
 
   // 超过一次缓存量 → 按相关度排序（有 Voyage 用 rerank，否则按最新）取 top-K。
+  // rerank 的查询用 rerankQueryFor 富化：偏好（"最好有独卫"）进不了硬筛选，
+  // 但必须在这里体现，否则用户说了等于没说。
   const pool2 = matched.slice(0, STRICT_RERANK_CAP);
   if (process.env.VOYAGE_API_KEY) {
     try {
       const topIndices = await rerankDocuments(
-        query,
+        rerankQueryFor(query, plan),
         pool2.map((r) => r.rawText),
         STRICT_BATCH_POOL
       );
       if (topIndices.length > 0) {
         return {
-          listings: topIndices
-            .map((i) => pool2[i])
-            .filter((r): r is XhsRentalSearchResultRow => Boolean(r)),
+          listings: rankByPlanSignals(
+            topIndices
+              .map((i) => pool2[i])
+              .filter((r): r is XhsRentalSearchResultRow => Boolean(r)),
+            plan
+          ),
           totalMatched: matched.length,
           outOfBay: false,
           bottlenecks: [],
@@ -1011,15 +1097,24 @@ function createStrictSearchRentalTool(chatId: string) {
             "Carry forward location, budget, bedrooms, move-in date, requirements from prior turns. " +
             "Example: '圣何塞两室一厅，预算2500以下，宠物友好，情侣入住'"
         ),
+      cities: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "EVERY Bay Area city the user would accept, standardized English names, resolved with " +
+            "your world knowledge: 'SOMA公寓' → ['San Francisco']; '在Moffett Park上班想住附近' → " +
+            "['Sunnyvale']; '94583附近' → ['San Ramon']. " +
+            "List ALL alternatives — 'Dublin优先，San Ramon也可以' → ['Dublin','San Ramon']. " +
+            "Naming several cities is NOT a reason to omit: the tool ORs them together. " +
+            "Omit only when the user named no location at all or only a broad region " +
+            "(南湾/东湾/半岛/湾区), which the tool expands on its own."
+        ),
       city: z
         .string()
         .nullable()
         .optional()
         .describe(
-          "Standardized English Bay Area city name the user wants, resolved with your world knowledge: " +
-            "'SOMA公寓' → 'San Francisco'; '在Moffett Park上班想住附近' → 'Sunnyvale'; '伯克利' → 'Berkeley'. " +
-            "Omit when the user named no location, only a broad region (南湾/东湾/湾区), " +
-            "or listed multiple acceptable cities ('MTV或Sunnyvale都行' → omit)."
+          "Deprecated single-city form; prefer `cities`. Merged into it when both are given."
         ),
       rentMin: z
         .number()
@@ -1033,31 +1128,45 @@ function createStrictSearchRentalTool(chatId: string) {
         .describe(
           "Maximum monthly rent in USD ('预算3k以下' → 3000). Only if the user stated a budget."
         ),
+      bedroomsAnyOf: z
+        .array(z.number().int())
+        .optional()
+        .describe(
+          "EVERY unit bedroom count the user would accept (studio=0, 一室/1B1B=1, 两室/2B2B=2). " +
+            "'想租2B2B里的一间' → [2]; '1b1b或studio都行' → [1,0]; '2b2b优先，2b1b、3b2b也可' → [2,3]. " +
+            "OMIT when the alternatives include something a bedroom count cannot express " +
+            "('Studio最优先，合租也行', '单间', '都可以') — an incomplete set filters out " +
+            "listings the user would have taken. Omit too when they never mentioned unit size."
+        ),
       bedroomsNum: z
         .number()
         .int()
         .nullable()
         .optional()
         .describe(
-          "Bedroom count of the UNIT the user wants (studio=0, 一室/1B1B=1, 两室/2B2B=2). " +
-            "For '想租2B2B里的一间' pass 2. HARD requirement only — omit when the user " +
-            "lists alternatives or preferences ('Studio最优先，合租也行' → omit)."
+          "Deprecated single-value form; prefer `bedroomsAnyOf`. Merged into it when both are given."
         ),
       petFriendly: z
         .boolean()
         .nullable()
         .optional()
-        .describe("true ONLY if the user needs pets allowed (有猫/养狗/宠物友好)."),
+        .describe(
+          "true ONLY if the user needs pets allowed (有猫/养狗/宠物友好)."
+        ),
       couplesOk: z
         .boolean()
         .nullable()
         .optional()
-        .describe("true ONLY if the user needs couple occupancy (情侣/夫妻同住)."),
+        .describe(
+          "true ONLY if the user needs couple occupancy (情侣/夫妻同住)."
+        ),
       utilitiesIncluded: z
         .boolean()
         .nullable()
         .optional()
-        .describe("true ONLY if the user requires utilities included (包水电)."),
+        .describe(
+          "true ONLY if the user requires utilities included (包水电)."
+        ),
       parkingIncluded: z
         .boolean()
         .nullable()
@@ -1105,14 +1214,15 @@ function createStrictSearchRentalTool(chatId: string) {
     execute: async ({ query, mustNotContain, more, ...params }) => {
       const startedAt = Date.now();
       try {
-        const blockTerms = (mustNotContain ?? [])
-          .map((t) => t.trim().toLowerCase())
-          .filter((t) => t.length > 0);
-
-        const fingerprint = batchFingerprint(query, params, blockTerms);
+        const fingerprint = batchFingerprint(
+          query,
+          params,
+          mustNotContain ?? []
+        );
 
         // "继续/换一批"：直接从上一轮排好序、终审过的结果里切下一批。
-        // 不查库、不调 LLM，且不可能与已展示的重复。
+        // 不查库、不调 LLM，且不可能与已展示的重复。指纹算在建计划之前，
+        // 命中缓存时连理解层的 LLM 调用都省掉——"瞬间"是这条路径的全部意义。
         if (more) {
           const nextBatch = await serveNextBatch(chatId, fingerprint);
           if (nextBatch) {
@@ -1121,7 +1231,21 @@ function createStrictSearchRentalTool(chatId: string) {
           // 缓存缺失/过期，或条件其实变了 → 退回一次完整搜索。
         }
 
-        const result = await findStrictListings(query, blockTerms, params);
+        // 理解层：自然语言 → 检索计划。聊天模型传的参数在这里覆盖计划。
+        const plan = await planQuery(query, params);
+        const blockTerms = [...(mustNotContain ?? []), ...plan.excludes]
+          .map((t) => t.trim().toLowerCase())
+          .filter((t) => t.length > 0);
+        console.log(
+          "[searchRental] plan",
+          JSON.stringify({
+            query: query.slice(0, 120),
+            plan: planSummary(plan),
+            source: plan.source,
+          })
+        );
+
+        const result = await findStrictListings(query, plan, blockTerms);
 
         // 终审（路线 C）：一次 LLM 调用对读需求原文与候选原文，剔除言下之意
         // 矛盾的房源。只做减法、fail-open；剔除决策进 Vercel log 供人工复核。
@@ -1164,7 +1288,9 @@ function createStrictSearchRentalTool(chatId: string) {
             totalMatched: 0,
             verifierCutCount: 0,
             action:
-              "OUT_OF_BAY: 用户找的城市不在湾区。如实告知：我们目前只收录旧金山湾区的房源，该城市暂无数据。不要展示任何房源。",
+              "OUT_OF_BAY: 用户找的地方不在湾区" +
+              (plan.outOfScopeReason ? `（${plan.outOfScopeReason}）` : "") +
+              "。如实告知：我们目前只收录旧金山湾区的房源，该地区暂无数据。不要展示任何房源。",
           };
         }
 

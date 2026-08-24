@@ -75,3 +75,19 @@ export function getVerifierModel() {
   }
   return gateway.languageModel(DEFAULT_CHAT_MODEL);
 }
+
+/**
+ * 查询理解层（lib/rental/query-plan.ts）。**每次搜索都会调用一次**，所以
+ * 要的是便宜+快+听话，不是最聪明——任务是把已经说出口的需求抄进 JSON，
+ * 不需要推理。gpt-4.1-mini 与聊天层同源，行为可预期。
+ *
+ * 换模型必须跑 `pnpm search-eval -- --source wanted --limit 181`（CODE_BUG=0）
+ * 和 `pnpm search-recall-eval`（recall 不下降）。理解层退化的典型表现是
+ * "库里明明有却说没有"——那是 recall 评测在看的东西，普通门禁看不见。
+ */
+export function getQueryPlannerModel() {
+  if (isTestEnvironment && myProvider) {
+    return myProvider.languageModel("title-model");
+  }
+  return gateway.languageModel(DEFAULT_CHAT_MODEL);
+}

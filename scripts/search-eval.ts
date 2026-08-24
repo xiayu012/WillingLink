@@ -169,13 +169,12 @@ async function main() {
   const { createSearchRentalTool, buildStrictPredicate } = await import(
     "@/lib/ai/tools/search-rental"
   );
-  const { isOutOfBayQuery } = await import("@/lib/rental/cities");
+  const { planQuery } = await import("@/lib/rental/query-plan");
 
   const cases = await collectCases();
   console.log(`评测 ${cases.length} 条（源：${cases[0]?.source ?? "?"}）\n`);
 
   // 全量房源一次取回，供 ground truth 与结果核验。
-  // ground truth 与运行时共用同一个 buildStrictPredicate，判定标准永不漂移。
   const listings = await db`
     SELECT "id", "title", "rawText", "locationText", "propertyName", "city",
            "rent", "rentNumeric", "bedrooms", "bedroomsNum", "availableFrom",
@@ -187,8 +186,11 @@ async function main() {
   const results: EvalResult[] = [];
 
   for (const [i, c] of cases.entries()) {
-    const outOfBay = isOutOfBayQuery(c.query);
-    const pred = buildStrictPredicate(c.query);
+    // ground truth 与运行时共用同一个理解层（planQuery，进程内缓存命中，
+    // 所以这里不会多花一次 LLM 调用）+ 同一个谓词，判定标准永不漂移。
+    const plan = await planQuery(c.query);
+    const outOfBay = plan.outOfScope;
+    const pred = buildStrictPredicate(plan);
 
     // ── ground truth：严格谓词下可满足的房源集合 ──
     const groundTruth = outOfBay
