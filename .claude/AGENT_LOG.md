@@ -8,6 +8,103 @@
 
 ---
 
+## 2026-08-24（一，第二轮）· 加上「距离」这个维度
+
+用户实测反馈：「求租…**靠近 GENERSIS AI**…预算1500」返回的全是 Sunnyvale /
+San Jose / Santa Clara 的房源。Genesis AI 在 **Palo Alto**，差了二三十公里。
+
+### 根因不是筛选松紧，是系统里根本没有"距离"
+
+复现出来的计划一看就明白：
+
+    锚点 = GENERSIS AI          ← 理解层不认识这家 2025 年的新公司（还拼错了）
+    城市 = San Jose/Santa Clara/Sunnyvale   ← **它猜的**，下游照单全收
+
+两个独立的毛病叠在一起：
+
+1. **理解层不认识就猜城市**。猜错的地点比没有地点更糟——用户会以为系统听懂了。
+2. **整套系统只会比城市名字符串**。`lat`/`lng` 1215 行里只有 47 行有值（4%），
+   `geocodedAt` 全是 0。人类中介会打开地图，我们不能。
+
+### 数据现实（决定了实现路线）
+
+- 500 行能从 locationText / title / rawText 里抠出邮编（41%），共 89 个不同邮编
+- 另有 410 行有 city 列
+- → **~75% 的房源能在零 API 成本下拿到坐标**
+
+所以路线是"静态表打底 + 地理编码补漏"，而不是"全量 geocode 一遍"。
+
+### `lib/rental/geo.ts`（新）
+
+- `ZIP_POINTS`：~150 个湾区邮编 → 近似质心。**邮编比城市精确一个数量级**
+  （San Jose 横跨 20+ 公里，95132 和 95136 差 15 公里），所以 `listingPoint`
+  的优先级是 真坐标 → 邮编 → city 列 → 正文识别的城市。
+- `LANDMARKS`：~50 个雇主/校园/商圈/枢纽（Google、Meta、TikTok、Stanford、
+  UCB、Valley Fair、River Oaks…）→ 坐标。真实语料里"靠近X"的 X 十有八九是这些。
+- `haversineKm`、`staticPlacePoint`（免费瞬时）、`geocodePlace`（Google，
+  **没 key 就返回 null**，调用方回落静态表）。
+- 精度声明写在文件头：邮编/地标是近似质心，±1–2km。它服务"15 公里通勤圈里外"
+  这种判断，不是导航。**别拿它算步行路线。**
+
+### QueryPlan 加 near / radiusKm / nearUnresolved
+
+理解层新出两个字段：`nearPlace`（**写成适合查地图的字符串**，不认识就照抄原文，
+**明令禁止编造城市**）和 `nearMode`（walk/bike/transit/drive → 2.5/6/12/25 km）。
+`planQuery` 里 `resolveNear` 负责静态表 → 地理编码 → 都落空。
+
+**解析成功时把 `cities` 清空**：距离约束比"在不在市界内"精确得多，而且这种句子
+里理解层给的城市往往就是猜的。
+
+### 三条关键取舍
+
+1. **`near` 生效时，定不出位置的房源是剔除不是放行。** 这看起来违反"沉默不算
+   违反"，其实不是：用户问的就是位置，一条不说自己在哪的帖子无法成为"靠近X"的
+   答案；这和 `rowInAnyCity` 对未知城市行的处理是同一条规则。**实测过放行版本，
+   后果是半张结果表被"沙城95832雅房分租"这种无坐标行占满**（顺手把
+   沙加缅度/Davis/Fresno 加进了 `NON_BAY_LISTING_RE`）。
+2. **距离分档不按公里连续排序**（1.5/3/6/10/15km 五档，`DISTANCE_WEIGHT=10`
+   压过其它排序信号）。档内保留语义 rerank 的顺序——人也是这么想的，"走路能到"
+   和"骑车能到"是两回事，档内差几百米无所谓。
+3. **定位不到就反问，绝不假装。** 新 action `LOCATION_UNKNOWN`（prompts.ts 有
+   对应段落）：如实说"「X」我定位不到，这批结果的距离没法保证"，然后问用户 X 在
+   哪个城市 / 给个地址邮编。这是这次事故最直接的教训——**假装知道的代价是
+   用户拿到一堆二三十公里外的房源还以为系统听懂了。**
+
+### 实测（用户原查询）
+
+    改前：Sunnyvale / San Jose / Santa Clara（离 Palo Alto 20-40km）
+    改后：0.0km MenloPark → 1.9km 94303 → 1.9km 紧挨palo alto → 1.9km 东帕洛
+          → 3.6km Menlo Park → 6.6km Mountain View → 8.1km ×2
+
+其它三条：`公司在94583附近` → San Ramon 0.0km / Dublin 9.4km（库里就这么多）；
+`步行到meta`（2.5km）→ NO_MATCH 并给出"放宽「距离」→ 155 个"；
+`靠近某个没人听过的XYZ公司` → LOCATION_UNKNOWN，带结果 + 反问。
+
+### 门禁
+
+`search-eval --source wanted --limit 181`：
+**PASS 154 / DATA_GAP 20 / VERIFIER_CUT 7 / CODE_BUG 0**（本轮改动前 155/19/7/0，
+持平）。`search-recall-eval`：**recall 71.1% → 77.2%，precision 27.0% → 34.4%，
+falseEmpty 1**。
+
+两个方向同时变好是有原因的，不是巧合：`near` 解析成功时会**清空 cities**，
+理解层猜的那串城市不再参与硬筛（召回上升）；同时距离半径比城市集合精确，
+筛掉的都是真的远（精确率上升）。
+
+### 遗留 / 需要用户配合
+
+- **`GOOGLE_MAPS_API_KEY` 还没有**（`.env.local` 里没有这个键，
+  `find-nearest-transit.ts` 里那套 geocode 代码因此一直是死的）。没有它，
+  静态表覆盖不到的地点（新公司、小众楼盘）只能走 LOCATION_UNKNOWN 反问用户。
+  **"Genesis AI → Palo Alto" 是我手工加进 LANDMARKS 的，那是针对这一个 case
+  的补丁，不是通解。** 拿到 key 之后 `geocodePlace` 自动生效，无需改代码。
+- 房源侧的 `lat`/`lng` 仍然只有 4%。有了 key 之后值得写个 backfill 把
+  locationText 批量 geocode 进列里，静态表就只剩兜底作用。
+- 邮编表是手工整理的近似值，没有对过官方数据。如果将来发现某个邮编的距离判断
+  离谱，第一嫌疑是 `ZIP_POINTS` 里那一行。
+
+---
+
 ## 2026-08-24（一）· 查询理解层 QueryPlan + 召回评测（伤筋动骨那次）
 
 用户原话："自然语言还是太出乎意料了，但是也要做到像人一样的聪明去搜索出符合

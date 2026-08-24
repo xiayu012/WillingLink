@@ -71,6 +71,7 @@ import {
   detectCity,
   detectCityStrict,
 } from "@/lib/rental/cities";
+import { haversineKm, listingPoint } from "@/lib/rental/geo";
 import { listingLeaseFromText } from "@/lib/rental/lease-duration";
 import {
   applyBlockTerms,
@@ -605,6 +606,7 @@ function confirmedCount(
 
 const ANCHOR_MIN_CHARS = 4;
 const ANCHOR_WEIGHT = 3; // 点名的小区命中 > 任何单个布尔确认
+const DISTANCE_WEIGHT = 10; // "靠近X" 压过其它排序信号
 
 /** Does the listing name one of the complexes/landmarks the user asked for? */
 function anchorHits(row: XhsRentalSearchResultRow, anchors: string[]): number {
@@ -630,17 +632,36 @@ function anchorHits(row: XhsRentalSearchResultRow, anchors: string[]): number {
  * that stay silent on a requirement remain reachable, they just rank below the
  * ones that say yes out loud. Ranking, never filtering.
  */
+// 距离分档而不是直接按公里排序：档内保留语义 rerank 的顺序。人找房也是这样
+// 想的——"走路能到"和"骑车能到"是两回事，档内差几百米无所谓。
+const DISTANCE_TIERS_KM = [1.5, 3, 6, 10, 15];
+
+/** 越近分越高；坐标未知的行落在最低档（不剔除，只是排后面）。 */
+function proximityScore(
+  row: XhsRentalSearchResultRow,
+  plan: QueryPlan
+): number {
+  if (!plan.near) return 0;
+  const p = listingPoint(row);
+  if (!p) return 0; // 位置不明 → 不加分，但也不惩罚到剔除
+  const km = haversineKm(p, plan.near);
+  const tier = DISTANCE_TIERS_KM.findIndex((limit) => km <= limit);
+  return tier === -1 ? 1 : DISTANCE_TIERS_KM.length + 1 - tier;
+}
+
 function rankByPlanSignals(
   rows: XhsRentalSearchResultRow[],
   plan: QueryPlan
 ): XhsRentalSearchResultRow[] {
   const needsBool = BOOL_FIELDS.some((k) => plan.requires[k] === true);
-  if (!(needsBool || plan.anchors.length > 0)) return rows;
+  if (!(needsBool || plan.anchors.length > 0 || plan.near)) return rows;
   return rows
     .map((row, i) => ({
       row,
       i,
       score:
+        // 用户说了"靠近X"时，距离压过一切其它排序信号——这正是他要的。
+        DISTANCE_WEIGHT * proximityScore(row, plan) +
         confirmedCount(row, plan.requires) +
         ANCHOR_WEIGHT * anchorHits(row, plan.anchors),
     }))
@@ -783,6 +804,7 @@ function isNonRentalRow(row: XhsRentalSearchResultRow): boolean {
 
 /** 严格谓词里可以单独放宽的约束维度（零结果时逐个试放宽，定位瓶颈）。 */
 export type StrictField =
+  | "near"
   | "city"
   | "rent"
   | "bedrooms"
@@ -801,6 +823,7 @@ const BOOL_FIELDS = [
 ] as const;
 
 const FIELD_LABEL: Record<StrictField, string> = {
+  near: "距离",
   city: "城市",
   rent: "预算",
   bedrooms: "房型",
@@ -843,6 +866,9 @@ export function buildStrictPredicate(
   matches: (row: XhsRentalSearchResultRow) => boolean;
 } {
   const active: StrictField[] = [];
+  if (plan.near && plan.radiusKm != null) {
+    active.push("near");
+  }
   if (plan.cities.length > 0) {
     active.push("city");
   }
@@ -868,6 +894,8 @@ export function buildStrictPredicate(
   }
 
   const kept = (f: StrictField): boolean => omit !== f;
+  const near = kept("near") ? plan.near : null;
+  const radiusKm = plan.radiusKm ?? 0;
   const cities = kept("city") ? plan.cities : [];
   const bedrooms = kept("bedrooms") ? plan.bedroomsAnyOf : [];
   const boolPrefs = {
@@ -895,6 +923,15 @@ export function buildStrictPredicate(
     matches: (raw) => {
       if (isNonRentalRow(raw) || listingOutOfBay(raw)) return false;
       const row = withRecoveredFields(raw);
+      // 距离约束生效时**取代**城市约束，因为坐标比市界精确得多。
+      // 定不出位置的房源在这里是剔除而不是放行——这不是"沉默"，用户问的就是
+      // 位置，一条不说自己在哪的帖子无法成为"靠近X"的答案。与下面 rowInAnyCity
+      // 对未知城市的处理是同一条规则。实测放行的后果是半张结果表被
+      // "沙城95832雅房分租" 这种无坐标行占满。
+      if (near) {
+        const p = listingPoint(row);
+        if (!p || haversineKm(p, near) > radiusKm) return false;
+      }
       if (cities.length > 0 && !rowInAnyCity(row, cities)) return false;
       // Bedrooms: lenient when the listing's unit size is unknown (偏严格),
       // otherwise it must be one of the counts the user said they'd take.
@@ -1245,6 +1282,16 @@ function createStrictSearchRentalTool(chatId: string) {
           })
         );
 
+        // 用户说了"靠近X"但我们定位不到 X：**绝不假装知道**。上一次假装的
+        // 代价是把 Palo Alto 的需求答成了 San Jose 的房源（Genesis AI）。
+        // 照常搜一轮（总比空手好），但让聊天层如实说明并反问。
+        if (plan.nearUnresolved) {
+          console.log(
+            "[searchRental] unresolved place",
+            JSON.stringify({ place: plan.nearUnresolved })
+          );
+        }
+
         const result = await findStrictListings(query, plan, blockTerms);
 
         // 终审（路线 C）：一次 LLM 调用对读需求原文与候选原文，剔除言下之意
@@ -1328,6 +1375,10 @@ function createStrictSearchRentalTool(chatId: string) {
             verifierCutCount: cut.length,
             bottlenecks: result.bottlenecks,
             action:
+              (plan.nearUnresolved
+                ? `LOCATION_UNKNOWN: 另外，系统查不到「${plan.nearUnresolved}」在哪，先问用户它属于哪个城市或给个地址/邮编，再重搜。
+`
+                : "") +
               "NO_MATCH: 数据库中没有完全符合用户全部要求的房源。如实告诉用户没有找到，绝不要用近似房源代替。" +
               (hint
                 ? `已算出各条件的松紧程度（${hint}）——据此明确告诉用户是哪个条件卡住了、放宽后大约有多少房源，并询问是否要放宽它再搜。`
@@ -1352,6 +1403,11 @@ function createStrictSearchRentalTool(chatId: string) {
           remainingInBatchCache: kept.length - batch.length,
           verifierCutCount: cut.length,
           action:
+            (plan.nearUnresolved
+              ? `LOCATION_UNKNOWN: 用户要求靠近「${plan.nearUnresolved}」，但系统查不到这个地点的位置，` +
+                "下面这批只是按其它条件筛的，**距离没有保证**。展示前先如实说明这一点，" +
+                "并请用户补充它在哪个城市、或给个地址/邮编，然后重新搜索。 "
+              : "") +
             `SHOW_LISTINGS: 找到 ${batch.length} 个严格符合要求的房源` +
             (result.totalMatched > batch.length
               ? `（共 ${result.totalMatched} 个通过硬性筛选，已按相关度与复核排序）`

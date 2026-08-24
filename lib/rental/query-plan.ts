@@ -38,6 +38,7 @@ import {
   NON_BAY_CITY_RE,
 } from "./cities";
 import type { FlexibleDate } from "./date-availability";
+import { geocodePlace, type ResolvedPlace, staticPlacePoint } from "./geo";
 import {
   extractBooleanPrefs,
   extractHardConstraints,
@@ -59,6 +60,17 @@ export type QueryPlan = {
   regions: BayRegion[];
   /** 小区/公寓/地标原文，用来给排序加权（**不参与硬筛选**）。 */
   anchors: string[];
+  /**
+   * 用户说"靠近X"里的那个 X，解析成坐标之后的结果。
+   * 一旦有值，它就**取代城市集合**成为地理约束——距离比"在不在市界内"精确得多。
+   */
+  near: ResolvedPlace | null;
+  /** 想靠近的地点原文；解析成功与否都留着，进日志和给用户的解释。 */
+  nearQuery: string | null;
+  /** 说了"靠近X"但 X 定位不出来 → 别假装知道，让聊天层反问用户。 */
+  nearUnresolved: string | null;
+  /** near 生效时的可接受半径（公里），按用户的出行方式定。 */
+  radiusKm: number | null;
   rentMin: number | null;
   rentMax: number | null;
   /** 可接受的整套卧室数集合（studio=0），OR 关系。空 = 不限户型。 */
@@ -101,6 +113,18 @@ const PLANNER_TIMEOUT_MS = 12_000;
 const PLAN_CACHE_MAX = 500;
 /** 区域展开覆盖超过这个比例的城市表 → 视为"整个湾区"，不构成约束。 */
 const BAY_WIDE_RATIO = 0.6;
+
+/**
+ * "靠近"到底是多近，按出行方式定。直线距离，实际路网还要打个折，所以取值
+ * 偏宽——这是硬筛选，宁可把稍远的留给排序去压，也不要误杀。
+ */
+const RADIUS_KM: Record<string, number> = {
+  walk: 2.5,
+  bike: 6,
+  transit: 12,
+  drive: 25,
+};
+const DEFAULT_RADIUS_KM = 12;
 /** 回退开关：SEARCH_PLANNER_OFF=1 → 只用正则计划，完全不调理解层 LLM。 */
 const PLANNER_OFF = process.env.SEARCH_PLANNER_OFF === "1";
 
@@ -111,6 +135,10 @@ export function emptyPlan(): QueryPlan {
     cities: [],
     regions: [],
     anchors: [],
+    near: null,
+    nearQuery: null,
+    nearUnresolved: null,
+    radiusKm: null,
     rentMin: null,
     rentMax: null,
     bedroomsAnyOf: [],
@@ -247,6 +275,16 @@ const PLANNER_SYSTEM = `你是湾区租房搜索的查询理解层。把租客�
   没写明城市的房源。
 - anchors：用户点名的小区/公寓/楼盘/地标原文（"Elan at River Oaks"、
   "the Hadley"、"Page Mill Rd"）。它只用来排序加权，不做过滤，宁可多填。
+- nearPlace：用户明确说要"靠近/附近/走路可到/通勤到"的**那一个**地点，
+  写成**适合拿去查地图的字符串**：原文 + 你知道的补充信息，例如
+  "GENERSIS AI" → "Genesis AI, Palo Alto"（拼写按你的判断纠正），
+  "公司在94583" → "94583"，"步行到Meta" → "Meta Menlo Park"。
+  **你不认识这个地方就照抄原文，不要编造城市**——下游会去查地图，查不到会
+  反问用户。**宁可让 cities 空着也不要拿猜的城市去填**，猜错的地点比没有地点
+  更糟：用户会拿到一堆二三十公里外的房源还以为系统听懂了。
+  用户没说"靠近某处"就填 null。
+- nearMode：靠近的方式 —— "walk" / "bike" / "transit" / "drive"，
+  说不清就 null。决定可接受半径，别乱填。
 - outOfScope：需求明显不在旧金山湾区（西雅图、纽约、匹兹堡/CMU、温哥华列治文、
   科罗拉多、洛杉矶、圣地亚哥…）→ true 并写明原因。注意同名陷阱：
   Richmond 既是湾区城市也是温哥华的列治文，Frisco 可能是科罗拉多，
@@ -277,7 +315,7 @@ const PLANNER_SYSTEM = `你是湾区租房搜索的查询理解层。把租客�
 - excludes：出现即淘汰的词（"中介"、"二房东"）。用户没明说排斥就留空。
 
 只输出一个 JSON 对象，不要代码围栏、不要任何解释文字：
-{"outOfScope":false,"outOfScopeReason":null,"cities":[],"regions":[],"anchors":[],"rentMin":null,"rentMax":null,"bedroomsAnyOf":[],"leaseMonthsMin":null,"leaseMonthsMax":null,"moveIn":null,"requires":{"petFriendly":null,"couplesOk":null,"utilitiesIncluded":null,"parkingIncluded":null},"prefers":[],"excludes":[]}`;
+{"outOfScope":false,"outOfScopeReason":null,"cities":[],"regions":[],"anchors":[],"nearPlace":null,"nearMode":null,"rentMin":null,"rentMax":null,"bedroomsAnyOf":[],"leaseMonthsMin":null,"leaseMonthsMax":null,"moveIn":null,"requires":{"petFriendly":null,"couplesOk":null,"utilitiesIncluded":null,"parkingIncluded":null},"prefers":[],"excludes":[]}`;
 
 const JSON_BLOCK_RE = /\{[\s\S]*\}/;
 const REGION_VALUES: BayRegion[] = [
@@ -383,6 +421,17 @@ function coercePlan(raw: RawPlan): QueryPlan {
     cities,
     regions,
     anchors: asStringArray(raw.anchors, MAX_ANCHORS),
+    // near 的解析要联网（可能），放到 planQuery 里做；这里只把原始诉求带出来。
+    near: null,
+    nearQuery:
+      typeof raw.nearPlace === "string" && raw.nearPlace.trim()
+        ? raw.nearPlace.trim().slice(0, 120)
+        : null,
+    nearUnresolved: null,
+    radiusKm:
+      typeof raw.nearMode === "string"
+        ? (RADIUS_KM[raw.nearMode.trim().toLowerCase()] ?? DEFAULT_RADIUS_KM)
+        : DEFAULT_RADIUS_KM,
     rentMin: asRent(raw.rentMin),
     rentMax: asRent(raw.rentMax),
     bedroomsAnyOf: beds,
@@ -479,8 +528,31 @@ export async function planQuery(
     const e = error as Error;
     console.error(`[planQuery] fail-open (${e.name}): ${e.message}`);
   }
+  plan = await resolveNear(plan, query);
   cacheSet(key, plan);
   return applyParams(plan, params);
+}
+
+/**
+ * "靠近X" → 坐标。静态表（邮编/地标/城市，免费瞬时）优先，落空才去 Google
+ * 地理编码（要 key）。两边都落空 → nearUnresolved，聊天层据此**反问用户**
+ * 而不是拿猜的城市糊弄过去。
+ *
+ * 解析成功时把城市集合清空：距离约束比"在不在市界内"精确得多，而且理解层给的
+ * 城市在这种句子里往往是猜的——用户实测那次 "靠近GENERSIS AI" 就被猜成了
+ * San Jose/Santa Clara/Sunnyvale，而 Genesis AI 在 Palo Alto。
+ */
+async function resolveNear(plan: QueryPlan, query: string): Promise<QueryPlan> {
+  if (!plan.nearQuery) return plan;
+  const point =
+    staticPlacePoint(plan.nearQuery) ??
+    (await geocodePlace(plan.nearQuery)) ??
+    // 最后一搏：整条查询里也许有邮编/地标是 nearPlace 字段没带上的。
+    staticPlacePoint(query);
+  if (!point) {
+    return { ...plan, nearUnresolved: plan.nearQuery, radiusKm: null };
+  }
+  return { ...plan, near: point, cities: [] };
 }
 
 // ── 排序 / 终审用的派生物 ───────────────────────────────────────────────────
@@ -497,6 +569,12 @@ export function rerankQueryFor(query: string, plan: QueryPlan): string {
 /** 计划里所有偏好的合并文本，供终审提示与人工日志使用。 */
 export function planSummary(plan: QueryPlan): string {
   const parts: string[] = [];
+  if (plan.near) {
+    parts.push(
+      `靠近=${plan.near.label}(${plan.near.source},${plan.radiusKm}km)`
+    );
+  }
+  if (plan.nearUnresolved) parts.push(`靠近?=${plan.nearUnresolved}(定位失败)`);
   if (plan.cities.length > 0) parts.push(`城市=${plan.cities.join("/")}`);
   if (plan.regions.length > 0) parts.push(`区域=${plan.regions.join("/")}`);
   if (plan.rentMin != null || plan.rentMax != null) {
