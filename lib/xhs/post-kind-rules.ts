@@ -61,7 +61,18 @@ const ROOMMATE_PATTERNS = [
 ] as const;
 
 const SEEKER_PATTERNS = [/求租/u, /找房/u, /想租/u, /求转租/u] as const;
-const LISTER_PATTERNS = [/出租/u, /招租/u, /转租/u] as const;
+// 「起租」是真实招租帖的高频词（"8/23起租1间主卧"），漏了它会让下面 roommate
+// 的让路判断失效——门禁那条 case 就是这么发现的
+const LISTER_PATTERNS = [/出租/u, /招租/u, /转租/u, /起租/u] as const;
+
+/**
+ * 否定语境里的「找室友」不算在找室友。
+ *
+ * 招租帖爱拿「没有找室友压力」「不用自己找室友」当卖点。只看关键词的话这类帖
+ * 会被判成 roommate（实测踩过：一篇屋主招租多间房的帖子就栽在这句上）。
+ */
+const ROOMMATE_NEGATED =
+  /(?:没有|不用|无需|不必|免得|免)[^。！？!?\n]{0,4}[找招募求寻][^。！？!?\n]{0,12}室友/u;
 
 function countHits(text: string, patterns: readonly RegExp[]): number {
   return patterns.filter((re) => re.test(text)).length;
@@ -94,13 +105,20 @@ export function classifyPostKindByRule(rawText: string): PostKindResult | null {
     };
   }
 
-  // 找室友：**只有在没有求租信号时**才敢直接判。
+  // 找室友：**只有在其它信号都没有时**才敢直接判。
   //
-  // 放宽「找…室友」允许插字之后踩过一次：求租帖里写「求租一个房间…希望室友
-  // 不抽烟」，被正则抢走判成 roommate，而模型本来判对是 seeker。求租帖顺带写
-  // 室友要求太常见了，所以这里让路——有 seeker 信号就交给模型，别抢。
-  // 体验词同时出现时同理。
-  if (roommate > 0 && review === 0 && seeker === 0) {
+  // 这条被放宽后连踩两次，都是「顺带提到室友」被当成「在找室友」：
+  //   1. 求租帖「求租一个房间…希望室友不抽烟」→ 误判 roommate（本该 seeker）
+  //   2. 招租帖「…没有**找室友**压力」→ 否定句里的词也被抓了（本该 lister）
+  // 求租帖写室友要求、招租帖拿"不用找室友"当卖点，都太常见了。正则分不出
+  // 「在找室友」和「提到室友」，所以在这种模糊地带一律让路给模型。
+  if (
+    roommate > 0 &&
+    !ROOMMATE_NEGATED.test(text) &&
+    review === 0 &&
+    seeker === 0 &&
+    lister === 0
+  ) {
     return {
       kind: "roommate",
       confidence: 0.85,

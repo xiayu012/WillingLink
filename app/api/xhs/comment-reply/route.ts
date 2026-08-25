@@ -1,7 +1,11 @@
 import { geolocation } from "@vercel/functions";
 import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import { resolveChatIdForUser } from "@/lib/chat/conversation";
-import { runPostScopedTurn, transformText } from "@/lib/chat/engine";
+import {
+  type ChatToolName,
+  runPostScopedTurn,
+  transformText,
+} from "@/lib/chat/engine";
 import {
   ChannelTableMissingError,
   resolveInternalUserId,
@@ -10,7 +14,9 @@ import {
   createGuestUser,
   findXhsRecordIdsByRawText,
   saveChat,
+  saveMessages,
 } from "@/lib/db/queries";
+import type { DBMessage } from "@/lib/db/schema";
 import { markListingAsSeen } from "@/lib/db/seen-listings";
 import { generateUUID } from "@/lib/utils";
 import { classifyPostKind } from "@/lib/xhs/post-kind";
@@ -55,6 +61,52 @@ const CONDENSE_AGAIN_MESSAGE =
 const RETRY_ABOVE_CODE_POINTS = 400;
 
 const codePoints = (text: string) => [...text].length;
+
+/**
+ * 身份定了，就**只放开对的那个搜索工具**。
+ *
+ * 闸门那一步（`classifyPostKind`）已经花了一次便宜调用判出租客/房东/找室友，
+ * 结果不传下去等于让贵的那个 agent 重新推一遍，推错了还没人知道。
+ * **同一件事只判一次，判完就往下传。**
+ *
+ * 而且光传还不够——**提示词是请求，工具表才是约束**。实测：身份已判定为房东、
+ * system 里白纸黑字写了"用 searchWanted"，gpt-4.1-mini 照样调 searchRental，
+ * 把帖主自己那套 Studio 又描述了一遍（那篇是通篇第二人称的招租广告：
+ * "想在伯克利找一套…这套Studio可以重点看看！"）。能用约束解决就别指望它听话。
+ *
+ * queryListings / 交通那两个是中性工具，三种身份都留着。
+ */
+const ROLE_TOOLS: Record<string, ChatToolName[]> = {
+  seeker: [
+    "searchRental",
+    "queryListings",
+    "findNearestTransit",
+    "getTransitTime",
+  ],
+  lister: [
+    "searchWanted",
+    "queryListings",
+    "findNearestTransit",
+    "getTransitTime",
+  ],
+  roommate: [
+    "searchWanted",
+    "queryListings",
+    "findNearestTransit",
+    "getTransitTime",
+  ],
+};
+
+const ROLE_HINT: Record<string, string> = {
+  seeker: `## 这一轮的帖主身份（已判定，不要再自行推翻）
+帖主是**租客**，本人正在找房。用 **searchRental** 找房源推给 ta。`,
+  lister: `## 这一轮的帖主身份（已判定，不要再自行推翻）
+帖主是**房东/二房东**，本人有房要出租。用 **searchWanted** 找正在求租的人推给 ta。
+**不要**给 ta 推房源——ta 手里就有房。也不要把 ta 自己帖子的内容复述回去。`,
+  roommate: `## 这一轮的帖主身份（已判定，不要再自行推翻）
+帖主在**找室友**（房子已定或将定，缺人一起住）。用 **searchWanted** 找同样在找
+室友/找合租的人推给 ta。**不要**把 ta 自己帖子的内容复述回去。`,
+};
 
 /**
  * 聊天页的回答是 Markdown，小红书评论框是纯文本，星号和方括号会原样露出来。
@@ -140,10 +192,13 @@ function optString(v: unknown): string | null {
  *      看房体验帖里全是租房词但帖主没在求租，冲上去推房源就是答非所问。
  *   2. **排除自帖** —— 油猴复制正文时先入库，这里再拿同一段正文去搜，第一条就是
  *      帖主自己。按 rawText 找出那几条，标成"已看过"，让既有排除机制挡掉。
- *   3. **起草** `runPostScopedTurn` —— **单帖作用域，不读任何历史**。有工具，
- *      要搜房源。写库是为了以后帖主从私信找过来接得上，不是为了这次。
+ *   3. **起草** `runPostScopedTurn` —— **单帖作用域，不读任何历史**。按闸门判出的
+ *      身份**只放开对应的那个搜索工具**（房东只有 searchWanted，租客只有
+ *      searchRental），从结构上堵掉"给房东推房子"。
  *   4. **压缩** `transformText` —— **纯变换，没有工具没有历史不写库**。
  *      压完死代码拼开场白，进剪贴板。
+ *   5. **存最终版** —— 存的是评论区实际贴出去那句，不是第 3 步那份带 URL 的草稿。
+ *      存错了会误导排查（用户就因为库里是草稿，以为线上"还在发 URL"）。
  *
  * ## 为什么第 3、4 步必须分开作用域
  *
@@ -260,6 +315,8 @@ export async function POST(request: Request) {
     // 用 runPostScopedTurn 而不是 runChatTurn：一次评论草稿的输入就该是这一篇
     // 帖子，同一帖主上一篇搜到过什么对这一篇没有参考价值（Case C/D 就是被那个
     // 污染的：第二次进来丢掉了 Dublin/San Ramon 的地理约束）。
+    // persist:false —— 库里要存的是**最终发出去那句话**，不是这份还带着 URL、
+    // 还没压缩的草稿。压缩完再自己存（见下面 persistTurn）。
     const draftTurn = await runPostScopedTurn(
       {
         chatId,
@@ -267,14 +324,54 @@ export async function POST(request: Request) {
         text: rawText.slice(0, MAX_RAW_TEXT_CHARS),
         channel: "xhs",
       },
-      { selectedChatModel: modelId, requestHints }
+      {
+        selectedChatModel: modelId,
+        requestHints,
+        persist: false,
+        extraSystem: ROLE_HINT[postKind.kind],
+        onlyTools: ROLE_TOOLS[postKind.kind],
+      }
     );
+
+    /**
+     * 把「帖子正文 + 最终评论」写进这条 conversation。
+     *
+     * 存最终版而不是草稿：网页上看到的必须跟评论区实际贴出去的一致，否则排查
+     * 问题时会被带偏（用户就因为库里存的是带 URL 的草稿，以为"还在发 url"）。
+     * 压缩指令本身不存——那是排版动作，不是帖主提的需求。
+     */
+    const persistTurn = async (finalText: string) => {
+      const now = Date.now();
+      await saveMessages({
+        messages: [
+          {
+            id: generateUUID(),
+            chatId,
+            role: "user",
+            parts: [
+              { type: "text", text: rawText.slice(0, MAX_RAW_TEXT_CHARS) },
+            ],
+            attachments: [],
+            createdAt: new Date(now),
+          },
+          {
+            id: generateUUID(),
+            chatId,
+            role: "assistant",
+            parts: [{ type: "text", text: finalText }],
+            attachments: [],
+            createdAt: new Date(now + 1),
+          },
+        ] as DBMessage[],
+      });
+    };
 
     const hasListings = hasListingResults(draftTurn.toolOutputs);
     // 工具只可能在起草那一步用到——压缩没有工具
     const toolsUsed = draftTurn.toolsUsed;
 
     if (style === "raw") {
+      await persistTurn(draftTurn.text);
       return jsonWithCors({
         ok: true,
         text: draftTurn.text,
@@ -326,6 +423,9 @@ export async function POST(request: Request) {
 
     // ---- 死代码拼开场白。没房源可推时不拼——那句话会变成假的 ----
     const text = hasListings ? `${OPENING_LINE}\n\n${condensed}` : condensed;
+
+    // 存最终版——网页上看到的就是评论区实际贴出去的那一句
+    await persistTurn(text);
 
     console.log(
       "[comment-reply]",

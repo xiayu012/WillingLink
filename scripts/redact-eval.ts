@@ -368,6 +368,13 @@ for (const c of [
     text: "9月准备搬到湾区工作，求租一个房间，位置Dublin优先，希望室友不抽烟、作息规律。",
     expectRuleMiss: true,
   },
+  {
+    // 同一条正则的第二次踩坑：招租帖拿「没有找室友压力」当卖点，否定句里的
+    // 「找室友」也被抓了。正则分不出「在找室友」和「提到室友」。
+    name: "招租帖含否定的室友字样→正则让路给模型",
+    text: "8/23起租1间独卫主卧套房，1700美元/月，无中介费直接和屋主签，没有找室友压力。",
+    expectRuleMiss: true,
+  },
 ]) {
   const ruled = classifyPostKindByRule(c.text);
   const actual = ruled

@@ -92,6 +92,7 @@ export function buildTurnSetup({
   rememberedPrefs = null,
   detectedLanguage = null,
   extraSystem,
+  onlyTools,
 }: {
   chatId: string;
   selectedChatModel?: string;
@@ -100,6 +101,14 @@ export function buildTurnSetup({
   detectedLanguage?: string | null;
   /** 渠道追加的提示词（例如评论区那套"输出去评论区"的渠道规则） */
   extraSystem?: string;
+  /**
+   * 只放开这几个工具。**已经知道该用哪个工具时，就别把错的那个留在桌上。**
+   *
+   * 实测：帖主身份已经判定为房东、system 里也明确写了"用 searchWanted"，
+   * gpt-4.1-mini 照样调 searchRental，把帖主自己的房子又描述了一遍
+   * （AGENT_LOG 2026-08-25）。提示词是请求，工具表是约束——能用约束就别用请求。
+   */
+  onlyTools?: ChatToolName[];
 }): TurnSetup {
   const isReasoningModel =
     selectedChatModel.includes("reasoning") ||
@@ -126,13 +135,13 @@ export function buildTurnSetup({
     // 推理模型不给工具（沿用 /api/chat 的既有行为，别改）
     activeTools: isReasoningModel
       ? []
-      : [
+      : (onlyTools ?? [
           "searchRental",
           "searchWanted",
           "queryListings",
           "findNearestTransit",
           "getTransitTime",
-        ],
+        ]),
     isReasoningModel,
   };
 }
@@ -322,8 +331,9 @@ export async function runChatTurn(
  * 进来时，模型看着上一轮的房源列表重新规划需求，Dublin / San Ramon 的地理约束
  * 整个丢掉，返回 Sunnyvale、Richmond、Newark。
  *
- * **仍然写库**：帖子正文和回答会存进这条 conversation，这样以后帖主从私信找过来
- * 时接得上上下文。写库是为了**以后**，不是为了**这次**——这次一个字都不读。
+ * **写库由调用方决定**（`persist`）。评论那条链路传 `false` 自己存，因为要存的
+ * 是**最终发出去的那句话**，不是这里这份还没压缩、还带着 URL 的草稿——库里存错
+ * 东西的直接后果是：网页上看到的跟评论区实际贴出去的对不上，排查时会被带偏。
  */
 export async function runPostScopedTurn(
   turn: InboundTurn,
@@ -333,6 +343,8 @@ export async function runPostScopedTurn(
     extraSystem?: string;
     /** 存不存进 conversation。评测/预览可以关掉 */
     persist?: boolean;
+    /** 只放开这几个工具（见 buildTurnSetup 的 onlyTools） */
+    onlyTools?: ChatToolName[];
   }
 ): Promise<TurnResult> {
   const startedAt = Date.now();
@@ -369,6 +381,7 @@ export async function runPostScopedTurn(
       country: undefined,
     },
     extraSystem: options?.extraSystem,
+    onlyTools: options?.onlyTools,
   });
 
   // 只有这一条消息——没有 history 展开，这就是"单帖作用域"的全部含义
