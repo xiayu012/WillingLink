@@ -94,12 +94,17 @@ export function classifyPostKindByRule(rawText: string): PostKindResult | null {
     };
   }
 
-  // 找室友：这个词本身就很硬，但体验词同时出现时交给模型定夺
-  if (roommate > 0 && review === 0) {
+  // 找室友：**只有在没有求租信号时**才敢直接判。
+  //
+  // 放宽「找…室友」允许插字之后踩过一次：求租帖里写「求租一个房间…希望室友
+  // 不抽烟」，被正则抢走判成 roommate，而模型本来判对是 seeker。求租帖顺带写
+  // 室友要求太常见了，所以这里让路——有 seeker 信号就交给模型，别抢。
+  // 体验词同时出现时同理。
+  if (roommate > 0 && review === 0 && seeker === 0) {
     return {
       kind: "roommate",
       confidence: 0.85,
-      reason: "命中找室友用语",
+      reason: "命中找室友用语，且无求租/看房体验信号",
       source: "rule",
     };
   }

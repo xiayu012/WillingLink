@@ -361,18 +361,31 @@ for (const c of [
     text: "NEU硅谷校区硕士新生，真诚找一位合拍女生室友，已看好2B2B公寓，人均2k+，9月初入住。",
     expectComment: true,
   },
+  {
+    // 回归钉子：放宽「找…室友」允许插字之后，这种帖被正则抢走误判成 roommate，
+    // 而模型本来判对是 seeker。求租帖顺带写室友要求太常见——正则必须让路。
+    name: "求租帖带室友要求→正则让路给模型",
+    text: "9月准备搬到湾区工作，求租一个房间，位置Dublin优先，希望室友不抽烟、作息规律。",
+    expectRuleMiss: true,
+  },
 ]) {
   const ruled = classifyPostKindByRule(c.text);
-  const got = ruled ? shouldDraftComment(ruled.kind) : null;
-  if (got === c.expectComment) {
-    kindChecks.push({ name: c.name, pass: true });
-  } else {
-    kindChecks.push({
-      name: c.name,
-      pass: false,
-      detail: `期望${c.expectComment ? "评论" : "跳过"}，实际${ruled ? `${ruled.kind}/${got ? "评论" : "跳过"}` : "正则未命中(会落到模型)"}`,
-    });
-  }
+  const actual = ruled
+    ? `${ruled.kind}/${shouldDraftComment(ruled.kind) ? "评论" : "跳过"}`
+    : "正则未命中(交给模型)";
+
+  // expectRuleMiss：要的就是「正则别抢，让模型判」
+  const pass = c.expectRuleMiss
+    ? ruled === null
+    : ruled !== null && shouldDraftComment(ruled.kind) === c.expectComment;
+
+  kindChecks.push({
+    name: c.name,
+    pass,
+    detail: pass
+      ? undefined
+      : `期望${c.expectRuleMiss ? "正则不命中" : c.expectComment ? "评论" : "跳过"}，实际${actual}`,
+  });
 }
 
 for (const c of kindChecks) {
