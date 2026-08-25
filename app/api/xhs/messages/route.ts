@@ -7,9 +7,10 @@ import {
 import { deliverToJijyun } from "@/lib/chat/jijyun";
 import { redactContactInfo } from "@/lib/chat/redact-contact";
 import {
-  insertListingSeparators,
+  formatForDm,
   wantsContactCollection,
   XHS_DM_EXTRA_SYSTEM,
+  XHS_DM_MODEL,
 } from "@/lib/chat/xhs-dm";
 
 // 60 秒撞过墙：2026-08-20 23:19 一次真实请求被 Vercel 硬杀（Task timed out after
@@ -79,13 +80,14 @@ export async function POST(request: Request) {
         externalUserId: id,
         text,
         extraSystem: XHS_DM_EXTRA_SYSTEM,
+        selectedChatModel: XHS_DM_MODEL,
       });
 
       // 判意图看**原文**：剔除那一层会按标点切碎重组，判完再剔才不会误伤
       const collectContact = wantsContactCollection(result.text);
       const { text: redacted, hits } = redactContactInfo(result.text);
-      // 分割线最后插：剔除会整行删字段、合并空行，先插行结构会被它改掉
-      const reply = insertListingSeparators(redacted);
+      // 排版最后做：剔除会整行删字段、合并空行，先插分割线行结构会被它改掉
+      const reply = formatForDm(redacted);
 
       console.log(
         "[xhs/messages]",

@@ -14,6 +14,8 @@
  */
 import { redactContactInfo } from "../lib/chat/redact-contact";
 import {
+  DM_CHAR_LIMIT,
+  formatForDm,
   insertListingSeparators,
   LISTING_SEPARATOR,
   wantsContactCollection,
@@ -241,31 +243,37 @@ sepChecks.push({
 
 const sepOut = insertListingSeparators(twoListings);
 const sepLines = sepOut.split("\n");
+const sepCount = sepLines.filter((l) => l === SEP).length;
+
+// 2 条房源 → 3 条线：第一条上面、两条之间、最后一条下面
 sepChecks.push({
-  name: "两条房源之间插且只插一条",
-  pass: sepLines.filter((l) => l === SEP).length === 1,
-  detail: `实际 ${sepLines.filter((l) => l === SEP).length} 条`,
+  name: "两条房源共3条线(首+中+尾)",
+  pass: sepCount === 3,
+  detail: `实际 ${sepCount} 条`,
 });
 sepChecks.push({
-  name: "插在第二条标题正上方",
-  pass: sepLines[sepLines.indexOf(SEP) + 1] === "Sunnyvale主卧独立卫浴9/1起",
+  name: "第一条房源上面有线",
+  pass: sepLines[0] === "以下是符合要求的房源：" && sepLines[1] === SEP,
+  detail: sepLines.slice(0, 2).join(" / "),
+});
+sepChecks.push({
+  name: "线插在标题正上方",
+  pass: sepLines[sepLines.indexOf(SEP) + 1] === "南湾west SJ SFH 4b3b整租招租",
   detail: sepLines[sepLines.indexOf(SEP) + 1],
 });
 sepChecks.push({
-  name: "引导语前不插",
-  pass: sepLines[0] === "以下是符合要求的房源：",
-  detail: sepLines[0],
+  name: "最后一条房源下面有线(在总结句之前)",
+  pass: sepLines.at(-2) === SEP && sepLines.at(-1)?.startsWith("这些房源") === true,
+  detail: sepLines.slice(-2).join(" / "),
 });
 sepChecks.push({
-  name: "结尾总结句前不插",
-  pass: sepLines.at(-2) !== SEP,
-  detail: sepLines.at(-2),
-});
-sepChecks.push({
-  name: "单条房源不插",
-  pass: !insertListingSeparators(
-    "房源一览：\n某房源标题\n- 租金: $1000\n- 房型: 1 室"
-  ).includes(SEP),
+  name: "单条房源也上下包线",
+  pass:
+    insertListingSeparators(
+      "房源一览：\n某房源标题\n- 租金: $1000\n- 房型: 1 室"
+    )
+      .split("\n")
+      .filter((l) => l === SEP).length === 2,
 });
 sepChecks.push({
   name: "重复跑不叠加(幂等)",
@@ -276,6 +284,43 @@ sepChecks.push({
   pass:
     insertListingSeparators("我在线，有什么需求告诉我") ===
     "我在线，有什么需求告诉我",
+});
+
+// ---- 1000 字上限：丢整条，不切半截 ----
+const bulky = [
+  "以下是符合要求的房源：",
+  ...Array.from({ length: 12 }, (_, n) => [
+    `房源标题第${n + 1}条`,
+    `- 租金: $${1000 + n}/月`,
+    `- 位置: San Jose ${n}`,
+    `- 简介: ${"细节".repeat(40)}`,
+  ]).flat(),
+  "以上就是全部房源。",
+].join("\n");
+const capped = formatForDm(bulky);
+
+sepChecks.push({
+  name: "超长压到1000字以内",
+  pass: capped.length <= DM_CHAR_LIMIT,
+  detail: `实际 ${capped.length}`,
+});
+sepChecks.push({
+  name: "短文本不动",
+  pass: formatForDm("我在线") === "我在线",
+});
+sepChecks.push({
+  name: "截断后仍以分割线收尾(没切在半截房源上)",
+  pass: capped.split("\n").filter((l) => l === SEP).length >= 2,
+  detail: `线 ${capped.split("\n").filter((l) => l === SEP).length} 条`,
+});
+sepChecks.push({
+  name: "截断保留的是完整房源(最后一个字段行完整)",
+  pass: (() => {
+    const lines = capped.split("\n");
+    const lastSep = lines.lastIndexOf(SEP);
+    const before = lines[lastSep - 1] ?? "";
+    return before.startsWith("- ") && before.endsWith("细节");
+  })(),
 });
 
 for (const c of sepChecks) {

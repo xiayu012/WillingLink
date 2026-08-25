@@ -13,7 +13,9 @@
  * 内容是用户口述的原话，没有改写：这是运营策略（什么时候要联系方式、定价多少、
  * 为什么不能直接给房东电话），不是我能替他决定的东西。
  */
-export const XHS_DM_EXTRA_SYSTEM = `你运转在小红书。你账号是企业专业号。租客会咨询你房源信息，当你觉得"火候"差不多了就叫对方填写联系方式。 还有一些FAQ只在对方问了才回答：价钱是6.88人民币或0.99美金，可获得多个房东的联系方式。需要租客自己联系房东，我不是中介，我只是替代租客做网络搜索。我无法主动联系房东，因为我是商业电话号`;
+export const XHS_DM_EXTRA_SYSTEM = `你运转在小红书。你账号是企业专业号。租客会咨询你房源信息，当你觉得"火候"差不多了就叫对方填写联系方式。 还有一些FAQ只在对方问了才回答：价钱是6.88人民币或0.99美金，可获得多个房东的联系方式。需要租客自己联系房东，我不是中介，我只是替代租客做网络搜索。我无法主动联系房东，因为我是商业电话号
+
+这是私信对话，**回复控制在1000字以内**，说人话，别长篇大论。对方问是非题就直接回答是或不是，别把房源列表再甩一遍。`;
 
 /**
  * 「这句话是在叫对方留联系方式吗」。
@@ -55,6 +57,20 @@ export function wantsContactCollection(text: string): boolean {
   return COLLECT_CONTACT_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+/**
+ * 私信这条链路用的模型。
+ *
+ * **跟网页分开、且比网页强**：私信里最难的不是找房，是先听懂"这两套还在吗"
+ * 是个是非问句而不是一次新搜索。这类意图分辨小模型做不好——gpt-4.1-mini 会
+ * 老老实实照着"看到房源词就搜索并展示"执行，甩一堆卡片出来，很不像人。
+ * 提示词那道判断闸（见 `lib/ai/prompts.ts` 开头）是根治，模型是让那道闸真正
+ * 被执行的前提，两个一起才有效。
+ *
+ * 换/回退只改环境变量，不用动代码；嫌慢或嫌贵就设成 `openai/gpt-4.1-mini`。
+ */
+export const XHS_DM_MODEL =
+  process.env.XHS_DM_MODEL?.trim() || "anthropic/claude-sonnet-4.5";
+
 /** 房源之间的分割线：15 个 em dash（U+2014） */
 export const LISTING_SEPARATOR = "—".repeat(15);
 
@@ -80,45 +96,106 @@ function neighborKind(
 }
 
 /**
- * 房源与房源之间插一条分割线。
+ * 房源标题行：**非字段行，且下一个非空行是字段行**。
  *
- * 模型输出的形状是固定的：一行标题（不带 `-`），跟着若干 `- 字段: 值`，如此循环，
- * 前面常有一句引导语、后面常有一句总结。所以「新房源的标题」＝**上一行是字段行、
- * 下一行也是字段行**的那种非字段行：
+ * 模型输出形状固定：一行标题（不带 `-`）+ 若干 `- 字段: 值`，循环，前面常有
+ * 一句引导语、后面常有一句总结。只看"下一行是不是字段"就够分辨：
  *
- *     南湾地区，预算5000美元每月…以下是符合要求的房源：   ← 引导语（上一行不是字段）
- *     南湾west SJ SFH 4b3b整租招租                      ← 第一条，前面不插
+ *     以下是符合要求的房源：      ← 下一行是标题（非字段）→ 不是标题 ✓
+ *     南湾west SJ SFH 4b3b整租招租 ← 下一行是字段 → 是标题 ✓
  *     - 租金: …
- *     - 房型: …
- *     ———————————————                                  ← 插在这
- *     Sunnyvale主卧独立卫浴9/1起available
- *     - 租金: …
- *     这些房源都在您预算内，需要我再筛吗？                ← 总结句（下一行不是字段）
- *
- * 两头的判断缺一不可：只看上一行，结尾的总结句会被误当成标题；只看下一行，
- * 开头的引导语会被误判。
+ *     这些房源都在您预算内…       ← 下一行没有/非字段 → 不是标题 ✓
+ */
+function isListingTitle(lines: string[], i: number): boolean {
+  const line = lines[i];
+  return (
+    line.trim().length > 0 &&
+    line !== LISTING_SEPARATOR &&
+    !FIELD_LINE.test(line) &&
+    neighborKind(lines, i, 1) === "field"
+  );
+}
+
+/**
+ * 给每条房源上下都包一条分割线：第一条上面、每两条之间、最后一条下面。
  *
  * **在剔除之后跑**：`redactContactInfo` 会整行删掉 `- 联系: …`、还会合并空行，
  * 先插分割线的话行号结构会被它改掉。
  */
 export function insertListingSeparators(text: string): string {
   const lines = text.split("\n");
+  const titles = lines.map((_, i) => isListingTitle(lines, i));
+  if (!titles.includes(true)) {
+    return text;
+  }
+
+  // 最后一条房源的最后一个字段行——分割线要收在它下面，而不是收在后面那句总结上
+  const lastTitle = titles.lastIndexOf(true);
+  let lastFieldOfLastBlock = lastTitle;
+  for (let i = lastTitle + 1; i < lines.length; i++) {
+    if (FIELD_LINE.test(lines[i])) {
+      lastFieldOfLastBlock = i;
+    } else if (lines[i].trim().length > 0 && lines[i] !== LISTING_SEPARATOR) {
+      break;
+    }
+  }
+
   const out: string[] = [];
-
   for (const [i, line] of lines.entries()) {
-    const isTitle =
-      line.trim().length > 0 &&
-      !FIELD_LINE.test(line) &&
-      neighborKind(lines, i, -1) === "field" &&
-      neighborKind(lines, i, 1) === "field";
-
-    // `out.at(-1)` 那半句是为了幂等：`neighborKind` 会跳过已有的分割线去看真正的
-    // 邻居，所以对已经插过的文本再跑一遍，标题仍然判为 true，不拦就会叠第二条。
-    if (isTitle && out.at(-1) !== LISTING_SEPARATOR) {
+    if (line === LISTING_SEPARATOR) {
+      continue; // 旧的先丢掉，下面统一重排——这样重复调用不会叠加
+    }
+    if (titles[i]) {
       out.push(LISTING_SEPARATOR);
     }
     out.push(line);
+    if (i === lastFieldOfLastBlock) {
+      out.push(LISTING_SEPARATOR);
+    }
   }
 
   return out.join("\n");
+}
+
+/** 发进小红书私信的长度上限 */
+export const DM_CHAR_LIMIT = 1000;
+
+/**
+ * 压到长度上限：**整条整条地丢，不切在半截房源上**。
+ *
+ * 排完版之后每条房源都被一对分割线夹着，所以"丢最后一条"就是删掉倒数第二条
+ * 分割线到倒数第一条分割线之间那一段。丢到只剩一条还超，就只能硬截——但那时
+ * 截的是一条房源的内部，已经是最差情况，正常不该发生。
+ */
+function capToLimit(text: string, limit: number): string {
+  let lines = text.split("\n");
+
+  while (lines.join("\n").length > limit) {
+    const sepAt = lines.reduce<number[]>((acc, line, i) => {
+      if (line === LISTING_SEPARATOR) {
+        acc.push(i);
+      }
+      return acc;
+    }, []);
+    if (sepAt.length < 2) {
+      break;
+    }
+    // 删「倒数第二条分割线 → 倒数第一条分割线之前」，即最后一条房源连它上面那条线
+    lines = [
+      ...lines.slice(0, sepAt.at(-2)),
+      ...lines.slice(sepAt.at(-1) as number),
+    ];
+  }
+
+  const capped = lines.join("\n");
+  return capped.length > limit ? `${capped.slice(0, limit - 1)}…` : capped;
+}
+
+/**
+ * 私信出站排版：先包分割线，再压到 1000 字。
+ *
+ * 顺序不能反——压缩靠分割线找房源边界，没排版就只能瞎截。
+ */
+export function formatForDm(text: string, limit = DM_CHAR_LIMIT): string {
+  return capToLimit(insertListingSeparators(text), limit);
 }

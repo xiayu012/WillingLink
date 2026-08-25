@@ -50,6 +50,8 @@ export type InboundMessage = {
    * "叫对方填联系方式"这种只对小红书成立的规则。
    */
   extraSystem?: string;
+  /** 该渠道要用的模型，不给就走项目默认（`DEFAULT_CHAT_MODEL`） */
+  selectedChatModel?: string;
 };
 
 /**
@@ -81,7 +83,10 @@ export async function handleInboundMessage(
       channel: inbound.channel,
       externalMessageId: inbound.externalMessageId ?? null,
     },
-    inbound.extraSystem ? { extraSystem: inbound.extraSystem } : undefined
+    {
+      extraSystem: inbound.extraSystem,
+      selectedChatModel: inbound.selectedChatModel,
+    }
   );
 }
 
