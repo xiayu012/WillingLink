@@ -225,8 +225,25 @@ export function applyParams(plan: QueryPlan, params: PlanParams): QueryPlan {
     ...(params.bedroomsNum == null ? [] : [params.bedroomsNum]),
   ].filter((n) => Number.isInteger(n) && n >= 0 && n <= 5);
 
+  // 模型点名了城市 → 清掉**由城市推出来的**那个半径锚点。
+  //
+  // 以前只覆盖 cities、不动 near，于是计划里同时留着 cities=["Mountain View"]
+  // 和 near=MountainView/12km。而 `planQuery` 自己解析时是二选一的（设了 near
+  // 就把 cities 清空），只有走 applyParams 这条路才会两个并存——语义上说不通，
+  // 匹配器里那句"距离约束生效时取代城市约束"的注释也就落了空。
+  //
+  // 实测后果："mountain view或者附近通勤30分钟内都可"被压平成 MV 周围 12km 的
+  // 均匀圆盘，Los Altos/Sunnyvale/Cupertino/Santa Clara 全部合格，用户点名的
+  // Mountain View 反而淹没在里面（AGENT_LOG 2026-08-26）。
+  //
+  // **只清城市锚点，不清地标锚点**：「近Apple Park」「走路到UCB」这种精度比城市
+  // 高，是 cities 表达不了的东西，清掉就是丢信息。
+  const dropCityAnchor = paramCities.length > 0 && plan.near?.source === "city";
+
   return {
     ...plan,
+    near: dropCityAnchor ? null : plan.near,
+    radiusKm: dropCityAnchor ? null : plan.radiusKm,
     cities: paramCities.length > 0 ? paramCities : plan.cities,
     bedroomsAnyOf:
       paramBeds.length > 0 ? [...new Set(paramBeds)] : plan.bedroomsAnyOf,

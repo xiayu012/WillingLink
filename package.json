@@ -21,7 +21,8 @@
     "xhs:verify-geo-index": "node tools/xhs-guide/geo/verify-geo-index.mjs",
     "search-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/search-eval.ts",
     "search-recall-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/search-recall-eval.ts",
-    "redact-eval": "tsx scripts/redact-eval.ts"
+    "redact-eval": "tsx scripts/redact-eval.ts",
+    "comment-reply-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/comment-reply-eval.ts"
   },
   "dependencies": {
     "@ai-sdk/gateway": "2.0.0-beta.85",

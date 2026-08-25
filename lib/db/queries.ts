@@ -1693,8 +1693,16 @@ export async function updateListingStructuredFields(
     parkingIncluded: boolean | null;
     leaseMinMonths: number | null;
     leaseMaxMonths: number | null;
+    /**
+     * 抽出来的租金文本（"$1800"、"1800-2000"）。这里顺手把它解析成
+     * `rentNumeric` —— **入库时不写这一列，是 rentNumeric 只有 12.4% 填充率的
+     * 直接原因**，而 `rentMax` 是最常用的硬条件之一，列空着等于筛不动。
+     * COALESCE 保证不覆盖已有值（回填脚本或人工填过的不动）。
+     */
+    rentText?: string | null;
   }
 ): Promise<void> {
+  const rentNumeric = parseRentNumeric(fields.rentText);
   await client`
     UPDATE "XhsRentalListing"
     SET
@@ -1705,7 +1713,9 @@ export async function updateListingStructuredFields(
       "utilitiesIncluded" = ${fields.utilitiesIncluded},
       "parkingIncluded"   = ${fields.parkingIncluded},
       "leaseMinMonths"    = ${fields.leaseMinMonths},
-      "leaseMaxMonths"    = ${fields.leaseMaxMonths}
+      "leaseMaxMonths"    = ${fields.leaseMaxMonths},
+      "rent"              = COALESCE("rent", ${fields.rentText ?? null}),
+      "rentNumeric"       = COALESCE("rentNumeric", ${rentNumeric})
     WHERE id = ${id}::uuid
   `;
 }

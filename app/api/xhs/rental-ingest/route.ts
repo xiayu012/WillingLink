@@ -57,6 +57,9 @@ async function extractStructuredFieldsSafe(
       parkingIncluded: fields.parkingIncluded,
       leaseMinMonths: fields.leaseMinMonths,
       leaseMaxMonths: fields.leaseMaxMonths,
+      // 抽取器一直在返回 rent 文本，只是从没写进库——rentNumeric 12.4% 的填充率
+      // 就是这么来的，而 rentMax 是最常用的硬条件之一
+      rentText: fields.rent,
     });
     return true;
   } catch (error) {

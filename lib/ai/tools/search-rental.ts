@@ -636,6 +636,19 @@ function anchorHits(row: XhsRentalSearchResultRow, anchors: string[]): number {
 // 想的——"走路能到"和"骑车能到"是两回事，档内差几百米无所谓。
 const DISTANCE_TIERS_KM = [1.5, 3, 6, 10, 15];
 
+/**
+ * 用户**点名**的城市要压过同一圈里的邻市。
+ *
+ * 距离分档最细也只到 1.5km，而相邻城市之间常常就差几公里（Mountain View 到
+ * Los Altos 约 4km），光靠距离分不开"他说的那个城"和"旁边那个城"。用户在帖子
+ * 标题里写了 mountain view，结果第一屏全是 Los Altos / Sunnyvale / Cupertino
+ * ——每一条距离上都说得通，但没有一条是他要的（AGENT_LOG 2026-08-26）。
+ *
+ * 权重比 DISTANCE_WEIGHT 高一档：命中点名城市 > 单纯离得近。这只影响**排序**，
+ * 不改硬筛选——邻市房源仍然会出现，只是排在后面。
+ */
+const NAMED_CITY_WEIGHT = 12;
+
 /** 越近分越高；坐标未知的行落在最低档（不剔除，只是排后面）。 */
 function proximityScore(
   row: XhsRentalSearchResultRow,
@@ -654,7 +667,11 @@ function rankByPlanSignals(
   plan: QueryPlan
 ): XhsRentalSearchResultRow[] {
   const needsBool = BOOL_FIELDS.some((k) => plan.requires[k] === true);
-  if (!(needsBool || plan.anchors.length > 0 || plan.near)) return rows;
+  if (
+    !(needsBool || plan.anchors.length > 0 || plan.near || plan.cities.length)
+  ) {
+    return rows;
+  }
   return rows
     .map((row, i) => ({
       row,
@@ -662,6 +679,7 @@ function rankByPlanSignals(
       score:
         // 用户说了"靠近X"时，距离压过一切其它排序信号——这正是他要的。
         DISTANCE_WEIGHT * proximityScore(row, plan) +
+        NAMED_CITY_WEIGHT * (rowInAnyCity(row, plan.cities) ? 1 : 0) +
         confirmedCount(row, plan.requires) +
         ANCHOR_WEIGHT * anchorHits(row, plan.anchors),
     }))

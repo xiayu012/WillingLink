@@ -285,6 +285,81 @@ prompt 缓存或历史消息里的旧形状而调用失败。`prompts.ts` 的 ST
 
 ---
 
+## 2026-08-26（三）· 「距离远」根因链 + comment-reply 50 例端到端评测
+
+用户反馈："求 mountain view，给的全是 Los Altos / Sunnyvale / Cupertino，距离远"。
+并要求**别再问他要批准**，自己造 50 个求租例子调真实 API 循环测到过关。
+
+### 根因链（一步步验证，不是猜）
+
+1. **模型传的参数是对的**：`cities:["Mountain View"], rentMax:2500,
+   parkingIncluded:true, leaseMonthsMin:3, leaseMonthsMax:4`。ROLE_HINT 没污染
+   参数，这点先排除了。
+2. **`planQuery` 把城市压平成圆盘**：`cities=[] near=MountainView radiusKm=12`。
+   用户写的是"mountain view **或者**附近通勤30分钟内都可"，MV 是首选、附近是
+   退让，被压成 12km 均匀圆盘后主次全没了——Los Altos(4km)、Sunnyvale(6km)、
+   Cupertino(10km)、Santa Clara(11km) 全部合格。
+3. **`applyParams` 只覆盖 cities、不清 near**：于是计划里 `cities=["Mountain
+   View"]` 和 `near=MV/12km` 并存。而 planQuery 自己解析时是二选一的（设了 near
+   就清 cities），只有走 applyParams 才会两个都在——匹配器里那句"距离约束生效时
+   **取代**城市约束"的注释因此落空。
+
+### 三处修改
+
+- **`applyParams`**：模型点名城市 → 清掉 near/radiusKm，**但只清
+  `source==="city"` 的锚点**。「近Apple Park」「走路到UCB」这种地标精度比城市高，
+  是 cities 表达不了的，清掉就是丢信息。
+- **`NAMED_CITY_WEIGHT = 12`**（> `DISTANCE_WEIGHT = 10`）：点名的城市要压过
+  同圈里的邻市。距离最细分档才 1.5km，而相邻城市常常就差 4km，光靠距离分不开
+  "他说的那个城"和"旁边那个城"。**只影响排序不影响硬筛选**，邻市仍会出现，只是排后面。
+- **入库补 `rentNumeric`**：`extractListingFields` 一直在返回 rent 文本，但
+  `updateListingStructuredFields` 从来没写这一列——这就是 rentNumeric 填充率只有
+  **12.4%** 的原因，而 rentMax 是最常用的硬条件之一，列空着等于筛不动。
+  用 COALESCE 不覆盖已有值。
+
+### `pnpm comment-reply-eval`（新）—— 49 条端到端
+
+**调的是真实路由的 POST**，不是绕过它调 chat engine。整条链路都在里面：六分类
+闸门 → 排除自帖 → 单帖作用域起草 → 纯变换压缩 → 拼开场白 → 写库。
+
+自动判据全部来自积累下来的产品要求：该评的要出内容 / 不该评的要跳过 / 身份判对 /
+**不许复述帖主原文** / 无 URL / 无联系方式 / 无聊天页话术 / 长度 ≤400。
+
+覆盖角度：求租（预算高低、短租长租、宠物、性别、多城备选、地标锚点、公司名、
+中英混写、极短、极啰嗦、湾区外）、招租（主卧/整租/转租/广告口吻/英文/极短）、
+找室友、以及**不该评论的**（看房体验、踩坑、攻略、提问、无关、家具/二手车/招聘、
+已租出、晒装修）。
+
+**跑出来的两个 bug：**
+
+1. **产品**：二手家具转让帖被判成 `lister`（有东西要"出"）。分类器提示词补了
+   "前三类的前提是**交易标的是住的地方**"——卖家具/健身卡/二手车/演出票哪怕写着
+   "出""便宜出"、哪怕带城市名，都是 other。
+2. **我自己测试台的**：`authorId` 用名字前 16 位十六进制，中文前缀相同的用例
+   （"求租-…"、"找室友-…"）**撞成同一个 authorId**，共用会话，`markListingAsSeen`
+   的排除跟着串。改成带序号。**写测试夹具时中文名做 key 要当心前缀碰撞。**
+
+最终 **49/49 通过**。
+
+### 门禁（这次跑全了）
+
+- `pnpm comment-reply-eval` 49/49
+- `pnpm redact-eval` 46/46
+- `pnpm search-eval -- --source wanted --limit 181` → **CODE_BUG=0，PASS 156**
+  （同日改动前是 155，没退步）
+
+**上一条我欠着的：前几次只跑了 40 条，CLAUDE.md 写的是 181。**这次补上了，
+以后动搜索/理解层一律跑满 181。
+
+### 还没做
+
+- 最近 7 天入库 321 条只有 87 条有 city（27%，历史均值 66%）——这个下滑是什么
+  时候、被什么带坏的，还没查。rentNumeric 的修复只对**新入库**生效，存量要跑
+  `scripts/backfill-listing-fields.ts`。
+- post-level 幂等：同帖重复调用不再互相污染，但仍会重跑一整轮 agent。
+
+---
+
 ## 2026-08-25（二）· 修我自己造的回归：判断闸把 comment-reply 打瘫了
 
 用户反馈"还是错的离谱，连对方是租客和房东都分不清，还在发 url，字数限制也没有"。
