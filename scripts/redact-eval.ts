@@ -20,6 +20,10 @@ import {
   LISTING_SEPARATOR,
   wantsContactCollection,
 } from "../lib/chat/xhs-dm";
+import {
+  classifyPostKindByRule,
+  shouldDraftComment,
+} from "../lib/xhs/post-kind-rules";
 
 type Case = {
   name: string;
@@ -263,7 +267,8 @@ sepChecks.push({
 });
 sepChecks.push({
   name: "最后一条房源下面有线(在总结句之前)",
-  pass: sepLines.at(-2) === SEP && sepLines.at(-1)?.startsWith("这些房源") === true,
+  pass:
+    sepLines.at(-2) === SEP && sepLines.at(-1)?.startsWith("这些房源") === true,
   detail: sepLines.slice(-2).join(" / "),
 });
 sepChecks.push({
@@ -332,7 +337,55 @@ for (const c of sepChecks) {
   }
 }
 
-const total = cases.length + collectCases.length + sepChecks.length;
+// ---------------------------------------------------------------------------
+// 帖子分类闸门。只钉**正则快路径**（不调模型，跑得快、结果确定）；LLM 那条路
+// 是概率性的，放进门禁只会变成随机失败。
+// 要钉的重点：看房体验帖不能被当成求租帖去评论（Case F）。
+// ---------------------------------------------------------------------------
+
+const kindChecks: { name: string; pass: boolean; detail?: string }[] = [];
+
+for (const c of [
+  {
+    name: "看房体验帖→不评论",
+    text: "看房体验分享：这次实地tour了Huxley、Indigo、Trestle三家公寓，Huxley前台服务好，Indigo健身房大，Trestle性价比高。",
+    expectComment: false,
+  },
+  {
+    name: "踩坑避雷帖→不评论",
+    text: "租房踩坑总结！签约前一定要看清楚这几条，避雷不良中介，我的血泪教训分享给大家。",
+    expectComment: false,
+  },
+  {
+    name: "找室友帖→要评论",
+    text: "NEU硅谷校区硕士新生，真诚找一位合拍女生室友，已看好2B2B公寓，人均2k+，9月初入住。",
+    expectComment: true,
+  },
+]) {
+  const ruled = classifyPostKindByRule(c.text);
+  const got = ruled ? shouldDraftComment(ruled.kind) : null;
+  if (got === c.expectComment) {
+    kindChecks.push({ name: c.name, pass: true });
+  } else {
+    kindChecks.push({
+      name: c.name,
+      pass: false,
+      detail: `期望${c.expectComment ? "评论" : "跳过"}，实际${ruled ? `${ruled.kind}/${got ? "评论" : "跳过"}` : "正则未命中(会落到模型)"}`,
+    });
+  }
+}
+
+for (const c of kindChecks) {
+  if (c.pass) {
+    console.log(`✅ kind: ${c.name}`);
+  } else {
+    failed++;
+    console.log(`❌ kind: ${c.name}${c.detail ? ` — ${c.detail}` : ""}`);
+  }
+}
+
+const total =
+  cases.length + collectCases.length + sepChecks.length + kindChecks.length;
 console.log(
   `\n${failed === 0 ? "✅ 全部通过" : `❌ ${failed}/${total} 条不通过`}`
 );

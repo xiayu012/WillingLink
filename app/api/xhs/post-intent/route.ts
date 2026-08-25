@@ -1,8 +1,5 @@
-import {
-  classifyRentalPostIntent,
-  type RentalPostIntent,
-} from "@/lib/ai/classify-rental-post";
-import { getFeedTitleModel } from "@/lib/ai/providers";
+import { classifyPostKind } from "@/lib/xhs/post-kind";
+import { shouldDraftComment } from "@/lib/xhs/post-kind-rules";
 
 export const preferredRegion = "sfo1";
 
@@ -21,15 +18,17 @@ export function OPTIONS() {
 }
 
 /**
- * 便宜的岔路口：这条帖子是不是「租客在求租」。
+ * 便宜的岔路口：这条帖子值不值得去评论。
  *
- * 油猴复制正文后先问这里，只有 seeker 才继续走 /api/xhs/comment-reply
- * ——那条路由每次要跑一整轮带搜索的 agent，而信息流里绝大多数帖子是招租帖或
- * 经验帖，先花这一次便宜调用挡掉，省下的是大头。
+ * 油猴复制正文后先问这里，只有该评论的类别才继续走 /api/xhs/comment-reply
+ * ——那条路由每次要跑一整轮带搜索的 agent，先花这一次便宜调用挡掉，省的是大头。
  *
- * 复用入库那套 `classifyRentalPostIntent`：它先跑正则快路径（多数帖子**一次
- * 模型都不用调**），命中不够确信才落到 LLM，这里把模型换成全项目最便宜的
- * gpt-4o-mini（`getFeedTitleModel`，信息流标题判定同款）。
+ * **分六类不是三类**（`lib/xhs/post-kind.ts`）：以前只分 seeker/其它，看房体验帖
+ * 里全是租房关键词，被当成求租帖，评论区就答非所问（AGENT_LOG 2026-08-25 Case F）。
+ * 现在 review/advice/other 明确挡在门外。
+ *
+ * 兼容：`isSeeker` 字段保留，老版本油猴还在读它——现在的语义是"该不该评论"，
+ * seeker/lister/roommate 都算 true。
  */
 export async function POST(request: Request) {
   const expectedToken = process.env.XHS_API_TOKEN?.trim();
@@ -52,17 +51,16 @@ export async function POST(request: Request) {
 
   const startedAt = Date.now();
   try {
-    const classification = await classifyRentalPostIntent(rawText, {
-      model: getFeedTitleModel(),
-    });
-    const intent: RentalPostIntent = classification.intent;
+    const result = await classifyPostKind(rawText);
+    const actionable = shouldDraftComment(result.kind);
 
     console.log(
       "[post-intent]",
       JSON.stringify({
-        intent,
-        confidence: classification.confidence,
-        source: classification.source,
+        kind: result.kind,
+        actionable,
+        confidence: result.confidence,
+        source: result.source,
         elapsedMs: Date.now() - startedAt,
         preview: rawText.slice(0, 60),
       })
@@ -70,11 +68,14 @@ export async function POST(request: Request) {
 
     return jsonWithCors({
       ok: true,
-      intent,
-      isSeeker: intent === "seeker",
-      confidence: classification.confidence,
-      reason: classification.reason,
-      source: classification.source,
+      kind: result.kind,
+      actionable,
+      // 老版本油猴读的是 intent/isSeeker，保持能用
+      intent: result.kind,
+      isSeeker: actionable,
+      confidence: result.confidence,
+      reason: result.reason,
+      source: result.source,
       elapsedMs: Date.now() - startedAt,
     });
   } catch (error) {

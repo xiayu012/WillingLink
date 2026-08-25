@@ -1,13 +1,20 @@
 import { geolocation } from "@vercel/functions";
 import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import { resolveChatIdForUser } from "@/lib/chat/conversation";
-import { runChatTurn } from "@/lib/chat/engine";
+import { runPostScopedTurn, transformText } from "@/lib/chat/engine";
 import {
   ChannelTableMissingError,
   resolveInternalUserId,
 } from "@/lib/chat/identity";
-import { createGuestUser, saveChat } from "@/lib/db/queries";
+import {
+  createGuestUser,
+  findXhsRecordIdsByRawText,
+  saveChat,
+} from "@/lib/db/queries";
+import { markListingAsSeen } from "@/lib/db/seen-listings";
 import { generateUUID } from "@/lib/utils";
+import { classifyPostKind } from "@/lib/xhs/post-kind";
+import { shouldDraftComment } from "@/lib/xhs/post-kind-rules";
 
 export const maxDuration = 60;
 export const preferredRegion = "sfo1";
@@ -32,13 +39,15 @@ const MAX_RAW_TEXT_CHARS = 2000;
 /** 死代码拼在最前面的一行，不经过模型，永远一字不差。 */
 const OPENING_LINE = "看看以下这些觉得怎么样，感兴趣的话私信我：";
 
-/** 第二轮就说这一句——跟真人在聊天页嫌回答太长时说的话一模一样。 */
+/** 压缩指令。**这是变换指令，不是对话**——走 `transformText`，没有工具没有历史。 */
 const CONDENSE_MESSAGE = "请缩写至260字符左右，不要带联系方式";
 
 /**
- * 没缩到位就再说一遍，**而且说得更具体**——真人嫌长时就是这么催的：
- * "只留三条、每条一行、别写结尾那句"。这仍然是以用户身份说话，不是往系统
- * 提示词里塞规则。只催一次，还不听就用它给的，不跟它耗。
+ * 没缩到位就再说一遍，**而且说得更具体**："只留三条、每条一行、别写结尾那句"。
+ * 只催一次，还不听就用它给的，不跟它耗。
+ *
+ * 第二次压缩仍然拿**第一轮的草稿**当输入，不是拿上一次压缩的结果——层层转述
+ * 会越缩越离原意。
  */
 const CONDENSE_AGAIN_MESSAGE =
   "还是太长了。只保留最多3条，每条压成一行，全文260字符以内，不要写联系方式（微信/电话/邮箱都不要），不要分点小标题，也不要最后那句让我调整条件的话。";
@@ -52,21 +61,26 @@ const codePoints = (text: string) => [...text].length;
  * 这里只做**格式**转换，一个字的内容都不改——不是在替模型改写。
  */
 function toPlainComment(text: string): string {
-  return text
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
-    // 短锚文本（原帖 / 详情 / 链接…）是链接把手，不是内容：整段去掉，
-    // 别留下孤零零两个字。长一点的锚文本才是真话，保留文字去掉链接。
-    .replace(/[（(]?\[[^\]]{1,6}\]\([^)]*\)[）)]?/g, "")
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, "$1")
-    .replace(/(?<![*\w])\*([^*\n]+)\*(?![*\w])/g, "$1")
-    .replace(/^\s*[-*]\s+/gm, "")
-    .replace(/[（(【]?\s*(原帖|详情|链接|详情见链接)\s*[】）)]?\s*(https?:\/\/\S+)?/g, "")
-    .replace(/https?:\/\/\S+/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return (
+    text
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+      // 短锚文本（原帖 / 详情 / 链接…）是链接把手，不是内容：整段去掉，
+      // 别留下孤零零两个字。长一点的锚文本才是真话，保留文字去掉链接。
+      .replace(/[（(]?\[[^\]]{1,6}\]\([^)]*\)[）)]?/g, "")
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, "$1")
+      .replace(/(?<![*\w])\*([^*\n]+)\*(?![*\w])/g, "$1")
+      .replace(/^\s*[-*]\s+/gm, "")
+      .replace(
+        /[（(【]?\s*(原帖|详情|链接|详情见链接)\s*[】）)]?\s*(https?:\/\/\S+)?/g,
+        ""
+      )
+      .replace(/https?:\/\/\S+/g, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+  );
 }
 
 /**
@@ -118,22 +132,31 @@ function optString(v: unknown): string | null {
 /**
  * 小红书评论草稿。**这条路由不对项目 AI 塞任何提示词。**
  *
- * 它做的就是替用户把话说了（见 AGENT_LOG「完全替代用户说话」）：
+ * 它做的就是替用户把话说了（见 AGENT_LOG「完全替代用户说话」）。
  *
- *   1. 把复制来的帖子正文原样发给项目 AI —— 跟人在聊天页粘一段帖子问"有房源吗"
- *      完全一样，同一套 system prompt、同一批工具，没有额外渠道规则。
- *   2. 模型照常输出一大段。
- *   3. 再以用户的身份说一句「请缩写至260字符左右」。
- *   4. 拿它缩写后的文字，**死代码**在最前面拼上那行开场白，进剪贴板。
+ * ## 链路（四步，每一步的作用域都不一样，别合并）
  *
- * 整个过程留在这个帖主的 conversation 里，网页打开能看到全部四条消息。
+ *   1. **闸门** `classifyPostKind` —— 六分类，只有 seeker/lister/roommate 往下走。
+ *      看房体验帖里全是租房词但帖主没在求租，冲上去推房源就是答非所问。
+ *   2. **排除自帖** —— 油猴复制正文时先入库，这里再拿同一段正文去搜，第一条就是
+ *      帖主自己。按 rawText 找出那几条，标成"已看过"，让既有排除机制挡掉。
+ *   3. **起草** `runPostScopedTurn` —— **单帖作用域，不读任何历史**。有工具，
+ *      要搜房源。写库是为了以后帖主从私信找过来接得上，不是为了这次。
+ *   4. **压缩** `transformText` —— **纯变换，没有工具没有历史不写库**。
+ *      压完死代码拼开场白，进剪贴板。
  *
- * 之前这里堆过一大套东西——追加渠道 system prompt、删聊天页话术、按结构化列
- * 确定性拼装条目、补固定开场白、按字数裁剪。**全部删掉了**：那些都是在跟模型
- * 较劲，而正确做法是像用户一样跟它说话，需要什么就直接说。
+ * ## 为什么第 3、4 步必须分开作用域
+ *
+ * 曾经这四步全是 `runChatTurn`，于是每一步都带全套工具、读整段历史。用户报的
+ * 6 个 case 里有 5 个是这一个错误造成的（AGENT_LOG 2026-08-25 有 chatId 和时间戳）：
+ * 压缩那轮会重新搜索换掉候选、会把上一条用户消息当成压缩对象、会"重新生成"时
+ * 编出原文没有的约束；同一帖主的第二篇帖会被第一篇的历史污染掉地理约束。
+ *
+ * **判断标准是「这一步的输入应该是什么」**：起草的输入是这篇帖子，压缩的输入是
+ * 那段草稿，都不是"这个人说过的所有话"。
  *
  * 鉴权：默认无鉴权，与同目录其它 /api/xhs 路由一致。设了 XHS_API_TOKEN 才校验
- * X-Xhs-Token —— 这条路由每次要跑两轮带搜索的 agent，被人扫到会烧钱。
+ * X-Xhs-Token —— 这条路由要跑一轮带搜索的 agent，被人扫到会烧钱。
  */
 export async function POST(request: Request) {
   const expectedToken = process.env.XHS_API_TOKEN?.trim();
@@ -198,8 +221,46 @@ export async function POST(request: Request) {
       });
     }
 
-    // ---- 第一轮：帖子正文原样发过去，什么都不加 ----
-    const first = await runChatTurn(
+    // ---- 闸门：这篇帖子值不值得评论 ----
+    // 只有 seeker/lister/roommate 才往下走。看房体验、求建议、无关帖直接返回
+    // ——评错一条比不评一条难看得多，而且白烧一整轮带搜索的 agent。
+    const postKind = await classifyPostKind(rawText);
+    if (!shouldDraftComment(postKind.kind)) {
+      console.log(
+        "[comment-reply] 跳过",
+        JSON.stringify({
+          kind: postKind.kind,
+          source: postKind.source,
+          reason: postKind.reason,
+        })
+      );
+      return jsonWithCors({
+        ok: true,
+        skipped: true,
+        postKind: postKind.kind,
+        postKindReason: postKind.reason,
+        text: "",
+        chatId,
+        identified,
+        hasListings: false,
+        chars: 0,
+        elapsedMs: Date.now() - startedAt,
+      });
+    }
+
+    // ---- 别把帖主自己的帖推荐给帖主 ----
+    // 油猴复制正文时先入库，几秒后这里再拿同一段正文去搜，第一条就是 ta 自己。
+    // 复用既有的"已看过"排除机制：把自帖标成已看过，搜索工具自然会跳过。
+    const ownRecordIds = await findXhsRecordIdsByRawText(rawText);
+    await Promise.all(
+      ownRecordIds.map((recordId) => markListingAsSeen(chatId, recordId))
+    );
+
+    // ---- 起草：**单帖作用域**，不读任何历史 ----
+    // 用 runPostScopedTurn 而不是 runChatTurn：一次评论草稿的输入就该是这一篇
+    // 帖子，同一帖主上一篇搜到过什么对这一篇没有参考价值（Case C/D 就是被那个
+    // 污染的：第二次进来丢掉了 Dublin/San Ramon 的地理约束）。
+    const draftTurn = await runPostScopedTurn(
       {
         chatId,
         userId,
@@ -209,54 +270,53 @@ export async function POST(request: Request) {
       { selectedChatModel: modelId, requestHints }
     );
 
-    const hasListings = hasListingResults(first.toolOutputs);
+    const hasListings = hasListingResults(draftTurn.toolOutputs);
+    // 工具只可能在起草那一步用到——压缩没有工具
+    const toolsUsed = draftTurn.toolsUsed;
 
     if (style === "raw") {
       return jsonWithCors({
         ok: true,
-        text: first.text,
+        text: draftTurn.text,
         chatId,
         identified,
         model: modelId,
         style,
-        toolsUsed: first.toolsUsed,
+        postKind: postKind.kind,
+        toolsUsed,
         hasListings,
-        chars: codePoints(first.text),
+        chars: codePoints(draftTurn.text),
         elapsedMs: Date.now() - startedAt,
       });
     }
 
-    // ---- 第二轮：像用户一样说一句"请缩写至260字符左右" ----
-    const second = await runChatTurn(
-      {
-        chatId,
-        userId,
-        text: CONDENSE_MESSAGE,
-        channel: "xhs",
-      },
-      { selectedChatModel: modelId, requestHints }
-    );
-
+    // ---- 压缩：**纯变换**，没有工具、没有历史、不写库 ----
+    const draft = dropChatPageTail(toPlainComment(draftTurn.text));
     let condensed =
-      dropChatPageTail(toPlainComment(second.text)) ||
-      dropChatPageTail(toPlainComment(first.text));
-    const toolsUsed = [...first.toolsUsed, ...second.toolsUsed];
+      dropChatPageTail(
+        toPlainComment(
+          await transformText({
+            input: draft,
+            instruction: CONDENSE_MESSAGE,
+            selectedChatModel: modelId,
+          })
+        )
+      ) || draft;
 
     if (codePoints(condensed) > RETRY_ABOVE_CODE_POINTS) {
-      const third = await runChatTurn(
-        {
-          chatId,
-          userId,
-          text: CONDENSE_AGAIN_MESSAGE,
-          channel: "xhs",
-        },
-        { selectedChatModel: modelId, requestHints }
+      const shorter = dropChatPageTail(
+        toPlainComment(
+          await transformText({
+            // 仍然拿第一版草稿去压，不是拿上一次压缩的结果
+            input: draft,
+            instruction: CONDENSE_AGAIN_MESSAGE,
+            selectedChatModel: modelId,
+          })
+        )
       );
-      const shorter = dropChatPageTail(toPlainComment(third.text));
       // 只在真的更短时才采纳：催完反而更长的情况实测出现过（739 字符）
       if (shorter && codePoints(shorter) < codePoints(condensed)) {
         condensed = shorter;
-        toolsUsed.push(...third.toolsUsed);
       }
     }
 
@@ -274,9 +334,12 @@ export async function POST(request: Request) {
         chatId,
         identified,
         authorId,
+        postKind: postKind.kind,
+        postKindSource: postKind.source,
+        ownRecordsExcluded: ownRecordIds.length,
         toolsUsed: [...new Set(toolsUsed)],
         hasListings,
-        firstChars: codePoints(first.text),
+        draftChars: codePoints(draftTurn.text),
         chars: codePoints(text),
         elapsedMs: Date.now() - startedAt,
         sourceUrl: optString(payload.sourceUrl),
@@ -290,6 +353,7 @@ export async function POST(request: Request) {
       identified,
       model: modelId,
       style,
+      postKind: postKind.kind,
       toolsUsed: [...new Set(toolsUsed)],
       hasListings,
       chars: codePoints(text),

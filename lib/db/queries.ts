@@ -14,8 +14,8 @@ import {
   like,
   lt,
   or,
-  sql,
   type SQL,
+  sql,
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
@@ -32,10 +32,10 @@ import {
   document,
   message,
   type Suggestion,
+  searchQueryLog,
   shift,
   stream,
   suggestion,
-  searchQueryLog,
   type User,
   user,
   vote,
@@ -863,6 +863,41 @@ export async function resolveXhsRecordKind(
   }
 
   return null;
+}
+
+/**
+ * 找出「就是这篇帖子本身」的那些记录 id（listing / wanted / 两张表都查）。
+ *
+ * 用途只有一个：**别把帖主自己的帖推荐给帖主**。油猴复制正文时会先入库，几秒后
+ * comment-reply 再拿同一段正文去搜，于是搜出来第一条就是 ta 自己刚发的那篇
+ * （AGENT_LOG 2026-08-25，Case E：`pending:a035be59`，sourceUrl 还是 pending 前缀，
+ * 一看就是同一次入库的）。
+ *
+ * 按 rawText 全等匹配：同一次复制进去的正文一字不差，等值比较足够，也不会误伤
+ * 别人写得像的帖子。
+ */
+export async function findXhsRecordIdsByRawText(
+  rawText: string
+): Promise<string[]> {
+  const text = rawText.trim();
+  if (text.length === 0) {
+    return [];
+  }
+
+  const [listings, wanted] = await Promise.all([
+    db
+      .select({ id: xhsRentalListing.id })
+      .from(xhsRentalListing)
+      .where(eq(xhsRentalListing.rawText, text))
+      .limit(10),
+    db
+      .select({ id: xhsRentalWanted.id })
+      .from(xhsRentalWanted)
+      .where(eq(xhsRentalWanted.rawText, text))
+      .limit(10),
+  ]);
+
+  return [...listings, ...wanted].map((row) => row.id);
 }
 
 export type UpdateXhsSourceUrlResult = {
