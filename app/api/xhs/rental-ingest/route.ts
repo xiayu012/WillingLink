@@ -63,7 +63,17 @@ async function extractStructuredFieldsSafe(
     });
     return true;
   } catch (error) {
-    console.error("[rental-ingest] field extraction failed for", id, error);
+    // 抽取挂了不能连累入库（正文和 embedding 是主链路），但**必须留下能被搜到的
+    // 痕迹**：2026-08-21 和 08-24 各有一整天（114 条 / 79 条）的结构化字段全空，
+    // 就是这里静默吞掉的——embedding 100% 正常，所以从入库量上完全看不出异常，
+    // 直到几天后有人抱怨"搜出来的房源离得远"才顺着查到这里。
+    // 统一前缀 + 明确措辞，方便在日志里按 `extract-failed` 拉一段时间的失败量。
+    const name = error instanceof Error ? error.name : "UnknownError";
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(
+      "[rental-ingest] extract-failed",
+      JSON.stringify({ id, name, message: message.slice(0, 200) })
+    );
     return false;
   }
 }

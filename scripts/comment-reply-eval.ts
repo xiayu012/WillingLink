@@ -366,7 +366,9 @@ const CONTACT_RE =
   /微信|weixin|wechat|\bwx\b|\bvx\b|qq号|[\w.+-]+@[\w-]+\.[\w.-]+|\d{3}[\s.-]?\d{3}[\s.-]?\d{4}/i;
 const CHAT_TAIL_RE =
   /如需调整条件|我再重新筛选|如仍不满意|随时告诉我|需要我帮您找|还是有其他/;
-const HARD_MAX_CHARS = 400;
+/** 小红书评论的硬上限。提示词里的 260 是用户故意留的余量，300 才是不能破的线。 */
+const HARD_MAX_CHARS = 300;
+const LISTING_NO_RE = /【第\s*(\d+)\s*套】/g;
 
 const codePoints = (s: string) => [...s].length;
 
@@ -465,6 +467,15 @@ async function runCase(
   }
   if (CHAT_TAIL_RE.test(text)) {
     problems.push(`含聊天页话术：${text.match(CHAT_TAIL_RE)?.[0]}`);
+  }
+  // 有房源可推时必须带【第N套】编号，且编号要从 1 连续——裁剪之后重新编过号
+  if (body.hasListings === true) {
+    const nums = [...text.matchAll(LISTING_NO_RE)].map((m) => Number(m[1]));
+    if (nums.length === 0) {
+      problems.push("有房源却没有【第N套】编号");
+    } else if (nums.some((n, i) => n !== i + 1)) {
+      problems.push(`编号不连续：${nums.join(",")}`);
+    }
   }
   if (codePoints(text) > HARD_MAX_CHARS) {
     problems.push(`超长：${codePoints(text)} 字 > ${HARD_MAX_CHARS}`);

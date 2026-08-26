@@ -375,6 +375,12 @@ for (const c of [
     text: "8/23起租1间独卫主卧套房，1700美元/月，无中介费直接和屋主签，没有找室友压力。",
     expectRuleMiss: true,
   },
+  {
+    // 需求已结束的帖子里租房词一个不少，之前被判成 lister 还去推了租客
+    name: "已出租帖→不评论",
+    text: "【已出租】谢谢大家关注，房子已经租出去了，帖子留着做个记录，祝大家都能找到合适的房子！",
+    expectComment: false,
+  },
 ]) {
   const ruled = classifyPostKindByRule(c.text);
   const actual = ruled

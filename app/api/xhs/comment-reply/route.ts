@@ -46,7 +46,8 @@ const MAX_RAW_TEXT_CHARS = 2000;
 const OPENING_LINE = "看看以下这些觉得怎么样，感兴趣的话私信我：";
 
 /** 压缩指令。**这是变换指令，不是对话**——走 `transformText`，没有工具没有历史。 */
-const CONDENSE_MESSAGE = "请缩写至260字符左右，不要带联系方式";
+const CONDENSE_MESSAGE =
+  "请缩写至260字符左右，不要带联系方式。每套房源单独一行，行首标上【第1套】【第2套】这样的编号。";
 
 /**
  * 没缩到位就再说一遍，**而且说得更具体**："只留三条、每条一行、别写结尾那句"。
@@ -56,9 +57,53 @@ const CONDENSE_MESSAGE = "请缩写至260字符左右，不要带联系方式";
  * 会越缩越离原意。
  */
 const CONDENSE_AGAIN_MESSAGE =
-  "还是太长了。只保留最多3条，每条压成一行，全文260字符以内，不要写联系方式（微信/电话/邮箱都不要），不要分点小标题，也不要最后那句让我调整条件的话。";
-/** 超过这个长度才值得再催一次（缩到 300 出头就算它听话了） */
-const RETRY_ABOVE_CODE_POINTS = 400;
+  "还是太长了。只保留最多3条，每条压成一行，行首标【第1套】【第2套】这样的编号，全文260字符以内，不要写联系方式（微信/电话/邮箱都不要），不要分点小标题，也不要最后那句让我调整条件的话。";
+
+/**
+ * 评论的硬上限。提示词里写 260 是用户**故意留的余量**，真正不能超的是 300
+ * ——提示词是请求，模型经常不听，所以这里还要有一道能兜住的闸。
+ */
+const DM_HARD_LIMIT = 300;
+
+/** 超过这个长度就再催一次压缩（还够不着硬上限，但已经明显没听话） */
+const RETRY_ABOVE_CODE_POINTS = 320;
+
+/** 行首的【第N套】编号——既是排版，也是下面按房源整条裁剪的边界 */
+const LISTING_NO_RE = /^\s*【第\s*\d+\s*套】/;
+
+/**
+ * 兜住 300 字：**整套整套地丢，不切在半句上**。
+ *
+ * 编号那一步顺带给了我们可靠的切分边界，所以超长时可以按房源砍，而不是硬截。
+ * 砍完重新编号，免得出现「第1套、第3套」这种跳号。真砍到只剩一套还超（说明
+ * 单套描述本身就写太长了），才退回硬截。
+ */
+function capComment(text: string, limit: number): string {
+  if (codePoints(text) <= limit) {
+    return text;
+  }
+
+  const lines = text.split("\n");
+  const head = lines.filter((l) => !LISTING_NO_RE.test(l));
+  const items = lines.filter((l) => LISTING_NO_RE.test(l));
+
+  const renumber = (kept: string[]) =>
+    [
+      ...head,
+      ...kept.map((l, i) => l.replace(LISTING_NO_RE, `【第${i + 1}套】`)),
+    ]
+      .join("\n")
+      .trim();
+
+  for (let keep = items.length - 1; keep >= 1; keep--) {
+    const candidate = renumber(items.slice(0, keep));
+    if (codePoints(candidate) <= limit) {
+      return candidate;
+    }
+  }
+
+  return `${[...text].slice(0, limit - 1).join("")}…`;
+}
 
 const codePoints = (text: string) => [...text].length;
 
@@ -422,7 +467,11 @@ export async function POST(request: Request) {
     }
 
     // ---- 死代码拼开场白。没房源可推时不拼——那句话会变成假的 ----
-    const text = hasListings ? `${OPENING_LINE}\n\n${condensed}` : condensed;
+    // 上限在拼完开场白之后才卡：开场白也占字数，先卡后拼等于白卡。
+    const text = capComment(
+      hasListings ? `${OPENING_LINE}\n\n${condensed}` : condensed,
+      DM_HARD_LIMIT
+    );
 
     // 存最终版——网页上看到的就是评论区实际贴出去的那一句
     await persistTurn(text);

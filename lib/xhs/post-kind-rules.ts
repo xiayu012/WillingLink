@@ -60,6 +60,18 @@ const ROOMMATE_PATTERNS = [
   /一起租|合租搭子|凑室友/u,
 ] as const;
 
+/**
+ * 需求已经结束的帖子。里面照样全是租房词，但再去推人推房只会尴尬。
+ *
+ * 只认**明确的完成态标记**，不做推理：「已出租」「已经租出去了」「已找到室友」。
+ * 「不用找室友压力」那种否定句由 `ROOMMATE_NEGATED` 单独管，别混进来。
+ */
+const CLOSED_PATTERNS = [
+  /【\s*已(?:出租|租出|出|找到|结束)\s*】/u,
+  /已经?(?:出租|租出去了|租掉了|租满|找到(?:室友|人|房)了)/u,
+  /(?:房子|房源|房间)已(?:出租|租出)/u,
+] as const;
+
 const SEEKER_PATTERNS = [/求租/u, /找房/u, /想租/u, /求转租/u] as const;
 // 「起租」是真实招租帖的高频词（"8/23起租1间主卧"），漏了它会让下面 roommate
 // 的让路判断失效——门禁那条 case 就是这么发现的
@@ -88,6 +100,16 @@ export function classifyPostKindByRule(rawText: string): PostKindResult | null {
   const text = rawText.trim();
   if (text.length === 0) {
     return null;
+  }
+
+  // 已成交/已作废最先判：这类帖子里租房词一个不少，先挡住免得被后面的规则捡走
+  if (countHits(text, CLOSED_PATTERNS) > 0) {
+    return {
+      kind: "other",
+      confidence: 0.9,
+      reason: "帖子明确标了已出租/已找到，需求已结束",
+      source: "rule",
+    };
   }
 
   const review = countHits(text, REVIEW_PATTERNS);
