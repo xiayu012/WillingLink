@@ -194,6 +194,54 @@ export type ListingFieldsResult = {
 // ── Main export ───────────────────────────────────────────────────────────────
 
 /**
+ * 电话号码不是租金。
+ *
+ * 实测（2026-08-26，用户报的）：一篇**通篇没写价格**的帖子，末尾是
+ * `看房联系：(510) 798‑1685`，抽取器把区号 510 当成了月租存进
+ * `rent`/`rentNumeric`——同一串数字在 `contactMethod` 里被正确识别成电话。
+ *
+ * 危害不只是显示成"价格：510美元/月"：`rentNumeric=510` 会让这条房源
+ * **假装通过任何预算上限的硬筛选**，出现在每一个"预算1500以内"的结果里。
+ *
+ * 光在提示词里写"电话不是租金"不够（这一轮已经反复验证提示词压不住输出约束），
+ * 所以这里再做一道**结构性校验**：抽出来的数字如果只在电话形状里出现过、
+ * 而没有任何一次出现在金额语境里，就判定是误读，退回 null。
+ *
+ * 判据刻意保守——真有一间 $510 的房，帖子里一定会写成 `$510` 或 `510/月`
+ * 之类的金额语境，那样就会被放行。
+ */
+export function rentLooksLikePhoneNumber(
+  rent: string | null,
+  rawText: string
+): boolean {
+  if (!rent) {
+    return false;
+  }
+  const digits = rent.match(/\d[\d,]*/)?.[0]?.replace(/,/g, "");
+  // 只有 3 位数才可能是区号；4 位以上的租金不会跟区号混
+  if (!digits || digits.length !== 3) {
+    return false;
+  }
+  // 分隔符可能是 ASCII `-`、Unicode 连字符 `‐`/`‑`（原帖用的就是 U+2011）、
+  // 点或空格。注意这是**字符串**不是正则字面量，反斜杠要写两个。
+  const sep = "[\\s\\-‐‑.]";
+  const phoneShaped = new RegExp(
+    `\\(?${digits}\\)?${sep}{0,2}\\d{3}${sep}{0,2}\\d{4}`
+  );
+  if (!phoneShaped.test(rawText)) {
+    return false;
+  }
+  // 同一个数字也出现在金额语境里 → 那是真价格，别动
+  const moneyShaped = new RegExp(
+    `[$￥￡]\\s*${digits}` +
+      `|${digits}\\s*(?:刀|美元|块|元|/\\s*月|每月|usd|per\\s*month|/mo)` +
+      `|(?:租金|房租|月租|价格|rent|price)\\D{0,10}${digits}`,
+    "i"
+  );
+  return !moneyShaped.test(rawText);
+}
+
+/**
  * Extract structured fields from a raw rental post text.
  * Uses LLM (Claude Haiku via generateObject); falls back to regex on failure.
  * Never throws — always returns a best-effort result.
@@ -214,6 +262,10 @@ Be precise:
 - For booleans: only true/false when explicitly stated; null when ambiguous or not mentioned.
 - For city: standardize to English city name; null if no clear Bay Area city.
 - For rent: extract the exact text; if a range like "1800-2000", return the range string.
+  **A phone number is not a rent.** Bay Area posts end with numbers like
+  "(510) 798-1685" / "408-219-1207"; the area code is NOT a price. If the post
+  never states a price, return null — do not manufacture one from a phone
+  number, a zip code, a square footage, or a street address.
 - For bedroomsNum: always return an integer (studio=0); null only if truly unclear.`,
       prompt: rawText.slice(0, 5000),
     });
@@ -221,7 +273,9 @@ Be precise:
     // Merge: LLM wins on all fields it provides; regex fills nulls
     return {
       title: object.title ?? regexFallback.title,
-      rent: object.rent ?? regexFallback.rent,
+      rent: rentLooksLikePhoneNumber(object.rent ?? null, rawText)
+        ? regexFallback.rent
+        : (object.rent ?? regexFallback.rent),
       deposit: object.deposit ?? regexFallback.deposit,
       availableFrom: object.availableFrom ?? regexFallback.availableFrom,
       leaseEndDate: object.leaseEndDate ?? regexFallback.leaseEndDate,

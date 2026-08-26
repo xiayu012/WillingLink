@@ -12,6 +12,7 @@
  * 要再对真实数据扫一遍时：从 Message_v2 拉 role='assistant' 的 parts，逐条过
  * `redactContactInfo`，然后用下面 mustDrop 的那几类正则去搜剔后文本。
  */
+import { rentLooksLikePhoneNumber } from "../lib/ai/extract-listing-fields";
 import { redactContactInfo } from "../lib/chat/redact-contact";
 import {
   DM_CHAR_LIMIT,
@@ -442,8 +443,72 @@ for (const c of kindChecks) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 电话号码不能被当成租金。
+//
+// 2026-08-26 用户报的：一篇**通篇没写价格**的帖子末尾是 `看房联系：
+// (510) 798‑1685`，抽取器把区号 510 存进了 rent/rentNumeric。同一串数字在
+// contactMethod 里被正确识别成电话——一个字段认对了，另一个字段认错了。
+// 危害不止显示成"价格：510美元/月"：rentNumeric=510 会让它**假装通过任何
+// 预算上限的硬筛选**。全库扫出 7 条，已清空。
+//
+// 正反都要钉：真的 $510 房源必须放行，否则就是把便宜房源全筛没了。
+// ---------------------------------------------------------------------------
+
+const PHONE_POST =
+  "户型：2房1厅1厨1卫\n入住时间：可立即入住\n看房联系：\n(510) 798‑1685\n(510) 269‑0119";
+
+const rentGuardCases: { name: string; rent: string; text: string; expect: boolean }[] =
+  [
+    { name: "区号被当成租金→拦下", rent: "510", text: PHONE_POST, expect: true },
+    {
+      name: "点分隔的电话也认得出",
+      rent: "408",
+      text: "近 Apple，联系 408.219.1207",
+      expect: true,
+    },
+    {
+      name: "真的$510房源→放行",
+      rent: "$510",
+      text: "单间 $510/月，包水电\n电话 510-798-1685",
+      expect: false,
+    },
+    {
+      name: "中文金额语境→放行",
+      rent: "510",
+      text: "月租510元\n联系 510-798-1685",
+      expect: false,
+    },
+    {
+      name: "面积数字不是电话→放行",
+      rent: "650",
+      text: "650 sqft 大开间，微信联系",
+      expect: false,
+    },
+    {
+      name: "四位数租金不参与判定",
+      rent: "1500",
+      text: PHONE_POST,
+      expect: false,
+    },
+  ];
+
+for (const c of rentGuardCases) {
+  const got = rentLooksLikePhoneNumber(c.rent, c.text);
+  if (got === c.expect) {
+    console.log(`✅ rent: ${c.name}`);
+  } else {
+    failed++;
+    console.log(`❌ rent: ${c.name} — 期望 ${c.expect}，实际 ${got}`);
+  }
+}
+
 const total =
-  cases.length + collectCases.length + sepChecks.length + kindChecks.length;
+  cases.length +
+  collectCases.length +
+  sepChecks.length +
+  kindChecks.length +
+  rentGuardCases.length;
 console.log(
   `\n${failed === 0 ? "✅ 全部通过" : `❌ ${failed}/${total} 条不通过`}`
 );
