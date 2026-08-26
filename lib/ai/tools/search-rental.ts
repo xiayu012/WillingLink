@@ -56,6 +56,10 @@ import { tool } from "ai";
 import { after } from "next/server";
 import { z } from "zod";
 import { embedText, rerankDocuments } from "@/lib/ai/embeddings";
+import {
+  withPresentation,
+  type ToolPresentation,
+} from "@/lib/ai/tools/presentation";
 import { verifyListingsAgainstQuery } from "@/lib/ai/verify-listings";
 import {
   logSearchQuery,
@@ -1457,11 +1461,15 @@ function createStrictSearchRentalTool(chatId: string) {
  * requirement, empty list when nothing does (the "换一个" flow is deprecated).
  * Set SEARCH_LEGACY_PICK_ONE=1 to restore the legacy one-at-a-time cascade.
  */
-export function createSearchRentalTool(chatId: string) {
-  if (!LEGACY_PICK_ONE) {
-    return createStrictSearchRentalTool(chatId);
-  }
-  return createLegacySearchRentalTool(chatId);
+export function createSearchRentalTool(
+  chatId: string,
+  presentation: ToolPresentation = "chat"
+) {
+  const base = LEGACY_PICK_ONE
+    ? createLegacySearchRentalTool(chatId)
+    : createStrictSearchRentalTool(chatId);
+  // 出口整形：评论区不吃聊天页那套舞台指示（见 presentation.ts）
+  return withPresentation(base, presentation);
 }
 
 /**

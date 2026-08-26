@@ -15,6 +15,10 @@
 
 import { tool } from "ai";
 import { z } from "zod";
+import {
+  shapeToolResult,
+  type ToolPresentation,
+} from "@/lib/ai/tools/presentation";
 import { cityAliases, detectCity } from "@/lib/rental/cities";
 import {
   checkMoveInFeasibility,
@@ -280,7 +284,10 @@ export function exhaustionNotice(attempts: number): string {
 
 // ── Tool factory ──────────────────────────────────────────────────────────────
 
-export function createSearchWantedTool(chatId: string) {
+export function createSearchWantedTool(
+  chatId: string,
+  presentation: ToolPresentation = "chat"
+) {
   return tool({
     description:
       "Search the XhsRentalWanted database for tenant-seeking posts (求租信息). " +
@@ -304,7 +311,16 @@ export function createSearchWantedTool(chatId: string) {
             "Accumulate across turns. Examples: ['中介', '转租'] to exclude subletting posts."
         ),
     }),
-    execute: async ({ query, mustNotContain }) => {
+    // 出口统一整形：评论区不吃聊天页那套舞台指示（见 presentation.ts）
+    execute: async (args) =>
+      shapeToolResult(await runWantedSearch(chatId, args), presentation),
+  });
+}
+
+async function runWantedSearch(
+  chatId: string,
+  { query, mustNotContain }: { query: string; mustNotContain?: string[] }
+) {
       try {
         const excludeIds = await getSeenListingIds(chatId);
         const blockTerms = (mustNotContain ?? [])
@@ -367,6 +383,4 @@ export function createSearchWantedTool(chatId: string) {
             "SEARCH_FAILED: Tell the user the search hit a temporary error and ask them to retry.",
         };
       }
-    },
-  });
 }

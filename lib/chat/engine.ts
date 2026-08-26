@@ -10,6 +10,7 @@ import { getLanguageModel } from "@/lib/ai/providers";
 import { findNearestTransit } from "@/lib/ai/tools/find-nearest-transit";
 import { getTransitTime } from "@/lib/ai/tools/get-transit-time";
 import { queryListings } from "@/lib/ai/tools/query-listings";
+import type { ToolPresentation } from "@/lib/ai/tools/presentation";
 import { createSearchRentalTool } from "@/lib/ai/tools/search-rental";
 import { createSearchWantedTool } from "@/lib/ai/tools/search-wanted";
 import { getMessagesByChatId, saveMessages } from "@/lib/db/queries";
@@ -93,6 +94,7 @@ export function buildTurnSetup({
   detectedLanguage = null,
   extraSystem,
   onlyTools,
+  presentation = "chat",
 }: {
   chatId: string;
   selectedChatModel?: string;
@@ -109,6 +111,15 @@ export function buildTurnSetup({
    * （AGENT_LOG 2026-08-25）。提示词是请求，工具表是约束——能用约束就别用请求。
    */
   onlyTools?: ChatToolName[];
+  /**
+   * 工具结果按哪个渠道整形。默认 `chat`。
+   *
+   * 搜索工具的 `action` 字段里塞满了聊天页的舞台指示（"展示完后告诉用户还可以说
+   * 「继续」"、"再问用户是否愿意放宽"）。评论区没有下一轮，那些指令全是错的，而且
+   * 模型信工具返回值胜过信 system——这就是评论一直带结尾邀请、一直转述"已放宽
+   * 关键词"的根因。见 `lib/ai/tools/presentation.ts`。
+   */
+  presentation?: ToolPresentation;
 }): TurnSetup {
   const isReasoningModel =
     selectedChatModel.includes("reasoning") ||
@@ -126,8 +137,8 @@ export function buildTurnSetup({
     model: getLanguageModel(selectedChatModel),
     system: extraSystem ? `${base}\n\n${extraSystem}` : base,
     tools: {
-      searchRental: createSearchRentalTool(chatId),
-      searchWanted: createSearchWantedTool(chatId),
+      searchRental: createSearchRentalTool(chatId, presentation),
+      searchWanted: createSearchWantedTool(chatId, presentation),
       queryListings,
       findNearestTransit,
       getTransitTime,
@@ -382,6 +393,9 @@ export async function runPostScopedTurn(
     },
     extraSystem: options?.extraSystem,
     onlyTools: options?.onlyTools,
+    // 单帖场景**没有下一轮**，工具结果里那套聊天页话术必须换掉。这是
+    // runPostScopedTurn 的固有语义，不做成可选项——谁调它谁就是一次性输出。
+    presentation: "comment",
   });
 
   // 只有这一条消息——没有 history 展开，这就是"单帖作用域"的全部含义

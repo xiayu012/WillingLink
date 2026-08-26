@@ -3,14 +3,14 @@
  *
  * **调的是真实路由** `app/api/xhs/comment-reply/route.ts` 的 POST，不是绕过它去
  * 直接调 chat engine。整条链路都在里面：六分类闸门 → 排除自帖 → 单帖作用域起草
- * → 纯变换压缩 → 拼开场白 → 写库。任何一环坏了这里都能看见。
+ * → 单帖起草成品 → 格式清洗 → 写库。任何一环坏了这里都能看见。
  *
  * 判据来自积累下来的产品要求，每条都能自动查：
  *   - 该评论的帖子必须真出内容，不该评论的必须跳过
  *   - 身份判对（求租帖→给房源，招租/找室友帖→给人）
  *   - **不许复述帖主自己的帖**（最常见的翻车：一个工具都不调，把原文总结一遍）
  *   - 小红书私信/评论风控：不许有 URL、不许有联系方式
- *   - 长度：评论要短（压缩后 260 上下，硬上限 400）
+ *   - 长度：硬上限 300；每条房源必须带租金
  *   - 不许出现聊天页话术（"如需调整条件…我再重新筛选"）
  *
  * 用法：
@@ -368,7 +368,8 @@ const CHAT_TAIL_RE =
   /如需调整条件|我再重新筛选|如仍不满意|随时告诉我|需要我帮您找|还是有其他/;
 /** 小红书评论的硬上限。提示词里的 260 是用户故意留的余量，300 才是不能破的线。 */
 const HARD_MAX_CHARS = 300;
-const LISTING_NO_RE = /【第\s*(\d+)\s*套】/g;
+/** 求租者看房源用「套」，房东/找室友看的是人，用「位」 */
+const LISTING_NO_RE = /【第\s*(\d+)\s*[套位]】/g;
 
 const codePoints = (s: string) => [...s].length;
 
@@ -481,13 +482,50 @@ async function runCase(
   if (CHAT_TAIL_RE.test(text)) {
     problems.push(`含聊天页话术：${text.match(CHAT_TAIL_RE)?.[0]}`);
   }
-  // 有房源可推时必须带【第N套】编号，且编号要从 1 连续——裁剪之后重新编过号
+  // 有结果可推时必须带【第N套/位】编号，且编号要从 1 连续——裁剪之后重新编过号
   if (body.hasListings === true) {
     const nums = [...text.matchAll(LISTING_NO_RE)].map((m) => Number(m[1]));
     if (nums.length === 0) {
-      problems.push("有房源却没有【第N套】编号");
+      problems.push("有结果却没有【第N套/位】编号");
     } else if (nums.some((n, i) => n !== i + 1)) {
       problems.push(`编号不连续：${nums.join(",")}`);
+    }
+
+    const lines = text.split("\n");
+    const isItem = (l: string) => /【第\s*\d+\s*[套位]】/.test(l);
+
+    // 每条都必须给出钱：推给求租者是**租金**，推给房东/找室友的是对方的**预算**。
+    // 线上实测压缩那一步会把价格全丢光，留下"社区安静生活便利"这种没有决策价值的
+    // 形容词（AGENT_LOG 2026-08-26）。确实没写时允许"面议/未标"，但不能整条不提。
+    const itemLines = lines.filter(isItem);
+    // 认得出"钱"的写法比想象中多：$2300、租金1700、预算3000、每天80美元、
+    // 价格未定。别只认"3-5位数字+单位"——那会把"租金1700，"判成没写价格。
+    const hasMoney = (l: string) =>
+      /\$\s*\d/.test(l) ||
+      /(?:租金|房租|月租|预算|价格|要价)\s*[:：约]?\s*\d/.test(l) ||
+      /\d+\s*(?:刀|美元|块|\/月|每月|一个月)/.test(l) ||
+      /面议|未标|未写|没写|未定|不详/.test(l);
+    const noPrice = itemLines.filter((l) => !hasMoney(l));
+    if (noPrice.length > 0) {
+      // 整行打出来，别截断——截断过的报错会让人把"租金1700"误判成没写价格
+      problems.push(
+        `${noPrice.length}/${itemLines.length} 条没写价格：${noPrice[0]}`
+      );
+    }
+
+    // 不能把对方自己提的条件复述成"房源"（实测出现过整条都是求租者的要求）
+    if (/信息有限|建议(?:您)?联系房东确认|具体.*房东确认/.test(text)) {
+      problems.push("出现了「信息有限/请联系房东确认」这类空话");
+    }
+
+    // 最后一条之后不能再有话。模型很爱加总结句（"以上均靠近San Mateo…"），
+    // 措辞每次都不同，只能按结构判：编号列表结束了就该结束。
+    const trailing = lines
+      .slice(lines.map(isItem).lastIndexOf(true) + 1)
+      .join("")
+      .trim();
+    if (trailing.length > 0) {
+      problems.push(`最后一条之后还有话：${trailing.slice(0, 40)}`);
     }
   }
   if (codePoints(text) > HARD_MAX_CHARS) {

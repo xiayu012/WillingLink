@@ -70,7 +70,7 @@ const DM_HARD_LIMIT = 300;
 const RETRY_ABOVE_CODE_POINTS = 320;
 
 /** 行首的【第N套】编号——既是排版，也是下面按房源整条裁剪的边界 */
-const LISTING_NO_RE = /^\s*【第\s*\d+\s*套】/;
+const LISTING_NO_RE = /^\s*【第\s*\d+\s*[套位]】/;
 
 /**
  * 兜住 300 字：**整套整套地丢，不切在半句上**。
@@ -91,7 +91,10 @@ function capComment(text: string, limit: number): string {
   const renumber = (kept: string[]) =>
     [
       ...head,
-      ...kept.map((l, i) => l.replace(LISTING_NO_RE, `【第${i + 1}套】`)),
+      // 只换数字，保留原本的量词（求租者是"套"，房东/找室友是"位"）
+      ...kept.map((l, i) =>
+        l.replace(LISTING_NO_RE, (m) => m.replace(/\d+/, String(i + 1)))
+      ),
     ]
       .join("\n")
       .trim();
@@ -196,6 +199,76 @@ const ROLE_TOOLS: Record<string, ChatToolName[]> = {
   ],
 };
 
+/**
+ * 评论的成品格式，直接讲给**起草那一轮**听。
+ *
+ * ## 为什么不再压缩第二遍
+ *
+ * 以前是：起草出一份两千多字的完整回答 → 再交给另一个模型"缩写至260字符"。
+ * 两次调用之间是个**信息瓶颈**：第二个模型手里只剩散文，不知道哪个字段重要。
+ * 线上实测（AGENT_LOG 2026-08-26 的四篇求租帖）：
+ *
+ * - 草稿里 `$2950`、`$3350`、`$2,XXX/月` 一应俱全，压缩后**一个价格都不剩**，
+ *   留下的是"社区安静生活便利""适合家庭或朋友合租"这种没有决策价值的形容词
+ * - 有明确价格的那条房源压缩时**没被选中**，选的全是信息最少的
+ * - 有一条更离谱：把**求租者自己的条件**（"预算2500以内，9月初起租3-4个月，
+ *   studio或含独立卫浴合租，带车位"）写成了房源描述，末尾还加"信息有限，
+ *   建议联系房东确认"
+ *
+ * 用户的判断是对的——"chat engine 很 OK"，坏的是后面那道工序。
+ * **手里有房源数据的是起草那一轮，成品就该由它写完**，中间不要再转一手。
+ *
+ * 少一次模型调用，还快了 3-6 秒。
+ */
+const FORMAT_COMMON = `- **全文 260 字符以内**，最多 3 条。评论区没有下一轮对话。
+- 不要写链接、不要写联系方式（微信/电话/邮箱）。
+- 不要写开场白，也**不要写任何形式的结尾邀请**："如需调整条件…"、"需要更多请
+  告诉我"、"说继续查看下一批"、"愿意放宽条件吗"统统不要。**评论区没有下一轮**，
+  写了就是穿帮。编号列表结束就结束，后面一个字都不要加（包括"以上均靠近…"
+  这类总结）。
+- 搜索工具有时会附一句"找不到完全符合要求的，已放宽…"——那是给你看的系统提示，
+  **不要转述给用户**。放宽之后拿到的结果，照常按编号列表写出来就行。
+- 一条都没搜到时，一句话说清楚没有符合的就结束，同样不要追问、不要提议放宽条件。`;
+
+/**
+ * 评论的成品格式，直接讲给**起草那一轮**听，而且**按角色分开写**。
+ *
+ * 求租者要看的是房源（编号叫"套"、必须有租金）；房东和找室友的人要看的是
+ * **人**（编号叫"位"、要写对方的预算和入住时间）。一份格式套两种角色，
+ * lister/roommate 那几条就会因为"第N套""租金"套不上去而干脆不编号——实测过。
+ */
+const COMMENT_FORMAT: Record<string, string> = {
+  seeker: `## 输出格式（这段回答会被直接贴进小红书评论区）
+
+${FORMAT_COMMON}
+- 每套房源单独一行，行首 \`【第1套】\`\`【第2套】\`\`【第3套】\` 编号。
+- 每行**必须**包含：所在城市/区域、房型、**租金**。
+  租金是租客最看重的一条，**每一行都不能省**——写卖点之前先把价格写上；
+  帖子里确实没写价格就写"价格面议"，但不能整行不提钱。
+  剩下的字数才用来写卖点（车位/独卫/包水电/可入住时间挑最相关的一两个）。
+- **只写房源本身的信息。** 不要把对方提的条件（预算多少、几月入住、要什么户型）
+  复述成房源描述——那是他自己写的，他知道。`,
+
+  lister: `## 输出格式（这段回答会被直接贴进小红书评论区）
+
+${FORMAT_COMMON}
+- 你推给对方的是**正在找房的租客**，不是房源。每位单独一行，行首
+  \`【第1位】\`\`【第2位】\`\`【第3位】\` 编号。
+- 每行**必须**包含：对方想租的区域、**预算**、入住时间。预算是房东最看重的一条，
+  **每一行都不能省**；对方没写预算就写"预算面议"。
+  剩下的字数写他的条件（几个人住、有无宠物、租期长短挑最相关的一两个）。
+- **只写这些租客的信息。** 不要复述房东自己帖子里的房源描述——那是他写的。`,
+
+  roommate: `## 输出格式（这段回答会被直接贴进小红书评论区）
+
+${FORMAT_COMMON}
+- 你推给对方的是**同样在找室友/找合租的人**，不是房源。每位单独一行，行首
+  \`【第1位】\`\`【第2位】\`\`【第3位】\` 编号。
+- 每行**必须**包含：对方想住的区域、**预算**、入住时间。没写预算就写"预算面议"。
+  剩下的字数写他的条件（性别、作息、有无宠物挑最相关的一两个）。
+- **只写这些人的信息。** 不要复述对方自己帖子里的内容。`,
+};
+
 const ROLE_HINT: Record<string, string> = {
   seeker: `## 这一轮的帖主身份（已判定，不要再自行推翻）
 帖主是**租客**，本人正在找房。用 **searchRental** 找房源推给 ta。`,
@@ -242,15 +315,34 @@ function toPlainComment(text: string): string {
  * 会带上，所以按字面删掉这一行，仅此一条，别再往上加。
  */
 const CHAT_PAGE_TAIL_RE =
-  /如仍不满意|如需换一个|我再重新筛选|再为您调整|如需调整条件|告诉我，我再|随时告诉我|可告诉我|看更多|有需求告诉我/;
+  /如仍不满意|如需换一个|我再重新筛选|再为您调整|如需调整条件|告诉我，我再|随时告诉我|可告诉我|看更多|有需求告诉我|如[果需]需?要?更多|请告诉我|告诉我["“]?继续|帮您继续找|愿意放宽/;
+
+/**
+ * 编好号之后，**最后一条房源行以下的东西一律不要**。
+ *
+ * 模型很爱在列表后面加一句总结（"以上均靠近San Mateo，适合10.1起租，符合半岛
+ * 20分钟车程要求。"）。这类句子每次措辞都不一样，靠关键词永远追不完；但位置是
+ * 确定的——**它一定在最后一个【第N套】之后**。按结构删比按词删可靠。
+ */
+function dropAfterLastListing(text: string): string {
+  const lines = text.split("\n");
+  const last = lines.map((l) => LISTING_NO_RE.test(l)).lastIndexOf(true);
+  return last === -1 ? text : lines.slice(0, last + 1).join("\n").trim();
+}
 
 function dropChatPageTail(text: string): string {
-  return text
-    .split("\n")
-    .filter((line) => !CHAT_PAGE_TAIL_RE.test(line))
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  const kept = dropAfterLastListing(
+    text
+      .split("\n")
+      .filter((line) => !CHAT_PAGE_TAIL_RE.test(line))
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+  );
+  // **删空了就当没删过。** 没搜到房源时整条回复可能只有一句
+  // "…您是否愿意放宽某些条件"，命中关键词后被删光，路由拿到空串直接 502
+  // ——实测踩过。这里的规则是"删尾巴"，不是"允许把话删没"。
+  return kept.length > 0 ? kept : text.trim();
 }
 
 /**
@@ -295,11 +387,12 @@ function optString(v: unknown): string | null {
  *      传 `force: true` 可以强制重跑。
  *   3. **排除自帖** —— 油猴复制正文时先入库，这里再拿同一段正文去搜，第一条就是
  *      帖主自己。按 rawText 找出那几条，标成"已看过"，让既有排除机制挡掉。
- *   4. **起草** `runPostScopedTurn` —— **单帖作用域，不读任何历史**。按闸门判出的
- *      身份**只放开对应的那个搜索工具**（房东只有 searchWanted，租客只有
- *      searchRental），从结构上堵掉"给房东推房子"。
- *   5. **压缩** `transformText` —— **纯变换，没有工具没有历史不写库**。
- *      压完死代码拼开场白，进剪贴板。
+ *   4. **起草成品** `runPostScopedTurn` —— **单帖作用域，不读任何历史**。按闸门
+ *      判出的身份**只放开对应的那个搜索工具**（房东只有 searchWanted，租客只有
+ *      searchRental），从结构上堵掉"给房东推房子"；同时把 `COMMENT_FORMAT`
+ *      一起讲清楚，让**手里有房源数据的这一轮直接写出成品**。
+ *   5. **格式清洗** —— Markdown 转纯文本、删聊天页尾巴、拼开场白、`capComment`
+ *      兜住 300 字。**没有第二次模型调用**（为什么砍掉见 COMMENT_FORMAT 上面那段）。
  *   6. **存最终版** —— 存的是评论区实际贴出去那句，不是第 4 步那份带 URL 的草稿。
  *      存错了会误导排查（用户就因为库里是草稿，以为线上"还在发 URL"）。
  *      **存的正文必须和第 2 步比对的逐字一致**，否则缓存永远命不中。
@@ -469,7 +562,8 @@ export async function POST(request: Request) {
         selectedChatModel: modelId,
         requestHints,
         persist: false,
-        extraSystem: ROLE_HINT[postKind.kind],
+        // 身份 + 成品格式一起讲清楚：起草这一轮手里有房源数据，成品就该它写完
+        extraSystem: `${ROLE_HINT[postKind.kind]}\n\n${COMMENT_FORMAT[postKind.kind]}`,
         onlyTools: ROLE_TOOLS[postKind.kind],
       }
     );
@@ -528,35 +622,10 @@ export async function POST(request: Request) {
       });
     }
 
-    // ---- 压缩：**纯变换**，没有工具、没有历史、不写库 ----
-    const draft = dropChatPageTail(toPlainComment(draftTurn.text));
-    let condensed =
-      dropChatPageTail(
-        toPlainComment(
-          await transformText({
-            input: draft,
-            instruction: CONDENSE_MESSAGE,
-            selectedChatModel: modelId,
-          })
-        )
-      ) || draft;
-
-    if (codePoints(condensed) > RETRY_ABOVE_CODE_POINTS) {
-      const shorter = dropChatPageTail(
-        toPlainComment(
-          await transformText({
-            // 仍然拿第一版草稿去压，不是拿上一次压缩的结果
-            input: draft,
-            instruction: CONDENSE_AGAIN_MESSAGE,
-            selectedChatModel: modelId,
-          })
-        )
-      );
-      // 只在真的更短时才采纳：催完反而更长的情况实测出现过（739 字符）
-      if (shorter && codePoints(shorter) < codePoints(condensed)) {
-        condensed = shorter;
-      }
-    }
+    // ---- 只做格式清洗，**不再压缩** ----
+    // 起草那一轮已经按 COMMENT_FORMAT 写成了成品（编号 + 带租金 + 260 字以内），
+    // 这里只把 Markdown 转纯文本、删掉聊天页尾巴。真超了长度由 capComment 兜底。
+    const condensed = dropChatPageTail(toPlainComment(draftTurn.text));
 
     if (!condensed) {
       return jsonWithCors({ ok: false, error: "Model returned no text" }, 502);
