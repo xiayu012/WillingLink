@@ -15,6 +15,7 @@ import {
   composeListingEmbeddingDoc,
   type ListingEmbeddingFields,
 } from "@/lib/rental/listing-embedding";
+import { isNewZealandText } from "@/lib/rental/cities";
 import { classifyPost } from "@/lib/xhs/classify-post";
 import {
   parseListingFields,
@@ -128,6 +129,41 @@ export async function POST(request: Request) {
     optString(payload.sourceUrl) ??
     optString(payload.pageUrl) ??
     `pending:${randomUUID()}`;
+
+  // Step 0: 新西兰奥克兰的帖子直接归 other。
+  // 「奥克兰」在中文里同时是 Oakland (CA) 和 Auckland (NZ)，而华人租房帖里后者
+  // 远比前者常见。不拦的话它会带着 city='Oakland' 正常入库，租客搜"奥克兰"就
+  // 收到南半球的房子——库里已经这么进来 34 条了（见 isNewZealandText 的注释）。
+  // 放在分类之前：这跟"是不是租房帖"无关，它就是不在我们的服务范围内。
+  if (isNewZealandText(rawText)) {
+    const inferredTitle =
+      rawText.split(/[\n。！？!?]/)[0]?.slice(0, 80) ?? null;
+    const row = await createXhsRentalOther({
+      sourceUrl: sourceUrlRaw,
+      rawText,
+      title: optString(payload.title) ?? inferredTitle,
+      aiReason: "新西兰奥克兰(Auckland NZ)，不在湾区服务范围",
+    });
+    if (!row) {
+      return jsonWithCors(
+        { ok: false, error: "Failed to save out-of-scope post" },
+        500
+      );
+    }
+    return jsonWithCors({
+      ok: true,
+      id: row.id,
+      duplicate: row.duplicate,
+      sourceUrl: sourceUrlRaw,
+      listingKind: "other",
+      classification: {
+        intent: "other",
+        confidence: 1,
+        reason: "新西兰奥克兰，非湾区",
+        source: "rule",
+      },
+    });
+  }
 
   // Step 1: 先判断是否为非交易帖（经验/科普）
   const broadCategory = await classifyPost(rawText);

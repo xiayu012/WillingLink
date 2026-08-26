@@ -34,6 +34,7 @@ import {
   cityByName,
   detectCities,
   detectRegions,
+  isNewZealandText,
   isOutOfBayQuery,
   NON_BAY_CITY_RE,
 } from "./cities";
@@ -390,7 +391,7 @@ function asMoveIn(value: unknown): FlexibleDate | null {
  * 故意**不**回退到正则基线：LLM 解析成功时它说的 null 是有意义的
  * （"用户没给这个条件"），拿正则值填回去会把已经修掉的误杀重新塞进来。
  */
-function coercePlan(raw: RawPlan): QueryPlan {
+function coercePlan(raw: RawPlan, query: string): QueryPlan {
   const regions = asStringArray(raw.regions, REGION_VALUES.length).filter(
     (r): r is BayRegion => (REGION_VALUES as string[]).includes(r)
   );
@@ -426,13 +427,20 @@ function coercePlan(raw: RawPlan): QueryPlan {
 
   // 点名的城市全部在收录范围外 = 这条需求本身就不在湾区。
   const allOutOfCoverage = outOfCoverage.length > 0 && namedCities.length === 0;
-  const outOfScope = raw.outOfScope === true || allOutOfCoverage;
+  // 新西兰要在这里单独兜一道：模型看到"奥克兰"就认成 Oakland（它没错，中文里
+  // 两个城市同名），所以指望 raw.outOfScope 是指望不上的。正则基线那条路
+  // （planFromRegex）已经判了，但 LLM 成功时整份 plan 都来自模型，基线的判断
+  // 就被丢掉了——实测"离奥克兰大学近一点"因此拿到了一整页新西兰房源。
+  const nzAmbiguity = isNewZealandText(query);
+  const outOfScope = raw.outOfScope === true || allOutOfCoverage || nzAmbiguity;
 
   return {
     outOfScope,
     outOfScopeReason: outOfScope
       ? typeof raw.outOfScopeReason === "string" && raw.outOfScopeReason.trim()
         ? raw.outOfScopeReason.trim().slice(0, 120)
+        : nzAmbiguity
+        ? "「奥克兰」在这里指新西兰 Auckland，不在旧金山湾区收录范围内"
         : `${outOfCoverage.join("、")} 不在旧金山湾区收录范围内`
       : null,
     cities,
@@ -512,7 +520,7 @@ async function planWithLlm(query: string): Promise<QueryPlan> {
   if (!match) {
     throw new Error(`planner returned no JSON object: ${text.slice(0, 200)}`);
   }
-  return coercePlan(JSON.parse(match[0]) as RawPlan);
+  return coercePlan(JSON.parse(match[0]) as RawPlan, query);
 }
 
 /**

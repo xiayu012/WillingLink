@@ -284,6 +284,15 @@ export function exhaustionNotice(attempts: number): string {
 
 // ── Tool factory ──────────────────────────────────────────────────────────────
 
+/**
+ * 每条求租帖必须交代的两件事，**写进工具返回值而不是 system prompt**。
+ * 房东第一眼看的就是对方出得起多少钱、什么时候要住进来。
+ * 理由同 search-rental 里的同名常量：模型对工具结果的服从度高于 system。
+ */
+const PER_WANTED_FACTS =
+  "**每一位都必须写出预算和入住时间**：没写预算就写「预算面议」；" +
+  "入住时间照原帖说法转述即可，原帖没写就明写「入住时间未标」——不许跳过不提。";
+
 export function createSearchWantedTool(
   chatId: string,
   presentation: ToolPresentation = "chat"
@@ -356,7 +365,7 @@ async function runWantedSearch(
             relaxedNote: result.relaxedNote,
             action:
               "SHOW_RELAXED_WANTED: No exact match found; criteria were auto-relaxed. " +
-              "Show relaxedNote in italics as the first line, then display the SINGLE post in standard format. " +
+              `Show relaxedNote in italics as the first line, then display the SINGLE post in standard format. ${PER_WANTED_FACTS} ` +
               "End with: '如仍不满意，可告诉我具体要求，我再为您调整。' " +
               "For subsequent '换一个': call searchWanted again with the SAME query." +
               exhaustion,
@@ -368,7 +377,7 @@ async function runWantedSearch(
           count: result.wanted.length,
           relaxedNote: null,
           action:
-            `SHOW_WANTED: Display these ${result.wanted.length} exact-match tenant-seeking post(s), each as its own block in standard format. ` +
+            `SHOW_WANTED: Display these ${result.wanted.length} exact-match tenant-seeking post(s), each as its own block in standard format. ${PER_WANTED_FACTS} ` +
             "For '换一个'/'next'/'不满意': call searchWanted again with the SAME query — " +
             "server automatically excludes already-shown posts." +
             exhaustion,

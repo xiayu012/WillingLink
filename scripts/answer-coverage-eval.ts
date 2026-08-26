@@ -130,20 +130,20 @@ const DIMENSIONS: Dimension[] = [
     key: "moveIn",
     label: "入住时间",
     stated: (p) => p.moveIn.kind !== "unknown",
-    covered: (a) => DATE_RE.test(a),
+    covered: (a) => DATE_RE.test(simplify(a)),
   },
   {
     key: "rent",
     label: "租金",
     stated: (p) => p.rentMin !== null || p.rentMax !== null,
-    covered: (a) => MONEY_RE.test(a),
+    covered: (a) => MONEY_RE.test(simplify(a)),
   },
   {
     key: "city",
     label: "城市",
     stated: (p) => p.cities.length > 0,
     covered: (a, p) => {
-      const lower = a.toLowerCase();
+      const lower = simplify(a).toLowerCase();
       return p.cities.some((c) => {
         if (lower.includes(c.toLowerCase())) {
           return true;
@@ -164,8 +164,8 @@ const DIMENSIONS: Dimension[] = [
     label: "户型",
     stated: (p) => p.bedroomsAnyOf.length > 0,
     covered: (a) =>
-      /\d\s*(?:室|房|b\b|bd|bedroom)|studio|开间|主卧|次卧|单间|一居|两居|整租|合租/i.test(
-        a
+      /\d\s*(?:室|房|b\b|bd|bedroom)|studio|开间|主卧|次卧|单间|房间|雅房|套间|一居|两居|整租|合租/i.test(
+        simplify(a)
       ),
   },
   {
@@ -174,36 +174,84 @@ const DIMENSIONS: Dimension[] = [
     stated: (p) => p.leaseMonthsMin !== null || p.leaseMonthsMax !== null,
     covered: (a) =>
       /租期|短租|长租|\d+\s*个?月|\d+\s*months?|month[\s-]?to[\s-]?month|长期|半年|一年/i.test(
-        a
+        simplify(a)
       ),
   },
   {
     key: "parking",
     label: "车位",
     stated: (p) => p.requires.parkingIncluded === true,
-    covered: (a) => /车位|停车|车库|parking|garage/i.test(a),
+    covered: (a) => /车位|停车|车库|parking|garage/i.test(simplify(a)),
   },
   {
     key: "pets",
     label: "宠物",
     stated: (p) => p.requires.petFriendly === true,
-    covered: (a) => /宠物|猫|狗|pet/i.test(a),
+    covered: (a) => /宠物|猫|狗|pet/i.test(simplify(a)),
   },
   {
     key: "utilities",
     label: "水电",
     stated: (p) => p.requires.utilitiesIncluded === true,
-    covered: (a) => /水电|utilit|包水|全包|水费|电费/i.test(a),
+    covered: (a) => /水电|utilit|包水|全包|水费|电费/i.test(simplify(a)),
   },
   {
     key: "couples",
     label: "情侣",
     stated: (p) => p.requires.couplesOk === true,
-    covered: (a) => /情侣|夫妻|couple|两人/i.test(a),
+    covered: (a) => /情侣|夫妻|couple|两人/i.test(simplify(a)),
   },
 ];
 
 const BULLET_RE = /^[ \t]*(?:[-•]|\*(?!\*))/;
+
+/**
+ * 繁→简，只覆盖判据里用到的那几个字。
+ *
+ * 帖主常用繁体，回答就跟着繁体。实测：回答写的是"都有停車位"，而判据里写的是
+ * "停车"，于是被判成"漏了车位"——又一个假失败。不引完整的繁简转换库：门禁只需要
+ * 认得出话题，这几个字够了。
+ */
+const TRAD_TO_SIMP: Record<string, string> = {
+  車: "车",
+  間: "间",
+  費: "费",
+  電: "电",
+  寵: "宠",
+  樓: "楼",
+  規: "规",
+  約: "约",
+  標: "标",
+  寫: "写",
+  單: "单",
+  門: "门",
+  區: "区",
+  長: "长",
+  點: "点",
+  經: "经",
+  離: "离",
+  邊: "边",
+  飯: "饭",
+  養: "养",
+  獨: "独",
+  衛: "卫",
+  機: "机",
+  設: "设",
+  備: "备",
+  廚: "厨",
+  預: "预",
+  價: "价",
+  錢: "钱",
+  時: "时",
+  訂: "订",
+  種: "种",
+  鐘: "钟",
+};
+
+/** 把回答归一化成简体再匹配，免得繁体回答整片误报 */
+function simplify(text: string): string {
+  return text.replace(/[一-鿿]/g, (c) => TRAD_TO_SIMP[c] ?? c);
+}
 
 /**
  * 把回答切成一条条房源块：标题行 + 它下面所有短横线信息点。
@@ -220,10 +268,16 @@ function listingBlocks(answer: string): string[] {
       line.trim().length > 0 &&
       !BULLET_RE.test(line) &&
       BULLET_RE.test(lines[i + 1] ?? "") &&
-      // 光看"非要点行 + 下一行是要点"会把引导语也算成房源标题。实测：帖主其实是
-      // 房东、引擎在反问缺什么信息，回答是"收到！看到您这边有房源：" + 几条要点，
-      // 于是被判成一条"没写租金的房源"。房源标题必定带加粗或原帖链接，用它区分。
-      (/\*\*/.test(line) || line.includes("原帖"));
+      // 房源标题**必须带「原帖」链接**——这是唯一高精度的信号。
+      //
+      // 只看"非要点行 + 下一行是要点"会把各种引导语算成房源，加粗也不够（模型
+      // 到处加粗）。实测误判过三种，全都是引擎**做对了事**却被记成失败：
+      //  1. "收到！看到您这边有房源：" + 要点（帖主是房东，引擎在反问缺什么）
+      //  2. 反问清单 `1. **"中区"** 具体指哪个城市？` + 缩进选项
+      //  3. `**如果您在湾区找房**，麻烦告诉我：` + 要点（引擎正确判断需求在
+      //     新西兰/伦敦，如实说不在覆盖范围）
+      // 这三种都不该按"每条房源要写租金"考核——它们压根不是房源。
+      line.includes("原帖");
     if (!isTitle) {
       continue;
     }
@@ -260,7 +314,7 @@ function perListingMisses(
   const blocks = listingBlocks(answer);
   return PER_LISTING.map((d) => ({
     label: d.label,
-    n: blocks.filter((b) => !d.re.test(b)).length,
+    n: blocks.filter((b) => !d.re.test(simplify(b))).length,
     of: blocks.length,
   })).filter((x) => x.n > 0);
 }
@@ -435,7 +489,15 @@ async function main() {
   if (bad.length > 0) {
     console.log("\n失败样例：");
     for (const r of bad.slice(0, SHOW)) {
-      console.log(`\n  ── 漏了：${r.missing.map((d) => d.label).join("、")}`);
+      const whole = r.missing.map((d) => d.label);
+      const per = r.perListing.map((x) => `${x.label}(${x.n}/${x.of}条没写)`);
+      console.log(`\n  ── 漏了：${[...whole, ...per].join("、")}`);
+      // 把 plan 一起打出来。城市这类判定失败时，光看回答猜不出是"引擎答错了"
+      // 还是"plan 里的城市跟我以为的不一样"——上一轮就在这上面空转过。
+      const p = r.plan;
+      console.log(
+        `  plan：城市=[${p.cities.join(",")}] 预算=${p.rentMin ?? ""}-${p.rentMax ?? ""} 户型=[${p.bedroomsAnyOf.join(",")}] 入住=${JSON.stringify(p.moveIn)}`
+      );
       console.log(`  租客：${r.query.slice(0, 130)}`);
       console.log(`  回答：${r.answer.replace(/\n+/g, " ⏎ ").slice(0, 300)}`);
     }

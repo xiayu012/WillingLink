@@ -912,7 +912,39 @@ export function cityAliases(entry: CityEntry): string[] {
 export const NON_BAY_CITY_RE =
   /西雅图|西雅圖|seattle|芝加哥|chicago|纽约|new\s*york|nyc|洛杉矶|los\s*angeles|圣地亚哥|san\s*diego|波士顿|boston|奥斯汀|austin|尔湾|irvine|拉斯维加斯|vegas|达拉斯|dallas|休斯顿|houston|费城|philadelphia|亚特兰大|atlanta|凤凰城|phoenix|丹佛|denver|波特兰|portland|盐湖城|salt\s*lake|\bucla\b|westwood|sawtelle|圣盖博|san\s*gabriel|temple\s*city|上东区?|上西区?|\blic\b|长岛市|佐治亚理工|georgia\s*tech|\busc\b|圣塔莫尼卡|santa\s*monica|匹兹堡大学|匹兹堡生活|\bpittsburgh\b|\bcmu\b|卡内基梅隆|松鼠山|温哥华|vancouver|列治文|多伦多|toronto|科罗拉多|colorado|安娜堡|ann\s*arbor|\bnyu\b|哥伦比亚大学|普林斯顿|princeton|康奈尔|cornell|奥克兰大学|university\s*of\s*auckland/i;
 
+/**
+ * 「奥克兰」到底是 Oakland (CA) 还是 Auckland (NZ)？
+ *
+ * 中文里两个城市同名，而**华人租房帖里 Auckland 远比 Oakland 常见**——新西兰
+ * 奥克兰是个巨大的华人租房市场。结果是库里躺着 34 条新西兰房源，`city` 全都写着
+ * `Oakland`（Blockhouse Bay、Remuera、Takapuna 都是奥克兰郊区），租客搜"奥克兰"
+ * 会收到南半球的房子（2026-08-26 的覆盖率门禁跑出来的）。
+ *
+ * `NON_BAY_CITY_RE` 拦不住：它里面虽然有"奥克兰大学"，但 `isOutOfBayQuery` 的
+ * 前提是"没匹配到任何湾区城市"，而"奥克兰"严格匹配上了 Oakland，整条判定失效。
+ * 歧义在别名本身，只能靠**新西兰独有的地名/货币**来断。
+ *
+ * 名单刻意保守：只收在湾区语境下不可能出现的词。特意**不含** Albany（Albany CA
+ * 就在东湾）、"北岸"、"中区"这些两边都说得通的。
+ */
+const NZ_SIGNAL_RE =
+  /新西兰|紐西蘭|纽西兰|new\s*zealand|\bnz\b|nz\$|纽币|紐幣|奥克兰大学|奥大\b|\baut\b|university\s*of\s*auckland|takapuna|remuera|blockhouse\s*bay|mt\.?\s*roskill|papatoetoe|manukau|howick|ponsonby|onehunga|glenfield|newmarket|botany\s*downs|henderson\s*nz|nx\s*线|北岸.{0,8}nx/i;
+
+/**
+ * 这段文字说的是新西兰奥克兰，不是加州奥克兰。
+ *
+ * 入库和检索**共用这一个判据**，免得两边漂移——入库放进来的东西检索必须能认出。
+ */
+export function isNewZealandText(text: string): boolean {
+  return NZ_SIGNAL_RE.test(text);
+}
+
 /** True when the query targets a non-Bay metro and names no Bay Area city. */
 export function isOutOfBayQuery(query: string): boolean {
+  // 新西兰要先判：它会伪装成一个合法的湾区城市名（奥克兰），
+  // 走到下面那句 `!detectCityStrict` 就已经被 Oakland 挡住了
+  if (isNewZealandText(query)) {
+    return true;
+  }
   return !detectCityStrict(query) && NON_BAY_CITY_RE.test(query);
 }

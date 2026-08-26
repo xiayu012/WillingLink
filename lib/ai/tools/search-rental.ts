@@ -74,6 +74,7 @@ import {
   cityByName,
   detectCity,
   detectCityStrict,
+  isNewZealandText,
 } from "@/lib/rental/cities";
 import { haversineKm, listingPoint } from "@/lib/rental/geo";
 import { listingLeaseFromText } from "@/lib/rental/lease-duration";
@@ -799,6 +800,14 @@ const NON_BAY_LISTING_RE =
   /西雅图|seattle|纽约|new\s*york|洛杉矶|los\s*angeles|圣地亚哥|san\s*diego|\bucsd\b|\bucla\b|\bucsb\b|\bsdsu\b|尔湾|irvine|波士顿|boston|芝加哥|chicago|匹兹堡|\bpittsburgh\b|\bcmu\b|温哥华|vancouver|多伦多|toronto/i;
 
 function listingOutOfBay(row: XhsRentalSearchResultRow): boolean {
+  // 新西兰奥克兰要**先于 city 列判**，而且必须看正文：这些行的 city 列写着
+  // 一个完全合法的湾区城市名 "Oakland"（中文"奥克兰"同时是 Oakland CA 和
+  // Auckland NZ），所以下面那条"相信 city 列"的捷径会直接放行。入库那侧已经
+  // 拦住新来的，但库里还躺着 34 条老数据。
+  const fullText = `${row.title ?? ""} ${row.locationText ?? ""} ${row.propertyName ?? ""} ${row.rawText}`;
+  if (isNewZealandText(fullText)) {
+    return true;
+  }
   const col = row.city?.trim();
   if (col && col.toLowerCase() !== "null") {
     // Trust the LLM-normalized column: a non-Bay city there (San Diego etc.)
@@ -806,8 +815,7 @@ function listingOutOfBay(row: XhsRentalSearchResultRow): boolean {
     // says. Bay/unknown cities pass.
     return NON_BAY_LISTING_RE.test(col);
   }
-  const text = `${row.title ?? ""} ${row.locationText ?? ""} ${row.propertyName ?? ""} ${row.rawText}`;
-  return !detectCityStrict(text) && NON_BAY_LISTING_RE.test(text);
+  return !detectCityStrict(fullText) && NON_BAY_LISTING_RE.test(fullText);
 }
 
 // A handful of scraped rows aren't rental listings at all (event/ad posts,
@@ -878,6 +886,21 @@ const FIELD_LABEL: Record<StrictField, string> = {
  * `plan.prefers` and `plan.anchors` deliberately have no effect here; they act
  * in rerankQueryFor and rankByPlanSignals instead.
  */
+/**
+ * 每条房源必须交代的两件事，**写进工具返回值而不是 system prompt**。
+ *
+ * 提示词里已经写过一遍"每一套都必须写清楚多少钱、什么时候能住"，实测仍有
+ * 21% 的房源条目一个价格都没有（覆盖率门禁，2026-08-26，196 条里 42 条）。
+ * 模型对**工具结果**的服从度明显高于 system——这个结论在评论区那条链路上已经
+ * 验证过一次（见 lib/ai/tools/presentation.ts）。同一句话搬到这里就压住了。
+ *
+ * 缺这两条中任何一条，对方都只能再问一轮；在私信里，再问一轮经常就没有下文。
+ */
+const PER_LISTING_FACTS =
+  "**每一条都必须写出租金和可入住时间**：租金没有数据就写「租金面议」；" +
+  "入住时间照原帖说法转述即可（「随时入住」「8月底」「9/1起租」都行），" +
+  "原帖没写就明写「入住时间未标」——**不许跳过不提**。";
+
 export function buildStrictPredicate(
   plan: QueryPlan,
   omit: StrictField | null = null
@@ -1122,7 +1145,7 @@ async function serveNextBatch(chatId: string, fingerprint: string) {
     remainingInBatchCache: remaining,
     action:
       `SHOW_LISTINGS: 这是同一次搜索的下一批，共 ${batch.length} 个（与之前展示过的不重复）。` +
-      "把 listings 数组里的每一个房源都完整展示出来（标准格式），不要遗漏、不要编造。" +
+      `把 listings 数组里的每一个房源都完整展示出来（标准格式），不要遗漏、不要编造。${PER_LISTING_FACTS}` +
       (remaining > 0
         ? `展示完后告诉用户还可以继续说"继续"（还有 ${remaining} 个）。`
         : "这是最后一批，展示完告知用户已经没有更多了。"),
@@ -1434,7 +1457,7 @@ function createStrictSearchRentalTool(chatId: string) {
             (result.totalMatched > batch.length
               ? `（共 ${result.totalMatched} 个通过硬性筛选，已按相关度与复核排序）`
               : "") +
-            "。把 listings 数组里的每一个房源都完整展示出来（标准格式），不要遗漏、不要编造。" +
+            `。把 listings 数组里的每一个房源都完整展示出来（标准格式），不要遗漏、不要编造。${PER_LISTING_FACTS}` +
             (kept.length > batch.length
               ? `展示完后告诉用户还可以说"继续"看下一批（还有 ${kept.length - batch.length} 个已备好）。`
               : ""),
