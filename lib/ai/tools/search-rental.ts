@@ -496,7 +496,21 @@ const STRICT_MAX_RESULTS = 8; // 每批展示上限
 // 一次检索就把 top-K 排好序并整批终审，存进会话缓存，"继续/换一批" 直接切下一批：
 // 瞬间返回，且与已展示的天然不重复（同一份有序列表往后走）。
 const STRICT_BATCH_POOL = STRICT_MAX_RESULTS * 3;
-const STRICT_POOL_LIMIT = 1000; // whole table today (~750 rows)
+/**
+ * 候选池上限。**必须始终大于全表行数**，否则就是在静默丢房源。
+ *
+ * 取数的 SQL 是 `ORDER BY "createdAt" DESC LIMIT <这个数>`，所以一旦表长过这个
+ * 数，**最老的那些房源直接从严格搜索里消失**——不报错、不降级，只是再也搜不到，
+ * 要等有人抱怨"我明明记得有那套房"才会发现。
+ *
+ * 上一版写 1000，注释是 "whole table today (~750 rows)"；2026-08-26 查账时表已经
+ * 1158 行，最老的 158 条**当时已经搜不到了**。这次放到 5000 重新留出余量。
+ *
+ * 表继续长的话这里还要再调。真正的解法是别再整表进内存（分页或 SQL 预筛），
+ * 但那会动到硬筛选，要连 `pnpm search-recall-eval` 一起做；在那之前，
+ * 这个数**只能调大，不能调小**。
+ */
+const STRICT_POOL_LIMIT = 5000;
 const STRICT_RERANK_CAP = 100; // rerank cost cap when many rows survive
 
 /**
