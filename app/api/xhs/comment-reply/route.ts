@@ -46,6 +46,19 @@ const MAX_RAW_TEXT_CHARS = 2000;
 /** 死代码拼在最前面的一行，不经过模型，永远一字不差。 */
 const OPENING_LINE = "看看以下这些觉得怎么样，感兴趣的话私信我：";
 
+/**
+ * 没有完全符合的时候发这一句，**整条评论就只有这一句**。
+ *
+ * 和 `OPENING_LINE` 一样是死代码：不经过模型，永远一字不差。
+ *
+ * 为什么不让模型自己说"没有"：同一批帖子连跑四轮，模型每轮的措辞都不一样
+ * ——"目前数据库里没有…"、"我们主要覆盖旧金山湾区"、"抱歉，数据库只包含…"。
+ * 这些话把**内部实现**（我们有个数据库、覆盖范围是湾区）说给了评论区的陌生人听，
+ * 而且每次都不同。对外只该有一种说法，那就把它钉死。
+ */
+const NO_EXACT_MATCH_LINE =
+  "我手里没有完全符合的，如果愿意放宽条件可以私聊我";
+
 /** 压缩指令。**这是变换指令，不是对话**——走 `transformText`，没有工具没有历史。 */
 const CONDENSE_MESSAGE =
   "请缩写至260字符左右，不要带联系方式。每套房源单独一行，行首标上【第1套】【第2套】这样的编号。";
@@ -364,6 +377,45 @@ function hasListingResults(toolOutputs: unknown[]): boolean {
   });
 }
 
+/**
+ * 检索状态码。**判据只能是它，不能是 `relaxedNote`。**
+ *
+ * `relaxedNote` 那句人话在评论渠道会被 `shapeToolResult` 抹成 null（见
+ * presentation.ts：那是给用户看的原话，模型见了会原样贴进评论）。所以到这里时
+ * 它**永远是空的**，拿它判"有没有放宽过"会一路判成 false。
+ *
+ * 状态码则是**故意留下来**的——presentation.ts 开头写明"状态码留着，它携带的是
+ * 真实检索状态"，改写的只是后面那串聊天页话术。它是这一层唯一可靠的事实来源。
+ */
+function statusCodes(toolOutputs: unknown[]): Set<string> {
+  const codes = new Set<string>();
+  for (const output of toolOutputs) {
+    if (!output || typeof output !== "object") {
+      continue;
+    }
+    const action = (output as { action?: unknown }).action;
+    if (typeof action !== "string") {
+      continue;
+    }
+    for (const m of action.match(/\b[A-Z][A-Z_]{3,}(?=:)/g) ?? []) {
+      codes.add(m);
+    }
+  }
+  return codes;
+}
+
+/**
+ * 这一轮拿到的**只是放宽后的结果**，不是真正符合要求的。
+ *
+ * searchWanted 的 Phase 2/3/4 报 `SHOW_RELAXED_WANTED`，searchRental 的旧级联报
+ * `SHOW_RELAXED_LISTING`（CLAUDE.md 明说要保留的回退路径，`SEARCH_LEGACY_PICK_ONE=1`
+ * 会走到）。searchRental 严格模式**从不放宽**——契约是宁可空手也不给近似的，
+ * 所以它没有这类状态码，空结果由 `hasListingResults` 判。
+ */
+function wasRelaxed(codes: Set<string>): boolean {
+  return codes.has("SHOW_RELAXED_WANTED") || codes.has("SHOW_RELAXED_LISTING");
+}
+
 function optString(v: unknown): string | null {
   if (typeof v !== "string") {
     return null;
@@ -604,6 +656,28 @@ export async function POST(request: Request) {
     const hasListings = hasListingResults(draftTurn.toolOutputs);
     // 工具只可能在起草那一步用到——压缩没有工具
     const toolsUsed = draftTurn.toolsUsed;
+    const searched = toolsUsed.some(
+      (t) => t === "searchRental" || t === "searchWanted"
+    );
+    const codes = statusCodes(draftTurn.toolOutputs);
+    /**
+     * **搜过了，但没有一条是真正符合的。**
+     *
+     * 两种情况合并成同一个结论：一条都没搜到（`!hasListings`），或者搜到的只是
+     * 放宽条件后的近似结果（`wasRelaxed`）。后者以前是**当成正常结果发出去的**
+     * ——`COMMENT_GUIDE.SHOW_RELAXED_WANTED` 明确让模型"不要提放宽这件事，照常按
+     * 编号列表写出来"，于是租客看到三条像模像样的房源，不知道其中没有一条满足
+     * 他提的条件。
+     *
+     * **出了服务范围的不算**：`OUT_OF_BAY` 时再怎么放宽也变不出奥克兰的房子，
+     * 那句"愿意放宽条件可以私聊我"是张空头支票，维持原有行为（如实说明只收录湾区）。
+     *
+     * **没调过搜索工具的也不算**：没有任何证据说明"没有符合的"，不能替它下结论。
+     */
+    const noExactMatch =
+      searched &&
+      !codes.has("OUT_OF_BAY") &&
+      (!hasListings || wasRelaxed(codes));
 
     if (style === "raw") {
       await persistTurn(draftTurn.text);
@@ -618,6 +692,40 @@ export async function POST(request: Request) {
         toolsUsed,
         hasListings,
         chars: codePoints(draftTurn.text),
+        elapsedMs: Date.now() - startedAt,
+      });
+    }
+
+    // ---- 没有完全符合的：发那一句固定的话，**把草稿整份丢掉** ----
+    // 丢掉不是浪费——那一轮的价值在 toolOutputs（我们正是靠它判出"没有符合的"），
+    // 它写的正文在这种情况下要么是编号列表（近似房源，不该发），要么是每轮都不
+    // 一样的"数据库里没有…"（不该让评论区看见内部实现）。
+    if (noExactMatch) {
+      await persistTurn(NO_EXACT_MATCH_LINE);
+      console.log(
+        "[comment-reply] 无完全匹配",
+        JSON.stringify({
+          chatId,
+          postKind: postKind.kind,
+          toolsUsed: [...new Set(toolsUsed)],
+          statusCodes: [...codes],
+          relaxed: wasRelaxed(codes),
+          hadApproximateResults: hasListings,
+          elapsedMs: Date.now() - startedAt,
+        })
+      );
+      return jsonWithCors({
+        ok: true,
+        text: NO_EXACT_MATCH_LINE,
+        chatId,
+        identified,
+        model: modelId,
+        style,
+        postKind: postKind.kind,
+        toolsUsed: [...new Set(toolsUsed)],
+        noExactMatch: true,
+        hasListings: false,
+        chars: codePoints(NO_EXACT_MATCH_LINE),
         elapsedMs: Date.now() - startedAt,
       });
     }
