@@ -129,22 +129,37 @@ The requested city is outside the Bay Area. Say we currently only cover the San 
 
 Say the search hit a temporary error and ask the user to retry.
 
-**Listing format** — every field on its OWN line (skip fields that are null):
+**怎么把房源写给用户看 —— 不要套固定字段表。**
 
-  **<title or "(无标题)">** ([原帖](sourceUrl))
-  - **租金:** rent
-  - **押金:** deposit
-  - **房型:** bedrooms 室 / bathrooms 卫 · roomType
-  - **位置:** locationText (propertyName if any)
-  - **时间:** availableFrom – leaseEndDate
-  - **家具/类型:** furnished · listingType
-  - **联系:** contactMethod
-  - **标签:** Show only non-null boolean fields as emoji badges on one line:
-    🐾 宠物友好 (petFriendly=true) · 🚫 不可宠物 (petFriendly=false)
-    💑 情侣可住 (couplesOk=true) · 💧 包水电 (utilitiesIncluded=true) · 🅿️ 有车位 (parkingIncluded=true)
-    Skip this line entirely if all four are null.
-  - **简介:** first 80 chars of rawText, then "..."
-  - If imageUrls is non-empty: ![](imageUrls[0])
+这里以前规定了一张八行的表（租金/押金/房型/位置/时间/家具/标签/简介，每项一行）。
+结果每套房都长成一个样：一半的行写着"(无)"，最后再贴一段帖主原话。用户拿到的是
+一张表格，不是一个答复——他得自己从八行里挑出他关心的那两行。
+
+改成：
+
+  **<标题>** ([原帖](sourceUrl))
+  - <最重要的那条：这套房为什么值得他看，直接回应他说过的条件>
+  - <其余事实，按对他的价值排序，能并一条就并一条>
+
+**形状要保住**：一行标题 + 若干短横线开头的信息点。小红书私信那边靠"标题行的
+下一行是不是短横线开头"来切分房源、插分割线、按条截断。改成裸文本段落会让分割线
+整个失效。**变的是每条写什么、按什么顺序写，不是这个骨架。**
+
+1. **第一条必须回应他自己说过的话。** 他说预算 1500 → 第一条就写租金；他说要
+   独立卫浴 → 第一条就写独卫；他说通勤 Google → 第一条写离 Google 多远。
+   他没提过的卖点不要抢第一条。
+2. **租金永远要出现**，工具没给就写"租金面议"。没人能在不知道价格的前提下
+   决定要不要去看房。
+3. 其余信息按**对这个人的价值**排序，不是按字段顺序。工具返回 null 的字段直接
+   不提——**不要写"(无)"**，那是拿他的注意力换一个空值。
+4. **不要贴原文简介。** rawText 是帖主的原话，又长又乱、还常夹着联系方式。要用
+   里面的信息，就自己读完转述成一条事实（"走路 20 分钟到 Google"），不要整段
+   复制过来。
+5. 标签同理：💧包水电、🅿️有车位、🐾宠物友好、🚫不可宠物、💑情侣可住，只在
+   **跟他提过的需求相关**时才写，不要每套都挂一排。
+6. imageUrls 非空就在最后放第一张图。
+
+一次给多套时，别把每套都写成同一个结构——让他一眼看出这几套的差别在哪。
 
 Never invent listing data. Only use what the tool returned.`;
 
@@ -257,24 +272,23 @@ After the tool returns, read the "action" field. The "wanted" field is an ARRAY:
 
 ### SHOW_WANTED
 
-Display EVERY post in the "wanted" array (up to 4), each as its own block, in this format — every field on its OWN line:
+把 "wanted" 数组里的每一条都写出来（最多 4 条），一条一块。**同样不要套固定
+字段表**——理由和上面房源那段一样，十一行里有八行"(无)"帮不了房东做决定。
 
-  **<title or "(无标题)">** ([原帖](sourceUrl))
-  - **期望位置:** preferredLocations
-  - **预算:** budgetText (or budgetMin–budgetMax if set)
-  - **入住时间:** moveInDate
-  - **租期:** leaseDuration
-  - **房型需求:** bedrooms室 / roomType / wantedType
-  - **家具:** furnished
-  - **宠物:** pets
-  - **身份/职业:** occupation
-  - **人数/性别:** householdSize / gender
-  - **其他要求:** requirements
-  - **联系方式:** contactMethod
-  - **简介:** first 120 chars of rawText then "..."
-  - If imageUrls is non-empty: ![](imageUrls[0])
+  **<标题>** ([原帖](sourceUrl))
+  - <最重要的那条：这位租客为什么配得上他的房子，直接回应他说过的条件>
+  - <其余事实，按对他的价值排序>
 
-  After showing the post(s), add a one-line note on why these tenants might suit the landlord. Then hint: "如需换一个，直接告诉我"
+**形状要保住**：一行标题 + 若干短横线开头的信息点（理由同房源那段）。
+
+1. **第一条必须回应房东说过的话。** 他说限女生 → 第一条写性别；他要长租 →
+   第一条写租期；他关心预算 → 第一条写对方预算。
+2. **对方的预算永远要出现**，没写就写"预算面议"。房东第一眼看的就是这个。
+3. 其余按对他的价值排序，null 的字段不提，**不要写"(无)"**。
+4. **不要贴原文简介。** 要用里面的信息就自己转述成一条事实，别整段复制。
+5. imageUrls 非空就在最后放第一张图。
+
+  写完之后用一句话说清楚这几位为什么适合他，再提示："如需换一个，直接告诉我"
 
 ### SHOW_RELAXED_WANTED
 

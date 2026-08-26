@@ -280,6 +280,38 @@ sepChecks.push({
       .split("\n")
       .filter((l) => l === SEP).length === 2,
 });
+// 钉 2026-08-26 那个藏了很久的 bug：FIELD_LINE 旧版把 `**加粗标题**` 开头的星号
+// 当成列表符号，于是加粗标题永远认不出来，整段被当成一个块，capToLimit 一裁就把
+// 所有房源都丢光、私信里只剩结尾那句总结。标题不加粗时完全看不出来。
+const boldTitleSample = [
+  "为您找到：",
+  "",
+  "**山景城單人房 CA94043** ([原帖](http://x.com/1))",
+  "- **$350/月**，9/01可入住",
+  "",
+  "**近Google南卧** ([原帖](http://x.com/2))",
+  "- 租金面议，包车位",
+  "",
+  "这几套都在预算内。",
+].join("\n");
+
+sepChecks.push({
+  name: "加粗标题也认得出来(不被当成列表符号)",
+  pass:
+    insertListingSeparators(boldTitleSample)
+      .split("\n")
+      .filter((l) => l === SEP).length === 3,
+});
+sepChecks.push({
+  name: "加粗标题的线包住房源、不包总结句",
+  pass: (() => {
+    const out = insertListingSeparators(boldTitleSample).split("\n");
+    return (
+      out[out.indexOf(SEP) + 1].startsWith("**山景城") &&
+      out.at(-1) === "这几套都在预算内。"
+    );
+  })(),
+});
 sepChecks.push({
   name: "重复跑不叠加(幂等)",
   pass: insertListingSeparators(sepOut) === sepOut,
