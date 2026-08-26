@@ -398,11 +398,15 @@ type Result = {
   info: string;
 };
 
-async function runCase(
+/** 打一次真实路由，把原始返回体交出来（幂等用例要直接比对两次的 body） */
+async function callRoute(
   c: Case,
   index: number,
-  POST: (r: Request) => Promise<Response>
-): Promise<Result> {
+  POST: (r: Request) => Promise<Response>,
+  /** 默认强制重跑：否则测到的是上一次跑评测留下的缓存，等于什么都没测。
+   *  只有幂等那条用例会传 false，它要的就是"第二次该命中缓存"。 */
+  force = true
+): Promise<Record<string, unknown>> {
   const req = new Request("http://local/api/xhs/comment-reply", {
     method: "POST",
     headers: {
@@ -420,11 +424,20 @@ async function runCase(
       // 落进同一条会话，`markListingAsSeen` 的排除也就串了。踩过一次。
       authorId: `eval-${index}-${Buffer.from(c.name).toString("hex").slice(-12)}`,
       authorName: `eval:${c.name}`,
+      force,
     }),
   });
 
   const res = await POST(req);
-  const body = (await res.json()) as Record<string, unknown>;
+  return (await res.json()) as Record<string, unknown>;
+}
+
+async function runCase(
+  c: Case,
+  index: number,
+  POST: (r: Request) => Promise<Response>
+): Promise<Result> {
+  const body = await callRoute(c, index, POST);
   const problems: string[] = [];
 
   if (!body.ok) {
@@ -520,6 +533,45 @@ async function main() {
       });
       console.log(`💥 ${msg}`);
     }
+  }
+
+  // ── 幂等：同一篇帖子调两次，第二次必须走缓存且给出一模一样的文字 ──────────
+  // 只在跑全量时测（跑子集时前面的用例没跑，比对没意义）
+  if (cases.length === CASES.length) {
+    process.stdout.write("[幂等] 同帖二次调用 ... ");
+    const idem = CASES[0];
+    const first = await callRoute(idem, 0, POST, true); // 先真跑一遍
+    const t0 = Date.now();
+    const second = await callRoute(idem, 0, POST, false); // 这次该走缓存
+    const secondMs = Date.now() - t0;
+
+    const problems: string[] = [];
+    if (second.cached !== true) {
+      problems.push("第二次没有命中缓存");
+    }
+    if (second.text !== first.text) {
+      problems.push("两次文字不一致");
+    }
+    if (second.hasListings !== first.hasListings) {
+      problems.push(
+        `hasListings 不一致：${String(first.hasListings)} → ${String(second.hasListings)}`
+      );
+    }
+    if (second.toolsUsed && (second.toolsUsed as string[]).length > 0) {
+      problems.push("命中缓存却还调了工具");
+    }
+
+    results.push({
+      name: "幂等-同帖二次调用",
+      ok: problems.length === 0,
+      problems,
+      info: `第二次 ${secondMs}ms cached=${String(second.cached)}`,
+    });
+    console.log(
+      problems.length === 0
+        ? `✅ 第二次 ${secondMs}ms 走缓存`
+        : `❌ ${problems.join("；")}`
+    );
   }
 
   const failed = results.filter((r) => !r.ok);

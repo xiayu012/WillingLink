@@ -13,6 +13,7 @@ import {
 import {
   createGuestUser,
   findXhsRecordIdsByRawText,
+  getMessagesByChatId,
   saveChat,
   saveMessages,
 } from "@/lib/db/queries";
@@ -106,6 +107,59 @@ function capComment(text: string, limit: number): string {
 }
 
 const codePoints = (text: string) => [...text].length;
+
+/**
+ * 同一篇帖子多久之内直接复用上次的评论。
+ *
+ * 场景是真实的：用户重新打开同一个帖子、油猴重试、或者手滑点两下复制正文，
+ * 每一次都会跑一整轮带搜索的 agent（十几秒 + 一次模型调用 + 一次 rerank）。
+ *
+ * 24 小时：短到库里新入的房源能反映出来，长到覆盖"同一次刷帖"的全过程。
+ * 想强制重跑就在 body 里传 `force: true`。
+ */
+const COMMENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 找上次给**这篇帖子**写过的评论。
+ *
+ * **不需要新建表**：第 5 步已经把「帖子正文 + 最终评论」存进这条 conversation 了，
+ * 缓存本来就在，只是以前没人去读。存的就是发出去那一句，所以复用它跟重跑一遍
+ * 拿到的是同一种东西——这也是当初坚持"存最终版而不是草稿"的额外好处。
+ *
+ * 按 chatId 找而不是全库找：chatId 是按帖主身份解析出来的，天然把不同人隔开。
+ * 匿名帖主（老版本油猴没传 authorId）每次都是新 chatId，命不中缓存——这是既有
+ * 的降级路径，不额外照顾。
+ */
+async function findCachedComment(
+  chatId: string,
+  storedRawText: string
+): Promise<{ text: string; at: Date } | null> {
+  const messages = await getMessagesByChatId({ id: chatId });
+  const textOf = (m: (typeof messages)[number]) =>
+    (m.parts as { type: string; text?: string }[])
+      .filter((p) => p.type === "text")
+      .map((p) => p.text ?? "")
+      .join("");
+
+  // 从后往前找最近一次：同一篇帖子可能被处理过多轮，要最新的那份
+  for (let i = messages.length - 1; i >= 1; i--) {
+    const assistant = messages[i];
+    const user = messages[i - 1];
+    if (
+      assistant.role !== "assistant" ||
+      user.role !== "user" ||
+      textOf(user) !== storedRawText
+    ) {
+      continue;
+    }
+    if (Date.now() - assistant.createdAt.getTime() > COMMENT_CACHE_TTL_MS) {
+      return null; // 太旧了，库里的房源大概已经变了
+    }
+    const text = textOf(assistant);
+    return text.trim().length > 0 ? { text, at: assistant.createdAt } : null;
+  }
+  return null;
+}
 
 /**
  * 身份定了，就**只放开对的那个搜索工具**。
@@ -231,21 +285,26 @@ function optString(v: unknown): string | null {
  *
  * 它做的就是替用户把话说了（见 AGENT_LOG「完全替代用户说话」）。
  *
- * ## 链路（四步，每一步的作用域都不一样，别合并）
+ * ## 链路（六步，每一步的作用域都不一样，别合并）
  *
  *   1. **闸门** `classifyPostKind` —— 六分类，只有 seeker/lister/roommate 往下走。
  *      看房体验帖里全是租房词但帖主没在求租，冲上去推房源就是答非所问。
- *   2. **排除自帖** —— 油猴复制正文时先入库，这里再拿同一段正文去搜，第一条就是
+ *   2. **命中缓存就直接返回** —— 同一篇帖子 24 小时内处理过就复用上次那句。
+ *      **不需要缓存表**：第 6 步存的就是发出去那一句，缓存本来就在库里。
+ *      放在闸门之后、起草之前：闸门便宜，起草才是十几秒 + 搜索 + rerank 的大头。
+ *      传 `force: true` 可以强制重跑。
+ *   3. **排除自帖** —— 油猴复制正文时先入库，这里再拿同一段正文去搜，第一条就是
  *      帖主自己。按 rawText 找出那几条，标成"已看过"，让既有排除机制挡掉。
- *   3. **起草** `runPostScopedTurn` —— **单帖作用域，不读任何历史**。按闸门判出的
+ *   4. **起草** `runPostScopedTurn` —— **单帖作用域，不读任何历史**。按闸门判出的
  *      身份**只放开对应的那个搜索工具**（房东只有 searchWanted，租客只有
  *      searchRental），从结构上堵掉"给房东推房子"。
- *   4. **压缩** `transformText` —— **纯变换，没有工具没有历史不写库**。
+ *   5. **压缩** `transformText` —— **纯变换，没有工具没有历史不写库**。
  *      压完死代码拼开场白，进剪贴板。
- *   5. **存最终版** —— 存的是评论区实际贴出去那句，不是第 3 步那份带 URL 的草稿。
+ *   6. **存最终版** —— 存的是评论区实际贴出去那句，不是第 4 步那份带 URL 的草稿。
  *      存错了会误导排查（用户就因为库里是草稿，以为线上"还在发 URL"）。
+ *      **存的正文必须和第 2 步比对的逐字一致**，否则缓存永远命不中。
  *
- * ## 为什么第 3、4 步必须分开作用域
+ * ## 为什么起草和压缩必须分开作用域
  *
  * 曾经这四步全是 `runChatTurn`，于是每一步都带全套工具、读整段历史。用户报的
  * 6 个 case 里有 5 个是这一个错误造成的（AGENT_LOG 2026-08-25 有 chatId 和时间戳）：
@@ -278,6 +337,8 @@ export async function POST(request: Request) {
 
   // raw：只跑第一轮，不缩写也不拼开场白，用来看模型原味回答
   const style = payload.style === "raw" ? "raw" : "comment";
+  /** 强制重跑，跳过"同一篇帖子最近处理过"的缓存 */
+  const force = payload.force === true;
   const modelId =
     optString(payload.model) ??
     process.env.XHS_COMMENT_REPLY_MODEL?.trim() ??
@@ -351,6 +412,41 @@ export async function POST(request: Request) {
     // ---- 别把帖主自己的帖推荐给帖主 ----
     // 油猴复制正文时先入库，几秒后这里再拿同一段正文去搜，第一条就是 ta 自己。
     // 复用既有的"已看过"排除机制：把自帖标成已看过，搜索工具自然会跳过。
+    const storedRawText = rawText.slice(0, MAX_RAW_TEXT_CHARS);
+
+    // ---- 同一篇帖子最近处理过就直接复用 ----
+    // 放在闸门之后、起草之前：闸门是一次便宜调用（多数还走正则），起草才是
+    // 十几秒 + 搜索 + rerank 的那一步，值得省的是后者。
+    if (!force && style === "comment") {
+      const cached = await findCachedComment(chatId, storedRawText);
+      if (cached) {
+        console.log(
+          "[comment-reply] 命中缓存",
+          JSON.stringify({
+            chatId,
+            postKind: postKind.kind,
+            ageMs: Date.now() - cached.at.getTime(),
+            chars: codePoints(cached.text),
+          })
+        );
+        return jsonWithCors({
+          ok: true,
+          text: cached.text,
+          chatId,
+          identified,
+          model: modelId,
+          style,
+          postKind: postKind.kind,
+          cached: true,
+          toolsUsed: [],
+          // 只在有房源可推时才拼开场白，所以开场白就是 hasListings 的准确凭证
+          hasListings: cached.text.startsWith(OPENING_LINE),
+          chars: codePoints(cached.text),
+          elapsedMs: Date.now() - startedAt,
+        });
+      }
+    }
+
     const ownRecordIds = await findXhsRecordIdsByRawText(rawText);
     await Promise.all(
       ownRecordIds.map((recordId) => markListingAsSeen(chatId, recordId))
@@ -366,7 +462,7 @@ export async function POST(request: Request) {
       {
         chatId,
         userId,
-        text: rawText.slice(0, MAX_RAW_TEXT_CHARS),
+        text: storedRawText,
         channel: "xhs",
       },
       {
@@ -393,9 +489,9 @@ export async function POST(request: Request) {
             id: generateUUID(),
             chatId,
             role: "user",
-            parts: [
-              { type: "text", text: rawText.slice(0, MAX_RAW_TEXT_CHARS) },
-            ],
+            // 存的这一份必须和 `findCachedComment` 比对的那一份**逐字一致**，
+            // 否则下次永远命不中缓存
+            parts: [{ type: "text", text: storedRawText }],
             attachments: [],
             createdAt: new Date(now),
           },
