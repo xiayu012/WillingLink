@@ -53,3 +53,5 @@ twa/keystore/
 
 # Search eval reports (generated artifacts)
 tests/search-eval/reports/
+scripts/_tmp-*
+scripts/tmp-*
