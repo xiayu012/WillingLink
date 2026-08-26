@@ -19,7 +19,7 @@ import {
   shapeToolResult,
   type ToolPresentation,
 } from "@/lib/ai/tools/presentation";
-import { cityAliases, detectCity } from "@/lib/rental/cities";
+import { cityAliases, detectCity, isNewZealandText } from "@/lib/rental/cities";
 import {
   checkMoveInFeasibility,
   extractQueryDate,
@@ -133,6 +133,35 @@ function filterExcluded(
   return rows.filter((r) => !excludeIds.includes(r.id));
 }
 
+/**
+ * 候选行**自己说自己在新西兰**，不管房东是怎么问的。
+ *
+ * 与 search-rental 的 `listingOutOfBay` 同一条判据（`isNewZealandText`，定义在
+ * lib/rental/cities.ts）——中文"奥克兰"同时是 Oakland (CA) 和 Auckland (NZ)，
+ * 而华人租房帖里后者远比前者常见。
+ *
+ * **为什么必须在这一侧再判一次**：入库那道闸（rental-ingest 的 Step 0）只挡新来的，
+ * 库里还躺着闸门上线前进来的存量；查询侧的 `outOfScope` 判的是"房东问了什么"，
+ * 而这里的失败模式是房东问湾区、库里那条求租帖自己在南半球，查询文本里根本没有
+ * 任何新西兰信号可判。三层里只有这一层能挡住这种情况。
+ *
+ * 判据放在正则而不是交给模型：实测同一批帖子连跑两轮，模型对"这是不是新西兰"
+ * 的判断会在两轮之间翻转（seeker 那侧四条奥克兰帖第二轮才拦住）。能确定性兜住的
+ * 就不指望它每次都想起来。
+ */
+function wantedOutOfBay(row: XhsRentalWantedSearchResultRow): boolean {
+  return isNewZealandText(
+    `${row.title ?? ""} ${row.preferredLocations ?? ""} ${row.rawText}`
+  );
+}
+
+/** 落在服务范围外的候选行一律丢掉——每个 phase 取回结果后的第一道手续。 */
+function inCoverage(
+  rows: XhsRentalWantedSearchResultRow[]
+): XhsRentalWantedSearchResultRow[] {
+  return rows.filter((r) => !wantedOutOfBay(r));
+}
+
 function applyBlockFilter(
   rows: XhsRentalWantedSearchResultRow[],
   blockTerms: string[]
@@ -213,7 +242,9 @@ export async function findNextWanted(
       locationTerms: location?.terms,
       keywords: keywords.length > 0 ? keywords : undefined,
     });
-    const unseen = dateFeasible(filterExcluded(results, excludeIds));
+    const unseen = dateFeasible(
+      inCoverage(filterExcluded(results, excludeIds))
+    );
 
     const strict = applyBlockFilter(unseen, blockTerms);
     if (strict.length > 0) {
@@ -235,7 +266,9 @@ export async function findNextWanted(
     const { results } = await searchXhsRentalWanted({
       locationTerms: location.terms,
     });
-    const unseen = dateFeasible(filterExcluded(results, excludeIds));
+    const unseen = dateFeasible(
+      inCoverage(filterExcluded(results, excludeIds))
+    );
 
     const strict = applyBlockFilter(unseen, blockTerms);
     if (strict.length > 0) {
@@ -255,7 +288,7 @@ export async function findNextWanted(
   // Phase 4 — last resort: one post from the 50 most recent.
   // Prefer move-in-feasible seekers, but never dead-end on the date alone.
   const { results: recent } = await searchXhsRentalWanted({ limit: 50 });
-  const recentUnseen = filterExcluded(recent, excludeIds);
+  const recentUnseen = inCoverage(filterExcluded(recent, excludeIds));
   const recentFeasible = dateFeasible(recentUnseen);
   const unseen = recentFeasible.length > 0 ? recentFeasible : recentUnseen;
   if (unseen.length > 0) {
