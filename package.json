@@ -23,6 +23,7 @@
     "search-recall-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/search-recall-eval.ts",
     "redact-eval": "tsx scripts/redact-eval.ts",
     "comment-reply-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/comment-reply-eval.ts",
+    "comment-concern-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/comment-concern-eval.ts",
     "wanted-recall-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/wanted-recall-eval.ts",
     "answer-coverage-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/answer-coverage-eval.ts"
   },
