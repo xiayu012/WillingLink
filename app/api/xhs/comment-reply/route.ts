@@ -293,6 +293,52 @@ ${FORMAT_COMMON}
 - **只写这些人的信息。** 不要复述对方自己帖子里的内容。`,
 };
 
+/**
+ * 租客**点名要的东西**，确定性地从原帖里抽出来，做成清单交给起草那一轮。
+ *
+ * 为什么不靠 COMMENT_FORMAT 里那条通则："房源没写的就明写未标"已经写在格式里了，
+ * 模型仍然会漏——实测租客列了「空调、in-unit laundry、车位」三项，回复答了后两项，
+ * **空调整个消失**，既没写有也没写"未标"，读的人不知道是漏了还是没有。
+ * 三项里漏一项，通则管不住；把他要的那几样**逐个列出来摆在眼前**才管得住。
+ *
+ * 只抽**他自己写出来的**，不脑补：清单为空就完全不注入。
+ */
+const REQUESTED_FEATURES: { re: RegExp; label: string }[] = [
+  { re: /空调|冷气|中央空调|\bA\/?C\b|air\s*condition/i, label: "空调" },
+  {
+    re: /in[-\s]?unit\s*laundry|室内洗衣|洗烘|洗衣机|烘干机/i,
+    label: "室内洗衣机",
+  },
+  { re: /车位|停车|parking|车库/i, label: "车位" },
+  { re: /独立卫浴|独卫|私人卫生间|独立卫生间/i, label: "独立卫浴" },
+  { re: /包水电|水电全包|utilities\s*included|包水|包网/i, label: "包水电网" },
+  { re: /家具|拎包入住|furnished/i, label: "家具" },
+  { re: /押金|deposit|押一付一/i, label: "押金" },
+  {
+    // "我有一只很乖的猫"——裸的猫/狗字也要认，实测只写"养猫|养狗"会漏掉
+    re: /养猫|养狗|宠物|pet\b|猫咪|[一二两三1-3]\s*只[^。；;，,\n]{0,8}(?:猫|狗)|有[^。；;，,\n]{0,8}(?:猫|狗)(?![粮窝舍])/i,
+    label: "宠物政策",
+  },
+  { re: /电梯|elevator/i, label: "电梯" },
+  { re: /健身房|泳池|gym|pool/i, label: "健身房/泳池" },
+  { re: /独立入口|独门独户|单独入口/i, label: "独立入口" },
+  { re: /可做饭|能做饭|开火|厨房/i, label: "厨房/能否做饭" },
+];
+
+function requestedFeatureChecklist(rawText: string): string {
+  const hit = REQUESTED_FEATURES.filter((f) => f.re.test(rawText)).map(
+    (f) => f.label
+  );
+  if (hit.length === 0) {
+    return "";
+  }
+  return `\n\n## 他点名要的（一项都不许跳过）
+${hit.map((h) => `- ${h}`).join("\n")}
+上面每一项，**每套房源都要交代**：房源写了就照写，房源没写就写"${hit[0]}未标"
+这样的字样。**漏掉一项和答错一样糟**——他专门写出来就是在等这个答案，
+你不提，他分不清是你漏了还是房源没有。`;
+}
+
 const ROLE_HINT: Record<string, string> = {
   seeker: `## 这一轮的帖主身份（已判定，不要再自行推翻）
 帖主是**租客**，本人正在找房。用 **searchRental** 找房源推给 ta。`,
@@ -626,7 +672,13 @@ export async function POST(request: Request) {
         requestHints,
         persist: false,
         // 身份 + 成品格式一起讲清楚：起草这一轮手里有房源数据，成品就该它写完
-        extraSystem: `${ROLE_HINT[postKind.kind]}\n\n${COMMENT_FORMAT[postKind.kind]}`,
+        extraSystem:
+          `${ROLE_HINT[postKind.kind]}\n\n${COMMENT_FORMAT[postKind.kind]}` +
+          // 只有求租者那侧才列设备清单：房东/找室友的人要看的是"人"，
+          // 空调车位不是他们挑租客的依据。
+          (postKind.kind === "seeker"
+            ? requestedFeatureChecklist(storedRawText)
+            : ""),
         onlyTools: ROLE_TOOLS[postKind.kind],
       }
     );
