@@ -804,6 +804,41 @@ function withRecoveredFields(
   };
 }
 
+/**
+ * 房源写明的**硬性性别限定**。库里 9.6% 的房源有（85 条限女、27 条限男），
+ * 男租客等于有 7.3% 的库存本就不该看见。
+ *
+ * **只认硬限定，不认偏好也不认房东自述**——这三种写法长得很像，但只有第一种
+ * 构成矛盾：
+ *   限定（要剔）："限女生"、"仅限女生"、"只招女生"、"找女生室友"、"female only"
+ *   偏好（不剔）："女生优先" —— 优先不是排他，剔了就是误杀
+ *   自述（不剔）："本人女生，招租一间" —— 说的是房东自己，不是对租客的要求
+ *
+ * 这条判据配 `plan.seekerGender` 使用，两边都确知且相反才算违反；
+ * 任何一边不确定都放行（沉默不算违反，与本文件其它谓词同一条规矩）。
+ */
+// 「希望再有一位女生加入」这一支是实测补的：最初漏判的那条房源正是这么写的
+// ——室友构成写得清清楚楚（"2男1女"），要求也写了，但既没用"限"也没用"招"。
+// 两边模式**必须对称**，"欢迎男生女生都行"才会两边同时命中、被下面判为
+// 说不准而放行。
+const LISTING_FEMALE_ONLY_RE =
+  /(?:限|仅限|只限|只招|只租|只收)\s*女(?:生|士|孩)?|女(?:生|士)?\s*(?:限定|only)|female\s*only|girls?\s*only|(?:找|招|募)\s*(?:一?位?)\s*女(?:生|室友|孩)|(?:希望|想找|想要|欢迎|再找|再来)(?:再)?[^。；;\n]{0,8}?(?:一[位个名])?\s*女(?:生|士|孩)/i;
+const LISTING_MALE_ONLY_RE =
+  /(?:限|仅限|只限|只招|只租|只收)\s*男(?:生|士|孩)?|男(?:生|士)?\s*(?:限定|only)|male\s*only|boys?\s*only|(?:找|招|募)\s*(?:一?位?)\s*男(?:生|室友|孩)|(?:希望|想找|想要|欢迎|再找|再来)(?:再)?[^。；;\n]{0,8}?(?:一[位个名])?\s*男(?:生|士|孩)/i;
+
+function listingGenderOnly(
+  row: XhsRentalSearchResultRow
+): "male" | "female" | null {
+  const text = `${row.title ?? ""}\n${row.rawText}`;
+  const female = LISTING_FEMALE_ONLY_RE.test(text);
+  const male = LISTING_MALE_ONLY_RE.test(text);
+  // 两个都命中说明这帖子在讲别的事（"男女不限"之类），判不准就别判
+  if (female === male) {
+    return null;
+  }
+  return female ? "female" : "male";
+}
+
 // The corpus is supposed to be Bay-Area-only but contains strays (San Diego
 // sublets etc.). A row whose text names a non-Bay metro/campus and no Bay city
 // is provably out of coverage — strict mode never returns it.
@@ -854,6 +889,7 @@ export type StrictField =
   | "bedrooms"
   | "lease"
   | "moveIn"
+  | "gender"
   | "petFriendly"
   | "couplesOk"
   | "utilitiesIncluded"
@@ -873,6 +909,7 @@ const FIELD_LABEL: Record<StrictField, string> = {
   bedrooms: "房型",
   lease: "租期",
   moveIn: "入住时间",
+  gender: "性别限定",
   petFriendly: "宠物友好",
   couplesOk: "情侣入住",
   utilitiesIncluded: "包水电",
@@ -946,6 +983,9 @@ export function buildStrictPredicate(
   if (plan.moveIn.kind !== "unknown") {
     active.push("moveIn");
   }
+  if (plan.seekerGender != null) {
+    active.push("gender");
+  }
   for (const key of BOOL_FIELDS) {
     if (plan.requires[key] === true) {
       active.push(key);
@@ -953,6 +993,7 @@ export function buildStrictPredicate(
   }
 
   const kept = (f: StrictField): boolean => omit !== f;
+  const seekerGender = kept("gender") ? plan.seekerGender : null;
   const near = kept("near") ? plan.near : null;
   const radiusKm = plan.radiusKm ?? 0;
   const cities = kept("city") ? plan.cities : [];
@@ -981,6 +1022,13 @@ export function buildStrictPredicate(
     active,
     matches: (raw) => {
       if (isNonRentalRow(raw) || listingOutOfBay(raw)) return false;
+      // 性别限定：两边都确知且相反才剔。房源没写、或求租者没自述，一律放行。
+      if (seekerGender != null) {
+        const only = listingGenderOnly(raw);
+        if (only != null && only !== seekerGender) {
+          return false;
+        }
+      }
       const row = withRecoveredFields(raw);
       // 距离约束生效时**取代**城市约束，因为坐标比市界精确得多。
       // 定不出位置的房源在这里是剔除而不是放行——这不是"沉默"，用户问的就是

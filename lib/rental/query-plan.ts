@@ -79,6 +79,15 @@ export type QueryPlan = {
   leaseMonthsMin: number | null;
   leaseMonthsMax: number | null;
   moveIn: FlexibleDate;
+  /**
+   * 求租者**本人**的性别。用来挡"限女生"的房源对男性租客（反之亦然）——
+   * 库里 9.6% 的房源带硬性性别限定，男租客有 7.3% 的库存本就不该看见。
+   *
+   * **只填本人性别，不填对室友的偏好**："本人男生"→male；
+   * "希望室友是女生"→null（那是偏好，不是他自己的属性）。填错方向会把
+   * 完全合适的房源筛掉。用户没说就是 null，绝大多数帖子都是 null。
+   */
+  seekerGender: "male" | "female" | null;
   /** 硬性布尔要求；只有 true 才构成约束。 */
   requires: Record<BoolRequirementKey, boolean | null>;
   /** 偏好原文（"最好有独卫"）：进 rerank 查询与终审提示，绝不进硬筛选。 */
@@ -146,6 +155,7 @@ export function emptyPlan(): QueryPlan {
     leaseMonthsMin: null,
     leaseMonthsMax: null,
     moveIn: { kind: "unknown" },
+    seekerGender: null,
     requires: {
       petFriendly: null,
       couplesOk: null,
@@ -156,6 +166,31 @@ export function emptyPlan(): QueryPlan {
     excludes: [],
     source: "regex",
   };
+}
+
+/**
+ * 求租者**本人**的性别，从自述里认。
+ *
+ * 只认紧跟在"本人/我是"后面的那一个字，以及"男生/女生一枚"这种自我介绍句式。
+ * **刻意不认**"希望室友是女生"「找女生室友」「女生优先」——那些说的是他想要
+ * 什么样的室友，不是他自己是谁。方向搞反会把完全合适的房源筛掉，
+ * 而这条约束是要拿去做硬筛选的，误判的代价是静默丢房源。
+ *
+ * 认不出就返回 null（绝大多数帖子如此），交给 LLM 那条路，或者干脆不约束。
+ */
+const SEEKER_SELF_GENDER_RE =
+  /(?:本人|我)\s*(?:是)?\s*(男|女)(?:生|士|孩)?(?![^。；;\n]{0,6}(?:室友|优先))|(男|女)(?:生|士)\s*一枚/;
+
+export function detectSeekerGender(query: string): "male" | "female" | null {
+  const m = query.match(SEEKER_SELF_GENDER_RE);
+  const ch = m?.[1] ?? m?.[2];
+  if (ch === "男") {
+    return "male";
+  }
+  if (ch === "女") {
+    return "female";
+  }
+  return null;
 }
 
 // ── 正则基线计划（兜底 + LLM 结果的地基）────────────────────────────────────
@@ -194,6 +229,7 @@ export function planFromRegex(query: string): QueryPlan {
     leaseMonthsMin: nl.leaseMonthsMin,
     leaseMonthsMax: nl.leaseMonthsMax,
     moveIn: nl.moveIn,
+    seekerGender: detectSeekerGender(query),
     requires: { ...nlBool },
     source: "regex",
   };
@@ -326,6 +362,13 @@ const PLANNER_SYSTEM = `你是湾区租房搜索的查询理解层。把租客�
     8-25 起租的房源误杀。
   · 明确的截止（"9月12日必须入住"、"9月中之前"）→ 填那一天。
   今年是 2026 年。
+- seekerGender：**求租者本人**的性别，"male"/"female"，没说就 null。
+  用来挡掉"限女生"的房源对男租客（反之亦然）。
+  **只填他自己是谁，不填他想要什么样的室友**——方向搞反会把合适的房源筛掉：
+  · "本人男，单身" / "我是女生" / "男生一枚" → 填他自己的性别。
+  · "希望室友全是女生" / "找女生室友" / "女生优先" → **null**，
+    那是他对室友的偏好，不是他自己的性别（这类偏好归 prefers）。
+  · 通篇没提自己性别 → null。大多数帖子都是 null，拿不准一律 null。
 - requires：四个布尔硬需求，只有"必须有"才填 true，否则填 null。
   "最好有车位"→null（进 prefers）。"我不养宠物"→null（那是自述，不是需求）。
 - prefers：其余所有软性/无法结构化的期望原文短语（"独立卫浴"、"女生室友"、
@@ -333,7 +376,7 @@ const PLANNER_SYSTEM = `你是湾区租房搜索的查询理解层。把租客�
 - excludes：出现即淘汰的词（"中介"、"二房东"）。用户没明说排斥就留空。
 
 只输出一个 JSON 对象，不要代码围栏、不要任何解释文字：
-{"outOfScope":false,"outOfScopeReason":null,"cities":[],"regions":[],"anchors":[],"nearPlace":null,"nearMode":null,"rentMin":null,"rentMax":null,"bedroomsAnyOf":[],"leaseMonthsMin":null,"leaseMonthsMax":null,"moveIn":null,"requires":{"petFriendly":null,"couplesOk":null,"utilitiesIncluded":null,"parkingIncluded":null},"prefers":[],"excludes":[]}`;
+{"outOfScope":false,"outOfScopeReason":null,"cities":[],"regions":[],"anchors":[],"nearPlace":null,"nearMode":null,"rentMin":null,"rentMax":null,"bedroomsAnyOf":[],"leaseMonthsMin":null,"leaseMonthsMax":null,"moveIn":null,"seekerGender":null,"requires":{"petFriendly":null,"couplesOk":null,"utilitiesIncluded":null,"parkingIncluded":null},"prefers":[],"excludes":[]}`;
 
 const JSON_BLOCK_RE = /\{[\s\S]*\}/;
 const REGION_VALUES: BayRegion[] = [
@@ -473,6 +516,12 @@ function coercePlan(raw: RawPlan, query: string): QueryPlan {
     // LLM 解析成功时它的 null 是有意义的（"用户没有给截止日"），不能回退到
     // 正则基线——正则会把"8/24即可入住"当成硬截止，正是要修的那个误杀。
     moveIn: asMoveIn(raw.moveIn) ?? { kind: "unknown" },
+    // LLM 没给（或给了不认识的值）才退回正则自述识别；两边都拿不准就是 null，
+    // 不构成约束。宁可不筛，也不能把方向搞反去误杀房源。
+    seekerGender:
+      raw.seekerGender === "male" || raw.seekerGender === "female"
+        ? raw.seekerGender
+        : detectSeekerGender(query),
     requires: {
       petFriendly: asBool(requires.petFriendly),
       couplesOk: asBool(requires.couplesOk),
