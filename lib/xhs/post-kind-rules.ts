@@ -51,6 +51,33 @@ const REVIEW_PATTERNS = [
   /租房(经验|攻略|心得|总结)/u,
 ] as const;
 
+/**
+ * **正在找房的人才会写的东西**：一个具体的预算数字，或一个具体的入住日期。
+ *
+ * 体验帖讲的是已经发生的事，不会给这两样——它没有"我要住进去"这个未来时。
+ * 而求租帖几乎一定会给，因为不给别人没法推荐。
+ *
+ * 为什么需要这条：2026-08-28 实测漏判——"求南湾靠谱1B1B推荐！预算$3,700以内，
+ * 时间10月1日左右入住…住得舒服的求推荐，**有坑也求避雷**"被判成 review 跳过了。
+ * 帖主分明在积极找房，只是顺口问一句有没有坑；而他写的是"求推荐"不是"求租"，
+ * `SEEKER_PATTERNS` 那四个字面词一个都没命中，"避雷"却命中了 review。
+ *
+ * 模型那份说明书里本来就有正确的规则（"只要给出任何一个可执行条件…就按 seeker
+ * 处理"），但正则快路径抢在它前面短路了。所以这里不下相反的结论，只是**让路**：
+ * 有这些信号就返回 null，把判断交回模型。符合本文件"只在证据非常硬时下结论"。
+ *
+ * 只认预算和日期这两样**最硬**的：户型（1b1b/主卧）体验帖也会大量出现，
+ * 拿它当信号会把真的体验帖也放走。
+ */
+const ACTIONABLE_BUDGET_RE =
+  /预算|budget|\$\s?[\d,]{3,7}|[\d,]{3,7}\s*(?:刀|美元|块)|[\d,]{3,7}\s*(?:以内|左右|上下)/iu;
+const ACTIONABLE_MOVE_IN_RE =
+  /入住时间|起租时间|\d{1,2}\s*[月/.]\s*\d{1,2}\s*[日号]?\s*(?:左右|前后)?\s*(?:入住|起租|开始|搬)|\d{1,2}\s*月\s*(?:初|中|底|末)?\s*(?:左右)?\s*(?:入住|起租|开始|搬)/u;
+
+function hasActionableRentalCondition(text: string): boolean {
+  return ACTIONABLE_BUDGET_RE.test(text) && ACTIONABLE_MOVE_IN_RE.test(text);
+}
+
 const ROOMMATE_PATTERNS = [
   // 中间要允许插字：真实帖子写的是「找**一位合拍女生**室友」「招**一个**室友」，
   // 死板的 /找室友/ 一条都命中不了（门禁里那条 case 就是这么发现的）。
@@ -117,8 +144,15 @@ export function classifyPostKindByRule(rawText: string): PostKindResult | null {
   const seeker = countHits(text, SEEKER_PATTERNS);
   const lister = countHits(text, LISTER_PATTERNS);
 
-  // 体验帖：有体验词、且没有任何交易意图词，才敢直接判定
-  if (review > 0 && roommate === 0 && seeker === 0 && lister === 0) {
+  // 体验帖：有体验词、且没有任何交易意图词，才敢直接判定。
+  // 再加一道：给了预算又给了入住日期的，是正在找房的人顺口问避雷，让路给模型。
+  if (
+    review > 0 &&
+    roommate === 0 &&
+    seeker === 0 &&
+    lister === 0 &&
+    !hasActionableRentalCondition(text)
+  ) {
     return {
       kind: "review",
       confidence: 0.9,
