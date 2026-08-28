@@ -190,6 +190,23 @@ function fingerprintFromParts(parts: Array<string | null | undefined>): string {
   return createHash("sha256").update(base).digest("hex");
 }
 
+/**
+ * 帖子原文本身的哈希——跟 `createXhsRentalListing`（小红书入库路径，见
+ * lib/db/queries.ts）用的是同一个算法：`sha256(rawText)`，不做任何归一化。
+ * 表里已经有一个唯一索引 `uq_listing_contenthash` 等着这个值，只是这两个论坛
+ * 爬虫（这个和 scrape-bay123.ts）一直没往里填。
+ *
+ * **为什么要加这一层，而不是只靠下面的 `listingFingerprint`**：2026-08-27
+ * 查账发现同一篇论坛帖被转帖/重抓了最多 8 次，正文一字不差，但
+ * `listingFingerprint` 判定不出来——它在字段数≥3时只拿 AI 抽取出来的
+ * 地点/户型这些字段去比对，而 AI 每次读同一段文字，抽出来的措辞会有细微
+ * 出入（"West San Jose" vs "West San Jose Westgate购物中心附近"），指纹
+ * 跟着变，判重失效。原文本身完全没变，直接比对原文最可靠，优先检查这个。
+ */
+function rawTextHash(rawText: string): string {
+  return createHash("sha256").update(rawText).digest("hex");
+}
+
 function toNullableCleanString(value: string | null | undefined): string | null {
   const cleaned = (value ?? "").replace(/\s+/g, " ").trim();
   if (!cleaned) {
@@ -695,7 +712,11 @@ async function main() {
 
     const existingByFingerprint = new Map<string, ExistingFingerprint>();
     const existingBySourceUrl = new Map<string, string>();
+    // 原文哈希优先于指纹检查——见 rawTextHash 的注释。用 rawText 现算而不是读
+    // 表里的 contentHash 列：那一列历史上一直是空的，现算才能兜住存量数据。
+    const existingByRawTextHash = new Map<string, string>();
     for (const row of existingRows) {
+      existingByRawTextHash.set(rawTextHash(row.rawText), row.id);
       const fp = listingFingerprint(
         row.title ?? "",
         row.rawText,
@@ -814,6 +835,7 @@ async function main() {
         continue;
       }
 
+      const contentHash = rawTextHash(rawText);
       const fp = listingFingerprint(
         title || candidate.title,
         rawText,
@@ -822,13 +844,17 @@ async function main() {
       const uploadedImageUrls = await uploadImageUrls(blobToken, candidate.url, imageUrls);
       const uniqueUploaded = Array.from(new Set(uploadedImageUrls));
 
+      // 原文哈希先于指纹判重——同一篇帖子一字不差地被重抓，这里必中，不会
+      // 再滑过去靠 AI 抽取字段判重（见 rawTextHash 的注释）。
       const existingId =
         existingBySourceUrl.get(candidate.url) ??
+        existingByRawTextHash.get(contentHash) ??
         existingByFingerprint.get(fp)?.id ??
         null;
       if (existingId) {
         await mergeImagesAndMaybePostedAt(existingId, uniqueUploaded, postedAt);
         existingByFingerprint.set(fp, { id: existingId, fingerprint: fp });
+        existingByRawTextHash.set(contentHash, existingId);
         existingBySourceUrl.set(candidate.url, existingId);
         deduped += 1;
         continue;
@@ -854,6 +880,7 @@ async function main() {
             "contactMethod",
             "imageUrls",
             "postedAt",
+            "contentHash",
             "createdAt"
           ) values (
             ${candidate.url},
@@ -873,6 +900,7 @@ async function main() {
             ${normalizedStructured.contactMethod},
             ${JSON.stringify(uniqueUploaded)}::jsonb,
             ${postedAt ? postedAt.toISOString() : null},
+            ${contentHash},
             ${new Date().toISOString()}
           )
           returning "id"
@@ -881,6 +909,7 @@ async function main() {
         const insertedId = insertedRows[0]?.id;
         if (insertedId) {
           existingByFingerprint.set(fp, { id: insertedId, fingerprint: fp });
+          existingByRawTextHash.set(contentHash, insertedId);
           existingBySourceUrl.set(candidate.url, insertedId);
 
           // 入库即嵌入：否则向量搜索（WHERE embedding IS NOT NULL）看不到新房源。
@@ -919,18 +948,25 @@ async function main() {
         inserted += 1;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (message.includes("uq_listing_sourceurl") || message.includes("duplicate key")) {
-          console.log(`[scrape] skip(URL已存在): url=${candidate.url}`);
+        if (
+          message.includes("uq_listing_sourceurl") ||
+          message.includes("uq_listing_contenthash") ||
+          message.includes("duplicate key")
+        ) {
+          console.log(`[scrape] skip(唯一约束): url=${candidate.url}`);
+          // sourceUrl 和 contentHash 都可能是撞上的那个唯一索引，两个都查，
+          // 免得 contentHash 撞的情况下按 sourceUrl 查不到人、白白漏合并。
           const rows = (await sql`
             select "id"
             from "XhsRentalListing"
-            where "sourceUrl" = ${candidate.url}
+            where "sourceUrl" = ${candidate.url} or "contentHash" = ${contentHash}
             limit 1
           `) as Array<{ id: string }>;
           const foundId = rows[0]?.id;
           if (foundId) {
             await mergeImagesAndMaybePostedAt(foundId, uniqueUploaded, postedAt);
             existingByFingerprint.set(fp, { id: foundId, fingerprint: fp });
+            existingByRawTextHash.set(contentHash, foundId);
             existingBySourceUrl.set(candidate.url, foundId);
           }
           deduped += 1;
