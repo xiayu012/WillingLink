@@ -48,6 +48,12 @@ const VERIFIER_SYSTEM = `你是租房搜索的终审员。硬性条件（城市/
 工作步骤（必须严格遵守）：
 1. 先把【用户需求】里明说或能可靠推出的条目抽成 requirements 清单，逐字有据；
    用户没提的属性（宠物/人数/性别等）**不存在**，不许出现在清单里。
+   **用户给了备选就必须把备选记全，一条清单项写成"A 或 B 或 C"。**
+   "整租或合租都可以"是**一条**允许两种的要求，不是"要整租"；
+   "studio / 1b / ADU / 合租都可以"是允许四种。
+   记成单值是这一步最常见的错，而且后果很重：把"整租或合租"记成"整租"，
+   接下来每一条合租房源都会被你以"不是整租"为由剔掉，而用户明明说了合租也行。
+   **满足备选里任意一个就算满足这条，不构成矛盾。**
 2. 再逐条候选对照清单。每个剔除必须指明违反了清单中的哪一条——
    清单之外的任何理由都是无效的，禁止使用。
 
@@ -172,7 +178,74 @@ function isRelitigatingMoveIn(reason: string): boolean {
   return MOVE_IN_EARLY_RE.test(reason);
 }
 
+/**
+ * 剔除理由里**自己说了"没矛盾"**——这条剔除是模型自我否定的，不能算数。
+ *
+ * 不是判断失误，是**格式误用**：模型把"逐条评语"当成了 cuts 数组来填，于是
+ * "帖子位于Mountain View，满足城市需求，无矛盾。"、"符合需求，不剔除"、
+ * "信息不完整但不构成矛盾，故不剔除" 这类**明显是保留结论**的句子，一并进了
+ * 待剔除清单。实测在终审和 search-eval 日志里都大量出现。
+ *
+ * 提示词治不了：`cuts` 的语义已经写在输出格式里了，它照样填错。而这一类
+ * 恰恰最好认——**理由自己承认不构成矛盾**，直接驳回即可，零误伤风险。
+ *
+ * 否定词要挡住："不符合需求"/"不满足要求" 是真矛盾，绝不能被当成自我否定。
+ */
+/** 明确的自我否定措辞，出现即作废，没有歧义。 */
+const SELF_NEGATING_CUT_RE =
+  /无矛盾|不矛盾|不构成矛盾|不算矛盾|无冲突|不剔除|不予剔除/;
+/** "符合…要求"这类肯定结论，中间常隔着字（"符合**合租**要求"）。 */
+const COMPLIES_RE = /(.{0,4})(?:符合|满足)[^，。；;]{0,6}(?:需求|要求|条件)/;
+/** 否定词：紧挨在"符合/满足"前面时，整句其实是在讲矛盾（"无法满足…需求"）。 */
+const NEGATION_BEFORE_RE = /[不无未没]/;
+/**
+ * 真违反的标志。理由里同时出现"符合…要求"和这些词时，多半是
+ * "大部分符合，但租金超了"——那是**真剔除**，不能当成自我否定。
+ */
+const VIOLATION_MARKER_RE =
+  /超出|超过|不符|不满足|无法|不是|不在|不含|缺少|只限|只招|限女|限男|晚于|早于|矛盾/;
+
+function isSelfNegating(reason: string): boolean {
+  if (SELF_NEGATING_CUT_RE.test(reason)) {
+    return true;
+  }
+  const m = reason.match(COMPLIES_RE);
+  if (!m) {
+    return false;
+  }
+  // "无法满足…" / "不符合…"：前面带否定词，讲的是矛盾
+  if (NEGATION_BEFORE_RE.test(m[1])) {
+    return false;
+  }
+  // "符合大部分要求，但租金超预算"：确实指出了违反，保留这条剔除
+  return !VIOLATION_MARKER_RE.test(reason);
+}
+
+/**
+ * 用户明说"合租也可以"，却被以"这不是整租"为由剔掉。
+ *
+ * CLAUDE.md 早就为硬筛选立过这条规矩——**备选是集合，按 OR 处理，
+ * "列了多个所以整条不筛"是修掉的老 bug**。但终审那侧不知道这回事：它抽需求时
+ * 把"整租或合租"记成"整租"，之后每一条合租房源都被判成矛盾。实测提示词里
+ * 把这条写进"抽需求"那一步也没用，模型照样记成单值。
+ *
+ * 所以在这里确定性地兜住：**用户明确接受合租**，而剔除理由的落点就是
+ * "不是整租"，这条剔除作废。用户没说接受合租时不生效——那种情况下
+ * "不是整租"是真矛盾。
+ */
+const QUERY_ACCEPTS_SHARED_RE =
+  /合租(?:都)?(?:也)?(?:可以|可|行|OK|ok)|(?:或|、|\/)\s*合租|合租.{0,4}都(?:可以|行)|接受合租/;
+const CUT_BECAUSE_NOT_WHOLE_RE =
+  /不是整租|非整租|不属于整租|无法满足整租|不满足整租|整租整套/;
+
+function isDeniedSharedOption(query: string, reason: string): boolean {
+  return (
+    QUERY_ACCEPTS_SHARED_RE.test(query) && CUT_BECAUSE_NOT_WHOLE_RE.test(reason)
+  );
+}
+
 function applyVerdict(
+  query: string,
   listings: XhsRentalSearchResultRow[],
   cuts: Cuts
 ): VerifierResult {
@@ -180,9 +253,23 @@ function applyVerdict(
     cuts
       .filter((c) => c.index >= 0 && c.index < listings.length)
       .filter((c) => {
+        if (isSelfNegating(c.reason)) {
+          console.log(
+            "[verifyListings] 驳回剔除(理由自称无矛盾):",
+            c.reason.slice(0, 120)
+          );
+          return false;
+        }
         if (isRelitigatingMoveIn(c.reason)) {
           console.log(
             "[verifyListings] 驳回剔除(重判入住日，上游已判过):",
+            c.reason.slice(0, 120)
+          );
+          return false;
+        }
+        if (isDeniedSharedOption(query, c.reason)) {
+          console.log(
+            "[verifyListings] 驳回剔除(用户明说合租也行，却按只要整租剔):",
             c.reason.slice(0, 120)
           );
           return false;
@@ -261,7 +348,7 @@ async function verifyChunk(
       );
       return { kept: listings, cut: [] };
     }
-    return applyVerdict(listings, cuts);
+    return applyVerdict(query, listings, cuts);
   } catch (error) {
     // 不能把 error 对象直接交给 console.error：AI SDK 的错误对象曾让
     // util.inspect 自身抛 TypeError，异常从 catch 里逃逸、击穿 fail-open。

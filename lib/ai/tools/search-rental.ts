@@ -1239,6 +1239,12 @@ function createStrictSearchRentalTool(chatId: string) {
         .describe(
           "Full natural language search request with ALL accumulated context. " +
             "Carry forward location, budget, bedrooms, move-in date, requirements from prior turns. " +
+            // 求租者自述的性别必须原样带上：9.6% 的房源写了硬性性别限定，
+            // 丢了这三个字，男租客就会收到"限女生"的房源（实测踩过：原帖写着
+            // "本人男，单身"，改写出的 query 里一个字没剩，下游无从判断）。
+            "**Keep the seeker's own stated gender verbatim ('本人男'/'我是女生'/'女生一枚')** — " +
+            "listings often say 限女生/只招男生 and it decides whether they can rent at all. " +
+            "Their preference about roommates ('希望室友是女生') is NOT their own gender; keep it too but do not confuse them. " +
             "Example: '圣何塞两室一厅，预算2500以下，宠物友好，情侣入住'"
         ),
       cities: z
@@ -1575,6 +1581,12 @@ function createLegacySearchRentalTool(chatId: string) {
         .describe(
           "Full natural language search request with ALL accumulated context. " +
             "Carry forward location, budget, bedrooms, move-in date, requirements from prior turns. " +
+            // 求租者自述的性别必须原样带上：9.6% 的房源写了硬性性别限定，
+            // 丢了这三个字，男租客就会收到"限女生"的房源（实测踩过：原帖写着
+            // "本人男，单身"，改写出的 query 里一个字没剩，下游无从判断）。
+            "**Keep the seeker's own stated gender verbatim ('本人男'/'我是女生'/'女生一枚')** — " +
+            "listings often say 限女生/只招男生 and it decides whether they can rent at all. " +
+            "Their preference about roommates ('希望室友是女生') is NOT their own gender; keep it too but do not confuse them. " +
             "Example: '圣何塞两室一厅，预算2500以下，宠物友好，情侣入住'"
         ),
       mustNotContain: z

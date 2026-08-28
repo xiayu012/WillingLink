@@ -179,11 +179,23 @@ export function emptyPlan(): QueryPlan {
  * 认不出就返回 null（绝大多数帖子如此），交给 LLM 那条路，或者干脆不约束。
  */
 const SEEKER_SELF_GENDER_RE =
-  /(?:本人|我)\s*(?:是)?\s*(男|女)(?:生|士|孩)?(?![^。；;\n]{0,6}(?:室友|优先))|(男|女)(?:生|士)\s*一枚/;
+  // "本人男" / "我是女生" / "本人女性"
+  /(?:本人|我)\s*(?:是)?\s*(男|女)(?:生|士|性|孩)?(?![^。；;\n]{0,6}(?:室友|优先))/;
+/**
+ * 裸自述："女生找9月短租"、"湾区女生找租"、"UCB步行可达，男生，单间或studio"
+ * ——真实检索请求里这类写法比"本人X"更常见。
+ *
+ * 靠**前面那个字**排除掉"被当宾语"的情况：`找/招/募/求/要/是/有` 后面的
+ * "女生"说的是他想找什么样的人，不是他自己（"找女生室友"、"希望室友全是女生"）。
+ * 后面再要求跟着逗号或"找/求"，把"女生优先"这种纯偏好也排除掉。
+ */
+const SEEKER_BARE_GENDER_RE =
+  /(?<![找招募求要是有和与跟])(男|女)(?:生|士|性)\s*(?:[，,]|一枚|找|求)(?![^。；;\n]{0,6}(?:室友|优先))/;
 
 export function detectSeekerGender(query: string): "male" | "female" | null {
-  const m = query.match(SEEKER_SELF_GENDER_RE);
-  const ch = m?.[1] ?? m?.[2];
+  const m =
+    query.match(SEEKER_SELF_GENDER_RE) ?? query.match(SEEKER_BARE_GENDER_RE);
+  const ch = m?.[1];
   if (ch === "男") {
     return "male";
   }
