@@ -55,6 +55,19 @@ const VERIFIER_SYSTEM = `你是租房搜索的终审员。硬性条件（城市/
 - 宁缺毋滥：候选与清单某条实质矛盾就剔，剔空也没关系。
 - "帖子没提到某个需求"、"信息不全/租金不明/有风险"都不是矛盾，不剔。
 
+**沉默 ≠ 矛盾，这条最容易违反，写理由时自己检查一遍。**
+矛盾是"帖子说了 A，用户要 B，A 和 B 打架"；帖子**压根没提**这件事，是沉默，
+不是矛盾。房东不写车位，可能只是没写，不代表没有——那要由用户自己去问，
+不该由你替他判死刑。
+线上实测的违规写法（这些 reason 全部属于**不该剔**，出现即错）：
+- 「入住时间8/31，早于用户需求9月底，**虽不矛盾**，但**无车位信息**」
+- 「房源为侧卧出租，且**无车位信息**」
+- 「虽然有停车位，但帖子**未明确**车位是否包含或收费，存在**潜在矛盾**」
+**自检规则**：写完 reason 回头看一眼，只要里面出现"虽不矛盾""潜在矛盾"
+"未明确""没写""无…信息""信息不全""可能"这类词，说明你手里根本没有实锤，
+**就不要剔这一条**。剔除的理由必须能指着帖子里的**一句实际存在的话**说
+"它写了这个，跟用户要的那个直接打架"。
+
 只输出一个 JSON 对象，不要任何其他文字或代码围栏，格式：
 {"requirements": ["…"], "cuts": [{"index": 候选序号, "requirement": "被违反的清单条目", "reason": "帖子里的什么证据与之矛盾"}]}
 没有要剔的就输出 {"requirements": […], "cuts": []}
@@ -129,6 +142,36 @@ function parseCuts(raw: string): Cuts | null {
   return null;
 }
 
+/**
+ * 「房源可入住日**早于**租客入住日」——终审员反复拿这个当剔除理由，而它根本
+ * 不是矛盾：房子早就空着，租客晚点搬进去当然可以。
+ *
+ * **为什么用代码挡而不是继续写提示词**：这条规则提示词里已经写了两遍（见
+ * VERIFIER_SYSTEM 里的方向说明），实测仍然每轮违反 4-6 次；把"无车位信息"
+ * 那个说法堵掉之后，它立刻改用这个说法继续剔同一批房源。措辞能无限换，
+ * 按下葫芦浮起瓢，只有代码挡得住。
+ *
+ * **为什么挡得心安理得**：能走到终审的房源，早就通过了硬筛选里的
+ * `checkMoveInFeasibility`（可入住日 ≤ 租客入住日）。也就是说"入住日可行性"
+ * 这件事**上游已经用结构化数据判过了**，终审在这里做的是重判，而且判错。
+ * 终审的职责是读言下之意，不是复核上游已经算准的东西。
+ *
+ * **不能误伤的那一类**：租期"结束得太早"（"短租9/14-22"盖不住8.31-9.30）
+ * 上游查不了，必须留给终审。所以这里只挡"开始得早"，凡是提到结束/到期/
+ * 租期盖不住的一律放行。
+ */
+const MOVE_IN_EARLY_RE =
+  /(?:入住|可入住|起租|available)[^。；;]{0,24}(?:早于|提前于|早|之前)|(?:早于|提前)[^。；;]{0,12}(?:用户|租客)?[^。；;]{0,12}入住/;
+const REAL_WINDOW_CONFLICT_RE =
+  /结束|到期|租期(?:到|至|结束)|住不满|盖不住|无法满足[^。；;]{0,12}(?:整段|租期)|短租[^。；;]{0,12}(?:到|至)/;
+
+function isRelitigatingMoveIn(reason: string): boolean {
+  if (REAL_WINDOW_CONFLICT_RE.test(reason)) {
+    return false; // 说的是"结束得太早"，那是真矛盾，放行
+  }
+  return MOVE_IN_EARLY_RE.test(reason);
+}
+
 function applyVerdict(
   listings: XhsRentalSearchResultRow[],
   cuts: Cuts
@@ -136,6 +179,16 @@ function applyVerdict(
   const reasonByIndex = new Map(
     cuts
       .filter((c) => c.index >= 0 && c.index < listings.length)
+      .filter((c) => {
+        if (isRelitigatingMoveIn(c.reason)) {
+          console.log(
+            "[verifyListings] 驳回剔除(重判入住日，上游已判过):",
+            c.reason.slice(0, 120)
+          );
+          return false;
+        }
+        return true;
+      })
       .map((c) => [c.index, c.reason])
   );
   const kept: XhsRentalSearchResultRow[] = [];
