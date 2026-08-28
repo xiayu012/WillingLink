@@ -175,11 +175,18 @@ async function main() {
   console.log(`评测 ${cases.length} 条（源：${cases[0]?.source ?? "?"}）\n`);
 
   // 全量房源一次取回，供 ground truth 与结果核验。
+  //
+  // **列清单必须覆盖 buildStrictPredicate 读到的每一列。** 少取一列不会报错，
+  // 只会让 ground truth 读到 undefined、以为房源能过，而工具那边拿的是完整行、
+  // 正确地筛掉了 —— 两边对不上就凭空多出 CODE_BUG。2026-08-28 加
+  // `wholeUnitOnly` 时就是这么踩的：漏了 listingType/roomType，评测凭空报了
+  // 两条不存在的 bug。谓词新增输入列时，这里同步加。
   const listings = await db`
     SELECT "id", "title", "rawText", "locationText", "propertyName", "city",
            "rent", "rentNumeric", "bedrooms", "bedroomsNum", "availableFrom",
            "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded",
-           "furnished", "leaseMinMonths", "leaseMaxMonths"
+           "furnished", "leaseMinMonths", "leaseMaxMonths",
+           "listingType", "roomType"
     FROM "XhsRentalListing"
   `;
 
@@ -217,10 +224,25 @@ async function main() {
     // ── 核验：每一个返回的房源都必须满足严格谓词 ──
     const violations: string[] = [];
     for (const item of returned) {
-      const full = listings.find((l) => l.id === item.id);
+      // 快照是评测开始时取的，而抓取脚本可能正在并发写库：工具查的是实时数据，
+      // 返回一条比快照更新的房源完全正常，不该记成违规（2026-08-28 实测被这条
+      // 污染出两个假 CODE_BUG，那条房源是评测跑到一半才入库的）。补查一次，
+      // 真查不到才算违规。
+      let full = listings.find((l) => l.id === item.id);
       if (!full) {
-        violations.push(`返回了库里不存在的房源 ${item.id}`);
-        continue;
+        const [fresh] = await db`
+          SELECT "id", "title", "rawText", "locationText", "propertyName", "city",
+                 "rent", "rentNumeric", "bedrooms", "bedroomsNum", "availableFrom",
+                 "petFriendly", "couplesOk", "utilitiesIncluded", "parkingIncluded",
+                 "furnished", "leaseMinMonths", "leaseMaxMonths",
+                 "listingType", "roomType"
+          FROM "XhsRentalListing" WHERE "id" = ${item.id}
+        `;
+        if (!fresh) {
+          violations.push(`返回了库里不存在的房源 ${item.id}`);
+          continue;
+        }
+        full = fresh;
       }
       if (outOfBay) {
         violations.push(`湾区外需求却返回了房源「${full.title ?? full.id}」`);

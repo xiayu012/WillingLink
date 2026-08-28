@@ -826,6 +826,31 @@ const LISTING_FEMALE_ONLY_RE =
 const LISTING_MALE_ONLY_RE =
   /(?:限|仅限|只限|只招|只租|只收)\s*男(?:生|士|孩)?|男(?:生|士)?\s*(?:限定|only)|male\s*only|boys?\s*only|(?:找|招|募)\s*(?:一?位?)\s*男(?:生|室友|孩)|(?:希望|想找|想要|欢迎|再找|再来)(?:再)?[^。；;\n]{0,8}?(?:一[位个名])?\s*男(?:生|士|孩)/i;
 
+/**
+ * 这条房源出租的是**别人房子里的一间**，不是整套。
+ *
+ * `bedroomsNum` 分不出这件事——它记的是这套房子有几个卧室，"整租两房"和
+ * "在两房里分租一间"都是 2。能区分的是 `listingType`（枚举，但全表只填了
+ * 六成）和 `roomType`（自由文本，"主卧和侧卧"这种）。两个都看，都没说就放行。
+ *
+ * **沉默不算违反**：`listingType` 和 `roomType` 都为空 → 返回 false（放行），
+ * 与本文件其它谓词同一条规矩。整租房源里很多两列都是空的，一刀切会误杀。
+ */
+const ROOM_ONLY_TYPE = new Set(["shared", "private_room", "bedspace"]);
+const ROOM_ONLY_TEXT_RE =
+  /主卧|次卧|侧卧|客卧|单间|雅房|床位|分租|一间|房间出租|room\s*for\s*rent/i;
+
+function listingIsRoomOnly(row: XhsRentalSearchResultRow): boolean {
+  const type = row.listingType?.trim().toLowerCase();
+  if (type && ROOM_ONLY_TYPE.has(type)) {
+    return true;
+  }
+  if (type === "entire") {
+    return false; // 结构化列明说整租，最权威，不必再看文本
+  }
+  return ROOM_ONLY_TEXT_RE.test(row.roomType ?? "");
+}
+
 function listingGenderOnly(
   row: XhsRentalSearchResultRow
 ): "male" | "female" | null {
@@ -890,6 +915,7 @@ export type StrictField =
   | "lease"
   | "moveIn"
   | "gender"
+  | "wholeUnit"
   | "petFriendly"
   | "couplesOk"
   | "utilitiesIncluded"
@@ -910,6 +936,7 @@ const FIELD_LABEL: Record<StrictField, string> = {
   lease: "租期",
   moveIn: "入住时间",
   gender: "性别限定",
+  wholeUnit: "整租",
   petFriendly: "宠物友好",
   couplesOk: "情侣入住",
   utilitiesIncluded: "包水电",
@@ -986,6 +1013,9 @@ export function buildStrictPredicate(
   if (plan.seekerGender != null) {
     active.push("gender");
   }
+  if (plan.wholeUnitOnly) {
+    active.push("wholeUnit");
+  }
   for (const key of BOOL_FIELDS) {
     if (plan.requires[key] === true) {
       active.push(key);
@@ -994,6 +1024,7 @@ export function buildStrictPredicate(
 
   const kept = (f: StrictField): boolean => omit !== f;
   const seekerGender = kept("gender") ? plan.seekerGender : null;
+  const wholeUnitOnly = kept("wholeUnit") ? plan.wholeUnitOnly : false;
   const near = kept("near") ? plan.near : null;
   const radiusKm = plan.radiusKm ?? 0;
   const cities = kept("city") ? plan.cities : [];
@@ -1022,6 +1053,10 @@ export function buildStrictPredicate(
     active,
     matches: (raw) => {
       if (isNonRentalRow(raw) || listingOutOfBay(raw)) return false;
+      // 用户要整套，而这条明说是分租房间 → 住不成，剔。两列都沉默时放行。
+      if (wholeUnitOnly && listingIsRoomOnly(raw)) {
+        return false;
+      }
       // 性别限定：两边都确知且相反才剔。房源没写、或求租者没自述，一律放行。
       if (seekerGender != null) {
         const only = listingGenderOnly(raw);

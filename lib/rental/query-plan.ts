@@ -88,6 +88,18 @@ export type QueryPlan = {
    * 完全合适的房源筛掉。用户没说就是 null，绝大多数帖子都是 null。
    */
   seekerGender: "male" | "female" | null;
+  /**
+   * 用户要的是**整套**，不是别人房子里的一间。
+   *
+   * 为什么光有 `bedroomsAnyOf` 不够：那一列记的是**这套房子有几个卧室**，
+   * 于是"整租一套两房"和"在一套两房里分租其中两间"**都是 2**，筛选分不出来。
+   * 实测（2026-08-28）：用户写"2B2B or 2B1B"求整租，结果收到
+   * 「town house两间卧室出租，一间主卧一间侧卧」——那是合租房间，住不成整套。
+   *
+   * 只有用户**明确要整套**时才 true。含糊、或明说合租也行 → false，
+   * 这条约束不生效（false 时完全不筛，宁可不筛也不误杀）。
+   */
+  wholeUnitOnly: boolean;
   /** 硬性布尔要求；只有 true 才构成约束。 */
   requires: Record<BoolRequirementKey, boolean | null>;
   /** 偏好原文（"最好有独卫"）：进 rerank 查询与终审提示，绝不进硬筛选。 */
@@ -156,6 +168,7 @@ export function emptyPlan(): QueryPlan {
     leaseMonthsMax: null,
     moveIn: { kind: "unknown" },
     seekerGender: null,
+    wholeUnitOnly: false,
     requires: {
       petFriendly: null,
       couplesOk: null,
@@ -191,6 +204,29 @@ const SEEKER_SELF_GENDER_RE =
  */
 const SEEKER_BARE_GENDER_RE =
   /(?<![找招募求要是有和与跟])(男|女)(?:生|士|性)\s*(?:[，,]|一枚|找|求)(?![^。；;\n]{0,6}(?:室友|优先))/;
+
+/**
+ * 用户明确要整套（而不是别人家里的一间）。
+ *
+ * 保守：**只认明说"整租"，或者报了整套户型规格又没提任何合租选项**。
+ * 一旦出现"合租/单间/次卧/主卧/一间/找室友"这类词，说明他接受房间，
+ * 立刻不生效——这条约束是拿去做硬筛选的，误判会静默丢房源。
+ */
+const WHOLE_UNIT_RE = /整租|整套|entire\s*(?:unit|place|apartment)/i;
+const SHARED_OK_RE =
+  // "找室友"中间会插字（"找**个**室友"、"找**一位合拍女生**室友"），
+  // 死板的 /找室友/ 漏掉一大半——同一个坑 post-kind-rules.ts 里也踩过。
+  /合租|分租|单间|雅房|床位|次卧|客卧|主卧|一间|room\s*in|[找招募寻][^。；;\n]{0,8}室友|share/i;
+/** 整套户型规格："2B2B"、"1b1b"、"studio" —— 说的是一个完整单元 */
+const UNIT_SPEC_RE =
+  /\d\s*b\s*\d(?:\.\d)?\s*b|studio|[\d一两二三四]\s*房[\d一两二三四]?\s*[卫厅]|[\d一两二三四]\s*室[\d一两二三四]?\s*[卫厅]/i;
+
+export function detectWholeUnitOnly(query: string): boolean {
+  if (SHARED_OK_RE.test(query)) {
+    return false;
+  }
+  return WHOLE_UNIT_RE.test(query) || UNIT_SPEC_RE.test(query);
+}
 
 export function detectSeekerGender(query: string): "male" | "female" | null {
   const m =
@@ -242,6 +278,7 @@ export function planFromRegex(query: string): QueryPlan {
     leaseMonthsMax: nl.leaseMonthsMax,
     moveIn: nl.moveIn,
     seekerGender: detectSeekerGender(query),
+    wholeUnitOnly: detectWholeUnitOnly(query),
     requires: { ...nlBool },
     source: "regex",
   };
@@ -374,6 +411,12 @@ const PLANNER_SYSTEM = `你是湾区租房搜索的查询理解层。把租客�
     8-25 起租的房源误杀。
   · 明确的截止（"9月12日必须入住"、"9月中之前"）→ 填那一天。
   今年是 2026 年。
+- wholeUnitOnly：用户要的是**整套**（不是别人房子里的一间）→ true，否则 false。
+  **光看 bedroomsAnyOf 分不出来**：整租一套两房、和在一套两房里分租其中两间，
+  卧室数都是 2，所以必须单独表态。
+  · "求租2B2B整租" / "想租一套1b1b" / 只报了整套户型规格没提合租 → true
+  · "2B2B里的一间" / "合租也可以" / "找室友" / "求主卧" / "单间" → false
+  · 看不出来 → false。**拿不准一律 false**（false = 不筛，不会误杀）。
 - seekerGender：**求租者本人**的性别，"male"/"female"，没说就 null。
   用来挡掉"限女生"的房源对男租客（反之亦然）。
   **只填他自己是谁，不填他想要什么样的室友**——方向搞反会把合适的房源筛掉：
@@ -388,7 +431,7 @@ const PLANNER_SYSTEM = `你是湾区租房搜索的查询理解层。把租客�
 - excludes：出现即淘汰的词（"中介"、"二房东"）。用户没明说排斥就留空。
 
 只输出一个 JSON 对象，不要代码围栏、不要任何解释文字：
-{"outOfScope":false,"outOfScopeReason":null,"cities":[],"regions":[],"anchors":[],"nearPlace":null,"nearMode":null,"rentMin":null,"rentMax":null,"bedroomsAnyOf":[],"leaseMonthsMin":null,"leaseMonthsMax":null,"moveIn":null,"seekerGender":null,"requires":{"petFriendly":null,"couplesOk":null,"utilitiesIncluded":null,"parkingIncluded":null},"prefers":[],"excludes":[]}`;
+{"outOfScope":false,"outOfScopeReason":null,"cities":[],"regions":[],"anchors":[],"nearPlace":null,"nearMode":null,"rentMin":null,"rentMax":null,"bedroomsAnyOf":[],"leaseMonthsMin":null,"leaseMonthsMax":null,"moveIn":null,"seekerGender":null,"wholeUnitOnly":false,"requires":{"petFriendly":null,"couplesOk":null,"utilitiesIncluded":null,"parkingIncluded":null},"prefers":[],"excludes":[]}`;
 
 const JSON_BLOCK_RE = /\{[\s\S]*\}/;
 const REGION_VALUES: BayRegion[] = [
@@ -534,6 +577,10 @@ function coercePlan(raw: RawPlan, query: string): QueryPlan {
       raw.seekerGender === "male" || raw.seekerGender === "female"
         ? raw.seekerGender
         : detectSeekerGender(query),
+    // LLM 说 true 才信；它没表态或说 false 时退回正则。两边都拿不准就是
+    // false（不筛），跟 seekerGender 一样宁可不筛也不误杀。
+    wholeUnitOnly:
+      raw.wholeUnitOnly === true ? true : detectWholeUnitOnly(query),
     requires: {
       petFriendly: asBool(requires.petFriendly),
       couplesOk: asBool(requires.couplesOk),
