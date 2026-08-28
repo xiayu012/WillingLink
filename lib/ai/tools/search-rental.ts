@@ -1280,6 +1280,11 @@ function createStrictSearchRentalTool(chatId: string) {
             "**Keep the seeker's own stated gender verbatim ('本人男'/'我是女生'/'女生一枚')** — " +
             "listings often say 限女生/只招男生 and it decides whether they can rent at all. " +
             "Their preference about roommates ('希望室友是女生') is NOT their own gender; keep it too but do not confuse them. " +
+            // 整租 vs 房间同理：丢了这个词，"情侣求租1b1b整套"就会收到
+            // "1b1b里的一间卧室"——住不成。用户原话怎么说就怎么带。
+            "**Keep whether they want a WHOLE UNIT or accept a ROOM, in their own words** " +
+            "('整租'/'2B2B or 2B1B'/'合租也可以'/'求主卧') — a couple asking for a whole 1b1b " +
+            "cannot live in one bedroom of a 1b1b, and the two read alike once the wording is dropped. " +
             "Example: '圣何塞两室一厅，预算2500以下，宠物友好，情侣入住'"
         ),
       cities: z
@@ -1622,6 +1627,11 @@ function createLegacySearchRentalTool(chatId: string) {
             "**Keep the seeker's own stated gender verbatim ('本人男'/'我是女生'/'女生一枚')** — " +
             "listings often say 限女生/只招男生 and it decides whether they can rent at all. " +
             "Their preference about roommates ('希望室友是女生') is NOT their own gender; keep it too but do not confuse them. " +
+            // 整租 vs 房间同理：丢了这个词，"情侣求租1b1b整套"就会收到
+            // "1b1b里的一间卧室"——住不成。用户原话怎么说就怎么带。
+            "**Keep whether they want a WHOLE UNIT or accept a ROOM, in their own words** " +
+            "('整租'/'2B2B or 2B1B'/'合租也可以'/'求主卧') — a couple asking for a whole 1b1b " +
+            "cannot live in one bedroom of a 1b1b, and the two read alike once the wording is dropped. " +
             "Example: '圣何塞两室一厅，预算2500以下，宠物友好，情侣入住'"
         ),
       mustNotContain: z
