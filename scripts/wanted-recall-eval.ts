@@ -230,8 +230,24 @@ async function main() {
     }
     toolReturned += returned.length;
 
+    // **工具返回的人必须单独送judge**，不能只在随机样本里找它们。
+    // 工具搜的是全表（227 条），样本只有 CANDIDATES 条，返回的人绝大多数
+    // 压根不在样本里 —— 拿"在不在样本的 yes 集合里"当 precision，算出来
+    // 必然接近 0，跟工具好坏无关。第一版就是这么错的，实测 precision 0.0%。
     const acceptedIds = new Set(accepted.map((a) => a.id));
-    const good = returned.filter((r) => acceptedIds.has(r.id)).length;
+    const unjudged = returned.filter((r) => !acceptedIds.has(r.id));
+    const extraVerdicts: { verdict: Judgement; reason: string }[] = [];
+    for (let i = 0; i < unjudged.length; i += JUDGE_CHUNK) {
+      extraVerdicts.push(
+        ...(await judgeBatch(
+          query,
+          unjudged.slice(i, i + JUDGE_CHUNK) as WantedRow[]
+        ))
+      );
+    }
+    const good =
+      returned.filter((r) => acceptedIds.has(r.id)).length +
+      extraVerdicts.filter((v) => v.verdict === "yes").length;
     toolGood += good;
 
     const isFalseEmpty = accepted.length > 0 && returned.length === 0;
@@ -266,7 +282,8 @@ async function main() {
     `  falseEmpty  ${falseEmpty}/${n} 条「库里有却返回空」 ← 最痛的失败\n` +
     `  relaxedRate ${relaxedCount}/${n} 条只能给出放宽结果\n` +
     `  precision   ${precision.toFixed(1)}%（返回 ${toolReturned} 人，其中认可 ${toolGood}）\n` +
-    `  判官认可合计 ${gtTotal} 人${judgeFailures > 0 ? `（判官失败 ${judgeFailures} 批）` : ""}`;
+    `  随机样本里判官认可 ${gtTotal} 人（仅用于 falseEmpty，不参与 precision）` +
+    `${judgeFailures > 0 ? `（判官失败 ${judgeFailures} 批）` : ""}`;
   console.log(`\n${summary}`);
 
   const dir = path.join("tests", "search-eval", "reports");
