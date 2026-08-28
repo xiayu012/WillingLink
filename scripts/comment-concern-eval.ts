@@ -251,6 +251,7 @@ async function main() {
   let declared = 0;
   let ignored = 0;
   let noMatchCases = 0;
+  let apiFailures = 0;
   const details: string[] = [];
 
   for (const [i, c] of picked.entries()) {
@@ -262,13 +263,26 @@ async function main() {
       },
       body: JSON.stringify({ rawText: c.post, force: true }),
     });
-    const json = (await res.json()) as {
+    // 路由偶发返回非 JSON 的错误页（网关 5xx、超时），直接 res.json() 会抛
+    // SyntaxError 把整轮评测炸掉——实测第 19 条崩过一次，前 18 条的结果全白跑。
+    // 评测本身绝不能因为一次抖动前功尽弃。
+    const raw = await res.text();
+    let json: {
       ok?: boolean;
       text?: string;
       chars?: number;
       postKind?: string;
       skipped?: boolean;
-    };
+    } = {};
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      console.log(
+        `[${i + 1}/${picked.length}] ⚠ 路由返回非 JSON（HTTP ${res.status}）：${raw.slice(0, 60)} — ${c.name}`
+      );
+      apiFailures++;
+      continue;
+    }
     const reply = json.text ?? "";
     if (!json.ok || json.skipped || !reply) {
       console.log(
@@ -321,7 +335,11 @@ async function main() {
     `评论关心点评测 ${new Date().toISOString().slice(0, 10)}：${picked.length} 条帖子，${total} 个关心点\n` +
     `  正面回答 ${answered}  明说未写 ${declared}  **回避 ${ignored}**\n` +
     `  合格率 ${okRate.toFixed(1)}%（回答+明说未写，回避才算失败）\n` +
-    `  另有 ${noMatchCases} 条库里无匹配、如实说了"没有"（不计入关心点）`;
+    `  另有 ${noMatchCases} 条库里无匹配、如实说了"没有"（不计入关心点）` +
+    (apiFailures > 0
+      ? `
+  ⚠ ${apiFailures} 条因路由报错跳过`
+      : "");
   console.log(`\n${summary}`);
 
   const dir = path.join("tests", "search-eval", "reports");
