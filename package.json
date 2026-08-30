@@ -25,7 +25,11 @@
     "comment-reply-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/comment-reply-eval.ts",
     "comment-concern-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/comment-concern-eval.ts",
     "wanted-recall-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/wanted-recall-eval.ts",
-    "answer-coverage-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/answer-coverage-eval.ts"
+    "answer-coverage-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/answer-coverage-eval.ts",
+    "brain:inspect": "tsx scripts/brain-inspect.ts",
+    "twilio:selftest": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/twilio-selftest.ts",
+    "twilio:inspect": "tsx scripts/twilio-inspect.ts",
+    "coliving:sim": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/coliving-sim.ts"
   },
   "dependencies": {
     "@ai-sdk/gateway": "2.0.0-beta.85",

@@ -6,6 +6,11 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   turbopack: {},
+  // 大脑准则以 .md 形式存放并在运行时 fs 读取，需显式打进产物，
+  // 否则 Vercel 上会因为文件缺失而报「读不到 doctrine 文件」。
+  outputFileTracingIncludes: {
+    "/**": ["./lib/ai/brains/**/doctrine/*.md"],
+  },
   images: {
     remotePatterns: [
       {

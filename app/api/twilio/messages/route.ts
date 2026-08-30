@@ -1,52 +1,125 @@
+import { after } from "next/server";
 import {
   adaptersEnabled,
   handleInboundMessage,
   jsonWithCors,
   toErrorResponse,
 } from "@/lib/chat/adapter";
+import { runColivingTurn } from "@/lib/chat/coliving/turn";
+import { emptyTwiml, sendSms, verifyTwilioSignature } from "@/lib/chat/twilio";
 
-export const maxDuration = 60;
+// 与 /api/xhs/messages 同理：AI 那段跑在 after() 里，仍算在这个预算内。
+// 60 秒撞过墙（见 AGENT_LOG），留够余量。
+export const maxDuration = 120;
 export const preferredRegion = "sfo1";
 
 /**
- * Twilio 短信 adapter（骨架）。
+ * Twilio 短信 —— **本项目唯一的 Twilio 入口**。
  *
- * 已经能跑通"一条短信 → 同一条 conversation → 回答"，但**上线前必须补**：
- * 1. `X-Twilio-Signature` 验签（现在谁都能 POST 进来）
- * 2. 回复格式：这里先回 JSON，真接 Twilio 时要回 TwiML
- *    （`<Response><Message>…</Message></Response>`，Content-Type: text/xml）
- * 3. 长回复要按 1600 字符分段
+ * 曾经短暂存在过 `/api/twilio/coliving`，已合并到这里，不要再开第二条。
  *
- * 结构上要看的只有一点：**adapter 只做字段翻译**，聊天逻辑一行都没有。
+ * 两种大脑，由 `TWILIO_BRAIN` 选择：
+ *
+ * - `coliving`（默认）合租房管理。走 `lib/ai/brains` 的 coliving 大脑，
+ *   **不依赖数据库**，会话与名册在内存/环境变量里。
+ * - `rental` 租房搜索。走 `handleInboundMessage` → Chat Engine，
+ *   跨渠道共用同一条 conversation，**需要 channel-identity 表**。
+ *
+ * 为什么不同步回 TwiML 正文：Twilio 对 webhook 只等约 15 秒，而一轮带
+ * 1–2 万字符准则、可能还要调工具的对话会压线。所以**立刻回空 TwiML，
+ * 回复走出站 API**——跟小红书那条踩过的是同一个坑。
  */
 export async function POST(request: Request) {
   if (!adaptersEnabled()) {
-    return jsonWithCors(
-      { ok: false, error: "Channel adapters disabled (set CHANNEL_ADAPTERS_ENABLED=1)" },
-      503
+    return new Response(
+      "channel adapters disabled (set CHANNEL_ADAPTERS_ENABLED=1)",
+      { status: 503 }
     );
   }
 
-  // Twilio 发的是 application/x-www-form-urlencoded
   const form = await request.formData().catch(() => null);
-  const from = String(form?.get("From") ?? "").trim();
-  const body = String(form?.get("Body") ?? "").trim();
-  const messageSid = String(form?.get("MessageSid") ?? "").trim() || null;
+  if (!form) {
+    return new Response("expected form-encoded body", { status: 400 });
+  }
 
+  const params: Record<string, string> = {};
+  for (const [k, v] of form.entries()) {
+    params[k] = typeof v === "string" ? v : "";
+  }
+
+  const verified = verifyTwilioSignature({
+    request,
+    params,
+    signature: request.headers.get("x-twilio-signature"),
+  });
+  if (!verified.ok) {
+    console.log("[twilio] 验签失败：", verified.reason);
+    return new Response("signature verification failed", { status: 403 });
+  }
+
+  const from = (params.From ?? "").trim();
+  const body = (params.Body ?? "").trim();
+  const messageSid = (params.MessageSid ?? "").trim();
+
+  // 送达回执等非消息回调也会打到这里，静默收下
   if (!(from && body)) {
-    return jsonWithCors({ ok: false, error: "From and Body are required" }, 400);
+    return emptyTwiml();
   }
 
-  try {
-    const result = await handleInboundMessage({
-      channel: "sms",
-      externalUserId: from, // 手机号就是这个渠道里的身份
-      text: body,
-      externalMessageId: messageSid,
-    });
-    // TODO(twilio): 换成 TwiML
-    return jsonWithCors({ ok: true, chatId: result.chatId, reply: result.text });
-  } catch (error) {
-    return toErrorResponse(error);
+  const brain = (process.env.TWILIO_BRAIN ?? "coliving").trim();
+
+  if (brain === "rental") {
+    // 老路径：DB 支撑的跨渠道会话。同步返回，因为它没有出站投递通道。
+    try {
+      const result = await handleInboundMessage({
+        channel: "sms",
+        externalUserId: from,
+        text: body,
+        externalMessageId: messageSid || null,
+      });
+      return jsonWithCors({ ok: true, chatId: result.chatId, reply: result.text });
+    } catch (error) {
+      return toErrorResponse(error);
+    }
   }
+
+  after(async () => {
+    try {
+      const outcome = await runColivingTurn({ fromPhone: from, text: body });
+
+      if (outcome.reply) {
+        const sent = await sendSms(from, outcome.reply);
+        if (!sent.ok) {
+          console.log("[twilio] 回复发送失败：", sent.error);
+        }
+      }
+
+      // 转交给管理方的短信
+      for (const msg of outcome.outbound) {
+        const sent = await sendSms(msg.to, msg.text);
+        if (!sent.ok) {
+          console.log("[twilio] 转交发送失败：", sent.error);
+        }
+      }
+
+      console.log(
+        "[twilio]",
+        JSON.stringify({
+          messageSid,
+          modules: outcome.modules,
+          tools: outcome.toolsUsed,
+          promptChars: outcome.promptChars,
+          replyChars: outcome.reply.length,
+          notified: outcome.outbound.length,
+        })
+      );
+    } catch (error) {
+      const name = error instanceof Error ? error.name : "UnknownError";
+      const message = error instanceof Error ? error.message : String(error);
+      // AI SDK 的错误对象别直接丢 console.error（见 AGENT_LOG 的 fail-open 事故）
+      console.log("[twilio] failed", `${name}: ${message}`);
+    }
+  });
+
+  return emptyTwiml();
 }
