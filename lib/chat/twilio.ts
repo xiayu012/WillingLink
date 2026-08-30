@@ -152,19 +152,37 @@ export async function sendSms(to: string, text: string): Promise<SendResult> {
   const accountSid = process.env.TWILIO_ACCOUNT_SID?.trim();
   const keySid = process.env.TWILIO_API_KEY_SID?.trim();
   const keySecret = process.env.TWILIO_API_KEY_SECRET?.trim();
+  const authToken = process.env.TWILIO_AUTH_TOKEN?.trim();
   const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID?.trim();
+
+  /**
+   * 认证优先用 API Key（可单独吊销，泄露不用换整个账号）；
+   * 没配 API Key 时回落到 AccountSid:AuthToken——Twilio 的经典认证方式。
+   *
+   * 回落存在的意义：验签本来就必须有 AuthToken，所以只要能收消息就一定能发，
+   * 不会出现「收得到但回不了」这种最难查的半通状态。
+   */
+  let credentials: string | null = null;
+  let authMode = "";
+  if (keySid && keySecret) {
+    credentials = `${keySid}:${keySecret}`;
+    authMode = "api-key";
+  } else if (accountSid && authToken) {
+    credentials = `${accountSid}:${authToken}`;
+    authMode = "auth-token";
+  }
 
   const missing = [
     !accountSid && "TWILIO_ACCOUNT_SID",
-    !keySid && "TWILIO_API_KEY_SID",
-    !keySecret && "TWILIO_API_KEY_SECRET",
+    !credentials && "TWILIO_API_KEY_SID+SECRET 或 TWILIO_AUTH_TOKEN",
     !messagingServiceSid && "TWILIO_MESSAGING_SERVICE_SID",
   ].filter(Boolean);
   if (missing.length) {
     return { ok: false, error: `缺少环境变量：${missing.join(", ")}` };
   }
 
-  const auth = Buffer.from(`${keySid}:${keySecret}`).toString("base64");
+  const auth = Buffer.from(credentials as string).toString("base64");
+  console.log(`[twilio] 出站认证方式：${authMode}`);
   const endpoint = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
   const sids: string[] = [];
 
