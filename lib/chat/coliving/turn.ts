@@ -1,10 +1,11 @@
 import "server-only";
 
-import { generateText, stepCountIs, tool } from "ai";
+import { generateText, hasToolCall, stepCountIs, tool } from "ai";
 import { z } from "zod";
 import { assembleSystemPrompt } from "@/lib/ai/brains";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
+import { colivingModelId } from "./model";
 import { embedOne } from "./embedding";
 import { normalizePhone } from "./phone";
 import * as repo from "./repo";
@@ -14,16 +15,6 @@ import * as repo from "./repo";
  * 判断 → 查历史 → 开 case → 联系另一个人 → 记规则。
  */
 const MAX_STEPS = 6;
-
-/**
- * 这个大脑用哪个模型。**不跟项目默认走。**
- * `DEFAULT_CHAT_MODEL` 是给查询理解那类「把已说出口的需求抄进 JSON」选的——
- * 便宜、快、听话，不需要推理。合租房大脑要做多方公平分配、算术、
- * 在互相冲突的原则之间权衡，是判断密集型任务。
- */
-function colivingModelId(): string {
-  return process.env.COLIVING_MODEL?.trim() || "anthropic/claude-sonnet-4.5";
-}
 
 export type TurnUsage = {
   steps: number;
@@ -35,15 +26,30 @@ export type TurnUsage = {
   costUsd: number;
 };
 
+type StepUsageLike = {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedInputTokens?: number;
+  inputTokenDetails?: {
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
+};
+
 /**
- * 从每一步的 providerMetadata 累加真实用量与计费。
+ * 从每一步累加真实用量与计费。**必须逐步累加**——带工具时一轮有多次往返，
+ * 只看最后一步会严重低估。
  *
- * **不能用 `result.usage` / `result.totalUsage`**——ai@6 beta 经 gateway 调用时
- * 那两个对象是空的（`inputTokenDetails: {}`）。真实数字在
- * `providerMetadata.anthropic.usage`，真实金额在 `providerMetadata.gateway.cost`。
- * 而且必须逐步累加：带工具时一轮有多次往返，只看最后一步会严重低估。
+ * token 数各家形状不同，所以按优先级试：
+ *   1. `providerMetadata.anthropic.usage`（Anthropic 的原始字段，最全）
+ *   2. `step.usage`（AI SDK 归一化的；Anthropic 经 gateway 时是空的，别家常有）
+ *
+ * **金额一律取 `providerMetadata.gateway.cost`**——那是 gateway 实际计的账，
+ * 与模型无关，不用自己按单价估算。换模型时这一行不用改。
  */
-function sumUsage(steps: readonly { providerMetadata?: unknown }[]): TurnUsage {
+function sumUsage(
+  steps: readonly { providerMetadata?: unknown; usage?: StepUsageLike }[]
+): TurnUsage {
   const out: TurnUsage = {
     steps: steps.length,
     inputTokens: 0,
@@ -59,12 +65,19 @@ function sumUsage(steps: readonly { providerMetadata?: unknown }[]): TurnUsage {
           gateway?: { cost?: string };
         }
       | undefined;
-    const u = meta?.anthropic?.usage;
-    if (u) {
-      out.inputTokens += u.input_tokens ?? 0;
-      out.cacheReadTokens += u.cache_read_input_tokens ?? 0;
-      out.cacheWriteTokens += u.cache_creation_input_tokens ?? 0;
-      out.outputTokens += u.output_tokens ?? 0;
+    const a = meta?.anthropic?.usage;
+    if (a) {
+      out.inputTokens += a.input_tokens ?? 0;
+      out.cacheReadTokens += a.cache_read_input_tokens ?? 0;
+      out.cacheWriteTokens += a.cache_creation_input_tokens ?? 0;
+      out.outputTokens += a.output_tokens ?? 0;
+    } else if (step.usage) {
+      const u = step.usage;
+      const read = u.inputTokenDetails?.cacheReadTokens ?? u.cachedInputTokens ?? 0;
+      out.inputTokens += Math.max((u.inputTokens ?? 0) - read, 0);
+      out.cacheReadTokens += read;
+      out.cacheWriteTokens += u.inputTokenDetails?.cacheWriteTokens ?? 0;
+      out.outputTokens += u.outputTokens ?? 0;
     }
     const cost = Number(meta?.gateway?.cost);
     if (Number.isFinite(cost)) {
@@ -201,7 +214,35 @@ export async function runColivingTurn(args: {
     return decisionId;
   };
 
+  /** 模型显式交付的正文。调了 sendReply 就以它为准，不再猜哪段自由文本是正文。 */
+  let deliveredReply: string | null = null;
+
   const tools = {
+    /**
+     * **最后一步调这个，把要发给对方的短信正文交出来。**
+     *
+     * 为什么不直接用模型的自由文本：不同模型在工具调用之间写的东西不一样——
+     * 有的在续写正文（只取最后一步会截断），有的在写给自己看的计划
+     * （全部拼起来会把「Reply to 小李 now — must contain his own portion」
+     * 这种自言自语发给住户，真实发生过）。**靠猜哪段是正文不可靠，
+     * 让它显式交付。**
+     */
+    sendReply: tool({
+      description:
+        "把要回给当前这个人的短信正文交出来。**这是本轮最后一步**，" +
+        "调完就结束。只放真正要发出去的话，不要放你的思考过程、" +
+        "不要放给别人的那条（那个用 contactPerson）。",
+      inputSchema: z.object({
+        text: z
+          .string()
+          .describe("短信正文。短、具体、纯文本，不要 markdown 符号"),
+      }),
+      execute: async ({ text }) => {
+        deliveredReply = text;
+        return { ok: true };
+      },
+    }),
+
     decide: tool({
       description:
         "**每一轮都要调这个。** 说清楚你这次的治理判断：要不要介入、找谁、" +
@@ -627,7 +668,8 @@ export async function runColivingTurn(args: {
     ],
     messages: [...history, { role: "user" as const, content: args.text }],
     tools,
-    stopWhen: stepCountIs(MAX_STEPS),
+    // 交付了正文就收工；没交付则最多跑到步数上限
+    stopWhen: [hasToolCall("sendReply"), stepCountIs(MAX_STEPS)],
   });
 
   for (const step of result.steps) {
@@ -637,19 +679,19 @@ export async function runColivingTurn(args: {
   }
 
   /**
-   * **不能只取 `result.text`**——那只是最后一步的文字。
-   * 模型经常先写半句、再调工具、再接着写，文字被拆在多个 step 里；
-   * 只取最后一步会发出「从今天开始这样分：」这种截断的短信。
-   * 按顺序把各步的文字拼起来，重复的段落跳过（工具后模型有时会重述）。
+   * 正文优先取模型显式交付的那份。
+   *
+   * 没调 sendReply 时才退回自由文本，并且**只拼最后一段连续的文字**——
+   * 早期 step 里的往往是写给自己看的计划。这是兜底，不是主路径。
    */
-  const pieces: string[] = [];
-  for (const step of result.steps) {
-    const t = step.text?.trim();
-    if (t && !pieces.some((p) => p.includes(t) || t.includes(p))) {
-      pieces.push(t);
-    }
+  let raw = deliveredReply as string | null;
+  if (!raw) {
+    const texts = result.steps
+      .map((s) => s.text?.trim())
+      .filter((t): t is string => Boolean(t));
+    raw = texts.at(-1) ?? "";
   }
-  const reply = stripMarkdown(pieces.join("\n"));
+  const reply = stripMarkdown(raw.trim());
 
   // ── 落库：入站消息、回复本身也算一次 communication ──
   await repo.appendMessage({

@@ -1,0 +1,25 @@
+/**
+ * 合租房大脑用哪个模型。**只管这一个大脑，不影响项目里任何别的 AI。**
+ *
+ * 各条链路的模型互相独立，别在这里"顺手统一"：
+ *   · 租房搜索      `lib/ai/models.ts` 的 DEFAULT_CHAT_MODEL
+ *   · 小红书私信    `lib/chat/xhs-dm.ts` 的 XHS_DM_MODEL
+ *   · 合租房管理员  这里
+ *
+ * 默认 DeepSeek V4 Flash 是 2026-08-30 实测选出来的（见 AGENT_LOG）：
+ * 同一条真实投诉，它 $0.004–0.011 一轮、sonnet-4.5 $0.127，**便宜约 18 倍**，
+ * 而且三个安全探针（非法驱逐 / 自杀信号 / 住房公平陷阱）全过，
+ * 「房东也是一票」这类新准则执行得比 sonnet 还到位。
+ * 便宜的主因不只是单价——**它把多个工具并行调用，一轮只要 1–2 次往返**。
+ *
+ * 代价是慢：38–60 秒一轮（sonnet 22–30 秒）。短信是异步回的，不影响正确性。
+ *
+ * 要切回或试别的：设 `COLIVING_MODEL`。同在 gateway 上、值得一试的还有
+ * `deepseek/deepseek-v4-pro`、`minimax/minimax-m3`、`zai/glm-5.3`。
+ * **注意 `zai/glm-5.3-flash` 试过，不行**——它反问问题、一个工具都不调。
+ */
+export const COLIVING_DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+
+export function colivingModelId(): string {
+  return process.env.COLIVING_MODEL?.trim() || COLIVING_DEFAULT_MODEL;
+}

@@ -4,6 +4,7 @@ import { assembleSystemPrompt } from "@/lib/ai/brains";
 import { generateText } from "ai";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
+import { colivingModelId } from "./model";
 import * as repo from "./repo";
 
 /**
@@ -19,8 +20,7 @@ import * as repo from "./repo";
  * 这样以后能一起复盘「有没有过度介入」。
  */
 
-const OUTREACH_MODEL = () =>
-  process.env.COLIVING_MODEL?.trim() || "anthropic/claude-sonnet-4.5";
+const OUTREACH_MODEL = colivingModelId;
 
 export type OutreachMessage = {
   to: string;
