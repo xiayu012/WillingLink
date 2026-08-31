@@ -78,7 +78,12 @@ export const colivingBrain: Brain = {
         /室友|房友|同住|roommate|housemate|楼上|楼下|隔壁|另一个人|那个人/,
         /吵|噪音|noise|loud|太响|睡不着|动静/,
         /脏|不洗|卫生|clean|dirty|垃圾|trash|臭|味|smell|油烟|做饭.*(味|臭)/,
-        /占|抢|厨房|卫生间|浴室|洗衣|冰箱|停车|kitchen|bathroom|laundry|fridge|parking/,
+        /占|抢|厨房|灶|卫生间|浴室|洗澡|洗手间|马桶|洗衣|冰箱|停车|客厅|阳台/,
+        /kitchen|bathroom|shower|laundry|fridge|parking|living room/i,
+        // 真实投诉的说法：多数不含设施名，只讲行为与感受
+        /做饭|做菜|煮饭|用餐|吃饭|挨饿|等不到|轮不到|排不上/,
+        /不公平|凭什么|一直占|老是占|总是占|太久|时间太长|每次都/,
+        /轮流|排班|时段|错开|先来后到/,
         /带人|客人|guest|过夜|留宿|女朋友|男朋友.{0,4}住/,
       ],
       modules: ["conflict"],

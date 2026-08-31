@@ -54,6 +54,10 @@ const SCENARIOS: Record<string, Array<{ who: string; text: string }>> = {
   cooktime: [
     { who: "tenant1", text: "隔壁每天晚上十点多才开始做饭，油烟味特别大，我第二天要早起" },
   ],
+  // 用户真实测试：五要素齐全的投诉，AI 必须直接提方案，不许再问
+  kitchen2h: [
+    { who: "tenant1", text: "小王每天下午六点开始做饭两个小时。我们其余两个人人都得挨饿两个小时。他这太久了，太不公平了" },
+  ],
   // 多轮：投诉 → 被投诉方回应
   crossfire: [
     { who: "tenant1", text: "隔壁那个人洗澡要洗四十分钟，早上我根本来不及" },

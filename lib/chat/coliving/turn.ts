@@ -7,7 +7,13 @@ import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { recordEvent, type Severity } from "./events";
 import { appendTurn, getTurns } from "./session";
-import { buildRuntimeContext, findPerson, getLandlords, normalizePhone } from "./roster";
+import {
+  buildRuntimeContext,
+  findPerson,
+  getLandlords,
+  getRoster,
+  normalizePhone,
+} from "./roster";
 
 /** 工具最多跑几步。合租房场景不需要长链路：识别 → 记录/转交 → 回话。 */
 const MAX_STEPS = 4;
@@ -38,10 +44,20 @@ export async function runColivingTurn(args: {
   /** 一轮只转交一次，防止重复短信 */
   let notified = false;
 
+  /**
+   * 关键词永远会有漏网的（真实投诉说的是"做饭""挨饿""不公平"，
+   * 不是"厨房""室友""吵"）。**提到同住人的名字，几乎必然是人际问题**——
+   * 这个信号比任何词表都可靠，而且名册本来就在手上。
+   */
+  const mentionsOther = getRoster().some(
+    (p) => p.phone !== from && p.name && args.text.includes(p.name)
+  );
+
   const { system, loadedModuleIds, chars } = assembleSystemPrompt({
     brainId: "coliving",
     routeOn: args.text,
     runtimeContext: buildRuntimeContext(from),
+    forceModules: mentionsOther ? ["conflict"] : undefined,
   });
 
   recordEvent({
