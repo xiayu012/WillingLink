@@ -68,7 +68,14 @@ async function apply() {
   console.log("✓ 建表完成");
 }
 
-type RosterEntry = { phone: string; name: string; role: string; note?: string };
+type RosterEntry = {
+  phone: string;
+  name: string;
+  role: string;
+  /** 住不住在这里。省略视为 true——房东也可能同住 */
+  resides?: boolean;
+  note?: string;
+};
 
 /**
  * 用 COLIVING_ROSTER 建出第一个真实 Household。
@@ -161,10 +168,12 @@ async function seed() {
         limit 1
       `;
       if (!existing) {
+        // resides 默认 true：**不要从 role 推**。房东完全可以住在自己房子里，
+        // 推错了共用资源就会少算一个人（真实事故，见 AGENT_LOG）。
         await tx`
           insert into coliving.membership (household_id, person_id, role, resides, note)
           values (${household.id}, ${personId}, ${role},
-                  ${role === "tenant"}, ${entry.note ?? null})
+                  ${entry.resides ?? true}, ${entry.note ?? null})
         `;
         console.log(`  + membership ${entry.name} → ${role}`);
       }
@@ -255,15 +264,35 @@ async function membership() {
       name: inName,
       phone,
       role: (argOf("--role") as "tenant" | "landlord") ?? "tenant",
+      resides: !args.includes("--not-resident"),
       note: argOf("--note") ?? null,
     });
     console.log(`✓ ${inName} 已搬入（onboarded_at 已设，头两周会主动接触）`);
   }
 
+  // 「住不住在这里」是可以随时改的事实，不是角色的推论
+  const resides = argOf("--set-resides");
+  if (resides) {
+    const m = await repo.findPersonByName(house.id, resides);
+    if (!m) {
+      console.log(`✗ ${house.label} 里没有「${resides}」`);
+      return;
+    }
+    const value = !args.includes("--no");
+    await repo.setResides({
+      householdId: house.id,
+      personId: m.personId,
+      resides: value,
+    });
+    console.log(`✓ ${m.name} ${value ? "住在" : "不住在"}这栋房子`);
+  }
+
   const members = await repo.getMembers(house.id);
   console.log(`\n${house.label} 当前成员：`);
   for (const m of members) {
-    console.log(`  ${m.name.padEnd(8)} ${m.role.padEnd(9)} ${m.phone ?? ""}`);
+    console.log(
+      `  ${m.name.padEnd(8)} ${m.role.padEnd(9)} ${m.resides ? "同住" : "不同住"}  ${m.phone ?? ""}`
+    );
   }
 }
 
@@ -294,7 +323,7 @@ async function main() {
   if (has("--wipe")) {
     await wipe();
   }
-  if (has("--move-in") || has("--move-out")) {
+  if (has("--move-in") || has("--move-out") || has("--set-resides")) {
     await membership();
   }
   if (has("--embed")) {
@@ -307,7 +336,7 @@ async function main() {
     has("--status") ||
     args.length === 0 ||
     !args.some((a) =>
-      ["--apply", "--wipe", "--seed", "--move-in", "--move-out", "--embed"].includes(a)
+      ["--apply","--wipe","--seed","--move-in","--move-out","--set-resides","--embed"].includes(a)
     )
   ) {
     await status();

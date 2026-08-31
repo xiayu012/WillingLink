@@ -247,7 +247,17 @@ export async function runColivingTurn(args: {
           doctrineModules: loadedModuleIds,
           contextChars: chars,
         });
-        return { ok: true, decisionId };
+        // 模型很爱在回复里写「我会跟他说」，然后这一轮就结束了，
+        // 对方永远收不到。判断说要联系人，就得在同一轮里真的联系到。
+        const mustContact = kind === "contact_one" || kind === "contact_group";
+        return {
+          ok: true,
+          decisionId,
+          next: mustContact
+            ? "你判断了要联系别人。**现在就用 contactPerson 逐个联系到**——" +
+              "只在回复里写「我会跟他说」而不调工具，那条消息永远发不出去。"
+            : undefined,
+        };
       },
     }),
 

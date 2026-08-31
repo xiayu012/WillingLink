@@ -655,6 +655,13 @@ export async function moveIn(args: {
   name: string;
   phone: string;
   role?: Role;
+  /**
+   * 住不住在这里。**必须显式给，不要从 role 推。**
+   * 曾经写成 `role !== 'landlord'`，结果同住的房东被算成不住这儿，
+   * 三个人的厨房被按两个人分了。房东完全可以住在自己房子里——
+   * 他要是住这儿，共用资源就得算他一份，共同规则他也是一票。
+   */
+  resides?: boolean;
   note?: string | null;
 }): Promise<string> {
   const phone = normalizePhone(args.phone);
@@ -682,7 +689,7 @@ export async function moveIn(args: {
       insert into coliving.membership
         (household_id, person_id, role, resides, note)
       values (${args.householdId}, ${personId}, ${args.role ?? "tenant"},
-              ${(args.role ?? "tenant") !== "landlord"}, ${args.note ?? null})
+              ${args.resides ?? true}, ${args.note ?? null})
       on conflict do nothing
     `;
     await tx`
@@ -725,19 +732,34 @@ export async function recordConsultation(args: {
   personId: string;
   stance: "asked" | "agreed" | "objected";
 }): Promise<void> {
-  const col =
-    args.stance === "agreed"
-      ? "agreed_by"
-      : args.stance === "objected"
-        ? "objected"
-        : "consulted";
-  await db().unsafe(
-    `update coliving.rule
-       set ${col} = (select array_agg(distinct x) from unnest(${col} || $1::uuid[]) x),
-           consulted = (select array_agg(distinct x) from unnest(consulted || $1::uuid[]) x)
-     where id = $2`,
-    [`{${args.personId}}`, args.ruleId]
-  );
+  // 表过态的人一律进 consulted；agreed/objected 再各自加一列。
+  // **不能把两条 set 拼成一句**——stance=asked 时两边都是 consulted，
+  // PostgreSQL 会报「multiple assignments to same column」，
+  // 整个工具调用静默失败（真实 bug，问过 0 人就是这么来的）。
+  const p = `{${args.personId}}`;
+  await db()`
+    update coliving.rule
+    set consulted = (select array_agg(distinct x)
+                     from unnest(consulted || ${p}::uuid[]) x)
+    where id = ${args.ruleId}
+  `;
+  if (args.stance === "agreed") {
+    await db()`
+      update coliving.rule
+      set agreed_by = (select array_agg(distinct x)
+                       from unnest(agreed_by || ${p}::uuid[]) x),
+          objected = array_remove(objected, ${args.personId}::uuid)
+      where id = ${args.ruleId}
+    `;
+  } else if (args.stance === "objected") {
+    await db()`
+      update coliving.rule
+      set objected = (select array_agg(distinct x)
+                      from unnest(objected || ${p}::uuid[]) x),
+          agreed_by = array_remove(agreed_by, ${args.personId}::uuid)
+      where id = ${args.ruleId}
+    `;
+  }
 }
 
 /** 所有在住的人都问过了 → 这条规则算走完一轮，正式成立 */
@@ -796,6 +818,19 @@ export async function newcomers(householdId: string): Promise<Member[]> {
       .map((p) => p.id)
   );
   return rows.filter((m) => ok.has(m.personId));
+}
+
+/** 改「住不住在这里」。房东可能就住在自己房子里，这是事实不是角色推导。 */
+export async function setResides(args: {
+  householdId: string;
+  personId: string;
+  resides: boolean;
+}): Promise<void> {
+  await db()`
+    update coliving.membership set resides = ${args.resides}
+    where household_id = ${args.householdId} and person_id = ${args.personId}
+      and valid_to is null
+  `;
 }
 
 export async function canReachProactively(personId: string): Promise<boolean> {
