@@ -50,6 +50,10 @@ const SCENARIOS: Record<string, Array<{ who: string; text: string }>> = {
   greet: [{ who: "tenant1", text: "在吗" }],
   hello: [{ who: "tenant2", text: "你好" }],
   settle: [{ who: "tenant1", text: "我刚搬进来两天" }],
+  // 复现真实测试：做饭时间冲突。检查是否抛"缩短还是换时段"这种自制菜单
+  cooktime: [
+    { who: "tenant1", text: "隔壁每天晚上十点多才开始做饭，油烟味特别大，我第二天要早起" },
+  ],
   // 多轮：投诉 → 被投诉方回应
   crossfire: [
     { who: "tenant1", text: "隔壁那个人洗澡要洗四十分钟，早上我根本来不及" },
