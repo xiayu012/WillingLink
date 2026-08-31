@@ -12,7 +12,7 @@ import * as repo from "./repo";
  * 一轮对话最多几步工具。比以前长：现在一轮里可能要
  * 判断 → 查历史 → 开 case → 联系另一个人 → 记规则。
  */
-const MAX_STEPS = 10;
+const MAX_STEPS = 6;
 
 /**
  * 这个大脑用哪个模型。**不跟项目默认走。**
@@ -43,6 +43,17 @@ export type TurnOutcome = {
   toolsUsed: string[];
   /** 认不出这个号码时为 true，调用方应当只回一句而不做任何记录 */
   unknownSender: boolean;
+  /**
+   * 这一轮真花了多少。`steps` 是模型往返次数——**带工具时一轮不止一次调用**，
+   * 每次都重发整个提示词，所以这个数字直接决定成本。
+   * `cachedInput` 是命中缓存的输入 token（价格是普通输入的十分之一）。
+   */
+  usage: {
+    steps: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+  };
 };
 
 const UNKNOWN_REPLY =
@@ -67,6 +78,12 @@ export async function runColivingTurn(args: {
       promptChars: 0,
       toolsUsed: [],
       unknownSender: true,
+      usage: {
+        steps: 0,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+      },
     };
   }
 
@@ -82,7 +99,7 @@ export async function runColivingTurn(args: {
     (m) => m.personId !== sender.personId && args.text.includes(m.name)
   );
 
-  const { system, loadedModuleIds, chars } = assembleSystemPrompt({
+  const { doctrine, runtime, loadedModuleIds, chars } = assembleSystemPrompt({
     brainId: "coliving",
     routeOn: args.text,
     runtimeContext: ctx.text,
@@ -442,9 +459,24 @@ export async function runColivingTurn(args: {
     }),
   };
 
+  /**
+   * 系统提示词拆成两条，**缓存断点卡在中间**。
+   *
+   * 这是本模块最大的一笔省钱：带工具的一轮对话不是一次调用，而是每调一次工具
+   * 就把整个提示词重发一遍——四个工具就是五遍一万四千字的准则。
+   * 准则那一段逐字不变，可以缓存（写入 1.25 倍价，命中 0.1 倍价）；
+   * 运行时状态每轮都变，留在断点之外，否则一变就整段落空。
+   */
   const result = await generateText({
     model: getLanguageModel(modelId),
-    system,
+    system: [
+      {
+        role: "system" as const,
+        content: doctrine,
+        providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+      },
+      ...(runtime ? [{ role: "system" as const, content: runtime }] : []),
+    ],
     messages: [...history, { role: "user" as const, content: args.text }],
     tools,
     stopWhen: stepCountIs(MAX_STEPS),
@@ -504,5 +536,11 @@ export async function runColivingTurn(args: {
     promptChars: chars,
     toolsUsed,
     unknownSender: false,
+    usage: {
+      steps: result.steps.length,
+      inputTokens: result.usage.inputTokens ?? 0,
+      cachedInputTokens: result.usage.cachedInputTokens ?? 0,
+      outputTokens: result.usage.outputTokens ?? 0,
+    },
   };
 }

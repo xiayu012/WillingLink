@@ -128,6 +128,8 @@ export async function POST(request: Request) {
           promptChars: outcome.promptChars,
           replyChars: outcome.reply.length,
           outbound: outcome.outbound.length,
+          // 成本可见：steps 是模型往返次数，带工具时一轮不止一次
+          usage: outcome.usage,
         })
       );
     } catch (error) {

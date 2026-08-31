@@ -68,7 +68,15 @@ export type RoutingDecision = {
 };
 
 export type AssembledPrompt = {
+  /** doctrine + runtime 拼在一起，给不需要分段的调用方（如 brain:inspect） */
   system: string;
+  /**
+   * 只有准则的那一段。**每轮之间逐字相同**——调用方应当把 prompt cache 的
+   * 断点卡在这一段之后，否则运行时状态一变，整段缓存全部落空。
+   */
+  doctrine: string;
+  /** 本轮运行时状态。每轮都在变，不进缓存。 */
+  runtime: string;
   brainId: string;
   loadedModuleIds: DoctrineModuleId[];
   routing: RoutingDecision;

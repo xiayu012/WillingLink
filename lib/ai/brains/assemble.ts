@@ -50,14 +50,20 @@ export function assembleSystemPrompt(opts: AssembleOptions): AssembledPrompt {
     parts.push(readDoctrine(brain, mod));
   }
 
-  if (opts.runtimeContext?.trim()) {
-    parts.push(`## 本轮运行时状态\n\n${opts.runtimeContext.trim()}`);
-  }
+  // 准则部分：每轮之间**逐字相同**，所以可以整段进 prompt cache
+  const doctrine = parts.join("\n\n---\n\n");
 
-  const system = parts.join("\n\n---\n\n");
+  // 运行时状态每轮都在变（未结的事、说话人），必须留在缓存断点之外
+  const runtime = opts.runtimeContext?.trim()
+    ? `## 本轮运行时状态\n\n${opts.runtimeContext.trim()}`
+    : "";
+
+  const system = runtime ? `${doctrine}\n\n---\n\n${runtime}` : doctrine;
 
   return {
     system,
+    doctrine,
+    runtime,
     brainId: brain.id,
     loadedModuleIds: moduleIds,
     routing,

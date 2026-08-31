@@ -110,10 +110,17 @@ async function speak(phone: string, text: string, L: Lib, members: Member[]) {
   const ms = Date.now() - started;
 
   console.log(`\x1b[32mAI\x1b[0m → ${out.reply}`);
+  const u = out.usage;
+  const cacheHit = u.inputTokens
+    ? Math.round((u.cachedInputTokens / u.inputTokens) * 100)
+    : 0;
   console.log(
     `\x1b[90m   [${ms}ms · 模块 ${out.modules.join("+") || "无"} · 提示词 ${out.promptChars} 字符 · 回复 ${out.reply.length} 字符${
       out.toolsUsed.length ? ` · 工具 ${out.toolsUsed.join(",")}` : ""
     }]\x1b[0m`
+  );
+  console.log(
+    `\x1b[90m   [${u.steps} 次模型往返 · 输入 ${u.inputTokens} token（缓存命中 ${u.cachedInputTokens}，${cacheHit}%）· 输出 ${u.outputTokens}]\x1b[0m`
   );
   // 模拟器不真发短信。把 communication 标成 skipped，否则它们永远停在
   // queued，看起来像一堆发送失败的消息，污染事实账本。
