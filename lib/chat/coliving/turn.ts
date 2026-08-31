@@ -3,7 +3,6 @@ import "server-only";
 import { generateText, stepCountIs, tool } from "ai";
 import { z } from "zod";
 import { assembleSystemPrompt } from "@/lib/ai/brains";
-import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { recordEvent, type Severity } from "./events";
 import { appendTurn, getTurns } from "./session";
@@ -31,9 +30,24 @@ export type TurnOutcome = {
  * 跑完一轮合租房对话。**不做投递**——把要发的消息返回给调用方，
  * 这样本地模拟器可以只打印不发送，线上路由才真发。
  */
+/**
+ * 这个大脑用哪个模型。
+ *
+ * **不跟项目默认走。** `DEFAULT_CHAT_MODEL` 是给查询理解那类"把已经说出口的
+ * 需求抄进 JSON"的任务选的——便宜、快、听话，不需要推理。
+ * 合租房大脑要做的是多方公平分配、算术、在互相冲突的原则之间权衡，
+ * 还要读一万多字的准则，是判断密集型任务，小模型会给出
+ * "一个人 90 分钟、另外两人各 15 分钟"这种自己都没算过的方案。
+ */
+function colivingModelId(): string {
+  return process.env.COLIVING_MODEL?.trim() || "anthropic/claude-sonnet-4.5";
+}
+
 export async function runColivingTurn(args: {
   fromPhone: string;
   text: string;
+  /** 仅测试用：临时覆盖模型，便于 A/B */
+  modelId?: string;
 }): Promise<TurnOutcome> {
   const from = normalizePhone(args.fromPhone);
   const me = findPerson(from);
@@ -168,7 +182,7 @@ export async function runColivingTurn(args: {
   const history = getTurns(from);
 
   const result = await generateText({
-    model: getLanguageModel(DEFAULT_CHAT_MODEL),
+    model: getLanguageModel(args.modelId ?? colivingModelId()),
     system,
     messages: [...history, { role: "user" as const, content: args.text }],
     tools,

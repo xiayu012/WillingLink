@@ -88,7 +88,9 @@ async function speak(phone: string, text: string, L: Awaited<ReturnType<typeof l
   console.log(`\n\x1b[36m${label}\x1b[0m → ${text}`);
 
   const started = Date.now();
-  const out = await L.turn.runColivingTurn({ fromPhone: phone, text });
+  const mi = process.argv.indexOf("--model");
+  const modelId = mi !== -1 ? process.argv[mi + 1] : undefined;
+  const out = await L.turn.runColivingTurn({ fromPhone: phone, text, modelId });
   const ms = Date.now() - started;
 
   console.log(`\x1b[32mAI\x1b[0m → ${out.reply}`);
