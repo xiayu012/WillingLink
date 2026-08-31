@@ -120,6 +120,30 @@ pnpm twilio:inspect --set-webhook https://…/api/twilio/messages
     若已完成 toll-free 验证则可用，否则只能用 Long Code 发
 - 2026-08-30 22:55 有一条真实入站测试报 `11200`，原因是当时代码尚未部署。
 
+## ⚠️ webhook 必须写 www，不能写裸域
+
+`willinglink.com` 会 **308 跳转**到 `www.willinglink.com`。
+Twilio 打裸域会吃到跳转，而 **`X-Twilio-Signature` 是按原始 URL 算的**——
+跳转之后 URL 变了，验签必然失败。表现是 403，且看不出原因。
+
+所以：
+- Twilio 号码的入站 webhook 必须填 `https://www.willinglink.com/api/twilio/messages`
+- 同时把 `TWILIO_WEBHOOK_URL` 设成同一个值。代理后面 `request.url` 未必等于
+  Twilio 实际请求的地址，显式指定才可靠。
+
+## 线上环境变量（Vercel · Production）
+
+已配好：`TWILIO_AUTH_TOKEN`（验签）、`TWILIO_ACCOUNT_SID`、
+`TWILIO_MESSAGING_SERVICE_SID`、`TWILIO_WEBHOOK_URL`、`COLIVING_ROSTER`、
+`CHANNEL_ADAPTERS_ENABLED=1`。
+
+**线上没有配 API Key**，出站走 `AccountSid:AuthToken` 回落路径（见 `sendSms`）。
+日志里会打 `[twilio] 出站认证方式：auth-token` 便于确认。
+
+`TWILIO_BRAIN` 没配，代码默认 `coliving`。
+
+**改了环境变量必须重新部署才生效**——Vercel 不会自动把新变量注入已有部署。
+
 ## 已知局限
 
 - **进程内存的会话**：serverless 上每实例一份，扩容/冷启动就丢，同一个人两条消息
