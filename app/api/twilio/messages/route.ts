@@ -5,6 +5,7 @@ import {
   jsonWithCors,
   toErrorResponse,
 } from "@/lib/chat/adapter";
+import { markCommunication } from "@/lib/chat/coliving/repo";
 import { runColivingTurn } from "@/lib/chat/coliving/turn";
 import { emptyTwiml, sendSms, verifyTwilioSignature } from "@/lib/chat/twilio";
 
@@ -21,7 +22,8 @@ export const preferredRegion = "sfo1";
  * 两种大脑，由 `TWILIO_BRAIN` 选择：
  *
  * - `coliving`（默认）合租房管理。走 `lib/ai/brains` 的 coliving 大脑，
- *   **不依赖数据库**，会话与名册在内存/环境变量里。
+ *   事实落在 `coliving` schema 的世界模型里（人、房子、成员关系、事件、
+ *   Case、Decision、Communication）。认不出的号码不落任何记录，只回一句。
  * - `rental` 租房搜索。走 `handleInboundMessage` → Chat Engine，
  *   跨渠道共用同一条 conversation，**需要 channel-identity 表**。
  *
@@ -87,30 +89,45 @@ export async function POST(request: Request) {
     try {
       const outcome = await runColivingTurn({ fromPhone: from, text: body });
 
-      if (outcome.reply) {
-        const sent = await sendSms(from, outcome.reply);
-        if (!sent.ok) {
-          console.log("[twilio] 回复发送失败：", sent.error);
+      // communication 先落库成 queued，发完再回写——发送结果本身也是事实账本的一部分
+      const deliver = async (
+        to: string,
+        text: string,
+        communicationId: string | null
+      ) => {
+        const sent = await sendSms(to, text);
+        if (communicationId) {
+          await markCommunication({
+            communicationId,
+            status: sent.ok ? "sent" : "failed",
+            error: sent.ok ? null : (sent.error ?? "unknown"),
+          });
         }
+        if (!sent.ok) {
+          console.log("[twilio] 发送失败：", sent.error);
+        }
+      };
+
+      if (outcome.reply) {
+        await deliver(from, outcome.reply, outcome.replyCommunicationId);
       }
 
-      // 转交给房东的短信
+      // 主动发给房子里其他人的（杠杆二）
       for (const msg of outcome.outbound) {
-        const sent = await sendSms(msg.to, msg.text);
-        if (!sent.ok) {
-          console.log("[twilio] 转交发送失败：", sent.error);
-        }
+        await deliver(msg.to, msg.text, msg.communicationId);
       }
 
       console.log(
         "[twilio]",
         JSON.stringify({
           messageSid,
+          unknownSender: outcome.unknownSender,
+          decisionId: outcome.decisionId,
           modules: outcome.modules,
           tools: outcome.toolsUsed,
           promptChars: outcome.promptChars,
           replyChars: outcome.reply.length,
-          notified: outcome.outbound.length,
+          outbound: outcome.outbound.length,
         })
       );
     } catch (error) {

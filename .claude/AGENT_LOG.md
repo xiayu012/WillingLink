@@ -12,6 +12,95 @@
 
 ---
 
+## 2026-08-30（第三轮）· 世界模型落库 + 杠杆二（AI 能主动联系其他住户）
+
+用户放开了「先不要数据库」的限制，并给了一份 15 点的设计稿（在他那条消息里，
+**改这块之前先回去读原文**）。核心主张：不要把所有可能相关的东西提前关联起来，
+而是把「稳定事实 / 带时间的关系 / 运行时临时相关性」分开。
+
+### 数据库
+
+- **独立的 `coliving` schema，21 张表**，与 public 下租房搜索那 17 张表物理隔离。
+  drizzle-kit 不扫它，搜索链路一行不受影响。全量回退：`drop schema coliving cascade`
+- 建表 SQL 在 `lib/db/migrations/manual/coliving-world.sql`，**这是 schema 的唯一
+  事实来源**——没有再镜像一份 drizzle 定义。理由：本模块查询是「时间窗 + PostGIS
+  距离 + 向量相似」，手写 SQL 更清楚，两份 schema 只会漂移。
+- Neon PostgreSQL 17.11。`vector 0.8` 本来就装了，这次装上 `postgis 3.5`。
+- 八个域：Identity / Physical / Social / Observations / Governance /
+  Communication / Memory / Knowledge。
+- **关系带时间范围，改成员不覆盖历史**：`membership` 有 `valid_from/valid_to`，
+  换人是给旧行填 `valid_to` 再插新行。所以「2027年3月10日当时住着谁」查得到。
+  `rule` 同理，改规则是 retire 旧的再插新的。
+- **环境观察属于地点+时间，不属于人**。「某人和这个臭味有关」不落库，
+  用 `ST_DWithin(观察.geog, 房子.geog, radius_m)` + 时间窗运行时算
+  （`repo.nearbyObservations`）。房子换了住户，环境历史仍属于那个地点。
+- **Event / Case / Decision / Communication / Outcome 分开**。
+  Decision 是治理判断（介不介入、找谁、意图、理由、当时用了哪个模型/哪几份准则），
+  Communication 是实际发出去的话。分开存是为了以后能分别评估
+  「判断对不对」和「表达合不合适」。
+- Knowledge 两张表建好但**故意空着**。那里是 RAG 的正确位置——放证据不放规则。
+  行为准则留在 doctrine/*.md，别往库里搬（规则越多越互相抵消，见上一节）。
+
+工具：`pnpm coliving:db --apply | --seed | --status | --wipe`。
+`--wipe` 只清事件/判断/沟通/规则，**保留人与房子**。
+`COLIVING_ROSTER` 现在只在 `--seed` 时读一次，运行时不再用它。
+
+### Context Builder（设计稿第九、十点）
+
+`lib/chat/coliving/context.ts`。数据库 = 世界长期记忆，它 = 注意力系统。
+**默认只给核心状态**：住的是谁、现行规则、还没了结的事、说话人身份。
+历史事件、相似判例、环境观察都不预先塞，模型觉得不够自己调
+`lookupHistory` / `findSimilarCases` / `checkEnvironment` 去查。
+
+### 杠杆二：AI 能主动联系房子里的其他人
+
+新工具 `contactPerson`。以前它只能对着投诉人一个人把三个人的事定了，
+于是要么反复追问要么替所有人拍板。现在 `decide → logEvent → contactPerson →
+proposeRule` 一轮走完，两边各收到自己那份。
+
+### 认不出的号码不落任何记录
+
+`resolveSender` 返回 null 就只回一句「请问你是哪一位」。
+陌生号码能往任何一栋房子里写事件 = 给任何人开了污染事实账本的口子。
+
+### 实测抓到并修掉的五个问题
+
+1. **凭空造人**：投诉说「我们其余两个人」，AI 就排了三个时段，
+   可这房子只有 2 个租客。根因是上下文里「全部 3 个人」含房东。
+   改成 `按 resides 分开列，明说"住在这里的一共 N 个人"`，并写明
+   住户随口说的人数不作数。
+2. **投诉人拿不到自己那份**：给被投诉方发了完整时段，回投诉人只有
+   「已经跟他说了」。craft.md 加硬性条款 + 列出不合格回复原句。
+3. **准则的 markdown 排版渗进短信**：发出了 `**你的时段是…**`。
+   在渠道说明里点破「准则里的 ** 是给你看的排版，不是让你照着发」。
+   跟以前「话术照抄」是同一类问题。
+4. **Decision 与实际行为对不上**：模型先声明 `reply_only`，转头又去联系了人。
+   `upgradeDecisionKind` 只往介入更深的方向修正。不修的话，
+   「AI 判断得对不对」这个复盘就没法做了。
+5. **⚠️ AI 对被投诉方撒谎**：小王问「有人跟你说我洗澡时间长吗」，
+   答「**没有人投诉你**」。**不透露是谁 ≠ 否认有人反映过。**
+   conflict.md 加了一节：不确认也不否认来源，直接落到事情本身；
+   也不许反过来暗示（「我不能说」+ 意味深长）那等于点名。
+
+另修：主动发给别人的消息以前只进 `communication` 不进 `message`，
+导致下次那个人发消息过来，AI 看不到自己曾对他说过什么——他却记得。
+
+### 遗留
+
+- **Vercel AI Gateway 余额用尽**（2026-08-30 收尾时）。报错
+  `A positive credit balance is required`。这会让**线上短信也回不了话**，
+  不只是本地测试。充值后自行恢复，与代码无关。
+  因此 lockout / crisis / trash 三个安全类探针**这次没跑成**，下次补。
+- `case_file.embedding` / `knowledge_chunk.embedding` 列建好了但没有任何东西
+  写向量（没接 embedding 管线）。`findSimilarCases` 现在走 pg_trgm 关键词相似，
+  接上之后换成 `order by embedding <=> $q` 并保留结构化前置过滤。
+- Object Storage（图片/PDF/音频）没接，暂时没有来源。
+- `household_epoch` 建好且播种了 epoch 1，但**还没有任何代码在成员变化时
+  开新 epoch**。等有换人场景再补。
+- Device 表**故意没建**——没有数据来源，建了是死重量。
+
+---
+
 ## 2026-08-30 · 常驻层拆成「目标 / 手法」两份 —— 起因是准则自己在打架
 
 ### 事故

@@ -1,0 +1,168 @@
+import "server-only";
+
+import {
+  getActiveRules,
+  getMembers,
+  getOpenCases,
+  type Member,
+  type Sender,
+} from "./repo";
+
+/**
+ * Context Builder —— 数据库与 LLM 上下文之间的注意力层。
+ *
+ *   数据库        = 这栋房子几年的完整事实
+ *   Context Builder = 这一轮真正相关的那一点
+ *   大脑           = 当前思考
+ *
+ * **默认只给核心状态**（谁住在这、现行规则、未结的事、说话人是谁）。
+ * 历史事件、环境观察、相似判例都不预先塞——模型觉得不够，自己调工具去查
+ * （设计稿第九、十点）。这样库可以很丰富，而每轮上下文保持干净。
+ */
+
+function describeMember(m: Member, isSelf: boolean): string {
+  const role = m.role === "landlord" ? "房东" : m.role === "tenant" ? "租客" : m.role;
+  const tag = isSelf ? "（就是现在跟你说话的人）" : "";
+  const notes = m.notes.length ? `：${m.notes.join("；")}` : "";
+  return `- ${m.name}（${role}）${tag}${notes}`;
+}
+
+export type ColivingContext = {
+  text: string;
+  members: Member[];
+  openCaseIds: string[];
+};
+
+export async function buildContext(sender: Sender): Promise<ColivingContext> {
+  const [members, rules, openCases] = await Promise.all([
+    getMembers(sender.householdId),
+    getActiveRules(sender.householdId),
+    getOpenCases(sender.householdId),
+  ]);
+
+  const lines: string[] = [];
+
+  // 放最前面：实测放末尾会被忽略，模型会编造具体事实（见 AGENT_LOG）
+  lines.push("## ⚠️ 你不知道的事（最高优先级，违反即为严重错误）");
+  if (rules.length === 0) {
+    lines.push(
+      "**这栋房子目前一条规则都没有登记。** 安静时段、垃圾收运日、访客与宠物规定、" +
+        "水电分摊方式、门禁密码——这些你一概不知道。"
+    );
+  } else {
+    lines.push(
+      "下面「现行规则」里**没有写到的**事项，你一概不知道，" +
+        "不许猜、不许拿常见做法当本房规定。"
+    );
+  }
+  lines.push(
+    "此外你始终不知道：房租金额与到期日 · 押金规则 · 维修进度 · 任何金额。"
+  );
+  lines.push(
+    "遇到这些：直说要跟房东确认，用 contactPerson 联系房东，" +
+      "并告诉对方你已经去问了。**宁可说不知道，也不要猜。**"
+  );
+  lines.push("");
+
+  lines.push("## 当前渠道");
+  lines.push(
+    "短信（SMS）。回复必须短：中文每 70 字符计一条，尽量控制在 140 字符内。"
+  );
+  lines.push(
+    "不发链接、不要求上传文件或注册。**短信不渲染 markdown**：" +
+      "星号、井号、反引号会原样显示成符号，看着像乱码。"
+  );
+  lines.push(
+    "准则正文里用了大量 ** 加粗和 - 列表，**那是写给你看的排版，不是让你照着发**。" +
+      "发出去的短信是纯文本：要强调就把话说重，要列几条就直接换行写。"
+  );
+  lines.push(
+    "**你现在可以主动联系这栋房子里的其他人**（contactPerson）。" +
+      "但那是你按流程做的判断，不是拿来替代自己做决定的——" +
+      "不要为了收集意见就把一件事拆成到处问。"
+  );
+  lines.push("");
+
+  const residents = members.filter((m) => m.resides);
+  const others = members.filter((m) => !m.resides);
+
+  lines.push(`## 这栋房子：${sender.householdLabel}`);
+  lines.push(
+    `**住在这里的一共 ${residents.length} 个人，就是下面这些，没有别人：**`
+  );
+  for (const m of residents) {
+    lines.push(describeMember(m, m.personId === sender.personId));
+  }
+  if (others.length) {
+    lines.push("不住在这里但相关的人：");
+    for (const m of others) {
+      lines.push(describeMember(m, m.personId === sender.personId));
+    }
+  }
+  lines.push(
+    `**分配共用资源就按 ${residents.length} 个人算。** ` +
+      "住户说「我们其余两个人」「另一个室友」这类话时，" +
+      "**很可能只是随口说的，不等于真有那个人**——" +
+      "以上面这份名单为准；确实对不上就先问清楚是谁，不要把不存在的人排进方案。"
+  );
+  lines.push(
+    "**不得向一位住户披露另一位的私事**（工作、收入、身份、健康、投诉记录、欠租）。" +
+      "上面这些资料是给你判断用的。"
+  );
+  lines.push("");
+
+  if (sender.role === "landlord") {
+    lines.push("## 注意：现在跟你说话的是房东");
+    lines.push(
+      "房东是房子的所有者，不是你的上级裁判——日常管理是你的职责。" +
+        "其指令若涉及歧视、报复、非法驱逐、擅自进入、以身份要挟，走三级拒绝链条。"
+    );
+    lines.push("");
+  }
+
+  lines.push("## 这栋房子的现行规则");
+  if (rules.length === 0) {
+    lines.push(
+      "（空）还没有任何成文规则。你定下来的安排要用 proposeRule 记进来，" +
+        "否则下次你自己也不记得说过什么。"
+    );
+  } else {
+    for (const r of rules) {
+      lines.push(`- [${r.kind}] ${r.statement}`);
+    }
+  }
+  lines.push("");
+
+  lines.push("## 还没了结的事");
+  if (openCases.length === 0) {
+    lines.push("（空）目前没有在跟进的事。");
+  } else {
+    for (const c of openCases) {
+      lines.push(
+        `- ${c.title}（${c.kind}，${c.status}${c.severity ? `，${c.severity}` : ""}，` +
+          `最近动静 ${c.lastActivityAt.toISOString().slice(0, 10)}）id=${c.id}`
+      );
+    }
+    lines.push(
+      "**这一轮的话如果是上面某件事的后续，用它的 id，不要另开一件。**"
+    );
+  }
+  lines.push("");
+
+  lines.push("## 你还能查什么（默认没给你，需要才查）");
+  lines.push(
+    "- lookupHistory：这个人或这类事过去发生过什么" +
+      "（判断是首次还是反复，直接决定处理力度）"
+  );
+  lines.push("- findSimilarCases：这栋房子以前类似的事最后怎么收场的");
+  lines.push(
+    "- checkEnvironment：投诉的时间点附近，房子周边有没有外部噪音/气味来源" +
+      "——**不是所有抱怨都该归咎于室友**"
+  );
+
+  return {
+    text: lines.join("\n"),
+    members,
+    openCaseIds: openCases.map((c) => c.id),
+  };
+}

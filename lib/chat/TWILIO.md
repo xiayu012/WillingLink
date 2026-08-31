@@ -13,7 +13,8 @@
                                          handleInboundMessage → Chat Engine（需 DB 表）
 ```
 
-合租房这条**不依赖数据库**：会话在进程内存，名册在 `COLIVING_ROSTER` 环境变量。
+合租房这条的事实全部落在 `coliving` schema 的世界模型里（人、房子、成员关系、
+事件、Case、Decision、Communication）。建表与播种见 `pnpm coliving:db`。
 
 ## 为什么不同步回 TwiML 正文
 
@@ -57,21 +58,28 @@ pnpm twilio:selftest                    # 环境变量 + 验签算法 + 大脑�
 pnpm twilio:selftest --send +1650XXXXXXX  # 真发一条（会计费）
 ```
 
-## 名册与角色（COLIVING_ROSTER）
+## 住户身份从哪来
 
-没有数据库，住户身份靠环境变量。**必须有**，否则 AI 不知道在跟谁说话——
-而说话人是租客还是管理方，决定了准则里一大半的行为分支。
+**数据库**，不再是环境变量。手机号 → `coliving.person_contact` → `person` →
+当前生效的 `membership`（`valid_to is null`）→ `household`。
+
+**认不出的号码不会落任何记录**，只回一句"请问你是哪一位"。这是有意的：
+陌生号码往任何一栋房子里写事件，等于给任何人开了污染事实账本的口子。
+
+首次建库与播种：
 
 ```
-COLIVING_ROSTER=[{"phone":"+1650...","name":"小李","role":"tenant","note":"上夜班，白天在睡觉"},
-                 {"phone":"+1510...","name":"小王","role":"tenant"},
-                 {"phone":"+1408...","name":"张房东","role":"manager"}]
+pnpm coliving:db --apply      # 建 coliving schema 的 21 张表（幂等）
+pnpm coliving:db --seed       # 用 COLIVING_ROSTER 建出第一个 household
+pnpm coliving:db --status     # 看每张表多少行
+pnpm coliving:db --wipe       # 清事件/判断/沟通，保留人与房子
 ```
 
-`note` 是自由文本，原样进提示词——放作息、语言偏好、在意的事，
-也就是 `情境_03` 里入住时该问的那八个问题的答案。
+`COLIVING_ROSTER` **只在 `--seed` 时读一次**，之后运行时不再用它。
+往房子里加人、换人，改数据库（成员变化是给旧行填 `valid_to` 再插新行，
+不覆盖历史），不要再改那个环境变量。
 
-**部署时记得在 Vercel 环境变量里也加一份**，本地 `.env.local` 不会自动同步过去。
+Vercel 上需要 `POSTGRES_URL`（本来就有）。
 
 ## 工具
 
@@ -134,8 +142,11 @@ Twilio 打裸域会吃到跳转，而 **`X-Twilio-Signature` 是按原始 URL �
 ## 线上环境变量（Vercel · Production）
 
 已配好：`TWILIO_AUTH_TOKEN`（验签）、`TWILIO_ACCOUNT_SID`、
-`TWILIO_MESSAGING_SERVICE_SID`、`TWILIO_WEBHOOK_URL`、`COLIVING_ROSTER`、
+`TWILIO_MESSAGING_SERVICE_SID`、`TWILIO_WEBHOOK_URL`、`POSTGRES_URL`、
 `CHANNEL_ADAPTERS_ENABLED=1`。
+
+`COLIVING_ROSTER` 线上**不再需要**（身份走数据库了），留着也无害。
+可选：`COLIVING_MODEL` 覆盖模型，默认 `anthropic/claude-sonnet-4.5`。
 
 **线上没有配 API Key**，出站走 `AccountSid:AuthToken` 回落路径（见 `sendSms`）。
 日志里会打 `[twilio] 出站认证方式：auth-token` 便于确认。
