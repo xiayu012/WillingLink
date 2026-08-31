@@ -123,13 +123,24 @@ export async function buildContext(sender: Sender): Promise<ColivingContext> {
   lines.push("## 这栋房子的现行规则");
   if (rules.length === 0) {
     lines.push(
-      "（空）还没有任何成文规则。你定下来的安排要用 proposeRule 记进来，" +
-        "否则下次你自己也不记得说过什么。"
+      "（空）还没有任何成文规则——**这不是等着谁来填的表格，是要靠问出来的。**"
+    );
+    lines.push(
+      "碰到相关的事就顺势问一句（一次一个问题），把答案用 proposeRule / " +
+        "remember 记进来。安静时段、垃圾谁倒、访客怎么算——" +
+        "**这些是住在这里的人共同的事，不是房东规定的，也不是你一个人定的。**"
     );
   } else {
     for (const r of rules) {
-      lines.push(`- [${r.kind}] ${r.statement}`);
+      const asked = r.consultedAt
+        ? "已问过所有人"
+        : `还没问全（同意 ${r.agreedCount} 人${r.objectedCount ? `，有异议 ${r.objectedCount} 人` : ""}）`;
+      lines.push(`- [${r.kind}] ${r.statement} —— ${asked}`);
     }
+    lines.push(
+      "标着「还没问全」的：先照它执行，但遇到相关话题时顺便问一下当前这个人的意见，" +
+        "用 recordStance 记下来。"
+    );
   }
   lines.push("");
 

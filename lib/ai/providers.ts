@@ -46,6 +46,14 @@ export function getLanguageModel(modelId: string) {
   return gateway.languageModel(modelId);
 }
 
+/**
+ * 向量模型。目前只有合租房的判例/资料检索在用。
+ * 维度与 `coliving.*.embedding` 列的 `vector(1536)` 绑定——换模型要一起改。
+ */
+export function getEmbeddingModel(modelId: string) {
+  return gateway.textEmbeddingModel(modelId);
+}
+
 export function getTitleModel() {
   if (isTestEnvironment && myProvider) {
     return myProvider.languageModel("title-model");

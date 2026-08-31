@@ -97,11 +97,19 @@ pnpm brain:inspect --brains           # 列出已注册的大脑
 按工具/意图切分的情境模块，路由按「搜房 / 通勤 / 求租帖 / 闲聊」分。
 迁移前先跑 `pnpm search-eval` 建立基线。
 
-## 尚未接入的两层
+## 运行时状态与工具（合租房大脑已接）
 
-**运行时状态**（住户档案、房屋规则、未闭环事项）——
-目前由调用方自己拼进 `runtimeContext`，等状态库落地后改为从数据库取。
-没有这一层，准则只能给通用建议。
+**运行时状态**由调用方拼进 `runtimeContext`。合租房那边是
+`lib/chat/coliving/context.ts` 从 `coliving` schema 的世界模型取——
+默认只给核心状态（住的是谁、现行规则、没了结的事），
+历史与判例让模型自己调工具查。**这一层缺了，准则只能给通用建议。**
 
-**工具**——`log_event` / `notify_manager` / `schedule_checkin` / `lookup_house_rule`。
-缺了工具，这套东西只是聊天机器人。
+**工具**在 `lib/chat/coliving/turn.ts`：判断、记录、联系他人、定共同规则、
+查历史、找相似判例、查周边环境。缺了工具，这套东西只是聊天机器人。
+
+**注意 prompt cache 的断点**：`assembleSystemPrompt` 返回的 `doctrine`
+每轮逐字相同（可缓存），`runtime` 每轮都变（不可缓存）。
+调用方要把它们作为两条 system message 传，只给 `doctrine` 那条打 cacheControl。
+整段一起缓存 = 运行时状态一变就全部落空，等于没开。
+带工具时**一轮不止一次模型调用**（每个工具一次往返，每次重发整个提示词），
+所以这个缓存是本模块最大的一笔省钱。

@@ -69,10 +69,37 @@ pnpm twilio:selftest --send +1650XXXXXXX  # 真发一条（会计费）
 首次建库与播种：
 
 ```
-pnpm coliving:db --apply      # 建 coliving schema 的 21 张表（幂等）
+pnpm coliving:db --apply      # 建表（幂等，两份 SQL 都会跑）
 pnpm coliving:db --seed       # 用 COLIVING_ROSTER 建出第一个 household
 pnpm coliving:db --status     # 看每张表多少行
 pnpm coliving:db --wipe       # 清事件/判断/沟通，保留人与房子
+```
+
+换人（**历史不覆盖**，两边都会滚新的 household_epoch）：
+
+```
+pnpm coliving:db --move-out 小王 --reason "租约到期"
+pnpm coliving:db --move-in 小陈 --phone +1555... --note "厨师，晚上十点下班"
+```
+
+主动发起（回访冷掉的事 · 问完没问全的共同规则 · 新住户头两周接触）：
+
+```
+pnpm coliving:outreach          # 干跑，只打印会发什么
+pnpm coliving:outreach --send   # 真发
+```
+
+线上是 `vercel.json` 的 cron，每天两次（太平洋时间正午与晚八点，
+避开早晚高峰）。**频率闸门不在 cron 上**，在 `outreach.ts` 里：
+同一个人两天内不主动找第二次、同一件事最多回访三次、
+`person.proactive_ok=false` 直接跳过。急停：`COLIVING_OUTREACH_OFF=1`。
+
+判例与资料（Knowledge 域，只放证据不放规则）：
+
+```
+pnpm coliving:ingest <文件或目录> --kind case_precedent --jurisdiction CA
+pnpm coliving:ingest --list
+pnpm coliving:db --embed        # 给已了结的 Case 补算向量
 ```
 
 `COLIVING_ROSTER` **只在 `--seed` 时读一次**，之后运行时不再用它。

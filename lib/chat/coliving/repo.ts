@@ -64,6 +64,10 @@ export type HouseRule = {
   id: string;
   kind: string;
   statement: string;
+  /** 走完一轮征询的时间。null = 还没问全，只是默认在跑 */
+  consultedAt: Date | null;
+  agreedCount: number;
+  objectedCount: number;
 };
 
 export type PastEvent = {
@@ -138,9 +142,12 @@ export async function getMembers(householdId: string): Promise<Member[]> {
 
 export async function getActiveRules(householdId: string): Promise<HouseRule[]> {
   return await db()<HouseRule[]>`
-    select id, kind, statement
+    select id, kind, statement,
+           consulted_at as "consultedAt",
+           coalesce(array_length(agreed_by, 1), 0) as "agreedCount",
+           coalesce(array_length(objected, 1), 0) as "objectedCount"
     from coliving.rule
-    where household_id = ${householdId} and status = 'active'
+    where household_id = ${householdId} and status in ('active','proposed')
       and (valid_to is null or valid_to > now())
     order by kind
   `;
@@ -503,29 +510,344 @@ export async function nearbyObservations(args: {
 /**
  * 找相似的历史 Case。
  *
- * **现在只做关键词/三元组相似**：embedding 列已经建好，但还没有任何东西
- * 往里写向量（没接 embedding 管线）。等接上之后这里换成
- * `order by embedding <=> $q` 并保留下面的结构化前置过滤——
- * 设计稿第十一点：先按 household / 时间 / 类别筛，再按语义排序。
+ * 设计稿第十一点：**向量只是普通查询之外的一种检索方式**，不是数据库结构本身。
+ * 所以这里先做结构化前置过滤（同一栋房子、可选类别），再按语义排序——
+ * 而不是拿一个向量去全库捞。
+ *
+ * 没有向量（还没算过 embedding）时自动退回 pg_trgm 关键词相似，不报错。
  */
 export async function findSimilarCases(args: {
   householdId: string;
   query: string;
+  queryVector?: number[] | null;
   kind?: string | null;
   limit?: number;
 }): Promise<
-  Array<{ id: string; title: string; kind: string; status: string; resolution: string | null }>
+  Array<{
+    id: string;
+    title: string;
+    kind: string;
+    status: string;
+    resolution: string | null;
+    score: number | null;
+  }>
 > {
+  const limit = args.limit ?? 5;
+  if (args.queryVector?.length) {
+    const vec = `[${args.queryVector.join(",")}]`;
+    return await db()`
+      select id, title, kind, status, resolution,
+             round((1 - (embedding <=> ${vec}::vector))::numeric, 3)::float as score
+      from coliving.case_file
+      where household_id = ${args.householdId}
+        and embedding is not null
+        and (${args.kind ?? null}::text is null or kind = ${args.kind ?? null})
+      order by embedding <=> ${vec}::vector
+      limit ${limit}
+    ` as never;
+  }
   return await db()`
-    select id, title, kind, status, resolution
+    select id, title, kind, status, resolution,
+           round(similarity(title, ${args.query})::numeric, 3)::float as score
     from coliving.case_file
     where household_id = ${args.householdId}
       and (${args.kind ?? null}::text is null or kind = ${args.kind ?? null})
-      and (title % ${args.query} or ${args.query} % title
-           or kind = ${args.kind ?? null})
+      and (title % ${args.query} or kind = ${args.kind ?? null})
     order by similarity(title, ${args.query}) desc, last_activity_at desc
-    limit ${args.limit ?? 5}
+    limit ${limit}
   ` as never;
+}
+
+/** 检索治理资料/判例（Knowledge 域）。同样先结构化后语义。 */
+export async function searchKnowledge(args: {
+  queryVector: number[];
+  kind?: string | null;
+  jurisdiction?: string | null;
+  limit?: number;
+}): Promise<Array<{ title: string; body: string; score: number }>> {
+  const vec = `[${args.queryVector.join(",")}]`;
+  return await db()`
+    select d.title, c.body,
+           round((1 - (c.embedding <=> ${vec}::vector))::numeric, 3)::float as score
+    from coliving.knowledge_chunk c
+    join coliving.knowledge_doc d on d.id = c.doc_id
+    where c.embedding is not null
+      and (${args.kind ?? null}::text is null or d.kind = ${args.kind ?? null})
+      and (${args.jurisdiction ?? null}::text is null
+           or d.jurisdiction = ${args.jurisdiction ?? null})
+    order by c.embedding <=> ${vec}::vector
+    limit ${args.limit ?? 4}
+  ` as never;
+}
+
+export async function setCaseEmbedding(
+  caseId: string,
+  vector: number[]
+): Promise<void> {
+  await db()`
+    update coliving.case_file
+    set embedding = ${`[${vector.join(",")}]`}::vector
+    where id = ${caseId}
+  `;
+}
+
+/** 还没算过向量的 Case，供离线补算 */
+export async function casesMissingEmbedding(
+  limit = 50
+): Promise<Array<{ id: string; title: string; kind: string; resolution: string | null }>> {
+  return await db()`
+    select id, title, kind, resolution from coliving.case_file
+    where embedding is null order by last_activity_at desc limit ${limit}
+  ` as never;
+}
+
+// ── 成员变更（换人）─────────────────────────────────────────────────────────
+// **不覆盖历史**：搬走是给旧行填 valid_to，搬进是插新行；
+// 成员结构一变就开一个新 epoch，用来分辨「这栋房子长期如此」
+// 还是「某一批人凑在一起才出问题」。
+
+async function rollEpoch(
+  tx: postgres.TransactionSql,
+  householdId: string,
+  label: string
+): Promise<void> {
+  const [cur] = await tx<{ seq: number }[]>`
+    select coalesce(max(seq), 0) as seq from coliving.household_epoch
+    where household_id = ${householdId}
+  `;
+  await tx`
+    update coliving.household_epoch set ended_at = now()
+    where household_id = ${householdId} and ended_at is null
+  `;
+  await tx`
+    insert into coliving.household_epoch (household_id, seq, label, started_at)
+    values (${householdId}, ${cur.seq + 1}, ${label}, now())
+  `;
+}
+
+export async function moveOut(args: {
+  householdId: string;
+  personId: string;
+  reason?: string | null;
+}): Promise<void> {
+  await db().begin(async (tx) => {
+    await tx`
+      update coliving.membership set valid_to = now(),
+        note = coalesce(note || ' / ', '') || ${args.reason ?? "搬出"}
+      where household_id = ${args.householdId}
+        and person_id = ${args.personId} and valid_to is null
+    `;
+    const [p] = await tx<{ display_name: string }[]>`
+      select display_name from coliving.person where id = ${args.personId}
+    `;
+    await rollEpoch(tx, args.householdId, `${p?.display_name ?? "某人"} 搬出后`);
+    // 他个人的偏好记忆也随之失效——那是关于「他住在这里时」的事实
+    await tx`
+      update coliving.memory set valid_to = now()
+      where person_id = ${args.personId} and household_id = ${args.householdId}
+        and valid_to is null
+    `;
+  });
+}
+
+export async function moveIn(args: {
+  householdId: string;
+  name: string;
+  phone: string;
+  role?: Role;
+  note?: string | null;
+}): Promise<string> {
+  const phone = normalizePhone(args.phone);
+  return await db().begin(async (tx) => {
+    // 同一个手机号可能是老住户搬回来——复用同一个 person，身份不因搬家而改变
+    const [existing] = await tx<{ person_id: string }[]>`
+      select person_id from coliving.person_contact
+      where kind = 'sms' and value = ${phone} limit 1
+    `;
+    let personId: string;
+    if (existing) {
+      personId = existing.person_id;
+    } else {
+      const [p] = await tx<{ id: string }[]>`
+        insert into coliving.person (display_name, onboarded_at)
+        values (${args.name}, now()) returning id
+      `;
+      personId = p.id;
+      await tx`
+        insert into coliving.person_contact (person_id, kind, value, is_primary)
+        values (${personId}, 'sms', ${phone}, true)
+      `;
+    }
+    await tx`
+      insert into coliving.membership
+        (household_id, person_id, role, resides, note)
+      values (${args.householdId}, ${personId}, ${args.role ?? "tenant"},
+              ${(args.role ?? "tenant") !== "landlord"}, ${args.note ?? null})
+      on conflict do nothing
+    `;
+    await tx`
+      update coliving.person set onboarded_at = now()
+      where id = ${personId} and onboarded_at is null
+    `;
+    await rollEpoch(tx, args.householdId, `${args.name} 搬入后`);
+    return personId;
+  });
+}
+
+// ── 共识规则：问过谁、谁同意、谁有异议 ───────────────────────────────────────
+
+export type PendingRule = {
+  id: string;
+  kind: string;
+  statement: string;
+  consulted: string[];
+  agreedBy: string[];
+  objected: string[];
+};
+
+/** 还没走完一轮征询的规则——主动发起的 cron 靠它找活干 */
+export async function rulesNeedingConsult(
+  householdId: string
+): Promise<PendingRule[]> {
+  return await db()<PendingRule[]>`
+    select id, kind, statement,
+           consulted as "consulted", agreed_by as "agreedBy", objected as "objected"
+    from coliving.rule
+    where household_id = ${householdId}
+      and status in ('proposed','active')
+      and consulted_at is null
+    order by valid_from
+  `;
+}
+
+export async function recordConsultation(args: {
+  ruleId: string;
+  personId: string;
+  stance: "asked" | "agreed" | "objected";
+}): Promise<void> {
+  const col =
+    args.stance === "agreed"
+      ? "agreed_by"
+      : args.stance === "objected"
+        ? "objected"
+        : "consulted";
+  await db().unsafe(
+    `update coliving.rule
+       set ${col} = (select array_agg(distinct x) from unnest(${col} || $1::uuid[]) x),
+           consulted = (select array_agg(distinct x) from unnest(consulted || $1::uuid[]) x)
+     where id = $2`,
+    [`{${args.personId}}`, args.ruleId]
+  );
+}
+
+/** 所有在住的人都问过了 → 这条规则算走完一轮，正式成立 */
+export async function closeConsultation(ruleId: string): Promise<void> {
+  await db()`
+    update coliving.rule set consulted_at = now(), status = 'active'
+    where id = ${ruleId}
+  `;
+}
+
+// ── 主动发起的候选 ───────────────────────────────────────────────────────────
+
+/** 冷了太久还没了结的事 */
+export async function casesNeedingFollowup(args: {
+  householdId: string;
+  staleDays?: number;
+  minGapDays?: number;
+}): Promise<OpenCase[]> {
+  return await db()<OpenCase[]>`
+    select id, kind, title, status, severity, last_activity_at as "lastActivityAt"
+    from coliving.case_file
+    where household_id = ${args.householdId}
+      and status in ('open','monitoring','waiting')
+      and last_activity_at < now() - (${args.staleDays ?? 3} || ' days')::interval
+      and (last_followup_at is null
+           or last_followup_at < now() - (${args.minGapDays ?? 5} || ' days')::interval)
+      and followup_count < 3
+    order by last_activity_at
+    limit 3
+  `;
+}
+
+export async function markFollowedUp(caseId: string): Promise<void> {
+  await db()`
+    update coliving.case_file
+    set last_followup_at = now(), followup_count = followup_count + 1
+    where id = ${caseId}
+  `;
+}
+
+/** 刚搬进来两周内的人——唯一低成本建立约定的窗口 */
+export async function newcomers(householdId: string): Promise<Member[]> {
+  const rows = await getMembers(householdId);
+  const all = await db()<{ id: string; onboarded_at: Date | null; last_outreach_at: Date | null; proactive_ok: boolean }[]>`
+    select id, onboarded_at, last_outreach_at, proactive_ok from coliving.person
+    where onboarded_at > now() - interval '14 days'
+  `;
+  const ok = new Set(
+    all
+      .filter(
+        (p) =>
+          p.proactive_ok &&
+          (!p.last_outreach_at ||
+            Date.now() - p.last_outreach_at.getTime() > 3 * 24 * 3600 * 1000)
+      )
+      .map((p) => p.id)
+  );
+  return rows.filter((m) => ok.has(m.personId));
+}
+
+export async function canReachProactively(personId: string): Promise<boolean> {
+  const [p] = await db()<{ ok: boolean }[]>`
+    select (proactive_ok and (last_outreach_at is null
+            or last_outreach_at < now() - interval '2 days')) as ok
+    from coliving.person where id = ${personId}
+  `;
+  return p?.ok ?? false;
+}
+
+export async function markOutreach(personId: string): Promise<void> {
+  await db()`
+    update coliving.person set last_outreach_at = now() where id = ${personId}
+  `;
+}
+
+export async function setProactiveOk(
+  personId: string,
+  ok: boolean
+): Promise<void> {
+  await db()`
+    update coliving.person set proactive_ok = ${ok} where id = ${personId}
+  `;
+}
+
+export async function startOutreachRun(args: {
+  householdId: string;
+  job: string;
+}): Promise<string> {
+  const rows = await db()<{ id: string }[]>`
+    insert into coliving.outreach_run (household_id, job)
+    values (${args.householdId}, ${args.job}) returning id
+  `;
+  return rows[0].id;
+}
+
+export async function finishOutreachRun(args: {
+  runId: string;
+  considered: number;
+  acted: number;
+  skipped?: Record<string, unknown>;
+  error?: string | null;
+}): Promise<void> {
+  await db()`
+    update coliving.outreach_run
+    set finished_at = now(), considered = ${args.considered},
+        acted = ${args.acted},
+        skipped_reason = ${JSON.stringify(args.skipped ?? {})}::jsonb,
+        error = ${args.error ?? null}
+    where id = ${args.runId}
+  `;
 }
 
 // ── 运维 / 调试用 ────────────────────────────────────────────────────────────

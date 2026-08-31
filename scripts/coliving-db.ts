@@ -54,15 +54,17 @@ async function status() {
   console.log("扩展：", ext.map((e) => e.extname).join(", ") || "（无）");
 }
 
+/** 按文件名顺序全部执行。每份都写成幂等的，重复跑不会出事。 */
+const MIGRATIONS = ["coliving-world.sql", "coliving-world-02.sql"];
+
 async function apply() {
-  const path = join(
-    process.cwd(),
-    "lib/db/migrations/manual/coliving-world.sql"
-  );
-  const text = readFileSync(path, "utf8");
-  console.log(`执行 ${path}（${text.length} 字符）…`);
-  // simple 协议才能一次跑多条语句
-  await sql.unsafe(text).simple();
+  for (const name of MIGRATIONS) {
+    const path = join(process.cwd(), "lib/db/migrations/manual", name);
+    const text = readFileSync(path, "utf8");
+    console.log(`执行 ${name}（${text.length} 字符）…`);
+    // simple 协议才能一次跑多条语句
+    await sql.unsafe(text).simple();
+  }
   console.log("✓ 建表完成");
 }
 
@@ -208,6 +210,83 @@ async function wipe() {
   console.log("✓ 已清空事件/判断/沟通/规则，人与房子保留");
 }
 
+function argOf(flag: string): string | undefined {
+  const i = args.indexOf(flag);
+  return i !== -1 ? args[i + 1] : undefined;
+}
+
+/**
+ * 换人。**不覆盖历史**：搬出是给 membership 填 valid_to，搬入是插新行，
+ * 两者都会滚一个新的 household_epoch，用来分辨
+ * 「这栋房子长期如此」还是「某一批人凑在一起才出问题」。
+ */
+async function membership() {
+  const repo = await import("../lib/chat/coliving/repo");
+  const [house] = await repo.listHouseholds();
+  if (!house) {
+    console.log("✗ 库里没有 household");
+    return;
+  }
+
+  const out = argOf("--move-out");
+  if (out) {
+    const m = await repo.findPersonByName(house.id, out);
+    if (!m) {
+      console.log(`✗ ${house.label} 里没有「${out}」`);
+      return;
+    }
+    await repo.moveOut({
+      householdId: house.id,
+      personId: m.personId,
+      reason: argOf("--reason") ?? null,
+    });
+    console.log(`✓ ${m.name} 已搬出（历史保留，开了新 epoch）`);
+  }
+
+  const inName = argOf("--move-in");
+  if (inName) {
+    const phone = argOf("--phone");
+    if (!phone) {
+      console.log("✗ --move-in 需要配 --phone");
+      return;
+    }
+    await repo.moveIn({
+      householdId: house.id,
+      name: inName,
+      phone,
+      role: (argOf("--role") as "tenant" | "landlord") ?? "tenant",
+      note: argOf("--note") ?? null,
+    });
+    console.log(`✓ ${inName} 已搬入（onboarded_at 已设，头两周会主动接触）`);
+  }
+
+  const members = await repo.getMembers(house.id);
+  console.log(`\n${house.label} 当前成员：`);
+  for (const m of members) {
+    console.log(`  ${m.name.padEnd(8)} ${m.role.padEnd(9)} ${m.phone ?? ""}`);
+  }
+}
+
+/** 给还没算过向量的 Case 补算，供 findSimilarCases 用 */
+async function embedBackfill() {
+  const repo = await import("../lib/chat/coliving/repo");
+  const { embedBatch } = await import("../lib/chat/coliving/embedding");
+  const pending = await repo.casesMissingEmbedding(100);
+  if (pending.length === 0) {
+    console.log("没有需要补算向量的 Case");
+    return;
+  }
+  console.log(`补算 ${pending.length} 条 Case 的向量…`);
+  const texts = pending.map(
+    (c) => `${c.kind}｜${c.title}｜${c.resolution ?? ""}`
+  );
+  const vectors = await embedBatch(texts);
+  for (const [i, c] of pending.entries()) {
+    await repo.setCaseEmbedding(c.id, vectors[i]);
+  }
+  console.log(`✓ 已写入 ${pending.length} 条`);
+}
+
 async function main() {
   if (has("--apply")) {
     await apply();
@@ -215,10 +294,22 @@ async function main() {
   if (has("--wipe")) {
     await wipe();
   }
+  if (has("--move-in") || has("--move-out")) {
+    await membership();
+  }
+  if (has("--embed")) {
+    await embedBackfill();
+  }
   if (has("--seed")) {
     await seed();
   }
-  if (has("--status") || args.length === 0) {
+  if (
+    has("--status") ||
+    args.length === 0 ||
+    !args.some((a) =>
+      ["--apply", "--wipe", "--seed", "--move-in", "--move-out", "--embed"].includes(a)
+    )
+  ) {
     await status();
   }
   await sql.end();

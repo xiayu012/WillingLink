@@ -5,6 +5,7 @@ import { z } from "zod";
 import { assembleSystemPrompt } from "@/lib/ai/brains";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
+import { embedOne } from "./embedding";
 import { normalizePhone } from "./phone";
 import * as repo from "./repo";
 
@@ -116,6 +117,7 @@ export async function runColivingTurn(args: {
   // ── 本轮累积的状态 ──
   let decisionId: string | null = null;
   let activeCaseId: string | null = null;
+  let activeRuleId: string | null = null;
   let lastEventId: string | null = null;
   const outbound: OutboundMessage[] = [];
   const toolsUsed: string[] = [];
@@ -325,8 +327,11 @@ export async function runColivingTurn(args: {
 
     proposeRule: tool({
       description:
-        "把你定下来的安排记成这栋房子的一条规则。**定了时段、轮值、约定就要记**，" +
-        "否则下一轮你自己也不知道说过什么。statement 要写成能直接念给住户听的一句话。",
+        "把共同生活的安排记成这栋房子的一条规则（时段、分工、访客约定等）。\n" +
+        "**这类规则不是你定的，也不是房东定的，是住在这里的人一起定的。**\n" +
+        "你给的是默认方案——先按它执行，省得大家从零协商；" +
+        "然后你要逐个私下问过每个住在这里的人（contactPerson），" +
+        "把谁同意、谁有异议用 recordStance 记下来。全问过一轮，这条规则才算真正成立。",
       inputSchema: z.object({
         kind: z
           .string()
@@ -335,7 +340,7 @@ export async function runColivingTurn(args: {
         agreedByNames: z
           .array(z.string())
           .optional()
-          .describe("已经明确同意的人。没人确认过就留空"),
+          .describe("此刻已经明确说过同意的人。没人确认过就留空"),
       }),
       execute: async ({ kind, statement, agreedByNames }) => {
         const agreed: string[] = [];
@@ -345,12 +350,50 @@ export async function runColivingTurn(args: {
             agreed.push(m.personId);
           }
         }
-        await repo.saveRule({
+        const ruleId = await repo.saveRule({
           householdId: sender.householdId,
           kind,
           statement,
           agreedBy: agreed,
           sourceCaseId: activeCaseId,
+        });
+        activeRuleId = ruleId;
+        const residents = ctx.members.filter((m) => m.resides);
+        return {
+          ok: true,
+          ruleId,
+          note:
+            `这条规则要问过这 ${residents.length} 个住在这里的人才算成立：` +
+            `${residents.map((m) => m.name).join("、")}。` +
+            "还没问的，用 contactPerson 去问。",
+        };
+      },
+    }),
+
+    recordStance: tool({
+      description:
+        "记下某个人对一条共同规则的态度。**只在对方真的表过态时才记**——" +
+        "没回复不等于同意，那属于「问过了但还没答」，用 asked。",
+      inputSchema: z.object({
+        name: z.string(),
+        stance: z
+          .enum(["asked", "agreed", "objected"])
+          .describe("asked=问过了还没答 · agreed=明确说行 · objected=提了异议"),
+        ruleId: z.string().optional().describe("不填就用本轮刚提的那条"),
+      }),
+      execute: async ({ name, stance, ruleId }) => {
+        const target = ruleId ?? activeRuleId;
+        if (!target) {
+          return { ok: false, reason: "本轮没有正在征询的规则" };
+        }
+        const m = await repo.findPersonByName(sender.householdId, name);
+        if (!m) {
+          return { ok: false, reason: `房子里没有叫「${name}」的人` };
+        }
+        await repo.recordConsultation({
+          ruleId: target,
+          personId: m.personId,
+          stance,
         });
         return { ok: true };
       },
@@ -415,18 +458,40 @@ export async function runColivingTurn(args: {
     }),
 
     findSimilarCases: tool({
-      description: "找这栋房子以前类似的事，看当时怎么收场的。",
+      description:
+        "找这栋房子以前类似的事，看当时怎么收场的。也会顺带检索治理资料里的相关判例。",
       inputSchema: z.object({
         query: z.string().describe("用一句话描述现在这件事"),
         kind: z.string().optional(),
       }),
       execute: async ({ query, kind }) => {
+        // 算不出向量（没配 key / 额度用尽）不能让整轮挂掉，退回关键词
+        let vec: number[] | null = null;
+        try {
+          vec = await embedOne(query);
+        } catch {
+          vec = null;
+        }
         const cases = await repo.findSimilarCases({
           householdId: sender.householdId,
           query,
+          queryVector: vec,
           kind: kind ?? null,
         });
-        return { count: cases.length, cases };
+        const refs = vec
+          ? await repo.searchKnowledge({ queryVector: vec, limit: 3 })
+          : [];
+        return {
+          cases: cases.map((c) => ({
+            title: c.title,
+            status: c.status,
+            resolution: c.resolution,
+          })),
+          references: refs.map((r) => ({
+            title: r.title,
+            excerpt: r.body.slice(0, 400),
+          })),
+        };
       },
     }),
 
