@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         xhs-guide-title-judge
 // @namespace    https://willinglink.local/
-// @version      0.20.1
+// @version      0.21.0
 // @description  小红书多标题识别高亮 + 详情页复制正文指引 + AI 评论回复自动粘贴
 // @author       local
 // @match        https://www.xiaohongshu.com/*
@@ -20,7 +20,7 @@
   "use strict";
 
   const LOG_PREFIX = "[xhs-guide]";
-  const SCRIPT_VERSION = "0.20.1";
+  const SCRIPT_VERSION = "0.21.0";
   const MAX_HIGHLIGHT_COUNT = 10;
   const VIEWPORT_MARGIN = 8;
   /** 信息流高亮仅框标题行，超过此高度视为误匹配到整卡容器 */
@@ -554,6 +554,9 @@
     /** 那次点击的占位框，用来限定编辑器搜索范围 */
     aiReplyPasteAnchor: null,
     aiReplyPasting: false,
+    /** 粘成功那次实际写进去的编辑器节点 + 文字，发送前用来兜底重插 */
+    aiReplyEditor: null,
+    aiReplyPastedText: null,
     /** 人工点过发送按钮：这一步完成后才轮到分享按钮的框选 */
     commentSent: false,
     /** 人工点过分享弹层里的「复制链接」：点完这一框就该收了 */
@@ -2806,10 +2809,23 @@
       : (editor.innerText ?? editor.textContent ?? "");
 
   /**
-   * 写进编辑器。**不用 execCommand，也不合成 paste/Ctrl+V**：那些是浏览器命令
-   * 或伪造事件，小红书的风控认得出来，不值当。这里就是普通的 DOM 操作 + 一对
-   * 冒泡的 beforeinput/input —— Vue/React 靠 input 事件感知值变化，只改 DOM
-   * 不发事件的话框里有字、组件数据仍是空，点发送等于发了条空评论。
+   * 写进编辑器。**仍然不 execCommand、不合成 ClipboardEvent('paste')**——那才是
+   * 小红书风控真正盯的信号。这里做的是普通 DOM 操作 + 一对冒泡的
+   * beforeinput/input，Vue/React 靠这两个事件感知值变化。
+   *
+   * 2026-08-28 从真实控制台日志里看到的：文字确实粘进去过（`readEditorText`
+   * 当场核验通过），但用户下一次点击时，评论框所在的 Vue 组件走了一次
+   * `handleActive` → 响应式更新 → `initTribute`（评论框用 Tribute.js 做 @提及
+   * 补全）的链路，日志里跟着一句 `Tribute was already bound to P`——这次
+   * re-init 把刚写进去的内容顶掉了，最终点发送时小红书报"参数错误"（它自己的
+   * 状态里这段评论其实是空的）。
+   *
+   * `inputType` 改成 `insertFromPaste`（原来是 `insertText`）算一层缓解：
+   * Tribute 这类 @提及库通常按输入类型决定要不要重新扫描/初始化——"逐字打字"
+   * 会触发它的补全逻辑，"粘贴一大段"通常不会。但这**不能保证根治**（这是
+   * Vue 组件自己的响应式副作用，不是我们这层能完全控制的），所以更可靠的
+   * 兜底是发送前再确认一次内容还在，见 `pasteAiReplyIntoComment` 和
+   * `ensureCommentClickListener` 里发送按钮那一分支。
    */
   const insertTextIntoEditor = (editor, text) => {
     editor.focus();
@@ -2857,19 +2873,37 @@
       selection?.addRange(caret);
     }
 
+    // 真实粘贴的 input 事件除了 data 还带 dataTransfer——部分编辑器读的是后者，
+    // 两个都给上，覆盖面更全。构造失败（极老的浏览器不支持 DataTransfer()）
+    // 就退回只带 data，不影响主流程。
+    let dataTransfer;
+    try {
+      dataTransfer = new DataTransfer();
+      dataTransfer.setData("text/plain", text);
+    } catch {
+      dataTransfer = undefined;
+    }
+
     for (const type of ["beforeinput", "input"]) {
       editor.dispatchEvent(
         new InputEvent(type, {
           bubbles: true,
           cancelable: type === "beforeinput",
-          inputType: "insertText",
+          inputType: "insertFromPaste",
           data: text,
+          dataTransfer,
         }),
       );
     }
 
     return readEditorText(editor).includes(text.slice(0, 12));
   };
+
+  /** 编辑器还在文档里、且还留着这段文字的前 12 个字符 */
+  const editorStillHasText = (editor, text) =>
+    !!editor &&
+    document.contains(editor) &&
+    readEditorText(editor).includes(text.slice(0, 12));
 
   const closestBySelectors = (target, selectors) => {
     if (!(target instanceof Element)) {
@@ -2905,6 +2939,9 @@
       return null;
     }
   };
+
+  /** 插入成功后再等这么久复核一次，防的是受控组件异步把内容顶掉 */
+  const SETTLE_CHECK_MS = 300;
 
   /**
    * 点一下输入框就当"光标一定在里面了"，立刻开始粘。
@@ -2945,16 +2982,33 @@
           continue;
         }
         sawEditor = true;
-        if (insertTextIntoEditor(editor, text)) {
-          logInfo("AI 回复已粘进评论框", {
-            chars: text.length,
-            waitedMs: elapsed,
-            editor: editor.id || editor.className || editor.tagName,
-          });
-          showAiReplyToast("✓ 已粘贴，检查后点发送", "ok");
-          renderDetailHighlight(config);
-          return;
+        if (!insertTextIntoEditor(editor, text)) {
+          continue;
         }
+        // 插入那一刻检查是对的，但评论框背后是个 Vue 组件，真实日志里见过它在
+        // 下一个 tick 用自己的响应式更新把刚写进去的内容顶掉（见
+        // insertTextIntoEditor 文档注释）——这种情况同步检查看不出来，之前会
+        // 直接当成功返回，用户看到的却是空框。隔一小段时间回头再看一眼，真被
+        // 顶掉就当没插入，进下一次重试（editorWaitMs 还有后续档位）。
+        await sleep(SETTLE_CHECK_MS);
+        if (!editorStillHasText(editor, text)) {
+          logWarn("插入后内容被评论框自己的逻辑顶掉，重试", {
+            waitedMs: elapsed,
+          });
+          continue;
+        }
+        // 记下这次真正落地的编辑器和文字——发送按钮点下去之前还会再核一遍，
+        // 顶掉两次的情况见过（日志里两次 handleActive）。
+        state.aiReplyEditor = editor;
+        state.aiReplyPastedText = text;
+        logInfo("AI 回复已粘进评论框", {
+          chars: text.length,
+          waitedMs: elapsed,
+          editor: editor.id || editor.className || editor.tagName,
+        });
+        showAiReplyToast("✓ 已粘贴，检查后点发送", "ok");
+        renderDetailHighlight(config);
+        return;
       }
 
       logWarn("未能自动插入评论框，文字已在剪贴板，手动 Ctrl+V 即可", {
@@ -2984,6 +3038,23 @@
         !state.commentSent &&
         closestBySelectors(target, config.commentReply.sendSelectorCandidates)
       ) {
+        // 最后一道兜底：粘贴成功之后，评论框可能被 Vue 自己的响应式更新顶空
+        // 过（见 insertTextIntoEditor 的注释），点发送那一刻内容可能已经不在
+        // 了——小红书自己不知道，会把空评论提交上去，报"参数错误"。这段代码
+        // 挂在 document 的 capture 阶段，比小红书自己挂在按钮上的点击处理器
+        // 先跑一步，所以这里**同步**重插一次还来得及，赶在真正的发送请求
+        // 发出去之前。
+        if (
+          state.aiReplyEditor &&
+          state.aiReplyPastedText &&
+          !editorStillHasText(state.aiReplyEditor, state.aiReplyPastedText)
+        ) {
+          const reinserted = insertTextIntoEditor(
+            state.aiReplyEditor,
+            state.aiReplyPastedText
+          );
+          logWarn("发送前发现评论框被顶空，已重插", { reinserted });
+        }
         state.commentSent = true;
         logInfo("评论已发送，进入分享步骤");
         renderDetailHighlight(config);
@@ -3028,6 +3099,8 @@
     state.aiReplyPasteRequested = false;
     state.aiReplyPasteAnchor = null;
     state.aiReplyPasting = false;
+    state.aiReplyEditor = null;
+    state.aiReplyPastedText = null;
     state.commentSent = false;
     document.getElementById("xhs-guide-ai-reply-toast")?.remove();
   };
@@ -3132,6 +3205,8 @@
     state.aiReplyText = null;
     state.aiReplyPasteRequested = false;
     state.aiReplyPasteAnchor = null;
+    state.aiReplyEditor = null;
+    state.aiReplyPastedText = null;
     state.commentSent = false;
     state.shareCopyLinkClicked = false;
     showAiReplyToast(config.commentReply.pendingHint, "pending");
