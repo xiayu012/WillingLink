@@ -7,7 +7,7 @@ import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { recordEvent, type Severity } from "./events";
 import { appendTurn, getTurns } from "./session";
-import { buildRuntimeContext, findPerson, getManagers, normalizePhone } from "./roster";
+import { buildRuntimeContext, findPerson, getLandlords, normalizePhone } from "./roster";
 
 /** 工具最多跑几步。合租房场景不需要长链路：识别 → 记录/转交 → 回话。 */
 const MAX_STEPS = 4;
@@ -17,7 +17,7 @@ export type TurnOutcome = {
   modules: string[];
   promptChars: number;
   toolsUsed: string[];
-  /** 需要额外发给管理方的短信（由调用方投递，便于本地模拟时不真发） */
+  /** 需要额外发给房东的短信（由调用方投递，便于本地模拟时不真发） */
   outbound: Array<{ to: string; text: string }>;
 };
 
@@ -87,49 +87,49 @@ export async function runColivingTurn(args: {
       },
     }),
 
-    notifyManager: tool({
+    notifyLandlord: tool({
       description:
-        "把事情转交给管理方（房东）。达到 P0/P1，或需要人到现场、需要动钱、" +
+        "把事情转交给房东。达到 P0/P1，或需要人到现场、需要动钱、" +
         "需要法定权限时调用。**转交不是询问住户的选项，是你按流程做的判断。**",
       inputSchema: z.object({
         urgency: z.enum(["P0", "P1", "P2"]).describe("紧急程度"),
         summary: z
           .string()
-          .describe("给管理方看的简报：谁、什么事、需要他做什么、什么时候之前"),
+          .describe("给房东看的简报：谁、什么事、需要他做什么、什么时候之前"),
       }),
       execute: async ({ urgency, summary }) => {
-        // 同一轮里模型有时会连调两次，那会给管理方发两条重复短信。
+        // 同一轮里模型有时会连调两次，那会给房东发两条重复短信。
         if (notified) {
           return { ok: true, note: "本轮已经转交过，不重复发送" };
         }
         notified = true;
 
-        // 不能把上报发回给发起人本人。管理方自己下达不当指令时，
-        // 「通知管理方」等于通知那个下命令的人——准则要求这类事不得在
-        // 管理方内部闭环（见 情境_05），必须留外部渠道并如实告知。
-        const managers = getManagers().filter((m) => m.phone !== from);
+        // 不能把上报发回给发起人本人。房东自己下达不当指令时，
+        // 「通知房东」等于通知那个下命令的人——准则要求这类事不得在
+        // 房东那里闭环（见 情境_05），必须留外部渠道并如实告知。
+        const landlords = getLandlords().filter((m) => m.phone !== from);
 
-        if (managers.length === 0) {
-          const senderIsManager = me?.role === "manager";
+        if (landlords.length === 0) {
+          const senderIsLandlord = me?.role === "landlord";
           recordEvent({
             fromPhone: from,
             fromName,
             kind: "notified",
             severity: urgency as Severity,
-            summary: senderIsManager
-              ? `【无法内部上报：事涉管理方本人】${summary}`
-              : `【名册里没有管理方】${summary}`,
+            summary: senderIsLandlord
+              ? `【无法内部上报：事涉房东本人】${summary}`
+              : `【名册里没有房东】${summary}`,
             modules: loadedModuleIds,
           });
           return {
             ok: false,
-            reason: senderIsManager
-              ? "事情涉及管理方本人，不能上报给他自己。已完整留痕。请如实告知对方：你不会执行、已记录、且不隐瞒外部申诉渠道。"
-              : "名册里没有可通知的管理方，已记录但无人可转交。请如实告知对方目前无法转交。",
+            reason: senderIsLandlord
+              ? "事情涉及房东本人，不能上报给他自己。已完整留痕。请如实告知对方：你不会执行、已记录、且不隐瞒外部申诉渠道。"
+              : "名册里没有可通知的房东，已记录但无人可转交。请如实告知对方目前无法转交。",
           };
         }
 
-        for (const m of managers) {
+        for (const m of landlords) {
           outbound.push({
             to: m.phone,
             text: `[${urgency}] 来自${fromName}：${summary}`,
@@ -141,10 +141,10 @@ export async function runColivingTurn(args: {
           kind: "notified",
           severity: urgency as Severity,
           summary,
-          detail: `已通知：${managers.map((m) => m.name).join("、")}`,
+          detail: `已通知：${landlords.map((m) => m.name).join("、")}`,
           modules: loadedModuleIds,
         });
-        return { ok: true, notified: managers.map((m) => m.name) };
+        return { ok: true, notified: landlords.map((m) => m.name) };
       },
     }),
   };

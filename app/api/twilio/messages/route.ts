@@ -94,7 +94,7 @@ export async function POST(request: Request) {
         }
       }
 
-      // 转交给管理方的短信
+      // 转交给房东的短信
       for (const msg of outcome.outbound) {
         const sent = await sendSms(msg.to, msg.text);
         if (!sent.ok) {
