@@ -19,6 +19,12 @@
 
 **为什么常驻放最前**：便于上游做 prompt caching，前缀稳定才能命中缓存。
 
+**为什么常驻是数组而不是一份文件**：`always` 按顺序拼，**顺序即优先级**——
+前面是目标与仲裁条款，后面是手法，正文里写明冲突时以前者为准。
+起因是一次真实事故：目标（别让住户费脑子）和手法（按周轮换）混在同一份
+1.6 万字文件里，没有任何东西说明谁压谁，模型按"具体压抽象"挑了错的那条。
+**准则变长时，缺的往往不是内容而是仲裁。** 详见 AGENT_LOG 2026-08-30。
+
 ## 目录
 
 ```
@@ -32,7 +38,8 @@ lib/ai/brains/
   coliving/
     index.ts     合租房大脑：清单 + 路由规则
     doctrine/    准则正文（编辑这里就能改行为）
-      always.md          常驻
+      core.md            常驻 A：目标与仲裁（三道闸、优先次序、禁区）
+      craft.md           常驻 B：手法（格式、措辞、轻管理十条）
       conflict.md        室友冲突调解
       complaint-risk.md  主动询问 / 投诉 / 风险升级
       tenancy.md         入住 / 规则 / 退租
@@ -76,7 +83,7 @@ pnpm brain:inspect --brains           # 列出已注册的大脑
 
 ## 新增一个大脑
 
-1. 建 `lib/ai/brains/<id>/doctrine/`，放 `always.md` 和若干情境 .md
+1. 建 `lib/ai/brains/<id>/doctrine/`，放常驻 .md（可多份，顺序即优先级）和若干情境 .md
 2. 建 `lib/ai/brains/<id>/index.ts`，导出 `Brain`（清单 + 路由规则）
 3. 在 `index.ts` 里 `registerBrain(...)`
 4. 在 `scripts/brain-inspect.ts` 里加探针
@@ -86,7 +93,7 @@ pnpm brain:inspect --brains           # 列出已注册的大脑
 **目前没有迁移 `lib/ai/prompts.ts`。** 那是搜索链路的核心，
 `.claude/AGENT_LOG.md` 里记着大量踩过的坑，动它风险高、收益低。
 
-将来若要迁移，路径是：把 `regularPrompt` 拆成 `always.md` +
+将来若要迁移，路径是：把 `regularPrompt` 拆成常驻层 +
 按工具/意图切分的情境模块，路由按「搜房 / 通勤 / 求租帖 / 闲聊」分。
 迁移前先跑 `pnpm search-eval` 建立基线。
 

@@ -58,7 +58,8 @@ function runProbes() {
   const brain = getBrain(BRAIN_ID);
   console.log(`大脑：${brain.title}（${brain.id}）`);
   console.log(
-    `常驻 1 份 + 情境 ${brain.situational.length} 份，单轮上限 ${brain.maxSituational ?? 2} 份\n`
+    `常驻 ${brain.always.length} 份（${brain.always.map((m) => m.id).join(" → ")}，顺序即优先级） + ` +
+      `情境 ${brain.situational.length} 份，单轮上限 ${brain.maxSituational ?? 2} 份\n`
   );
 
   let pass = 0;

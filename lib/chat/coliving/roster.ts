@@ -116,6 +116,12 @@ export function buildRuntimeContext(fromPhone: string): string {
   lines.push("## 当前渠道");
   lines.push("短信（SMS）。回复必须短：中文每 70 字符计一条，尽量控制在 140 字符内。");
   lines.push("不发链接、不要求上传文件或注册、不用 markdown 语法（短信不渲染）。");
+  lines.push(
+    "**你这一轮只能回复当前这个人。你没有主动联系其他住户的能力**——" +
+      "不要说"我去跟某某说""我分别通知他们"，那是做不到的承诺。" +
+      "需要让其他人知道的安排，用 notifyLandlord 转给房东去通知，" +
+      "并如实告诉对方是这么走的。"
+  );
   lines.push("");
 
   lines.push("## 你在跟谁说话");

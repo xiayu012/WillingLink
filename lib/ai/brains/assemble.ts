@@ -37,7 +37,8 @@ export function assembleSystemPrompt(opts: AssembleOptions): AssembledPrompt {
     ? [...new Set([...routing.moduleIds, ...opts.forceModules])]
     : routing.moduleIds;
 
-  const parts: string[] = [readDoctrine(brain, brain.always)];
+  // 常驻层按声明顺序拼：先目标与仲裁，后手法
+  const parts: string[] = brain.always.map((m) => readDoctrine(brain, m));
 
   for (const id of moduleIds) {
     const mod = findModule(brain.situational, id);

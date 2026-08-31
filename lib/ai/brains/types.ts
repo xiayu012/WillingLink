@@ -40,8 +40,14 @@ export type Brain = {
   description: string;
   /** doctrine 文件所在目录的绝对路径 */
   doctrineDir: string;
-  /** 每轮必带 */
-  always: DoctrineModule;
+  /**
+   * 每轮必带。**数组顺序即优先级**——排在前面的是目标与仲裁条款，
+   * 后面的是手法。两者冲突时以前者为准（这句话本身写在准则正文里）。
+   *
+   * 拆开的原因见 AGENT_LOG「按周轮换」事故：目标与手法混在一份文件里，
+   * 模型无从判断哪条压哪条，会挑更具体的那条执行。
+   */
+  always: DoctrineModule[];
   /** 按情境加载 */
   situational: DoctrineModule[];
   /** 路由规则，按顺序求值 */

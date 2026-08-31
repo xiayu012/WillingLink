@@ -14,11 +14,12 @@ export const colivingBrain: Brain = {
     "美国低价合租房的住户沟通、冲突调解、投诉受理、规则执行与记录留痕。",
   doctrineDir: join(process.cwd(), "lib/ai/brains/coliving/doctrine"),
 
-  always: {
-    id: "always",
-    title: "常驻准则",
-    file: "always.md",
-  },
+  // 顺序即优先级：core 是目标与仲裁，craft 是手法，冲突时 core 说了算。
+  // 拆开的起因见 AGENT_LOG「按周轮换」事故。
+  always: [
+    { id: "core", title: "目标与仲裁", file: "core.md" },
+    { id: "craft", title: "手法", file: "craft.md" },
+  ],
 
   situational: [
     { id: "conflict", title: "室友冲突调解", file: "conflict.md" },
