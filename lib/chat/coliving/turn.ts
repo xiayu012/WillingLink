@@ -7,7 +7,6 @@ import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
 import { colivingModelId } from "./model";
 import { embedOne } from "./embedding";
-import { normalizePhone } from "./phone";
 import * as repo from "./repo";
 
 /**
@@ -136,13 +135,16 @@ const UNKNOWN_REPLY =
   "抱歉，我这边没有这个号码的记录。请问你是哪一位、找哪一户？";
 
 export async function runColivingTurn(args: {
-  fromPhone: string;
+  /** 从哪个渠道来：sms / wecom / xhs。决定认人用哪种地址、回信走哪条路 */
+  channel?: string;
+  /** 该渠道里的发信人地址：短信是手机号，企业微信是 UserID */
+  from: string;
   text: string;
   /** 仅测试用：临时覆盖模型，便于 A/B */
   modelId?: string;
 }): Promise<TurnOutcome> {
-  const from = normalizePhone(args.fromPhone);
-  const sender = await repo.resolveSender(from);
+  const channel = args.channel ?? "sms";
+  const sender = await repo.resolveSender(channel, args.from);
 
   if (!sender) {
     return {
@@ -165,7 +167,7 @@ export async function runColivingTurn(args: {
     };
   }
 
-  const ctx = await buildContext(sender);
+  const ctx = await buildContext(sender, channel);
   const modelId = args.modelId ?? colivingModelId();
 
   /**
@@ -187,7 +189,7 @@ export async function runColivingTurn(args: {
   const conversationId = await repo.getOrCreateConversation({
     personId: sender.personId,
     householdId: sender.householdId,
-    channel: "sms",
+    channel,
   });
   const history = await repo.getRecentTurns(conversationId);
 
@@ -394,8 +396,11 @@ export async function runColivingTurn(args: {
             reason: "这是当前跟你说话的人，直接回复就行，不用另外发",
           };
         }
-        if (!target.phone) {
-          return { ok: false, reason: `${target.name} 没有登记手机号，联系不上` };
+        if (!target.address) {
+          return {
+            ok: false,
+            reason: `${target.name} 在这个渠道没有登记地址，联系不上`,
+          };
         }
         if (contacted.has(target.personId)) {
           return { ok: false, reason: `本轮已经给 ${target.name} 发过了` };
@@ -413,7 +418,7 @@ export async function runColivingTurn(args: {
           decisionId: did,
           caseId: activeCaseId,
           toPersonId: target.personId,
-          channel: "sms",
+          channel,
           purpose,
           body: message,
         });
@@ -422,19 +427,19 @@ export async function runColivingTurn(args: {
         const theirConversation = await repo.getOrCreateConversation({
           personId: target.personId,
           householdId: sender.householdId,
-          channel: "sms",
+          channel,
         });
         await repo.appendMessage({
           conversationId: theirConversation,
           personId: target.personId,
           direction: "outbound",
-          channel: "sms",
+          channel,
           body: message,
           communicationId,
         });
 
         outbound.push({
-          to: target.phone,
+          to: target.address,
           personId: target.personId,
           text: message,
           communicationId,
@@ -698,7 +703,7 @@ export async function runColivingTurn(args: {
     conversationId,
     personId: sender.personId,
     direction: "inbound",
-    channel: "sms",
+    channel,
     body: args.text,
   });
 
@@ -710,7 +715,7 @@ export async function runColivingTurn(args: {
       decisionId: did,
       caseId: activeCaseId,
       toPersonId: sender.personId,
-      channel: "sms",
+      channel,
       purpose: "回复本人",
       body: reply,
     });
@@ -718,7 +723,7 @@ export async function runColivingTurn(args: {
       conversationId,
       personId: sender.personId,
       direction: "outbound",
-      channel: "sms",
+      channel,
       body: reply,
       communicationId: replyCommunicationId,
     });

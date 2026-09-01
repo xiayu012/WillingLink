@@ -33,9 +33,12 @@ export type ColivingContext = {
   openCaseIds: string[];
 };
 
-export async function buildContext(sender: Sender): Promise<ColivingContext> {
+export async function buildContext(
+  sender: Sender,
+  channel = "sms"
+): Promise<ColivingContext> {
   const [members, rules, openCases] = await Promise.all([
-    getMembers(sender.householdId),
+    getMembers(sender.householdId, channel),
     getActiveRules(sender.householdId),
     getOpenCases(sender.householdId),
   ]);
@@ -66,7 +69,9 @@ export async function buildContext(sender: Sender): Promise<ColivingContext> {
 
   lines.push("## 当前渠道");
   lines.push(
-    "短信（SMS）。回复必须短：中文每 70 字符计一条，尽量控制在 140 字符内。"
+    channel === "wecom"
+      ? "企业微信。回复短一些，控制在 200 字以内。"
+      : "短信（SMS）。回复必须短：中文每 70 字符计一条，尽量控制在 140 字符内。"
   );
   lines.push(
     "不发链接、不要求上传文件或注册。**短信不渲染 markdown**：" +

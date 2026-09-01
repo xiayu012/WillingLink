@@ -270,6 +270,25 @@ async function membership() {
     console.log(`✓ ${inName} 已搬入（onboarded_at 已设，头两周会主动接触）`);
   }
 
+  // 给某个人在某个渠道登记地址：同一个人可以有手机号 + 企业微信 UserID，
+  // person 只有一个 —— 身份不因换渠道而改变。
+  const contactFor = argOf("--contact");
+  if (contactFor) {
+    const kind = argOf("--kind") ?? "wecom";
+    const value = argOf("--value");
+    if (!value) {
+      console.log("✗ --contact 需要配 --value（该渠道里的地址）");
+      return;
+    }
+    const m = await repo.findPersonByName(house.id, contactFor);
+    if (!m) {
+      console.log(`✗ ${house.label} 里没有「${contactFor}」`);
+      return;
+    }
+    await repo.addContact({ personId: m.personId, kind, value });
+    console.log(`✓ ${m.name} 的 ${kind} 地址已登记`);
+  }
+
   // 「住不住在这里」是可以随时改的事实，不是角色的推论
   const resides = argOf("--set-resides");
   if (resides) {
@@ -291,7 +310,7 @@ async function membership() {
   console.log(`\n${house.label} 当前成员：`);
   for (const m of members) {
     console.log(
-      `  ${m.name.padEnd(8)} ${m.role.padEnd(9)} ${m.resides ? "同住" : "不同住"}  ${m.phone ?? ""}`
+      `  ${m.name.padEnd(8)} ${m.role.padEnd(9)} ${m.resides ? "同住" : "不同住"}  ${m.address ?? ""}`
     );
   }
 }
@@ -323,7 +342,7 @@ async function main() {
   if (has("--wipe")) {
     await wipe();
   }
-  if (has("--move-in") || has("--move-out") || has("--set-resides")) {
+  if (has("--move-in") || has("--move-out") || has("--set-resides") || has("--contact")) {
     await membership();
   }
   if (has("--embed")) {
@@ -336,7 +355,7 @@ async function main() {
     has("--status") ||
     args.length === 0 ||
     !args.some((a) =>
-      ["--apply","--wipe","--seed","--move-in","--move-out","--set-resides","--embed"].includes(a)
+      ["--apply","--wipe","--seed","--move-in","--move-out","--set-resides","--contact","--embed"].includes(a)
     )
   ) {
     await status();

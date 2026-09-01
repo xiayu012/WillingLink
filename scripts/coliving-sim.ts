@@ -78,16 +78,16 @@ function resolvePhone(who: string, members: Member[]): string | null {
   const tenants = members.filter((m) => m.role === "tenant");
   const landlords = members.filter((m) => m.role === "landlord");
   if (who === "tenant1") {
-    return tenants[0]?.phone ?? null;
+    return tenants[0]?.address ?? null;
   }
   if (who === "tenant2") {
-    return tenants[1]?.phone ?? null;
+    return tenants[1]?.address ?? null;
   }
   if (who === "landlord" || who === "manager") {
-    return landlords[0]?.phone ?? null;
+    return landlords[0]?.address ?? null;
   }
   const byName = members.find((m) => m.name === who);
-  return byName?.phone ?? who;
+  return byName?.address ?? who;
 }
 
 function modelOverride(): string | undefined {
@@ -96,14 +96,14 @@ function modelOverride(): string | undefined {
 }
 
 async function speak(phone: string, text: string, L: Lib, members: Member[]) {
-  const me = members.find((m) => m.phone === phone);
+  const me = members.find((m) => m.address === phone);
   console.log(
     `\n\x1b[36m${me ? `${me.name}(${me.role})` : phone}\x1b[0m → ${text}`
   );
 
   const started = Date.now();
   const out = await L.turn.runColivingTurn({
-    fromPhone: phone,
+    from: phone,
     text,
     modelId: modelOverride(),
   });
@@ -166,7 +166,7 @@ async function main() {
   console.log(`── ${house.label} ──`);
   for (const m of members) {
     console.log(
-      `  ${m.name.padEnd(8)} ${m.role.padEnd(9)} ${m.phone ?? "（无号码）"}${
+      `  ${m.name.padEnd(8)} ${m.role.padEnd(9)} ${m.address ?? "（无地址）"}${
         m.notes.length ? `  ${m.notes.join("；")}` : ""
       }`
     );
@@ -200,7 +200,7 @@ async function main() {
   console.log("\n用 `@名字 内容` 切换说话人，默认第一位租客。/who /log /quit");
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   let current =
-    members.find((m) => m.role === "tenant")?.phone ?? members[0].phone ?? "";
+    members.find((m) => m.role === "tenant")?.address ?? members[0].address ?? "";
 
   for (;;) {
     const line = (await rl.question("\n> ")).trim();
@@ -209,7 +209,7 @@ async function main() {
     }
     if (line === "/who") {
       for (const m of members) {
-        console.log(`  ${m.name} ${m.role} ${m.phone ?? ""}`);
+        console.log(`  ${m.name} ${m.role} ${m.address ?? ""}`);
       }
       continue;
     }
@@ -227,7 +227,7 @@ async function main() {
       }
       text = sp === -1 ? "" : line.slice(sp + 1).trim();
       if (!text) {
-        const p = members.find((m) => m.phone === current);
+        const p = members.find((m) => m.address === current);
         console.log(`（切换到 ${p?.name ?? current}）`);
         continue;
       }

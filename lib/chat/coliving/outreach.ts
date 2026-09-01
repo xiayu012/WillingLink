@@ -94,7 +94,7 @@ async function send(args: {
   rationale: string;
   out: OutreachMessage[];
 }): Promise<boolean> {
-  if (!args.person.phone) {
+  if (!args.person.address) {
     return false;
   }
   if (!(await repo.canReachProactively(args.person.personId))) {
@@ -152,7 +152,7 @@ async function send(args: {
   });
   await repo.markOutreach(args.person.personId);
   args.out.push({
-    to: args.person.phone,
+    to: args.person.address,
     personId: args.person.personId,
     text,
     communicationId,

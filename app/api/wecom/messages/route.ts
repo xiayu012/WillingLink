@@ -1,5 +1,7 @@
 import { after } from "next/server";
 import { adaptersEnabled, handleInboundMessage } from "@/lib/chat/adapter";
+import { markCommunication } from "@/lib/chat/coliving/repo";
+import { runColivingTurn } from "@/lib/chat/coliving/turn";
 import {
   decryptWecom,
   sendWecomText,
@@ -29,8 +31,13 @@ export const preferredRegion = "sfo1";
  *    才能去点保存 —— 反过来做一定失败，而且它只说「回调地址验证失败」，
  *    不告诉你是签名错了还是解密错了。本地先跑 `pnpm wecom:selftest`。
  *
- * 目前接的是租房搜索那条链路（`handleInboundMessage`），与既有行为一致。
- * 要换成别的大脑，改下面那一处调用即可。
+ * 两种大脑，由 `WECOM_BRAIN` 选择（与 Twilio 那条对称）：
+ *   `coliving`（默认）合租房管理，事实落在 coliving schema
+ *   `rental`            租房搜索，走 handleInboundMessage，需要 channel-identity 表
+ *
+ * 认人靠 `coliving.person_contact` 里 kind='wecom' 的那条，值是企业微信 UserID
+ * （从微信加入的成员，userid 会是 wxid_ 开头）。认不出就只回一句问对方是谁，
+ * **不落任何记录** —— 否则任何人都能往事实账本里塞东西。
  */
 
 function textResponse(body: string, status = 200): Response {
@@ -126,28 +133,69 @@ export async function POST(request: Request) {
     return textResponse("");
   }
 
+  const brain = (process.env.WECOM_BRAIN ?? "coliving").trim();
+
   after(async () => {
     try {
-      const result = await handleInboundMessage({
-        channel: "wecom",
-        externalUserId: fromUser,
-        text: content,
-        accountId: config.agentId,
-        externalMessageId: msgId || null,
-      });
-      if (result.text) {
-        const sent = await sendWecomText({
-          config,
-          toUser: fromUser,
-          text: result.text,
+      if (brain === "rental") {
+        const result = await handleInboundMessage({
+          channel: "wecom",
+          externalUserId: fromUser,
+          text: content,
+          accountId: config.agentId,
+          externalMessageId: msgId || null,
         });
+        if (result.text) {
+          await sendWecomText({ config, toUser: fromUser, text: result.text });
+        }
+        console.log("[wecom]", JSON.stringify({ msgId, chatId: result.chatId }));
+        return;
+      }
+
+      const outcome = await runColivingTurn({
+        channel: "wecom",
+        from: fromUser,
+        text: content,
+      });
+
+      // communication 先落库成 queued，发完回写——发送结果也是事实账本的一部分
+      const deliver = async (
+        toUser: string,
+        text: string,
+        communicationId: string | null
+      ) => {
+        const sent = await sendWecomText({ config, toUser, text });
+        if (communicationId) {
+          await markCommunication({
+            communicationId,
+            status: sent.ok ? "sent" : "failed",
+            error: sent.ok ? null : (sent.error ?? "unknown"),
+          });
+        }
         if (!sent.ok) {
           console.log("[wecom] 推送失败：", sent.error);
         }
+      };
+
+      if (outcome.reply) {
+        await deliver(fromUser, outcome.reply, outcome.replyCommunicationId);
       }
+      // 主动发给房子里其他人的（杠杆二）；他们得也有 wecom 地址才收得到
+      for (const m of outcome.outbound) {
+        await deliver(m.to, m.text, m.communicationId);
+      }
+
       console.log(
         "[wecom]",
-        JSON.stringify({ msgId, chatId: result.chatId, replyChars: result.text.length })
+        JSON.stringify({
+          msgId,
+          from: fromUser,
+          unknownSender: outcome.unknownSender,
+          tools: outcome.toolsUsed,
+          replyChars: outcome.reply.length,
+          outbound: outcome.outbound.length,
+          usage: outcome.usage,
+        })
       );
     } catch (error) {
       const name = error instanceof Error ? error.name : "UnknownError";

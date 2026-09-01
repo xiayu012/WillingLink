@@ -87,7 +87,7 @@ export async function POST(request: Request) {
 
   after(async () => {
     try {
-      const outcome = await runColivingTurn({ fromPhone: from, text: body });
+      const outcome = await runColivingTurn({ channel: "sms", from, text: body });
 
       // communication 先落库成 queued，发完再回写——发送结果本身也是事实账本的一部分
       const deliver = async (

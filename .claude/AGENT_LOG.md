@@ -12,6 +12,48 @@
 
 ---
 
+## 2026-09-01 · 企业微信接进合租房大脑 + 大脑从「只认手机号」改成「认渠道」
+
+用户配好企业微信后测试毫无反应。根因不是加解密（回调保存成功就证明
+GET 验证和解密是对的），而是 **POST 之后接的是租房搜索那条链路**
+（handleInboundMessage → 需要 ChannelIdentity 表），出错只 console.log 吞掉。
+
+### 大脑改成渠道无关
+
+原来 `runColivingTurn({ fromPhone })` 和 `resolveSender(phone)` 把 sms 写死了。
+改成：
+
+- `resolveSender(channel, externalId)` —— 按 `person_contact.kind` 匹配
+- `Member.phone` → **`Member.address`**：他在**当前渠道**里的地址。
+  短信是手机号，企业微信是 UserID。改名是因为这个大脑已经不只有短信了。
+- `getMembers(householdId, channel)`、`buildContext(sender, channel)`
+- conversation / message / communication 的 channel 全部跟着走
+
+> **同一个人可以在多个渠道有地址，person 只有一个** ——
+> 身份不因换渠道而改变，跟不因搬家而改变是同一个道理。
+
+### wecom 路由
+
+加 `WECOM_BRAIN`（默认 coliving，与 Twilio 那条对称）。
+认人靠 `person_contact` 里 kind='wecom' 的行，值是企业微信 UserID
+（**从微信加入的成员，userid 会是 wxid_ 开头**，文档确认 FromUserName
+就是成员 UserID）。认不出只回一句问是谁，不落任何记录。
+
+登记地址：`pnpm coliving:db --contact 小李 --kind wecom --value wxid_xxx`。
+
+### 实测
+
+认出小李 ✓ · 陌生 wxid 正确拒绝 ✓ · 跑完整轮 $0.0050 ·
+而且「我这边可以」被识别为对厨房规则表态，自动调了 recordStance 入库。
+
+### 遗留
+
+- 用户的微信身份**挂在小李名下**（测试方便，一条命令可改）。
+- 出站给其他人（杠杆二）在 wecom 下要求对方也有 wecom 地址，
+  目前只有小李有 —— 所以企业微信里发起的多方协调暂时只能回自己。
+
+---
+
 ## 2026-08-30（第七轮）· 默认模型换成 DeepSeek V4 Flash（便宜 18 倍且更好）
 
 用户嫌 $0.179 一轮太贵，让我查性价比高的模型，说也可以另接 API key。

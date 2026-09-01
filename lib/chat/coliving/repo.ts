@@ -37,7 +37,11 @@ export type Member = {
   name: string;
   role: Role;
   resides: boolean;
-  phone: string | null;
+  /**
+   * 他在**当前这个渠道**里的地址：短信是手机号，企业微信是 UserID。
+   * 不叫 phone 是因为这个大脑已经不只有短信了。
+   */
+  address: string | null;
   /** 长期记忆里关于这个人的作息/偏好，已经拼成一行 */
   notes: string[];
 };
@@ -82,9 +86,19 @@ export type PastEvent = {
 
 // ── 认人 ────────────────────────────────────────────────────────────────────
 
-/** 入站消息认人：手机号 → 这个人 + 他当前所在的 household。认不出返回 null。 */
-export async function resolveSender(phone: string): Promise<Sender | null> {
-  const target = normalizePhone(phone);
+/**
+ * 入站消息认人：**渠道 + 该渠道里的地址** → 这个人 + 他当前所在的 household。
+ * 认不出返回 null（调用方应当只回一句问对方是谁，不落任何记录）。
+ *
+ * 同一个人可以在多个渠道有地址（手机号 + 企业微信 UserID），
+ * person 只有一个——身份不因换渠道而改变，跟不因搬家而改变是同一个道理。
+ */
+export async function resolveSender(
+  channel: string,
+  externalId: string
+): Promise<Sender | null> {
+  const target =
+    channel === "sms" ? normalizePhone(externalId) : externalId.trim();
   if (!target) {
     return null;
   }
@@ -102,7 +116,7 @@ export async function resolveSender(phone: string): Promise<Sender | null> {
       on m.person_id = p.id and m.valid_to is null
     join coliving.household h
       on h.id = m.household_id and h.status = 'active'
-    where pc.kind = 'sms' and pc.value = ${target}
+    where pc.kind = ${channel} and pc.value = ${target}
     limit 1
   `;
   return rows[0] ?? null;
@@ -115,7 +129,10 @@ export async function resolveSender(phone: string): Promise<Sender | null> {
  * 换成 `valid_from <= $t and (valid_to is null or valid_to > $t)` 即可——
  * 历史没有被覆盖，所以查得到。
  */
-export async function getMembers(householdId: string): Promise<Member[]> {
+export async function getMembers(
+  householdId: string,
+  channel = "sms"
+): Promise<Member[]> {
   return await db()<Member[]>`
     select
       p.id           as "personId",
@@ -123,8 +140,8 @@ export async function getMembers(householdId: string): Promise<Member[]> {
       m.role         as role,
       m.resides      as resides,
       (select pc.value from coliving.person_contact pc
-        where pc.person_id = p.id and pc.kind = 'sms'
-        order by pc.is_primary desc limit 1) as phone,
+        where pc.person_id = p.id and pc.kind = ${channel}
+        order by pc.is_primary desc limit 1) as address,
       coalesce(
         (select array_agg(mem.content order by mem.created_at)
            from coliving.memory mem
@@ -818,6 +835,23 @@ export async function newcomers(householdId: string): Promise<Member[]> {
       .map((p) => p.id)
   );
   return rows.filter((m) => ok.has(m.personId));
+}
+
+/**
+ * 给某人在某渠道登记地址。同一渠道同一地址只能属于一个人（唯一索引兜着），
+ * 重复登记同一个人是幂等的。
+ */
+export async function addContact(args: {
+  personId: string;
+  kind: string;
+  value: string;
+}): Promise<void> {
+  const value = args.kind === "sms" ? normalizePhone(args.value) : args.value.trim();
+  await db()`
+    insert into coliving.person_contact (person_id, kind, value, is_primary)
+    values (${args.personId}, ${args.kind}, ${value}, false)
+    on conflict (kind, value) do update set person_id = excluded.person_id
+  `;
 }
 
 /** 改「住不住在这里」。房东可能就住在自己房子里，这是事实不是角色推导。 */
