@@ -5,6 +5,7 @@ import { generateText } from "ai";
 // 直接引 registry 会在大脑还没注册时静默放行一切（真踩过）。
 import { getBrain, readDoctrine } from "@/lib/ai/brains";
 import { getLanguageModel } from "@/lib/ai/providers";
+import { CRITIC_TIMEOUT_MS, deadline } from "./deadline";
 import { colivingModelId } from "./model";
 
 /**
@@ -110,6 +111,9 @@ export async function critique(args: CriticInput): Promise<Verdict> {
             '{"pass":true} 或 {"pass":false,"broke":"第几条","why":"一句话"}',
         },
       ],
+      // **审稿是加分项，超时按放行走**（下面的 catch 会兜住）。
+      // 卡在这儿等于让住户收不到消息 —— 那比漏审一条严重得多。
+      abortSignal: deadline(CRITIC_TIMEOUT_MS),
     });
 
     const m = result.text.match(/\{[\s\S]*?\}/);

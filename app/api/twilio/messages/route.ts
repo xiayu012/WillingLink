@@ -10,8 +10,12 @@ import { runColivingTurn } from "@/lib/chat/coliving/turn";
 import { emptyTwiml, sendSms, verifyTwilioSignature } from "@/lib/chat/twilio";
 
 // 与 /api/xhs/messages 同理：AI 那段跑在 after() 里，仍算在这个预算内。
-// 60 秒撞过墙（见 AGENT_LOG），留够余量。
-export const maxDuration = 120;
+// 60 秒撞过墙，**120 秒也撞过**（2026-09-02：加了批判器之后，
+// 一轮要跑生成 2–3 次 + 每条出站各审一次 + 可能的重写，
+// 其中一次外部调用卡了 117.81 秒，整轮被杀，住户收不到任何回复）。
+// 现在每次模型调用各自带时限（lib/chat/coliving/deadline.ts），
+// 这个上限是最后一道兜底。
+export const maxDuration = 300;
 export const preferredRegion = "sfo1";
 
 /**

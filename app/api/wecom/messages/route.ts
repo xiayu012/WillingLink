@@ -11,7 +11,7 @@ import {
 } from "@/lib/chat/wecom";
 
 // 与 Twilio 那条同理：AI 那段跑在 after() 里，仍算在这个预算内
-export const maxDuration = 120;
+export const maxDuration = 300;
 export const preferredRegion = "sfo1";
 
 /**
