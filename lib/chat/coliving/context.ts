@@ -4,6 +4,7 @@ import {
   getActiveRules,
   getMembers,
   getOpenCases,
+  isRosterComplete,
   type Member,
   type Sender,
 } from "./repo";
@@ -38,10 +39,11 @@ export async function buildContext(
   channel = "sms",
   opts: { justJoined?: boolean } = {}
 ): Promise<ColivingContext> {
-  const [members, rules, openCases] = await Promise.all([
+  const [members, rules, openCases, rosterComplete] = await Promise.all([
     getMembers(sender.householdId, channel),
     getActiveRules(sender.householdId),
     getOpenCases(sender.householdId),
+    isRosterComplete(sender.householdId),
   ]);
 
   const lines: string[] = [];
@@ -92,34 +94,48 @@ export async function buildContext(
   if (opts.justJoined) {
     // 只陈述事实。**怎么说是准则的事**（见 tenancy.md〈第一次接触〉），
     // 这里不写"你应该说……"——那样等于用一句随手写的提示压过整份准则。
-    lines.push("## 这个人刚被加进来，这是你第一次跟他说话");
+    lines.push("## 这是你第一次跟这个人说话");
     lines.push(
-      "关于他你目前只知道一个手机号。名字是系统占位符，不是真名。"
+      "**「第一次跟他说话」不等于「他刚搬进来」。** 我们只是刚拿到他的号码——" +
+        "他可能已经在这儿住了三年。**在他自己说之前，你不知道他住了多久。**"
     );
+    lines.push("关于他你目前只知道一个手机号。名字是系统占位符，不是真名。");
     lines.push("");
   }
 
-  const residents = members.filter((m) => m.resides);
-  const others = members.filter((m) => !m.resides);
+  const residents = members.filter((m) => m.resides === true);
+  const unknown = members.filter((m) => m.resides === null);
+  const others = members.filter((m) => m.resides === false);
 
-  lines.push(`## 这栋房子：${sender.householdLabel}`);
+  lines.push(`## 名册上的人：${sender.householdLabel}`);
   lines.push(
-    `**住在这里的一共 ${residents.length} 个人，就是下面这些，没有别人：**`
+    `**这是名册，不是这栋房子的全部住户。** 名册上现在有 ${members.length} 个人——` +
+      "只代表我们手上有这几个人的联系方式，不代表房子里只住这几个。"
   );
-  for (const m of residents) {
-    lines.push(describeMember(m, m.personId === sender.personId));
+  if (residents.length) {
+    lines.push(`确认住在这里的（${residents.length} 人）：`);
+    for (const m of residents) {
+      lines.push(describeMember(m, m.personId === sender.personId));
+    }
+  }
+  if (unknown.length) {
+    lines.push(`**住不住在这里还不知道的（${unknown.length} 人）**：`);
+    for (const m of unknown) {
+      lines.push(describeMember(m, m.personId === sender.personId));
+    }
   }
   if (others.length) {
-    lines.push("不住在这里但相关的人：");
+    lines.push("确认不住在这里的：");
     for (const m of others) {
       lines.push(describeMember(m, m.personId === sender.personId));
     }
   }
   lines.push(
-    `**分配共用资源就按 ${residents.length} 个人算。** ` +
-      "住户说「我们其余两个人」「另一个室友」这类话时，" +
-      "**很可能只是随口说的，不等于真有那个人**——" +
-      "以上面这份名单为准；确实对不上就先问清楚是谁，不要把不存在的人排进方案。"
+    rosterComplete
+      ? "**名册已确认完整**，分配共用资源就按上面确认住在这里的人数算。"
+      : "**⚠️ 名册还没确认过完整性。** 分配共用资源之前，" +
+          "要么先问一句这屋一共住几个人，要么在给方案时说清这是按目前知道的人算的。" +
+          "**不要笃定地说「三个人分」，除非你真的确认过只有三个人。**"
   );
   lines.push(
     "名字带「新住客」字样的是**系统占位符，不是他真名**——" +

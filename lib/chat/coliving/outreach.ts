@@ -299,26 +299,27 @@ export async function runOutreachForHousehold(
     jobs.push({ job: "rule_consult", considered, acted });
   }
 
-  // ── 3. 新住户头两周 —— 唯一低成本建立约定的窗口 ────────────────────
+  // ── 3. 刚录入系统的人 —— 注意：是我们刚认识他，不是他刚搬来 ──────────
   {
     const runId = await repo.startOutreachRun({ householdId, job: "onboarding" });
-    const fresh = await repo.newcomers(householdId);
+    const fresh = await repo.recentlyAdded(householdId);
     let acted = 0;
     for (const who of fresh) {
-      const known = who.notes.length;
       const ok = await send({
         householdId,
         person: who,
-        purpose: "入住早期主动关注，顺便问一件他自己的事",
+        purpose: "刚拿到他的联系方式，第一次接触",
         brief:
-          `他刚搬进来不久。这是建立约定成本最低的窗口。\n` +
-          (known
-            ? `已经知道的：${who.notes.join("；")}。**别重复问已经知道的。**\n`
-            : "关于他还什么都不知道。\n") +
-          `问一个跟他自己有关的问题（作息、什么时候需要用厨房或卫生间、` +
-          `有没有什么会打扰到他）。一次只问一个。`,
+          "他刚被录入系统，之前没跟你说过话。" +
+          "**你不知道他住了多久**——可能昨天搬来，也可能住了三年。" +
+          (who.movedInAt
+            ? `已知入住时间：${who.movedInAt.toISOString().slice(0, 10)}。`
+            : "入住时间未知。") +
+          (who.notes.length
+            ? `关于他已经知道的：${who.notes.join("；")}`
+            : "关于他还什么都不知道。"),
         decisionKind: "observe",
-        rationale: "入住两周内，按流程主动接触一次",
+        rationale: "刚录入系统，第一次主动接触",
         out: messages,
       });
       if (ok) {

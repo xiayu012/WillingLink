@@ -36,7 +36,14 @@ export type Member = {
   personId: string;
   name: string;
   role: Role;
-  resides: boolean;
+  /**
+   * true=确认住在这里，false=确认不住，**null=不知道**。
+   * 不知道就是不知道——共用资源怎么分直接取决于这个数，
+   * 拿默认值顶替会让 AI 笃定地算错（见 coliving-world-05.sql）。
+   */
+  resides: boolean | null;
+  /** 他真正搬进来的时间。null = 不知道。**不是录入时间** */
+  movedInAt: Date | null;
   /**
    * 他在**当前这个渠道**里的地址：短信是手机号，企业微信是 UserID。
    * 不叫 phone 是因为这个大脑已经不只有短信了。
@@ -142,6 +149,7 @@ export async function getMembers(
       p.display_name as name,
       m.role         as role,
       m.resides      as resides,
+      p.moved_in_at  as "movedInAt",
       (select pc.value from coliving.person_contact pc
         where pc.person_id = p.id and pc.kind = ${channel}
         order by pc.is_primary desc limit 1) as address,
@@ -958,8 +966,17 @@ export async function markFollowedUp(caseId: string): Promise<void> {
   `;
 }
 
-/** 刚搬进来两周内的人——唯一低成本建立约定的窗口 */
-export async function newcomers(householdId: string): Promise<Member[]> {
+/**
+ * **刚录入系统两周内的人**——注意不是「刚搬进来的人」。
+ *
+ * 曾经把这两件事混为一谈：`onboarded_at` 记的是我们什么时候把人放进系统，
+ * 提示词读成了入住时间，于是 AI 对一个住了三年的租客说
+ * 「刚搬进来这几天住得还顺吗」。真正的入住时间在 `person.moved_in_at`，
+ * 只有问出来才有，默认是 null。
+ *
+ * 这个窗口仍然值得主动接触——**因为我们刚认识他**，不是因为他刚搬来。
+ */
+export async function recentlyAdded(householdId: string): Promise<Member[]> {
   const rows = await getMembers(householdId);
   const all = await db()<{ id: string; onboarded_at: Date | null; last_outreach_at: Date | null; proactive_ok: boolean }[]>`
     select id, onboarded_at, last_outreach_at, proactive_ok from coliving.person
@@ -1061,6 +1078,39 @@ export async function finishOutreachRun(args: {
 }
 
 // ── 运维 / 调试用 ────────────────────────────────────────────────────────────
+
+/**
+ * 名册确认过完整没有。**默认 false**——房东给几个号码我们就有几个，
+ * 不代表这栋房子只住这几个人。共用资源怎么分直接建立在这个数上，
+ * 所以不确认就不能笃定地说「三个人分」。
+ */
+export async function isRosterComplete(householdId: string): Promise<boolean> {
+  const [h] = await db()<{ roster_complete: boolean }[]>`
+    select roster_complete from coliving.household where id = ${householdId}
+  `;
+  return h?.roster_complete ?? false;
+}
+
+export async function setRosterComplete(
+  householdId: string,
+  complete: boolean
+): Promise<void> {
+  await db()`
+    update coliving.household set roster_complete = ${complete}
+    where id = ${householdId}
+  `;
+}
+
+/** 记下某人真正搬进来的时间——**问出来才填**，不是录入时间 */
+export async function setMovedInAt(
+  personId: string,
+  movedInAt: Date
+): Promise<void> {
+  await db()`
+    update coliving.person set moved_in_at = ${movedInAt}, updated_at = now()
+    where id = ${personId}
+  `;
+}
 
 export async function isTestHousehold(householdId: string): Promise<boolean> {
   const [h] = await db()<{ is_test: boolean }[]>`
