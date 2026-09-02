@@ -308,7 +308,9 @@ export async function runColivingTurn(args: {
           .describe("如果是某件未了结事情的后续，填它的 id"),
       }),
       execute: async ({ kind, intent, rationale, caseId }) => {
-        if (caseId) {
+        // 模型会编 id。编的 id 插 communication 时会撞外键、整轮崩掉，
+        // 而 touchCase 更新零行是不报错的——所以必须先验存在。
+        if (caseId && (await repo.caseExists(sender.householdId, caseId))) {
           activeCaseId = caseId;
           await repo.touchCase(caseId);
         }
@@ -413,18 +415,13 @@ export async function runColivingTurn(args: {
         scope: z
           .enum(["personal", "shared"])
           .describe(
-            "personal=针对他个人的事；shared=对**共用这件东西的人**一样的规矩，" +
-              "只是分别通知到每个人。说规矩就填 shared，" +
-              "不然对方会读成在说他一个人。"
+            "personal=针对他个人的事；shared=一条规矩，对同样的人都一样。" +
+              "说规矩就填 shared，不然对方会读成在说他一个人。"
           ),
         sharedWith: z
           .string()
           .optional()
-          .describe(
-            "填 shared 时说清是**哪些人**共用这件东西（写名字）。" +
-              "**别默认是全屋**——一栋房子里可能几个人共用一个卫生间、" +
-              "另几个人用另一个。不确定谁在共用就先问，别猜。"
-          ),
+          .describe("填 shared 时写清这条对哪些人一样（人名）"),
         message: z
           .string()
           .describe(

@@ -320,6 +320,27 @@ export async function updateCase(args: {
   `;
 }
 
+/**
+ * 这个 case 真的存在吗（且属于这栋房子）。
+ *
+ * **模型会编 id。** 编了之后 `touchCase` 更新零行、不报错，
+ * 但后面拿它去插 communication 就会撞外键，**整轮崩掉、住户什么都收不到**。
+ * 所以凡是模型给的 id，用之前一律先验。
+ */
+export async function caseExists(
+  householdId: string,
+  caseId: string
+): Promise<boolean> {
+  if (!/^[0-9a-f-]{36}$/i.test(caseId)) {
+    return false;
+  }
+  const rows = await db()<{ id: string }[]>`
+    select id from coliving.case_file
+    where id = ${caseId} and household_id = ${householdId} limit 1
+  `;
+  return rows.length > 0;
+}
+
 export async function touchCase(caseId: string): Promise<void> {
   await db()`
     update coliving.case_file set last_activity_at = now() where id = ${caseId}
