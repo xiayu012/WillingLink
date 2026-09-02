@@ -588,8 +588,8 @@ export async function runColivingTurn(args: {
       description:
         "改掉某个人的显示名。**在对话里自然听出真名时才用**——" +
         "比如他自己说「我是小王」，或别人提到他的名字。" +
-        "**不要为了填这个字段专门去问名字。** 系统给的「新住客N」只是占位符，" +
-        "不知道真名就一直用着，不影响任何事。",
+        "**不必一上来就问名字**，但要称呼他、或者不问就得说出系统编号时，" +
+        "问一句「怎么称呼你」是自然的。问到了就用这个工具记下来。",
       inputSchema: z.object({
         currentName: z.string().describe("现在系统里叫什么（占位名或旧名）"),
         newName: z.string().describe("听出来的真名或他希望被怎么称呼"),

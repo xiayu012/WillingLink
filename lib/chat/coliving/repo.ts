@@ -45,6 +45,15 @@ export type Member = {
   /** 他真正搬进来的时间。null = 不知道。**不是录入时间** */
   movedInAt: Date | null;
   /**
+   * 这个名字是不是真名。false = 系统给的占位名（「2号住客」这种）。
+   *
+   * **必须逐人标出来给模型看。** 曾经靠在提示词里写一句
+   * 「名字带『新住客』字样的是占位符」来防——后来占位名格式改成
+   * 「N号住客」，那句话就失效了，AI 把「2号、3号」念进了短信里。
+   * 靠字符串匹配的规则会随格式漂移而静默失效，靠字段不会。
+   */
+  nameConfirmed: boolean;
+  /**
    * 他在**当前这个渠道**里的地址：短信是手机号，企业微信是 UserID。
    * 不叫 phone 是因为这个大脑已经不只有短信了。
    */
@@ -150,6 +159,7 @@ export async function getMembers(
       m.role         as role,
       m.resides      as resides,
       p.moved_in_at  as "movedInAt",
+      p.name_confirmed as "nameConfirmed",
       (select pc.value from coliving.person_contact pc
         where pc.person_id = p.id and pc.kind = ${channel}
         order by pc.is_primary desc limit 1) as address,

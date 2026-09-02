@@ -24,8 +24,11 @@ import {
 function describeMember(m: Member, isSelf: boolean): string {
   const role = m.role === "landlord" ? "房东" : m.role === "tenant" ? "租客" : m.role;
   const tag = isSelf ? "（就是现在跟你说话的人）" : "";
+  // 占位名逐个标出来。**不要靠在别处写一句「名字带 X 字样的是占位符」**——
+  // 占位名格式一改那句话就静默失效（真踩过：AI 把「2号、3号」念进了短信）。
+  const placeholder = m.nameConfirmed ? "" : "〔占位名，不是真名，不可念出口〕";
   const notes = m.notes.length ? `：${m.notes.join("；")}` : "";
-  return `- ${m.name}（${role}）${tag}${notes}`;
+  return `- ${m.name}${placeholder}（${role}）${tag}${notes}`;
 }
 
 export type ColivingContext = {
@@ -138,8 +141,14 @@ export async function buildContext(
           "**不要笃定地说「三个人分」，除非你真的确认过只有三个人。**"
   );
   lines.push(
-    "名字带「新住客」字样的是**系统占位符，不是他真名**——" +
-      "别当着他的面念，也别拿它称呼他。听出真名了用 renamePerson 改。"
+    "标了〔占位名〕的是**系统编的号，不是这个人的名字**。" +
+      "**任何情况下都不许把它说进消息里**——住户看到「2号」「3号」" +
+      "会觉得自己在被编号管理。要提到那个人又不知道他叫什么，" +
+      "就用位置或事情来指（「另一位」「住楼上那位」「跟你反映噪音的那位」）。"
+  );
+  lines.push(
+    "**需要称呼他本人却不知道名字时，直接问一句就行**——" +
+      "「怎么称呼你」是自然的，不是审问。问到了用 renamePerson 记下来。"
   );
   lines.push(
     "**不得向一位住户披露另一位的私事**（工作、收入、身份、健康、投诉记录、欠租）。" +
