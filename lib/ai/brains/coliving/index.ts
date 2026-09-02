@@ -32,7 +32,17 @@ export const colivingBrain: Brain = {
     { id: "craft", title: "手法", file: "craft.md" },
   ],
 
+  /**
+   * 审稿清单 `rubric` **不进任何一次生成**，只有批判器读它（critic.ts）。
+   * 放在这里只是为了复用 doctrine 的读取与缓存——
+   * 它没有对应的 route 规则，路由永远不会命中它。
+   *
+   * 为什么单独一份：宪法是「没写过的情况怎么推」，清单是「这条写好的消息
+   * 哪里不对」。推理要抽象原则，检查要具体问题。用同一份文档干两件事，
+   * 检查那一侧就会形同虚设（真出过：批判器放行了一条读起来像指控的消息）。
+   */
   situational: [
+    { id: "rubric", title: "审稿清单（仅批判器用）", file: "rubric.md" },
     { id: "conflict", title: "室友冲突调解", file: "conflict.md" },
     {
       id: "complaint-risk",

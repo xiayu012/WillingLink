@@ -792,15 +792,30 @@ export async function runColivingTurn(args: {
    * 发出去之前过一道批判器（宪法层）。
    * 不过就让生成器改一版，**只改一次**——见 critic.ts 里为什么不迭代。
    */
+  /**
+   * 收信人在这件事里是什么角色。**批判器最需要的就是这个**——
+   * 同一段内容发给报告问题的人和发给被说到的人，一个合格一个是指控。
+   *
+   * 他自己刚说了话 = 他是来反映情况的；我们主动发的 = 他多半是被说到的那个。
+   * 判不准就说不确定，别硬猜（宪法第二条）。
+   */
+  const senderRole = args.text.trim()
+    ? ("报告问题的人" as const)
+    : ("不确定" as const);
+
   const verdict = await critique({
-    situation:
-      `${sender.name} 说：${args.text}\n` +
-      `房子里的人：${ctx.members.map((m) => m.name).join("、")}` +
+    to: sender.name,
+    role: senderRole,
+    said: args.text,
+    facts:
+      `名册上的人：${ctx.members.map((m) => m.name).join("、")}\n` +
+      `本轮调用的工具：${toolsUsed.join("、") || "无"}` +
       (outbound.length
-        ? `\n同时还会发给：${outbound.map((o) => o.text).join(" ／ ")}`
-        : ""),
+        ? `\n同一轮还会发给别人：${outbound
+            .map((o) => `→${o.text}`)
+            .join(" ／ ")}`
+        : "\n这一轮没有联系任何其他人"),
     draft: reply,
-    modelId,
   });
 
   if (!verdict.pass) {

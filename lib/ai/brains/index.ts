@@ -26,7 +26,7 @@ if (listBrains().length === 0) {
 
 export { assembleSystemPrompt } from "./assemble";
 export type { AssembleOptions } from "./assemble";
-export { clearDoctrineCache } from "./loader";
+export { clearDoctrineCache, readDoctrine } from "./loader";
 export { getBrain, listBrains } from "./registry";
 export { route } from "./router";
 export type {

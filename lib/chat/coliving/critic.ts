@@ -1,9 +1,10 @@
 import "server-only";
 
 import { generateText } from "ai";
+// **必须从 index 引**，不能直接引 registry：注册发生在 index 的副作用里。
+// 直接引 registry 会在大脑还没注册时静默放行一切（真踩过）。
+import { getBrain, readDoctrine } from "@/lib/ai/brains";
 import { getLanguageModel } from "@/lib/ai/providers";
-import { readDoctrine } from "@/lib/ai/brains/loader";
-import { getBrain } from "@/lib/ai/brains/registry";
 import { colivingModelId } from "./model";
 
 /**
@@ -11,21 +12,34 @@ import { colivingModelId } from "./model";
  *
  * ## 为什么不是「你自己再检查一遍」
  *
- * 查过资料：**朴素的自我复查在生产里不可靠**——模型会朝「它以为你想听的」
- * 修正（sycophancy），甚至把本来对的改错。行业里站得住的做法是
- * **生成器–批判器分离**：换一套提示词、只做评判不做创作、迭代次数封顶。
+ * 朴素的自我复查在生产里不可靠——模型会朝「它以为你想听的」修正，
+ * 甚至把本来对的改错。行业里站得住的是**生成器–批判器分离**：
+ * 换一套提示词、只评不写、迭代封顶。
  *
- * 所以这里刻意做了四件事：
- *   1. **不给它准则全文**，只给宪法十四条 —— 批判器要判的是原则，不是细则
- *   2. **不给它工具**，不让它改写，只让它回「过 / 不过 + 哪条 + 为什么」
- *   3. **只跑一次**。不过就退回生成器改一版，改完直接发，不再评第二轮
- *   4. **默认放行**：批判器自己出错、超时、说不清楚，一律当通过 ——
- *      **绝不能因为这道闸挂了就让住户收不到消息**
+ * ## 为什么对着「清单」而不是「宪法」
+ *
+ * 上一版让它对着宪法判，结果放行了一条读起来像指控的消息——
+ * 住户报告马桶脏，回信是「你用完顺手刷一下，别留给下一个人」。
+ * **宪法里没有一条叫「别对报告问题的人下指令」**，抽象原则判不出这种事。
+ *
+ * 宪法是「没写过的情况怎么推」，清单是「这条写好的消息哪里不对」。
+ * 推理要抽象原则，检查要具体问题。**两件事，两份文档。**
+ *
+ * ## 为什么批判器用更贵的模型
+ *
+ * 生成一轮要带一万多字准则、跑好几步；审稿只带一份清单和一条消息，
+ * 短得多。所以**审稿换成聪明模型的边际成本很低，收益却直接**。
+ * `COLIVING_CRITIC_MODEL` 可覆盖，默认 sonnet。
+ *
+ * ## 三条兜底
+ * 只跑一次 · 不给工具不让改写 · **默认放行**——
+ * 批判器自己挂了、超时了、说不清楚，一律当通过。
+ * **绝不能因为这道闸让住户收不到消息。**
  */
 
 export type Verdict = {
   pass: boolean;
-  /** 违反了哪一条（宪法的序号或名字），没违反就空 */
+  /** 第几条不合格 */
   broke: string;
   /** 一句话说清哪儿不对，交给生成器去改 */
   why: string;
@@ -33,56 +47,67 @@ export type Verdict = {
 
 const PASS: Verdict = { pass: true, broke: "", why: "" };
 
-function constitution(): string {
+function criticModelId(): string {
+  return (
+    process.env.COLIVING_CRITIC_MODEL?.trim() || "anthropic/claude-sonnet-4.5"
+  );
+}
+
+function rubric(): string {
   const brain = getBrain("coliving");
-  const mod = brain.always.find((m) => m.id === "constitution");
+  const mod = brain.situational.find((m) => m.id === "rubric");
   return mod ? readDoctrine(brain, mod) : "";
 }
 
-/**
- * 判一条待发消息过不过。
- *
- * `situation` 是这一轮的事实摘要（谁说了什么、房子里有谁），
- * 批判器需要它才能判断「说的是不是真的」这类问题。
- */
-export async function critique(args: {
-  situation: string;
+export type CriticInput = {
+  /** 收信人叫什么 */
+  to: string;
+  /**
+   * 他在这件事里是什么角色。**批判器最需要的就是这个**——
+   * 同一段内容发给报告问题的人和发给被说到的人，一个合格一个是指控。
+   */
+  role: "报告问题的人" | "被说到的人" | "受影响的其他人" | "不确定";
+  /** 他刚才说了什么。没说（主动发起）就留空 */
+  said: string;
+  /** 这一轮还知道些什么，够批判器判断「有没有说没证据的事」 */
+  facts: string;
   draft: string;
-  modelId?: string;
-}): Promise<Verdict> {
+};
+
+export async function critique(args: CriticInput): Promise<Verdict> {
   if (process.env.COLIVING_CRITIC_OFF === "1" || !args.draft.trim()) {
     return PASS;
   }
 
   try {
     const result = await generateText({
-      model: getLanguageModel(args.modelId ?? colivingModelId()),
+      model: getLanguageModel(criticModelId()),
       system: [
         {
           role: "system" as const,
           content:
             "你是审稿人，不是作者。有人写了一条要发给住户的短信，" +
-            "你只判断它有没有违反下面这份宪法。\n\n" +
-            "**只挑真正的违反**：读完之后住户会被误导、被不公平对待、" +
-            "被摊上不该他承担的事、或者收到一个执行不下去的安排。\n" +
-            "**措辞不够漂亮不算违反。** 你不写替代方案，只说哪条、为什么。\n\n" +
-            constitution(),
+            "你对着下面的清单逐条查，只报**真正的违反**。\n" +
+            "你不写替代方案，只说第几条、为什么。\n\n" +
+            rubric(),
         },
       ],
       messages: [
         {
           role: "user" as const,
           content:
-            `【这一轮的情况】\n${args.situation}\n\n` +
+            `【收信人】${args.to}\n` +
+            `【他在这件事里的角色】${args.role}\n` +
+            `【他刚才说的话】${args.said || "（没说话，是我们主动发的）"}\n` +
+            `【这一轮已知的事实】\n${args.facts}\n\n` +
             `【待发出的消息】\n${args.draft}\n\n` +
-            "只回一行 JSON，别的都不要：\n" +
-            '{"pass": true} 或 ' +
-            '{"pass": false, "broke": "第几条", "why": "一句话"}',
+            "只回一行 JSON：\n" +
+            '{"pass":true} 或 {"pass":false,"broke":"第几条","why":"一句话"}',
         },
       ],
     });
 
-    const m = result.text.match(/\{[\s\S]*\}/);
+    const m = result.text.match(/\{[\s\S]*?\}/);
     if (!m) {
       return PASS;
     }
@@ -96,7 +121,6 @@ export async function critique(args: {
       why: String(parsed.why ?? ""),
     };
   } catch (error) {
-    // **默认放行。** 这道闸是加分项，不能让它变成消息发不出去的原因。
     console.log(
       "[critic] 判不了，放行：",
       error instanceof Error ? error.message : String(error)
@@ -104,3 +128,10 @@ export async function critique(args: {
     return PASS;
   }
 }
+
+/** 生成器没被调用时也别浪费一次审稿 */
+export function criticEnabled(): boolean {
+  return process.env.COLIVING_CRITIC_OFF !== "1";
+}
+
+export { colivingModelId };
