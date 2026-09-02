@@ -53,6 +53,8 @@ export type Sender = {
   householdId: string;
   householdLabel: string;
   dwellingId: string;
+  /** 测试屋。本地进程只能写这种（见 guard.ts 里那次事故） */
+  isTest: boolean;
 };
 
 export type OpenCase = {
@@ -109,7 +111,8 @@ export async function resolveSender(
       m.role          as role,
       h.id            as "householdId",
       h.label         as "householdLabel",
-      h.dwelling_id   as "dwellingId"
+      h.dwelling_id   as "dwellingId",
+      h.is_test       as "isTest"
     from coliving.person_contact pc
     join coliving.person p on p.id = pc.person_id
     join coliving.membership m
@@ -1058,6 +1061,37 @@ export async function finishOutreachRun(args: {
 }
 
 // ── 运维 / 调试用 ────────────────────────────────────────────────────────────
+
+export async function isTestHousehold(householdId: string): Promise<boolean> {
+  const [h] = await db()<{ is_test: boolean }[]>`
+    select is_test from coliving.household where id = ${householdId}
+  `;
+  return h?.is_test ?? false;
+}
+
+/**
+ * 开一栋测试屋。**本地脚本只能写这种。**
+ * 真人住的房子由 `/api/coliving/enroll` 从房东号码建起，永远 is_test = false。
+ */
+export async function createTestHousehold(
+  label = "测试屋"
+): Promise<{ householdId: string }> {
+  return await db().begin(async (tx) => {
+    const [place] = await tx<{ id: string }[]>`
+      insert into coliving.place (kind, label, country)
+      values ('dwelling', ${label}, 'US') returning id`;
+    const [dw] = await tx<{ id: string }[]>`
+      insert into coliving.dwelling (place_id, label)
+      values (${place.id}, ${label}) returning id`;
+    const [h] = await tx<{ id: string }[]>`
+      insert into coliving.household (dwelling_id, label, is_test)
+      values (${dw.id}, ${label}, true) returning id`;
+    await tx`
+      insert into coliving.household_epoch (household_id, seq, label, started_at)
+      values (${h.id}, 1, '开张', now())`;
+    return { householdId: h.id };
+  });
+}
 
 export async function listHouseholds(): Promise<
   Array<{ id: string; label: string }>

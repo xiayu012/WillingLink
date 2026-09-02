@@ -4,6 +4,7 @@ import { assembleSystemPrompt } from "@/lib/ai/brains";
 import { generateText } from "ai";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
+import { assertCanWrite } from "./guard";
 import { colivingModelId } from "./model";
 import * as repo from "./repo";
 
@@ -42,6 +43,8 @@ async function compose(args: {
   purpose: string;
   brief: string;
 }): Promise<string> {
+  // 这个 sender 只是为了拼上下文，不代表真有人在说话。
+  // isTest 在这里没有意义——真正的闸门在 send() 里，那才是会写库的地方。
   const sender: repo.Sender = {
     personId: args.person.personId,
     name: args.person.name,
@@ -49,6 +52,7 @@ async function compose(args: {
     householdId: args.householdId,
     householdLabel: "",
     dwellingId: "",
+    isTest: false,
   };
   const ctx = await buildContext(sender);
   const { doctrine, runtime } = assembleSystemPrompt({
@@ -97,6 +101,11 @@ async function send(args: {
   if (!args.person.address) {
     return false;
   }
+  // 本地脚本不许往真人住的房子里发东西（见 guard.ts 那次事故）
+  assertCanWrite({
+    isTestHousehold: await repo.isTestHousehold(args.householdId),
+    what: "主动发起",
+  });
   if (!(await repo.canReachProactively(args.person.personId))) {
     return false;
   }

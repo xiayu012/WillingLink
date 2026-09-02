@@ -5,6 +5,7 @@ import { z } from "zod";
 import { assembleSystemPrompt } from "@/lib/ai/brains";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
+import { assertCanWrite } from "./guard";
 import { colivingModelId } from "./model";
 import { embedOne } from "./embedding";
 import * as repo from "./repo";
@@ -149,6 +150,19 @@ export async function runColivingTurn(args: {
 }): Promise<TurnOutcome> {
   const channel = args.channel ?? "sms";
   const sender = await repo.resolveSender(channel, args.from);
+
+  /**
+   * **本地脚本不许把伪造的消息写进真人住的房子。**
+   * 我干过：伪造「我上周被裁了」测试，结果它成了用户的真实对话历史，
+   * AI 之后带着这段编造的前情跟他说话。详见 guard.ts。
+   * 放在这里是因为这是伪造入站消息的唯一入口。
+   */
+  if (sender) {
+    assertCanWrite({
+      isTestHousehold: sender.isTest,
+      what: `跑一轮对话（${sender.householdLabel}）`,
+    });
+  }
 
   if (!sender) {
     return {

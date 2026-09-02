@@ -60,6 +60,7 @@ const MIGRATIONS = [
   "coliving-world.sql",
   "coliving-world-02.sql",
   "coliving-world-03.sql",
+  "coliving-world-04.sql",
 ];
 
 async function apply() {
@@ -246,11 +247,20 @@ async function main() {
   if (has("--purge")) {
     await purge();
   }
+  if (has("--test-house")) {
+    const repo = await import("../lib/chat/coliving/repo");
+    const { householdId } = await repo.createTestHousehold(
+      argOf("--test-house") ?? "测试屋"
+    );
+    console.log(`✓ 测试屋已建 ${householdId}`);
+    console.log("  本地脚本只能写这一种房子（见 lib/chat/coliving/guard.ts）");
+    console.log("  跑对话时带上 COLIVING_LOCAL_WRITE=1");
+  }
   if (
     has("--status") ||
     args.length === 0 ||
     !args.some((a) =>
-      ["--apply","--wipe","--purge","--move-in","--move-out","--set-resides","--contact","--embed"].includes(a)
+      ["--apply","--wipe","--purge","--test-house","--move-in","--move-out","--set-resides","--contact","--embed"].includes(a)
     )
   ) {
     await status();
