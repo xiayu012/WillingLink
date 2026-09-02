@@ -113,8 +113,13 @@ export type OutboundMessage = {
   communicationId: string;
   /** 审稿没过，调用方不要投递（已在库里标成 skipped 并写明原因） */
   blocked?: boolean;
-  /** 这条是对全屋一样的规矩，不是针对他个人的事。审稿据此判角色 */
-  houseWide?: boolean;
+  /** 这条是对**共用者**一样的规矩，不是针对他个人的事。审稿据此判角色 */
+  sharedRule?: boolean;
+  /**
+   * 哪些人共用这件东西。**不假定是全屋**——一栋房子里可能几个人共用
+   * 一个卫生间、另几个人用另一个，系统并不知道这个结构。
+   */
+  sharedWith?: string | null;
 };
 
 export type TurnOutcome = {
@@ -406,11 +411,19 @@ export async function runColivingTurn(args: {
           .string()
           .describe("这条消息的目的，例如：告知新的厨房时段安排"),
         scope: z
-          .enum(["personal", "house-wide"])
+          .enum(["personal", "shared"])
           .describe(
-            "personal=针对他个人的事；house-wide=一条对全屋一样的规矩，" +
-              "只是分别通知到每个人。**说规矩就填 house-wide**，" +
+            "personal=针对他个人的事；shared=对**共用这件东西的人**一样的规矩，" +
+              "只是分别通知到每个人。说规矩就填 shared，" +
               "不然对方会读成在说他一个人。"
+          ),
+        sharedWith: z
+          .string()
+          .optional()
+          .describe(
+            "填 shared 时说清是**哪些人**共用这件东西（写名字）。" +
+              "**别默认是全屋**——一栋房子里可能几个人共用一个卫生间、" +
+              "另几个人用另一个。不确定谁在共用就先问，别猜。"
           ),
         message: z
           .string()
@@ -418,7 +431,7 @@ export async function runColivingTurn(args: {
             "真正要发出去的短信正文。短、具体、直接说事。不提是谁反映的。"
           ),
       }),
-      execute: async ({ name, purpose, scope, message: raw }) => {
+      execute: async ({ name, purpose, scope, sharedWith, message: raw }) => {
         const message = stripMarkdown(raw);
         const target = await repo.findPersonByName(sender.householdId, name);
         if (!target) {
@@ -477,7 +490,8 @@ export async function runColivingTurn(args: {
           personId: target.personId,
           text: message,
           communicationId,
-          houseWide: scope === "house-wide",
+          sharedRule: scope === "shared",
+          sharedWith: sharedWith ?? null,
         });
         return { ok: true, sentTo: target.name };
       },
@@ -846,11 +860,16 @@ export async function runColivingTurn(args: {
     ...outbound.map((o) =>
       critique({
         to: outboundNames.get(o.personId) ?? "某位住户",
-        // 全屋规矩和针对个人的事，判法完全不同
-        role: o.houseWide ? "全屋通知的对象" : "被说到的人",
+        // 共用者规矩和针对个人的事，判法完全不同
+        role: o.sharedRule ? "共用者通知的对象" : "被说到的人",
         said: "",
         facts:
-          `${baseFacts}\n这条是主动发的，起因是 ${sender.name} 说：${args.text}`,
+          `${baseFacts}\n这条是主动发的，起因是 ${sender.name} 说：${args.text}` +
+          (o.sharedRule
+            ? `\n这是对共用者一样的规矩；模型声明的共用范围：${
+                o.sharedWith ?? "（没说清是哪些人 —— 这本身就是问题）"
+              }`
+            : ""),
         draft: o.text,
       })
     ),
