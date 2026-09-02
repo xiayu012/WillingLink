@@ -618,6 +618,87 @@ export async function casesMissingEmbedding(
   ` as never;
 }
 
+// ── 自助加入 ────────────────────────────────────────────────────────────────
+
+/**
+ * 用加入码换一栋房子。码不区分大小写，从整段文本里找——
+ * 住户不会规规矩矩只发那六位，他会说「我是新搬来的 8A1FC8」。
+ */
+export async function findHouseholdByJoinCode(
+  text: string
+): Promise<{ id: string; label: string } | null> {
+  const codes = await db()<{ id: string; label: string; join_code: string }[]>`
+    select id, label, join_code from coliving.household
+    where join_code is not null and status = 'active'
+  `;
+  const upper = text.toUpperCase();
+  return (
+    codes.find((h) => upper.includes(h.join_code.toUpperCase())) ?? null
+  );
+}
+
+/**
+ * 自助入住。**不问任何问题**：名字先给个占位符，
+ * AI 在后续对话里听出真名再自己改（renamePerson）。
+ *
+ * 占位名不是「用户1」这种编号——那读起来像工单。用「新住客」这类
+ * 中性称呼，万一漏进短信里也不至于太怪。
+ */
+export async function selfJoin(args: {
+  householdId: string;
+  channel: string;
+  externalId: string;
+}): Promise<Sender | null> {
+  const value =
+    args.channel === "sms" ? normalizePhone(args.externalId) : args.externalId.trim();
+  if (!value) {
+    return null;
+  }
+  await db().begin(async (tx) => {
+    const [existing] = await tx<{ person_id: string }[]>`
+      select person_id from coliving.person_contact
+      where kind = ${args.channel} and value = ${value} limit 1`;
+    let personId: string;
+    if (existing) {
+      personId = existing.person_id;
+    } else {
+      const [n] = await tx<{ c: number }[]>`
+        select count(*)::int as c from coliving.membership
+        where household_id = ${args.householdId} and valid_to is null`;
+      const [p] = await tx<{ id: string }[]>`
+        insert into coliving.person (display_name, onboarded_at)
+        values (${`新住客${n.c + 1}`}, now()) returning id`;
+      personId = p.id;
+      await tx`
+        insert into coliving.person_contact (person_id, kind, value, is_primary)
+        values (${personId}, ${args.channel}, ${value}, true)`;
+    }
+    await tx`
+      insert into coliving.membership (household_id, person_id, role, resides)
+      values (${args.householdId}, ${personId}, 'tenant', true)
+      on conflict do nothing`;
+  });
+  return await resolveSender(args.channel, args.externalId);
+}
+
+/**
+ * 改名。AI 在对话里听出真名时用——**不是让住户填表**，
+ * 是它自己听出来的。`confirmed` 表示这名字是本人说的，不是我们编的。
+ */
+export async function renamePerson(args: {
+  personId: string;
+  name: string;
+  confirmed?: boolean;
+}): Promise<void> {
+  await db()`
+    update coliving.person
+    set display_name = ${args.name},
+        name_confirmed = ${args.confirmed ?? true},
+        updated_at = now()
+    where id = ${args.personId}
+  `;
+}
+
 // ── 成员变更（换人）─────────────────────────────────────────────────────────
 // **不覆盖历史**：搬走是给旧行填 valid_to，搬进是插新行；
 // 成员结构一变就开一个新 epoch，用来分辨「这栋房子长期如此」

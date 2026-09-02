@@ -27,9 +27,9 @@ Twilio 对 webhook 只等约 15 秒，而一轮带 1–2 万字符准则的对�
 | | `coliving`（默认） | `rental` |
 |---|---|---|
 | 准则 | `lib/ai/brains` 的 coliving | `lib/ai/prompts.ts` |
-| 会话存储 | 进程内存 | Neon（需 channel-identity 表） |
-| 跨渠道上下文 | 无 | 有 |
-| 工具 | logEvent / notifyManager | 搜索那一套 |
+| 会话存储 | `coliving` schema 的世界模型 | Neon（需 channel-identity 表） |
+| 跨渠道上下文 | 有（同一个 person 可有多个渠道地址） | 有 |
+| 工具 | 见下表 | 搜索那一套 |
 | 返回方式 | 空 TwiML + 出站 API | 同步 JSON |
 
 用 `TWILIO_BRAIN` 切换。验签、TwiML、分段、出站发送都在 `lib/chat/twilio.ts`，两者共用。
@@ -70,7 +70,8 @@ pnpm twilio:selftest --send +1650XXXXXXX  # 真发一条（会计费）
 
 ```
 pnpm coliving:db --apply      # 建表（幂等，两份 SQL 都会跑）
-pnpm coliving:db --seed       # 用 COLIVING_ROSTER 建出第一个 household
+pnpm coliving:db --new-house "标签"   # 开一栋房子，打印加入码
+pnpm coliving:db --purge             # 彻底清空（知识库保留）
 pnpm coliving:db --status     # 看每张表多少行
 pnpm coliving:db --wipe       # 清事件/判断/沟通，保留人与房子
 ```
@@ -102,9 +103,10 @@ pnpm coliving:ingest --list
 pnpm coliving:db --embed        # 给已了结的 Case 补算向量
 ```
 
-`COLIVING_ROSTER` **只在 `--seed` 时读一次**，之后运行时不再用它。
-往房子里加人、换人，改数据库（成员变化是给旧行填 `valid_to` 再插新行，
-不覆盖历史），不要再改那个环境变量。
+**住户怎么进来：把加入码给他，他发条短信带上它就行。** 没有表格、不问名字——
+名字先用「新住客N」占位，AI 在日常对话里听出真名再自己改。
+
+不带码的陌生号码只会收到一句「把加入码发给我」，**不落任何记录**。
 
 Vercel 上需要 `POSTGRES_URL`（本来就有）。
 
@@ -112,13 +114,17 @@ Vercel 上需要 `POSTGRES_URL`（本来就有）。
 
 | 工具 | 作用 |
 |---|---|
-| `logEvent` | 留痕。**判定「无需处理」时也要调**——准则要求不作为同样可被复核 |
-| `notifyManager` | 转交管理方，真的发短信过去 |
+| `decide` | **治理判断**：介不介入、找谁、意图、理由。与说出口的话分开存 |
+| `logEvent` | 留痕。**判定「无需处理」时也要调**——不作为同样必须可复核 |
+| `contactPerson` | 主动联系房子里的另一个人（杠杆二） |
+| `proposeRule` / `recordStance` | 共同规则与征询状态 |
+| `renamePerson` | 对话里听出真名时改名。**不许为此专门去问** |
+| `remember` | 记长期事实（作息、偏好） |
+| `lookupHistory` / `findSimilarCases` / `checkEnvironment` | 按需展开上下文 |
+| `sendReply` | **显式交付要发出去的正文**，调完收尾 |
 
-`notifyManager` 有一条硬逻辑：**收件人里排除发起人本人**。
-管理方自己下达不当指令时，「通知管理方」等于通知那个下命令的人；
-此时改为完整留痕 + 提示 AI 如实告知不执行、且不隐瞒外部申诉渠道
-（见 `情境_05`「涉及管理方本身的投诉不得在内部闭环」）。
+`contactPerson` 有一条硬逻辑：不能把上报发回给发起人本人。
+房东自己下达不当指令时，「通知房东」等于通知那个下命令的人。
 
 ## 本地测试（不发短信、不花钱）
 
@@ -172,8 +178,8 @@ Twilio 打裸域会吃到跳转，而 **`X-Twilio-Signature` 是按原始 URL �
 `TWILIO_MESSAGING_SERVICE_SID`、`TWILIO_WEBHOOK_URL`、`POSTGRES_URL`、
 `CHANNEL_ADAPTERS_ENABLED=1`。
 
-`COLIVING_ROSTER` 线上**不再需要**（身份走数据库了），留着也无害。
-可选：`COLIVING_MODEL` 覆盖模型，默认 `anthropic/claude-sonnet-4.5`。
+可选：`COLIVING_MODEL` 覆盖模型，默认 `deepseek/deepseek-v4-flash`
+（实测比 sonnet-4.5 便宜约 18 倍且更好，见 AGENT_LOG 2026-08-30 第七轮）。
 
 **线上没有配 API Key**，出站走 `AccountSid:AuthToken` 回落路径（见 `sendSms`）。
 日志里会打 `[twilio] 出站认证方式：auth-token` 便于确认。
@@ -184,10 +190,9 @@ Twilio 打裸域会吃到跳转，而 **`X-Twilio-Signature` 是按原始 URL �
 
 ## 已知局限
 
-- **进程内存的会话**：serverless 上每实例一份，扩容/冷启动就丢，同一个人两条消息
-  可能落到不同实例。**只存对话轮次，不存住户档案**——而准则真正要的是档案
-  （「有人投诉噪音时系统已经知道谁在睡」靠的是档案不是历史）。
-- **没有工具**：不能真的记录事件、通知管理方、安排回访。目前只会说话。
 - **没有去重**：Twilio 重试会重复触发一轮模型调用。
-- **没有限流**：无鉴权入口（验签之外没有额度控制），靠 `CHANNEL_ADAPTERS_ENABLED` 兜底。
-- **禁区只在提示词里**：不谈驱逐、不给法律建议、不碰钱——这些**应当在应用层拦截**。
+- **没有限流与预算闸**：无鉴权入口（验签之外没有额度控制）。
+  名册闸挡住了陌生号码（不落库、不调模型），但已入住的人可以无限发。
+- **禁区只在提示词里**：不谈驱逐、不给法律建议、不碰钱——
+  这些**应当在应用层也拦一道**。
+- **记忆不检测矛盾**：同一个人可以同时有两条互相冲突的生效记忆。

@@ -3,12 +3,14 @@
  *
  *   pnpm coliving:db --status   看 coliving schema 现在有什么
  *   pnpm coliving:db --apply    执行 migrations/manual/coliving-world.sql（幂等）
- *   pnpm coliving:db --seed     用 COLIVING_ROSTER 建出第一个 Household
+ *   pnpm coliving:db --purge            彻底清空（知识库保留）
+ *   pnpm coliving:db --new-house "标签"  开一栋房子并打印加入码
  *
  * 为什么不走 drizzle-kit：与 ChannelIdentity 同样的理由——
  * 手写 SQL 一次性建表，不进 drizzle journal，drizzle-kit 也不扫 coliving schema，
  * 这样 public 下租房搜索那 17 张表完全不受影响。
  */
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "dotenv";
@@ -55,7 +57,11 @@ async function status() {
 }
 
 /** 按文件名顺序全部执行。每份都写成幂等的，重复跑不会出事。 */
-const MIGRATIONS = ["coliving-world.sql", "coliving-world-02.sql"];
+const MIGRATIONS = [
+  "coliving-world.sql",
+  "coliving-world-02.sql",
+  "coliving-world-03.sql",
+];
 
 async function apply() {
   for (const name of MIGRATIONS) {
@@ -68,134 +74,55 @@ async function apply() {
   console.log("✓ 建表完成");
 }
 
-type RosterEntry = {
-  phone: string;
-  name: string;
-  role: string;
-  /** 住不住在这里。省略视为 true——房东也可能同住 */
-  resides?: boolean;
-  note?: string;
-};
+/**
+ * **彻底清空**：人、房子、成员关系、所有事件与消息，一个不留。
+ * 保留 knowledge_doc / knowledge_chunk —— 那是治理资料语料，跟身份无关，
+ * 重新灌一次要花钱。
+ */
+async function purge() {
+  await sql.unsafe(`
+    truncate
+      coliving.outcome, coliving.communication, coliving.message,
+      coliving.conversation, coliving.decision, coliving.event,
+      coliving.case_file, coliving.obligation, coliving.rule,
+      coliving.memory, coliving.observation, coliving.outreach_run,
+      coliving.membership, coliving.household_epoch, coliving.household,
+      coliving.room, coliving.dwelling, coliving.place,
+      coliving.person_contact, coliving.person
+    cascade
+  `);
+  console.log("✓ 已彻底清空（知识库保留）");
+}
 
 /**
- * 用 COLIVING_ROSTER 建出第一个真实 Household。
+ * 开一栋新房子，打印加入码。
  *
- * 幂等：按手机号找人，找不到才建；household 按 label 找。
- * 这是「从环境变量名册」过渡到「数据库世界模型」的那一步，
- * 跑完之后 roster.ts 就不再是唯一事实来源。
+ * **没有名册、没有表格**：把这个码给住户，他发条短信带上它就进来了。
+ * 名字先用占位符，AI 在日常对话里听出真名再自己改（renamePerson）。
  */
-async function seed() {
-  const raw = process.env.COLIVING_ROSTER?.trim();
-  if (!raw) {
-    console.log("✗ 没有 COLIVING_ROSTER，无从播种");
-    return;
-  }
-  const roster = JSON.parse(raw) as RosterEntry[];
-  const label = process.env.COLIVING_HOUSE_LABEL?.trim() || "第一栋房子";
-
+async function newHouse() {
+  const label = argOf("--new-house") || "新房子";
+  const code = randomBytes(3).toString("hex").toUpperCase();
   await sql.begin(async (tx) => {
-    // ── 地点与房子 ──
-    let [place] = await tx<{ id: string }[]>`
-      select id from coliving.place where label = ${label} limit 1
-    `;
-    if (!place) {
-      [place] = await tx<{ id: string }[]>`
-        insert into coliving.place (kind, label, city, region, country)
-        values ('dwelling', ${label},
-                ${process.env.COLIVING_HOUSE_CITY ?? null},
-                ${process.env.COLIVING_HOUSE_REGION ?? "CA"}, 'US')
-        returning id
-      `;
-      console.log(`  + place ${label}`);
-    }
-
-    let [dwelling] = await tx<{ id: string }[]>`
-      select id from coliving.dwelling where place_id = ${place.id} limit 1
-    `;
-    if (!dwelling) {
-      [dwelling] = await tx<{ id: string }[]>`
-        insert into coliving.dwelling (place_id, label) values (${place.id}, ${label})
-        returning id
-      `;
-      console.log(`  + dwelling ${label}`);
-    }
-
-    let [household] = await tx<{ id: string }[]>`
-      select id from coliving.household where dwelling_id = ${dwelling.id} limit 1
-    `;
-    if (!household) {
-      [household] = await tx<{ id: string }[]>`
-        insert into coliving.household (dwelling_id, label) values (${dwelling.id}, ${label})
-        returning id
-      `;
-      await tx`
-        insert into coliving.household_epoch (household_id, seq, label, started_at)
-        values (${household.id}, 1, '初始成员', now())
-      `;
-      console.log(`  + household ${label}（epoch 1）`);
-    }
-
-    // ── 人与成员关系 ──
-    for (const entry of roster) {
-      const role = entry.role === "manager" ? "landlord" : entry.role;
-      const phone = entry.phone.trim();
-
-      let [contact] = await tx<{ person_id: string }[]>`
-        select person_id from coliving.person_contact
-        where kind = 'sms' and value = ${phone} limit 1
-      `;
-      let personId: string;
-      if (contact) {
-        personId = contact.person_id;
-      } else {
-        const [p] = await tx<{ id: string }[]>`
-          insert into coliving.person (display_name, note)
-          values (${entry.name}, ${entry.note ?? null})
-          returning id
-        `;
-        personId = p.id;
-        await tx`
-          insert into coliving.person_contact (person_id, kind, value, is_primary)
-          values (${personId}, 'sms', ${phone}, true)
-        `;
-        console.log(`  + person ${entry.name}`);
-      }
-
-      const [existing] = await tx<{ id: string }[]>`
-        select id from coliving.membership
-        where household_id = ${household.id} and person_id = ${personId}
-          and valid_to is null
-        limit 1
-      `;
-      if (!existing) {
-        // resides 默认 true：**不要从 role 推**。房东完全可以住在自己房子里，
-        // 推错了共用资源就会少算一个人（真实事故，见 AGENT_LOG）。
-        await tx`
-          insert into coliving.membership (household_id, person_id, role, resides, note)
-          values (${household.id}, ${personId}, ${role},
-                  ${entry.resides ?? true}, ${entry.note ?? null})
-        `;
-        console.log(`  + membership ${entry.name} → ${role}`);
-      }
-
-      // 名册里的 note 是入住时问出来的作息偏好，属于长期记忆
-      if (entry.note) {
-        const [mem] = await tx<{ id: string }[]>`
-          select id from coliving.memory
-          where person_id = ${personId} and kind = 'schedule' and valid_to is null
-          limit 1
-        `;
-        if (!mem) {
-          await tx`
-            insert into coliving.memory (household_id, person_id, kind, content, confidence)
-            values (${household.id}, ${personId}, 'schedule', ${entry.note}, 0.9)
-          `;
-        }
-      }
-    }
+    const [place] = await tx<{ id: string }[]>`
+      insert into coliving.place (kind, label, country)
+      values ('dwelling', ${label}, 'US') returning id`;
+    const [dw] = await tx<{ id: string }[]>`
+      insert into coliving.dwelling (place_id, label)
+      values (${place.id}, ${label}) returning id`;
+    const [h] = await tx<{ id: string }[]>`
+      insert into coliving.household (dwelling_id, label, join_code)
+      values (${dw.id}, ${label}, ${code}) returning id`;
+    await tx`
+      insert into coliving.household_epoch (household_id, seq, label, started_at)
+      values (${h.id}, 1, '开张', now())`;
   });
-
-  console.log("✓ 播种完成");
+  console.log(`✓ 「${label}」已创建`);
+  console.log("");
+  console.log(`  加入码：${code}`);
+  console.log("");
+  console.log("  把这个码给住户，让他给项目号码发条短信带上它就行。");
+  console.log(`  例如：「我是新搬进来的，${code}」`);
 }
 
 /**
@@ -348,14 +275,17 @@ async function main() {
   if (has("--embed")) {
     await embedBackfill();
   }
-  if (has("--seed")) {
-    await seed();
+  if (has("--purge")) {
+    await purge();
+  }
+  if (has("--new-house")) {
+    await newHouse();
   }
   if (
     has("--status") ||
     args.length === 0 ||
     !args.some((a) =>
-      ["--apply","--wipe","--seed","--move-in","--move-out","--set-resides","--contact","--embed"].includes(a)
+      ["--apply","--wipe","--purge","--new-house","--move-in","--move-out","--set-resides","--contact","--embed"].includes(a)
     )
   ) {
     await status();

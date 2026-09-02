@@ -35,7 +35,8 @@ export type ColivingContext = {
 
 export async function buildContext(
   sender: Sender,
-  channel = "sms"
+  channel = "sms",
+  opts: { justJoined?: boolean } = {}
 ): Promise<ColivingContext> {
   const [members, rules, openCases] = await Promise.all([
     getMembers(sender.householdId, channel),
@@ -88,6 +89,23 @@ export async function buildContext(
   );
   lines.push("");
 
+  if (opts.justJoined) {
+    lines.push("## ⚠️ 这个人刚刚加入，这是他的第一条消息");
+    lines.push(
+      "他发了加入码，系统把他放进这栋房子了。**他还什么都没被问过。**"
+    );
+    lines.push(
+      "**不要借机做入住登记。** 不要问名字、不要一次问一串、不要列清单让他确认。" +
+        "先像个人一样回应他刚才说的话，欢迎一句，说明你是干什么的（一句），" +
+        "**最多再问一件事**——问他自己的事（作息之类），不问也行。"
+    );
+    lines.push(
+      "他现在的名字是系统随手给的占位符。**别念给他听、别问「你叫什么」**；" +
+        "以后哪天他自己说了，或别人提到了，你再用 renamePerson 改。"
+    );
+    lines.push("");
+  }
+
   const residents = members.filter((m) => m.resides);
   const others = members.filter((m) => !m.resides);
 
@@ -109,6 +127,10 @@ export async function buildContext(
       "住户说「我们其余两个人」「另一个室友」这类话时，" +
       "**很可能只是随口说的，不等于真有那个人**——" +
       "以上面这份名单为准；确实对不上就先问清楚是谁，不要把不存在的人排进方案。"
+  );
+  lines.push(
+    "名字带「新住客」字样的是**系统占位符，不是他真名**——" +
+      "别当着他的面念，也别拿它称呼他。听出真名了用 renamePerson 改。"
   );
   lines.push(
     "**不得向一位住户披露另一位的私事**（工作、收入、身份、健康、投诉记录、欠租）。" +

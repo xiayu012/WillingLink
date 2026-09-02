@@ -131,8 +131,12 @@ export type TurnOutcome = {
   usage: TurnUsage;
 };
 
+/**
+ * 认不出来时说什么。**不能太像客服**，但也不能给陌生人任何信息。
+ * 提一句加入码，是因为真正的新住户十有八九手里就有那个码，只是忘了带上。
+ */
 const UNKNOWN_REPLY =
-  "抱歉，我这边没有这个号码的记录。请问你是哪一位、找哪一户？";
+  "我这边还没有你的号码。要是你刚搬进来，把房子给你的那串加入码发给我就行。";
 
 export async function runColivingTurn(args: {
   /** 从哪个渠道来：sms / wecom / xhs。决定认人用哪种地址、回信走哪条路 */
@@ -144,7 +148,26 @@ export async function runColivingTurn(args: {
   modelId?: string;
 }): Promise<TurnOutcome> {
   const channel = args.channel ?? "sms";
-  const sender = await repo.resolveSender(channel, args.from);
+  let sender = await repo.resolveSender(channel, args.from);
+  let justJoined = false;
+
+  /**
+   * 不认识这个号码时，看看他有没有带加入码。
+   *
+   * **入住流程只有这一步**：把码给他，他发条短信带上它。不填表、不问名字——
+   * 名字先占位，后面在日常对话里听出来再改（renamePerson）。
+   */
+  if (!sender) {
+    const house = await repo.findHouseholdByJoinCode(args.text);
+    if (house) {
+      sender = await repo.selfJoin({
+        householdId: house.id,
+        channel,
+        externalId: args.from,
+      });
+      justJoined = Boolean(sender);
+    }
+  }
 
   if (!sender) {
     return {
@@ -167,7 +190,7 @@ export async function runColivingTurn(args: {
     };
   }
 
-  const ctx = await buildContext(sender, channel);
+  const ctx = await buildContext(sender, channel, { justJoined });
   const modelId = args.modelId ?? colivingModelId();
 
   /**
@@ -517,6 +540,34 @@ export async function runColivingTurn(args: {
           ruleId: target,
           personId: m.personId,
           stance,
+        });
+        return { ok: true };
+      },
+    }),
+
+    renamePerson: tool({
+      description:
+        "改掉某个人的显示名。**在对话里自然听出真名时才用**——" +
+        "比如他自己说「我是小王」，或别人提到他的名字。" +
+        "**不要为了填这个字段专门去问名字。** 系统给的「新住客N」只是占位符，" +
+        "不知道真名就一直用着，不影响任何事。",
+      inputSchema: z.object({
+        currentName: z.string().describe("现在系统里叫什么（占位名或旧名）"),
+        newName: z.string().describe("听出来的真名或他希望被怎么称呼"),
+        confirmed: z
+          .boolean()
+          .optional()
+          .describe("true=他本人说的；false=从别人嘴里听来的，可能不准"),
+      }),
+      execute: async ({ currentName, newName, confirmed }) => {
+        const m = await repo.findPersonByName(sender.householdId, currentName);
+        if (!m) {
+          return { ok: false, reason: `房子里没有叫「${currentName}」的人` };
+        }
+        await repo.renamePerson({
+          personId: m.personId,
+          name: newName,
+          confirmed: confirmed ?? true,
         });
         return { ok: true };
       },
