@@ -4,13 +4,12 @@
  *   pnpm coliving:db --status   看 coliving schema 现在有什么
  *   pnpm coliving:db --apply    执行 migrations/manual/coliving-world.sql（幂等）
  *   pnpm coliving:db --purge            彻底清空（知识库保留）
- *   pnpm coliving:db --new-house "标签"  开一栋房子并打印加入码
+ *   pnpm coliving:watch                 监听本地 csv，房东号码入库（另一个脚本）
  *
  * 为什么不走 drizzle-kit：与 ChannelIdentity 同样的理由——
  * 手写 SQL 一次性建表，不进 drizzle journal，drizzle-kit 也不扫 coliving schema，
  * 这样 public 下租房搜索那 17 张表完全不受影响。
  */
-import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "dotenv";
@@ -92,37 +91,6 @@ async function purge() {
     cascade
   `);
   console.log("✓ 已彻底清空（知识库保留）");
-}
-
-/**
- * 开一栋新房子，打印加入码。
- *
- * **没有名册、没有表格**：把这个码给住户，他发条短信带上它就进来了。
- * 名字先用占位符，AI 在日常对话里听出真名再自己改（renamePerson）。
- */
-async function newHouse() {
-  const label = argOf("--new-house") || "新房子";
-  const code = randomBytes(3).toString("hex").toUpperCase();
-  await sql.begin(async (tx) => {
-    const [place] = await tx<{ id: string }[]>`
-      insert into coliving.place (kind, label, country)
-      values ('dwelling', ${label}, 'US') returning id`;
-    const [dw] = await tx<{ id: string }[]>`
-      insert into coliving.dwelling (place_id, label)
-      values (${place.id}, ${label}) returning id`;
-    const [h] = await tx<{ id: string }[]>`
-      insert into coliving.household (dwelling_id, label, join_code)
-      values (${dw.id}, ${label}, ${code}) returning id`;
-    await tx`
-      insert into coliving.household_epoch (household_id, seq, label, started_at)
-      values (${h.id}, 1, '开张', now())`;
-  });
-  console.log(`✓ 「${label}」已创建`);
-  console.log("");
-  console.log(`  加入码：${code}`);
-  console.log("");
-  console.log("  把这个码给住户，让他给项目号码发条短信带上它就行。");
-  console.log(`  例如：「我是新搬进来的，${code}」`);
 }
 
 /**
@@ -278,14 +246,11 @@ async function main() {
   if (has("--purge")) {
     await purge();
   }
-  if (has("--new-house")) {
-    await newHouse();
-  }
   if (
     has("--status") ||
     args.length === 0 ||
     !args.some((a) =>
-      ["--apply","--wipe","--purge","--new-house","--move-in","--move-out","--set-resides","--contact","--embed"].includes(a)
+      ["--apply","--wipe","--purge","--move-in","--move-out","--set-resides","--contact","--embed"].includes(a)
     )
   ) {
     await status();

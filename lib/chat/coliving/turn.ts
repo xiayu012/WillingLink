@@ -132,11 +132,11 @@ export type TurnOutcome = {
 };
 
 /**
- * 认不出来时说什么。**不能太像客服**，但也不能给陌生人任何信息。
- * 提一句加入码，是因为真正的新住户十有八九手里就有那个码，只是忘了带上。
+ * 认不出来时说什么。**这是唯一一处硬编码文案**——因为模型根本没被调用
+ * （见 CLAUDE.md「不要替大脑写话术」：硬编码只留给不过大脑的路径）。
+ * 短、中性、不透露任何住户信息。
  */
-const UNKNOWN_REPLY =
-  "我这边还没有你的号码。要是你刚搬进来，把房子给你的那串加入码发给我就行。";
+const UNKNOWN_REPLY = "这个号码我这边没有记录，先确认一下你是哪一位。";
 
 export async function runColivingTurn(args: {
   /** 从哪个渠道来：sms / wecom / xhs。决定认人用哪种地址、回信走哪条路 */
@@ -148,26 +148,7 @@ export async function runColivingTurn(args: {
   modelId?: string;
 }): Promise<TurnOutcome> {
   const channel = args.channel ?? "sms";
-  let sender = await repo.resolveSender(channel, args.from);
-  let justJoined = false;
-
-  /**
-   * 不认识这个号码时，看看他有没有带加入码。
-   *
-   * **入住流程只有这一步**：把码给他，他发条短信带上它。不填表、不问名字——
-   * 名字先占位，后面在日常对话里听出来再改（renamePerson）。
-   */
-  if (!sender) {
-    const house = await repo.findHouseholdByJoinCode(args.text);
-    if (house) {
-      sender = await repo.selfJoin({
-        householdId: house.id,
-        channel,
-        externalId: args.from,
-      });
-      justJoined = Boolean(sender);
-    }
-  }
+  const sender = await repo.resolveSender(channel, args.from);
 
   if (!sender) {
     return {
@@ -190,7 +171,18 @@ export async function runColivingTurn(args: {
     };
   }
 
-  const ctx = await buildContext(sender, channel, { justJoined });
+  const conversationId = await repo.getOrCreateConversation({
+    personId: sender.personId,
+    householdId: sender.householdId,
+    channel,
+  });
+  const history = await repo.getRecentTurns(conversationId);
+
+  // 「刚进来」= 这条会话线上还没有过任何来往。比记一个标志位可靠：
+  // 不管他是自己发来的第一条，还是回复我们主动发的第一条，都算。
+  const ctx = await buildContext(sender, channel, {
+    justJoined: history.length === 0,
+  });
   const modelId = args.modelId ?? colivingModelId();
 
   /**
@@ -208,13 +200,6 @@ export async function runColivingTurn(args: {
     runtimeContext: ctx.text,
     forceModules: mentionsOther ? ["conflict"] : undefined,
   });
-
-  const conversationId = await repo.getOrCreateConversation({
-    personId: sender.personId,
-    householdId: sender.householdId,
-    channel,
-  });
-  const history = await repo.getRecentTurns(conversationId);
 
   // ── 本轮累积的状态 ──
   let decisionId: string | null = null;
@@ -542,6 +527,45 @@ export async function runColivingTurn(args: {
           stance,
         });
         return { ok: true };
+      },
+    }),
+
+    addResident: tool({
+      description:
+        "把一个手机号加进这栋房子。**拿到号码就加，不要等**——" +
+        "房东（或别人）在对话里报出室友号码时用这个。" +
+        "加完他就能收到消息了。名字不知道就别填，占位符不影响任何事。",
+      inputSchema: z.object({
+        phone: z.string().describe("手机号，原样填，系统会自己规范化"),
+        name: z.string().optional().describe("对方说了名字才填，没说就留空"),
+        role: z
+          .enum(["tenant", "landlord"])
+          .optional()
+          .describe("默认 tenant。只有明确是业主才填 landlord"),
+        note: z.string().optional().describe("顺带提到的信息，比如住哪间"),
+      }),
+      execute: async ({ phone, name, role, note }) => {
+        try {
+          const r = await repo.addResident({
+            householdId: sender.householdId,
+            phone,
+            name: name ?? null,
+            role: (role ?? "tenant") as repo.Role,
+            note: note ?? null,
+          });
+          return {
+            ok: true,
+            created: r.created,
+            note: r.created
+              ? "已加入，现在可以用 contactPerson 联系他了"
+              : "这个号码本来就在房子里",
+          };
+        } catch (e) {
+          return {
+            ok: false,
+            reason: e instanceof Error ? e.message : "加不进去",
+          };
+        }
       },
     }),
 

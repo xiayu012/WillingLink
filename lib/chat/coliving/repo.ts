@@ -618,69 +618,6 @@ export async function casesMissingEmbedding(
   ` as never;
 }
 
-// ── 自助加入 ────────────────────────────────────────────────────────────────
-
-/**
- * 用加入码换一栋房子。码不区分大小写，从整段文本里找——
- * 住户不会规规矩矩只发那六位，他会说「我是新搬来的 8A1FC8」。
- */
-export async function findHouseholdByJoinCode(
-  text: string
-): Promise<{ id: string; label: string } | null> {
-  const codes = await db()<{ id: string; label: string; join_code: string }[]>`
-    select id, label, join_code from coliving.household
-    where join_code is not null and status = 'active'
-  `;
-  const upper = text.toUpperCase();
-  return (
-    codes.find((h) => upper.includes(h.join_code.toUpperCase())) ?? null
-  );
-}
-
-/**
- * 自助入住。**不问任何问题**：名字先给个占位符，
- * AI 在后续对话里听出真名再自己改（renamePerson）。
- *
- * 占位名不是「用户1」这种编号——那读起来像工单。用「新住客」这类
- * 中性称呼，万一漏进短信里也不至于太怪。
- */
-export async function selfJoin(args: {
-  householdId: string;
-  channel: string;
-  externalId: string;
-}): Promise<Sender | null> {
-  const value =
-    args.channel === "sms" ? normalizePhone(args.externalId) : args.externalId.trim();
-  if (!value) {
-    return null;
-  }
-  await db().begin(async (tx) => {
-    const [existing] = await tx<{ person_id: string }[]>`
-      select person_id from coliving.person_contact
-      where kind = ${args.channel} and value = ${value} limit 1`;
-    let personId: string;
-    if (existing) {
-      personId = existing.person_id;
-    } else {
-      const [n] = await tx<{ c: number }[]>`
-        select count(*)::int as c from coliving.membership
-        where household_id = ${args.householdId} and valid_to is null`;
-      const [p] = await tx<{ id: string }[]>`
-        insert into coliving.person (display_name, onboarded_at)
-        values (${`新住客${n.c + 1}`}, now()) returning id`;
-      personId = p.id;
-      await tx`
-        insert into coliving.person_contact (person_id, kind, value, is_primary)
-        values (${personId}, ${args.channel}, ${value}, true)`;
-    }
-    await tx`
-      insert into coliving.membership (household_id, person_id, role, resides)
-      values (${args.householdId}, ${personId}, 'tenant', true)
-      on conflict do nothing`;
-  });
-  return await resolveSender(args.channel, args.externalId);
-}
-
 /**
  * 改名。AI 在对话里听出真名时用——**不是让住户填表**，
  * 是它自己听出来的。`confirmed` 表示这名字是本人说的，不是我们编的。
@@ -697,6 +634,126 @@ export async function renamePerson(args: {
         updated_at = now()
     where id = ${args.personId}
   `;
+}
+
+// ── 开张与加人 ──────────────────────────────────────────────────────────────
+
+/**
+ * 房东入库：没有房子就开一栋，把他放进去当 landlord。
+ *
+ * **这是整个系统的起点。** 用户先认识房东、先有房东的号码，
+ * 剩下的住户号码由 AI 从房东那里问出来（`addResident`）。
+ * 幂等：同一个号码重复调用不会重复建人。
+ */
+export async function enrollLandlord(args: {
+  phone: string;
+  label?: string | null;
+}): Promise<{ personId: string; householdId: string; created: boolean }> {
+  const phone = normalizePhone(args.phone);
+  if (!phone) {
+    throw new Error("[coliving] 手机号无法解析");
+  }
+  return await db().begin(async (tx) => {
+    const [existing] = await tx<{ person_id: string; household_id: string }[]>`
+      select pc.person_id, m.household_id
+      from coliving.person_contact pc
+      join coliving.membership m
+        on m.person_id = pc.person_id and m.valid_to is null
+      where pc.kind = 'sms' and pc.value = ${phone}
+      limit 1`;
+    if (existing) {
+      return {
+        personId: existing.person_id,
+        householdId: existing.household_id,
+        created: false,
+      };
+    }
+
+    const label = args.label?.trim() || "这栋房子";
+    const [place] = await tx<{ id: string }[]>`
+      insert into coliving.place (kind, label, country)
+      values ('dwelling', ${label}, 'US') returning id`;
+    const [dw] = await tx<{ id: string }[]>`
+      insert into coliving.dwelling (place_id, label)
+      values (${place.id}, ${label}) returning id`;
+    const [h] = await tx<{ id: string }[]>`
+      insert into coliving.household (dwelling_id, label)
+      values (${dw.id}, ${label}) returning id`;
+    await tx`
+      insert into coliving.household_epoch (household_id, seq, label, started_at)
+      values (${h.id}, 1, '开张', now())`;
+
+    const [p] = await tx<{ id: string }[]>`
+      insert into coliving.person (display_name, onboarded_at)
+      values ('房东', now()) returning id`;
+    await tx`
+      insert into coliving.person_contact (person_id, kind, value, is_primary)
+      values (${p.id}, 'sms', ${phone}, true)`;
+    // resides 默认 true —— 房东完全可能住在自己房子里，这是事实不是角色推导。
+    // 不确定时按住着算，AI 聊出来再改。
+    await tx`
+      insert into coliving.membership (household_id, person_id, role, resides)
+      values (${h.id}, ${p.id}, 'landlord', true)`;
+
+    return { personId: p.id, householdId: h.id, created: true };
+  });
+}
+
+/**
+ * 加一个住户。**AI 从对话里拿到号码时调用**——房东把室友号码发过来，
+ * 它就一个个加进来，不需要任何人填表。
+ *
+ * 名字先占位；真名在往后的对话里听出来再改（renamePerson）。
+ */
+export async function addResident(args: {
+  householdId: string;
+  phone: string;
+  name?: string | null;
+  role?: Role;
+  note?: string | null;
+}): Promise<{ personId: string; created: boolean }> {
+  const phone = normalizePhone(args.phone);
+  if (!phone) {
+    throw new Error("手机号无法解析");
+  }
+  return await db().begin(async (tx) => {
+    const [existing] = await tx<{ person_id: string }[]>`
+      select person_id from coliving.person_contact
+      where kind = 'sms' and value = ${phone} limit 1`;
+    if (existing) {
+      const [inHouse] = await tx<{ id: string }[]>`
+        select id from coliving.membership
+        where household_id = ${args.householdId}
+          and person_id = ${existing.person_id} and valid_to is null limit 1`;
+      if (inHouse) {
+        return { personId: existing.person_id, created: false };
+      }
+      await tx`
+        insert into coliving.membership (household_id, person_id, role, resides)
+        values (${args.householdId}, ${existing.person_id},
+                ${args.role ?? "tenant"}, true)`;
+      return { personId: existing.person_id, created: false };
+    }
+
+    // 占位名按人数编号，但**模型会并行调多次 addResident**——
+    // 两个事务同时读到同样的 count，两个人都叫「2号住客」，
+    // findPersonByName 就分不清了。用事务级咨询锁按房子串行化。
+    await tx`select pg_advisory_xact_lock(hashtext(${args.householdId}))`;
+    const [n] = await tx<{ c: number }[]>`
+      select count(*)::int as c from coliving.membership
+      where household_id = ${args.householdId} and valid_to is null`;
+    const [p] = await tx<{ id: string }[]>`
+      insert into coliving.person (display_name, onboarded_at)
+      values (${args.name?.trim() || `${n.c + 1}号住客`}, now()) returning id`;
+    await tx`
+      insert into coliving.person_contact (person_id, kind, value, is_primary)
+      values (${p.id}, 'sms', ${phone}, true)`;
+    await tx`
+      insert into coliving.membership (household_id, person_id, role, resides, note)
+      values (${args.householdId}, ${p.id}, ${args.role ?? "tenant"}, true,
+              ${args.note ?? null})`;
+    return { personId: p.id, created: true };
+  });
 }
 
 // ── 成员变更（换人）─────────────────────────────────────────────────────────

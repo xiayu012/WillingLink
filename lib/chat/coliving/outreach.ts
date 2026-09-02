@@ -160,6 +160,48 @@ async function send(args: {
   return true;
 }
 
+/**
+ * 开张第一条：房东刚进库，主动联系他。
+ *
+ * **这条消息的措辞完全由准则决定**（tenancy.md〈开张〉），这里只给事实和目标：
+ * 他是谁、系统还不知道什么、这一轮要拿到什么。
+ * 见 CLAUDE.md「不要替大脑写话术」——出过事，别再犯。
+ */
+export async function kickoffLandlord(args: {
+  householdId: string;
+  personId: string;
+}): Promise<OutreachMessage[]> {
+  const members = await repo.getMembers(args.householdId);
+  const who = members.find((m) => m.personId === args.personId);
+  if (!who) {
+    return [];
+  }
+  const messages: OutreachMessage[] = [];
+  const runId = await repo.startOutreachRun({
+    householdId: args.householdId,
+    job: "kickoff",
+  });
+  const ok = await send({
+    householdId: args.householdId,
+    person: who,
+    purpose: "开张：第一次联系房东，拿到住户号码",
+    brief:
+      "他是这栋房子的业主，刚被录入系统，之前从没收到过你的消息。" +
+      "**这栋房子目前只有他一个人在库里**，其他住户你一个都联系不上，" +
+      "在拿到号码之前你做不了任何协调工作。" +
+      "这一轮的目标：拿到住在这里的其他人的手机号。",
+    decisionKind: "contact_one",
+    rationale: "房东刚入库，系统里还没有任何住户，必须先拿到号码才能开始工作",
+    out: messages,
+  });
+  await repo.finishOutreachRun({
+    runId,
+    considered: 1,
+    acted: ok ? 1 : 0,
+  });
+  return messages;
+}
+
 export async function runOutreachForHousehold(
   householdId: string,
   label: string
@@ -191,7 +233,7 @@ export async function runOutreachForHousehold(
         purpose: "回访：之前那件事后来怎么样了",
         brief:
           `${c.lastActivityAt.toISOString().slice(0, 10)} 起没有新进展的一件事：${c.title}（${c.kind}）。` +
-          `问一句现在情况有没有好转。**不要重述细节**，也不要让他觉得必须回。`,
+          `目的：了解现在的情况有没有变化。`,
         caseId: c.id,
         decisionKind: "observe",
         rationale: `Case 已 ${Math.round((Date.now() - c.lastActivityAt.getTime()) / 86400000)} 天无动静，按流程回访一次`,
@@ -230,7 +272,7 @@ export async function runOutreachForHousehold(
         brief:
           `这栋房子现在按这条在跑：「${rule.statement}」。\n` +
           `**这是默认方案，不是定论**——住在这里的人一起说了算，他有一票。\n` +
-          `问他这样行不行、有没有要改的。说明不回也没关系，不回就照现在这样。`,
+          `目的：拿到他对这条规则的态度。不回就照现在这样跑。`,
         decisionKind: "propose_rule",
         rationale: `规则 ${rule.kind} 尚未征询 ${who.name}，共同生活的规则要问过每个住的人`,
         out: messages,
