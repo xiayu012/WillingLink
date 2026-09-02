@@ -6,11 +6,6 @@ import { assembleSystemPrompt } from "@/lib/ai/brains";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
 import { critique } from "./critic";
-import {
-  deadline,
-  GENERATE_TIMEOUT_MS,
-  REWRITE_TIMEOUT_MS,
-} from "./deadline";
 import { assertCanWrite } from "./guard";
 import { colivingModelId } from "./model";
 import { embedOne } from "./embedding";
@@ -793,9 +788,6 @@ export async function runColivingTurn(args: {
     tools,
     // 交付了正文就收工；没交付则最多跑到步数上限
     stopWhen: [hasToolCall("sendReply"), stepCountIs(MAX_STEPS)],
-    // **必须有时限。** 生产上出过单次调用卡 117 秒、把整个函数预算吃光、
-    // 住户完全收不到回复的事故（见 deadline.ts）。
-    abortSignal: deadline(GENERATE_TIMEOUT_MS),
   });
 
   for (const step of result.steps) {
@@ -916,7 +908,6 @@ export async function runColivingTurn(args: {
               `${verdict.why}\n重写一条，只输出要发出去的正文。`,
           },
         ],
-        abortSignal: deadline(REWRITE_TIMEOUT_MS),
       });
       const fixed = stripMarkdown(redo.text.trim());
       if (fixed) {
