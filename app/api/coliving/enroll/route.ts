@@ -1,6 +1,7 @@
 import { after } from "next/server";
+import { sendSmsOrSkip } from "@/lib/chat/coliving/deliver";
 import { kickoffLandlord } from "@/lib/chat/coliving/outreach";
-import { enrollLandlord } from "@/lib/chat/coliving/repo";
+import { enrollLandlord, markCommunication } from "@/lib/chat/coliving/repo";
 
 /**
  * 房东入库 —— **整个系统的起点**。
@@ -57,10 +58,23 @@ export async function POST(request: Request) {
       // 新建的才打招呼；已经在库里的不要重复骚扰
       if (r.created) {
         after(async () => {
-          await kickoffLandlord({
+          const messages = await kickoffLandlord({
             householdId: r.householdId,
             personId: r.personId,
           });
+          // kickoffLandlord 只落库成 queued，**投递是调用方的事**——
+          // 漏了这一步的表现是消息永远停在 queued，人什么都收不到。
+          for (const m of messages) {
+            const sent = await sendSmsOrSkip(m.to, m.text);
+            await markCommunication({
+              communicationId: m.communicationId,
+              status: sent.ok ? "sent" : "failed",
+              error: sent.ok ? null : sent.error,
+            });
+            if (!sent.ok) {
+              console.log("[coliving/enroll] 发送失败：", sent.error);
+            }
+          }
         });
       }
     } catch (error) {
