@@ -111,6 +111,10 @@ export type OutboundMessage = {
   personId: string;
   text: string;
   communicationId: string;
+  /** 审稿没过，调用方不要投递（已在库里标成 skipped 并写明原因） */
+  blocked?: boolean;
+  /** 这条是对全屋一样的规矩，不是针对他个人的事。审稿据此判角色 */
+  houseWide?: boolean;
 };
 
 export type TurnOutcome = {
@@ -401,13 +405,20 @@ export async function runColivingTurn(args: {
         purpose: z
           .string()
           .describe("这条消息的目的，例如：告知新的厨房时段安排"),
+        scope: z
+          .enum(["personal", "house-wide"])
+          .describe(
+            "personal=针对他个人的事；house-wide=一条对全屋一样的规矩，" +
+              "只是分别通知到每个人。**说规矩就填 house-wide**，" +
+              "不然对方会读成在说他一个人。"
+          ),
         message: z
           .string()
           .describe(
             "真正要发出去的短信正文。短、具体、直接说事。不提是谁反映的。"
           ),
       }),
-      execute: async ({ name, purpose, message: raw }) => {
+      execute: async ({ name, purpose, scope, message: raw }) => {
         const message = stripMarkdown(raw);
         const target = await repo.findPersonByName(sender.householdId, name);
         if (!target) {
@@ -466,6 +477,7 @@ export async function runColivingTurn(args: {
           personId: target.personId,
           text: message,
           communicationId,
+          houseWide: scope === "house-wide",
         });
         return { ok: true, sentTo: target.name };
       },
@@ -803,20 +815,62 @@ export async function runColivingTurn(args: {
     ? ("报告问题的人" as const)
     : ("不确定" as const);
 
-  const verdict = await critique({
-    to: sender.name,
-    role: senderRole,
-    said: args.text,
-    facts:
-      `名册上的人：${ctx.members.map((m) => m.name).join("、")}\n` +
-      `本轮调用的工具：${toolsUsed.join("、") || "无"}` +
-      (outbound.length
-        ? `\n同一轮还会发给别人：${outbound
-            .map((o) => `→${o.text}`)
-            .join(" ／ ")}`
-        : "\n这一轮没有联系任何其他人"),
-    draft: reply,
-  });
+  const baseFacts =
+    `名册上的人：${ctx.members.map((m) => m.name).join("、")}\n` +
+    `本轮调用的工具：${toolsUsed.join("、") || "无"}`;
+
+  /**
+   * **每一条出站消息都要审，不只是回复。**
+   *
+   * 曾经只审 reply，`contactPerson` 发给别人的消息完全没人把关——
+   * 用户收到的那条「看到脏了就随手刷一下」正是走的这条路。
+   * 主动发给别人的消息风险更高（对方没找过你，突然收到一条冲他来的话），
+   * 反而是唯一没被检查的。
+   */
+  const outboundNames = new Map(
+    ctx.members.map((m) => [m.personId, m.name] as const)
+  );
+
+  const verdicts = await Promise.all([
+    critique({
+      to: sender.name,
+      role: senderRole,
+      said: args.text,
+      facts:
+        baseFacts +
+        (outbound.length
+          ? `\n同一轮还会发给别人：${outbound.map((o) => `→${o.text}`).join(" ／ ")}`
+          : "\n这一轮没有联系任何其他人"),
+      draft: reply,
+    }),
+    ...outbound.map((o) =>
+      critique({
+        to: outboundNames.get(o.personId) ?? "某位住户",
+        // 全屋规矩和针对个人的事，判法完全不同
+        role: o.houseWide ? "全屋通知的对象" : "被说到的人",
+        said: "",
+        facts:
+          `${baseFacts}\n这条是主动发的，起因是 ${sender.name} 说：${args.text}`,
+        draft: o.text,
+      })
+    ),
+  ]);
+
+  const verdict = verdicts[0];
+  // 出站那些不重写（重写要重跑整轮），但**不合格就不发**，并留痕。
+  // 宁可少发一条，也不发一条会让人觉得被冤枉的。
+  for (const [i, v] of verdicts.slice(1).entries()) {
+    if (!v.pass) {
+      const msg = outbound[i];
+      console.log("[critic] 拦下一条出站：", v.broke, v.why, msg.text);
+      await repo.markCommunication({
+        communicationId: msg.communicationId,
+        status: "skipped",
+        error: `审稿不合格 第${v.broke}条：${v.why}`,
+      });
+      msg.blocked = true;
+    }
+  }
 
   if (!verdict.pass) {
     console.log("[critic] 打回：", verdict.broke, verdict.why);
@@ -886,7 +940,8 @@ export async function runColivingTurn(args: {
   return {
     reply,
     replyCommunicationId,
-    outbound,
+    // 审稿拦下的不交给调用方投递
+    outbound: outbound.filter((o) => !o.blocked),
     decisionId,
     modules: loadedModuleIds,
     promptChars: chars,
