@@ -58,6 +58,9 @@ async function push(): Promise<void> {
   }
 
   const secret = process.env.CRON_SECRET?.trim();
+  if (!secret) {
+    console.log("⚠️ .env.local 里没有 CRON_SECRET，线上会 401");
+  }
   const res = await fetch(TARGET, {
     method: "POST",
     headers: {
@@ -65,11 +68,23 @@ async function push(): Promise<void> {
       ...(secret ? { authorization: `Bearer ${secret}` } : {}),
     },
     body: JSON.stringify({ phones }),
+    // **不跟随重定向**：跟了就会把 POST 变成打 /api/auth/guest，
+    // 拿回一个莫名其妙的 405，看不出真正原因（踩过一次）。
+    redirect: "manual",
   }).catch((e) => {
     console.log("发送失败：", e instanceof Error ? e.message : e);
     return null;
   });
   if (!res) {
+    return;
+  }
+
+  if (res.status >= 300 && res.status < 400) {
+    console.log(
+      `✗ 被重定向到 ${res.headers.get("location") ?? "?"}\n` +
+        "  这条路由被中间件当成需要登录的页面拦了。" +
+        "proxy.ts 里要放行 /api/coliving/。"
+    );
     return;
   }
 

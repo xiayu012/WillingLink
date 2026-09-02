@@ -37,7 +37,10 @@ export async function proxy(request: NextRequest) {
   // （CHANNEL_ADAPTERS_ENABLED），验签在各 adapter 里补。
   if (
     pathname.startsWith("/api/twilio/") ||
-    pathname.startsWith("/api/wecom/")
+    pathname.startsWith("/api/wecom/") ||
+    // 房东入库：本地脚本用 CRON_SECRET Bearer 打进来，同样不是会话 cookie。
+    // 漏了这条的表现是 307 跳到 /api/auth/guest 再 405，路由压根没跑到。
+    pathname.startsWith("/api/coliving/")
   ) {
     return NextResponse.next();
   }
