@@ -40,6 +40,9 @@ export const preferredRegion = "sfo1";
  * **不落任何记录** —— 否则任何人都能往事实账本里塞东西。
  */
 
+/** 改了这个路由就顺手 +1，用来从外面确认生产环境跑的是哪一版 */
+const BUILD_MARKER = "2026-09-01-coliving";
+
 function textResponse(body: string, status = 200): Response {
   return new Response(body, {
     status,
@@ -51,12 +54,26 @@ function textResponse(body: string, status = 200): Response {
 export async function GET(request: Request) {
   const config = wecomConfig();
   if (!config) {
-    return textResponse("wecom not configured", 503);
+    return Response.json(
+      { ok: false, endpoint: "wecom", configured: false, build: BUILD_MARKER },
+      { status: 503 }
+    );
   }
   const url = new URL(request.url);
   const echostr = url.searchParams.get("echostr") ?? "";
   if (!echostr) {
-    return textResponse("missing echostr", 400);
+    // 不带 echostr 的裸 GET = 健康检查。只回布尔和大脑名，不泄漏任何密钥。
+    // 存在的理由：出问题时最难回答的是「生产环境到底跑的哪一版、配全了没」，
+    // 从外面看这一切都是不可见的。
+    return Response.json({
+      ok: true,
+      endpoint: "wecom",
+      brain: process.env.WECOM_BRAIN ?? "coliving",
+      configured: true,
+      adaptersEnabled: adaptersEnabled(),
+      agentId: config.agentId,
+      build: BUILD_MARKER,
+    });
   }
 
   const ok = verifyWecomSignature({
