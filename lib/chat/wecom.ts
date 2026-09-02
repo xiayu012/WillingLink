@@ -161,7 +161,18 @@ export async function getWecomAccessToken(
   return cachedToken.value;
 }
 
-/** 主动推送一条文本。被动回复只有 5 秒，正经答案都走这里。 */
+/**
+ * 主动推送一条文本。被动回复只有 5 秒，正经答案都走这里。
+ *
+ * ⚠️ **errcode 60020 = 出站 IP 不在「企业可信IP」白名单里**，不是代码问题。
+ * 企业微信对 message/send 这类接口做来源 IP 校验，要在
+ * 「应用管理 → 自建应用 → 拉到底 → 企业可信IP」里加。
+ * 错误信息里会带 `from ip: x.x.x.x`，加那个就行。
+ *
+ * **这跟无服务器是天然冲突的**：Vercel 的出站 IP 不保证固定。
+ * 现在的做法是把观察到的 IP 加进去，失效了就再加。
+ * 真要稳，得把出站走一个固定 IP 的中转（或 Vercel 的静态出口 IP 方案）。
+ */
 export async function sendWecomText(args: {
   config: WecomConfig;
   toUser: string;
