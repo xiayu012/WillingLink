@@ -14,9 +14,20 @@ export const colivingBrain: Brain = {
     "美国低价合租房的住户沟通、冲突调解、投诉受理、规则执行与记录留痕。",
   doctrineDir: join(process.cwd(), "lib/ai/brains/coliving/doctrine"),
 
-  // 顺序即优先级：core 是目标与仲裁，craft 是手法，冲突时 core 说了算。
-  // 拆开的起因见 AGENT_LOG「按周轮换」事故。
+  /**
+   * 顺序即优先级。三层，从抽象到具体：
+   *
+   *   constitution  十四条，正面表述、描述行为。**新情况从这里推**
+   *   core          目标与仲裁：决定权归属、三道闸、禁区
+   *   craft         手法：措辞、格式
+   *
+   * 为什么要最上面那层：一个 bug 加一条规则，规则会越堆越多、互相抵消，
+   * 而且没覆盖到的新情况照样出错。宪法是让它**能自己推**的那一层。
+   * 十四条这个规模、正面表述、描述行为——都是照 C3AI（ACM Web Conf 2025）
+   * 的实证结论定的，不是我拍的。
+   */
   always: [
+    { id: "constitution", title: "宪法十四条", file: "constitution.md" },
     { id: "core", title: "目标与仲裁", file: "core.md" },
     { id: "craft", title: "手法", file: "craft.md" },
   ],

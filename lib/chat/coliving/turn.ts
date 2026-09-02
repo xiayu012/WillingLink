@@ -5,6 +5,7 @@ import { z } from "zod";
 import { assembleSystemPrompt } from "@/lib/ai/brains";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
+import { critique } from "./critic";
 import { assertCanWrite } from "./guard";
 import { colivingModelId } from "./model";
 import { embedOne } from "./embedding";
@@ -785,7 +786,56 @@ export async function runColivingTurn(args: {
       .filter((t): t is string => Boolean(t));
     raw = texts.at(-1) ?? "";
   }
-  const reply = stripMarkdown(raw.trim());
+  let reply = stripMarkdown(raw.trim());
+
+  /**
+   * 发出去之前过一道批判器（宪法层）。
+   * 不过就让生成器改一版，**只改一次**——见 critic.ts 里为什么不迭代。
+   */
+  const verdict = await critique({
+    situation:
+      `${sender.name} 说：${args.text}\n` +
+      `房子里的人：${ctx.members.map((m) => m.name).join("、")}` +
+      (outbound.length
+        ? `\n同时还会发给：${outbound.map((o) => o.text).join(" ／ ")}`
+        : ""),
+    draft: reply,
+    modelId,
+  });
+
+  if (!verdict.pass) {
+    console.log("[critic] 打回：", verdict.broke, verdict.why);
+    try {
+      const redo = await generateText({
+        model: getLanguageModel(modelId),
+        system: [
+          { role: "system" as const, content: doctrine },
+          { role: "system" as const, content: runtime },
+        ],
+        messages: [
+          ...history,
+          { role: "user" as const, content: args.text },
+          { role: "assistant" as const, content: reply },
+          {
+            role: "user" as const,
+            content:
+              `【这不是住户说的，是审稿意见】\n你刚才那条违反了宪法${verdict.broke}：` +
+              `${verdict.why}\n重写一条，只输出要发出去的正文。`,
+          },
+        ],
+      });
+      const fixed = stripMarkdown(redo.text.trim());
+      if (fixed) {
+        reply = fixed;
+      }
+    } catch (error) {
+      // 改不动就用原来那条——有消息总好过没消息
+      console.log(
+        "[critic] 重写失败，用原稿：",
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
 
   // ── 落库：入站消息、回复本身也算一次 communication ──
   await repo.appendMessage({
