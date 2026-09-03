@@ -107,7 +107,10 @@ export async function critique(args: CriticInput): Promise<Verdict> {
             `【这一轮已知的事实】\n${args.facts}\n\n` +
             `【待发出的消息】\n${args.draft}\n\n` +
             "只回一行 JSON：\n" +
-            '{"pass":true} 或 {"pass":false,"broke":"第几条","why":"一句话"}',
+            '{"pass":true} 或 {"pass":false,"broke":"第几条","why":"一句话"}\n' +
+            "why 里要引用消息原文时，不要加引号，直接说是哪句话——" +
+            "引号会把 JSON 撑破（真出过：模型自己引用了一句话，" +
+            "打回原因解析成了乱码，喂给重写模型时更糟）。",
         },
       ],
     });
@@ -133,10 +136,15 @@ export async function critique(args: CriticInput): Promise<Verdict> {
     // 兜底：模型有时不给 JSON，直接说了理由。
     // **只在明确说了不合格时才打回**，含糊的一律放行。
     if (/"?pass"?\s*[:：]\s*false|不合格|违反了?第/.test(result.text)) {
+      // 先试着从坏掉的 JSON 里精确抠 why 字段（模型在 why 里加了引号，
+      // 把 JSON 撑破时最常见），抠不到才退回粗暴截断。
+      const whyField = result.text.match(/"why"\s*:\s*"([\s\S]*?)"\s*\}?\s*$/);
       return {
         pass: false,
         broke: result.text.match(/第\s*(\d+)\s*条/)?.[1] ?? "?",
-        why: result.text.replace(/[\s\S]*?[:：]/, "").slice(0, 80).trim(),
+        why: (
+          whyField?.[1] ?? result.text.replace(/[\s\S]*?[:：]/, "")
+        ).slice(0, 100).trim(),
       };
     }
     return PASS;
