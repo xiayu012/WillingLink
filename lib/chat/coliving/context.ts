@@ -84,11 +84,33 @@ export async function buildContext(
 
   // 它一直在处理「周四」「这周」「明天」这类说法，却从来不知道今天几号——
   // 实测把「周四姐姐来住」的失效日算成了三个月前。
+  //
+  // **必须显式转太平洋时区，不能用 getDay()/toTimeString()。**
+  // 那两个用的是服务器本地时区；本地开发机恰好设成了太平洋时间所以测不出来，
+  // 但 Vercel 函数默认 UTC——错位窗口是太平洋下午5点到午夜这7小时
+  // （夏令时 UTC-7），**正好是住户最常发短信的时段**。真实事故：
+  // 房东说「垃圾周四收」，AI 回「今天正好是周四」，但太平洋时间其实还是周三，
+  // UTC 已经跳到周四了。
   const now = new Date();
-  const week = "日一二三四五六"[now.getDay()];
+  const pacific = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(now);
+  const part = (t: string) => pacific.find((p) => p.type === t)?.value ?? "";
+  const weekMap: Record<string, string> = {
+    周日: "日", 周一: "一", 周二: "二", 周三: "三",
+    周四: "四", 周五: "五", 周六: "六",
+  };
   lines.push(
-    `## 现在是 ${now.toISOString().slice(0, 10)} 星期${week} ` +
-      `${now.toTimeString().slice(0, 5)}（太平洋时间）`
+    `## 现在是 ${part("year")}-${part("month")}-${part("day")} ` +
+      `星期${weekMap[part("weekday")] ?? part("weekday")} ` +
+      `${part("hour")}:${part("minute")}（太平洋时间，真实换算，不是服务器时区）`
   );
   lines.push("");
 
