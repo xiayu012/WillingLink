@@ -250,11 +250,15 @@ export async function buildContext(
           `**还差 ${r.pendingNames.length} 位没表态：${r.pendingNames.join("、")}**`;
       }
       lines.push(`- [${r.kind}] ${r.statement}
-  → ${state}`);
+  → ${state}（id: ${r.id}）`);
     }
     lines.push(
       "还差人没表态的：先照它执行，去问还没表态的那几位（只问他们，" +
-        "已经表过态的不要再问），拿到答复用 recordStance 记下来。"
+        "已经表过态的不要再问），拿到答复用 recordStance 记下来。\n" +
+        "**这条规则不是这一轮提的，recordStance 要带上上面括号里那个 id**" +
+        "（不带 id 只在同一轮刚用 proposeRule 提的规则上才能用，" +
+        "对着一条老规则调不带 id 的 recordStance 会静默失败——" +
+        "有人反悔、有人补表态，都是对着老规则，**必须带 id**）。"
     );
   }
   lines.push("");

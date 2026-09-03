@@ -551,7 +551,10 @@ export async function runColivingTurn(args: {
     recordStance: tool({
       description:
         "记下某个人对一条共同规则的态度。**只在对方真的表过态时才记**——" +
-        "没回复不等于同意，那属于「问过了但还没答」，用 asked。",
+        "没回复不等于同意，那属于「问过了但还没答」，用 asked。\n" +
+        "**之前同意过的人现在说这条不合适、对他不公平——那就是在表异议**，" +
+        "立刻记 objected，**不用等你问完细节、想好新方案再记**。" +
+        "先记态度，重新设计规则是另一件事，两者不互相等待。",
       inputSchema: z.object({
         name: z.string(),
         stance: z
