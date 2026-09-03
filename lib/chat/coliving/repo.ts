@@ -90,6 +90,8 @@ export type HouseRule = {
   consultedAt: Date | null;
   agreedCount: number;
   objectedCount: number;
+  /** 还没表过态的人名。**由 SQL 算好**，不让模型自己去名单里减 */
+  pendingNames: string[];
 };
 
 export type PastEvent = {
@@ -192,14 +194,26 @@ export async function getMembers(
 
 export async function getActiveRules(householdId: string): Promise<HouseRule[]> {
   return await db()<HouseRule[]>`
-    select id, kind, statement,
-           consulted_at as "consultedAt",
-           coalesce(array_length(agreed_by, 1), 0) as "agreedCount",
-           coalesce(array_length(objected, 1), 0) as "objectedCount"
-    from coliving.rule
-    where household_id = ${householdId} and status in ('active','proposed')
-      and (valid_to is null or valid_to > now())
-    order by kind
+    select r.id, r.kind, r.statement,
+           r.consulted_at as "consultedAt",
+           coalesce(array_length(r.agreed_by, 1), 0) as "agreedCount",
+           coalesce(array_length(r.objected, 1), 0) as "objectedCount",
+           -- **谁还没表态，由数据库算**。让模型拿名单去减人，它会算错，
+           -- 而且每一轮都要重算一遍——确定性的账不该进提示词。
+           coalesce((
+             select array_agg(p.display_name order by p.display_name)
+             from coliving.membership mb
+             join coliving.person p on p.id = mb.person_id
+             where mb.household_id = r.household_id
+               and mb.valid_to is null
+               and mb.resides is not false
+               and not (p.id = any(r.agreed_by))
+               and not (p.id = any(r.objected))
+           ), '{}') as "pendingNames"
+    from coliving.rule r
+    where r.household_id = ${householdId} and r.status in ('active','proposed')
+      and (r.valid_to is null or r.valid_to > now())
+    order by r.kind
   `;
 }
 
@@ -1115,6 +1129,39 @@ export async function closeConsultation(ruleId: string): Promise<void> {
     update coliving.rule set consulted_at = now(), status = 'active'
     where id = ${ruleId}
   `;
+}
+
+/**
+ * 表态齐了就自动收口。**由代码判断，不靠模型**。
+ *
+ * 这类「状态读得到、但没人做那个收尾动作」的 bug 已经犯过三次：
+ * `roster_complete` 读了没人写、`name_confirmed` 写了没人读、
+ * 现在是征询完成没人合。表现都一样——AI 被提示词一直催着去问，
+ * 问到了也没处收，于是下一轮接着问。
+ *
+ * 判据是确定性的：名册上没有 `resides = false` 的人里，
+ * 每一个都出现在 agreed_by 或 objected 里。
+ */
+export async function closeConsultationIfComplete(
+  ruleId: string
+): Promise<boolean> {
+  const rows = await db()<{ id: string }[]>`
+    update coliving.rule r
+    set consulted_at = now(), status = 'active'
+    where r.id = ${ruleId}
+      and r.consulted_at is null
+      and not exists (
+        select 1 from coliving.membership mb
+        join coliving.person p on p.id = mb.person_id
+        where mb.household_id = r.household_id
+          and mb.valid_to is null
+          and mb.resides is not false
+          and not (p.id = any(r.agreed_by))
+          and not (p.id = any(r.objected))
+      )
+    returning r.id
+  `;
+  return rows.length > 0;
 }
 
 // ── 主动发起的候选 ───────────────────────────────────────────────────────────

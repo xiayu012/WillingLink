@@ -573,7 +573,15 @@ export async function runColivingTurn(args: {
           personId: m.personId,
           stance,
         });
-        return { ok: true };
+        // 齐了就自动收口。**不靠模型判断**——它会一直以为还没问全。
+        const done = await repo.closeConsultationIfComplete(target);
+        return {
+          ok: true,
+          note: done
+            ? "所有人都表过态了，**这条规则已经定下来**。不用再问任何人，" +
+              "把最终结果告诉大家就行。"
+            : undefined,
+        };
       },
     }),
 

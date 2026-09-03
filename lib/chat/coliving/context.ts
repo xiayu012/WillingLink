@@ -211,14 +211,25 @@ export async function buildContext(
     );
   } else {
     for (const r of rules) {
-      const asked = r.consultedAt
-        ? "已问过所有人"
-        : `还没问全（同意 ${r.agreedCount} 人${r.objectedCount ? `，有异议 ${r.objectedCount} 人` : ""}）`;
-      lines.push(`- [${r.kind}] ${r.statement} —— ${asked}`);
+      // **结论由代码给，不让模型自己数人头。** 它拿名单去减人会算错，
+      // 而且每一轮都要重算——确定性的账不该进提示词。
+      let state: string;
+      if (r.consultedAt || r.pendingNames.length === 0) {
+        state =
+          r.objectedCount > 0
+            ? `**都表过态了**（同意 ${r.agreedCount}，有异议 ${r.objectedCount}）—— 有异议就调整后再走一遍`
+            : `**都表过态了，${r.agreedCount} 位都同意，这条已经定下来了。别再问了。**`;
+      } else {
+        state =
+          `同意 ${r.agreedCount}${r.objectedCount ? `，异议 ${r.objectedCount}` : ""}，` +
+          `**还差 ${r.pendingNames.length} 位没表态：${r.pendingNames.join("、")}**`;
+      }
+      lines.push(`- [${r.kind}] ${r.statement}
+  → ${state}`);
     }
     lines.push(
-      "标着「还没问全」的：先照它执行，但遇到相关话题时顺便问一下当前这个人的意见，" +
-        "用 recordStance 记下来。"
+      "还差人没表态的：先照它执行，去问还没表态的那几位（只问他们，" +
+        "已经表过态的不要再问），拿到答复用 recordStance 记下来。"
     );
   }
   lines.push("");
