@@ -163,12 +163,16 @@ export async function getMembers(
       (select pc.value from coliving.person_contact pc
         where pc.person_id = p.id and pc.kind = ${channel}
         order by pc.is_primary desc limit 1) as address,
+      -- **不按 kind 过滤。** 记忆的类别是自由文本（见 coliving-world-06.sql），
+      -- 这里写死白名单的话，模型记了新类别也读不出来——静默失效，
+      -- 而且要到有人发现「它明明记过却不知道」时才暴露。
+      -- 只排掉 summary：那是给人看的汇总，不是关于这个人的事实。
       coalesce(
         (select array_agg(mem.content order by mem.created_at)
            from coliving.memory mem
           where mem.person_id = p.id
             and mem.valid_to is null
-            and mem.kind in ('schedule','preference','sensitivity')),
+            and mem.kind <> 'summary'),
         '{}'
       ) as notes
     from coliving.membership m
@@ -477,6 +481,17 @@ export async function saveRule(args: {
   });
 }
 
+/**
+ * 记一条长期记忆。**同一个人同一件事只留最新的一条。**
+ *
+ * 不去重的后果实测过：「傍晚六点半开始做晚饭」被换着措辞记了五遍，
+ * 而这些 notes 每一轮都进上下文。**鼓励它多记之后，重复会滚雪球。**
+ *
+ * 去重用 pg_trgm 的相似度，不是精确相等——模型每次措辞都不一样
+ * （「六点半左右」「傍晚六点半」「六点半开始做晚饭」）。
+ * 命中就把旧的置为失效再插新的：**保留历史，不覆盖**，
+ * 跟成员关系、规则的处理方式一致。
+ */
 export async function noteMemory(args: {
   householdId: string;
   personId?: string | null;
@@ -485,13 +500,45 @@ export async function noteMemory(args: {
   confidence?: number | null;
   sourceEventId?: string | null;
 }): Promise<void> {
-  await db()`
-    insert into coliving.memory
-      (household_id, person_id, kind, content, confidence, source_event_id)
-    values (${args.householdId}, ${args.personId ?? null}, ${args.kind},
-            ${args.content}, ${args.confidence ?? 0.8},
-            ${args.sourceEventId ?? null})
-  `;
+  await db().begin(async (tx) => {
+    if (args.personId) {
+      /**
+       * 阈值 0.2 是量出来的，不是拍的。同一个人的记忆两两比：
+       *   同义改写  0.600 / 0.600 / 0.318 / 0.053
+       *   不相干的  全部 0.000（作息 vs 健康 vs 偏好 vs 另一件作息）
+       * 中文三元组对语序很敏感，所以同义也可能掉到很低；
+       * 但**不相干的是干净的 0**，所以阈值取低是安全的。
+       */
+      await tx`
+        update coliving.memory
+        set valid_to = now()
+        where person_id = ${args.personId}
+          and valid_to is null
+          and similarity(content, ${args.content}) > 0.2
+      `;
+
+      /**
+       * 再加一道总量闸：一个人最多留 10 条生效记忆，超了把最老的挤掉。
+       * 相似度去重挡不住「换个角度说同一件事」，而这些 notes **每一轮都进
+       * 上下文**——没有上限的话，用得越久提示词越肿、越贵、越容易跑偏。
+       */
+      await tx`
+        update coliving.memory set valid_to = now()
+        where id in (
+          select id from coliving.memory
+          where person_id = ${args.personId} and valid_to is null
+          order by created_at desc offset 9
+        )
+      `;
+    }
+    await tx`
+      insert into coliving.memory
+        (household_id, person_id, kind, content, confidence, source_event_id)
+      values (${args.householdId}, ${args.personId ?? null}, ${args.kind},
+              ${args.content}, ${args.confidence ?? 0.8},
+              ${args.sourceEventId ?? null})
+    `;
+  });
 }
 
 // ── 按需展开的查询（Context Builder 默认不带，模型要了才查）──────────────────

@@ -671,12 +671,25 @@ export async function runColivingTurn(args: {
 
     remember: tool({
       description:
-        "把关于某个人的长期事实记下来（作息、偏好、在意的事、身体状况）。" +
-        "**只记以后还用得上的**，不记这一次的经过——经过用 logEvent。",
+        "记下关于某个人的长期事实。**顺手记，不声张。**\n" +
+        "不用等他专门告诉你——**说话里带出来的就记**：" +
+        "他说「她今天没回来」，你就知道那位是女性；说「我下班晚」，" +
+        "就知道他作息偏晚；说「我这两天嗓子不行」，就知道他在生病。\n" +
+        "**记完不要跟他说你记了**，也不要复述给别人听。" +
+        "这些是给你以后判断用的，不是拿来展示的。\n" +
+        "**只记事实，不记评判**：「他上夜班」是事实，「他挺懒的」不是——" +
+        "后者会让你以后带着偏见处理他的事。\n" +
+        "不记这一次的经过（那个用 logEvent），只记以后还用得上的。",
       inputSchema: z.object({
         name: z.string().describe("这条记忆是关于谁的"),
-        kind: z.enum(["preference", "schedule", "sensitivity", "fact"]),
-        content: z.string().describe("一句话"),
+        kind: z
+          .string()
+          .describe(
+            "你自己起个短名字：schedule / preference / sensitivity / " +
+              "identity / health / work / language / fact 都行。" +
+              "**没有固定清单**，需要新类别就直接写"
+          ),
+        content: z.string().describe("一句话，写事实"),
       }),
       execute: async ({ name, kind, content }) => {
         const m = await repo.findPersonByName(sender.householdId, name);
