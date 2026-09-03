@@ -63,6 +63,7 @@ const MIGRATIONS = [
   "coliving-world-04.sql",
   "coliving-world-05.sql",
   "coliving-world-06.sql",
+  "coliving-world-07.sql",
 ];
 
 async function apply() {

@@ -686,24 +686,99 @@ export async function runColivingTurn(args: {
           .string()
           .describe(
             "你自己起个短名字：schedule / preference / sensitivity / " +
-              "identity / health / work / language / fact 都行。" +
-              "**没有固定清单**，需要新类别就直接写"
+              "identity / health / work / language 都行。**没有固定清单**"
           ),
         content: z.string().describe("一句话，写事实"),
+        basis: z
+          .enum(["stated", "observed", "inferred"])
+          .describe(
+            "**这条是怎么来的，必须诚实**：stated=当事人自己说的 · " +
+              "observed=你从系统记录里看到的 · inferred=**你推出来的**。\n" +
+              "「我上夜班」是 stated；「所以他白天睡觉」是 inferred。\n" +
+              "把推断标成 stated，几年后你会把自己的猜测当事实读回去，" +
+              "再基于它推新的——**记忆会被自己污染，而且回不去了**。"
+          ),
+        subjectKey: z
+          .string()
+          .describe(
+            "主题键。**同一个人同一个主题只留一条当前有效**，新的自动取代旧的。\n" +
+              "先从这几个里挑，挑不到再自己起：\n" +
+              "`work_schedule`（上什么班、几点上下班——**作息和班次算同一个主题**，" +
+              "别一次写 work 一次写 sleep_schedule，那样旧的取代不掉）· " +
+              "`cooking_time` · `health` · `diet` · `guests` · " +
+              "`noise_sensitivity` · `language` · `identity` · `room`\n" +
+              "**关键是同一件事以后一直用同一个键。** 他 3 月说11点睡、" +
+              "8 月说凌晨3点回——那是取代，不是并列。"
+          ),
+        untilWhen: z
+          .string()
+          .optional()
+          .describe(
+            "这条事实什么时候失效，ISO 日期。**只要话里带了时间范围就必须填**：\n" +
+              "「**这周**上夜班」→ 填本周日 · 「**这两天**感冒」→ 填两天后 · " +
+              "「**周四**我姐来住」→ 填周五\n" +
+              "不填 = 永久有效。把临时的存成永久，几个月后你还会以为他在上夜班。"
+          ),
       }),
-      execute: async ({ name, kind, content }) => {
+      execute: async ({ name, kind, content, basis, subjectKey, untilWhen }) => {
         const m = await repo.findPersonByName(sender.householdId, name);
         if (!m) {
           return { ok: false, reason: `房子里没有叫「${name}」的人` };
         }
+        // 算不出向量不影响记录本身，只是以后语义召回不到这条
+        let embedding: number[] | null = null;
+        try {
+          embedding = await embedOne(`${kind}｜${content}`);
+        } catch {
+          embedding = null;
+        }
+        const factTo = untilWhen ? new Date(untilWhen) : null;
         await repo.noteMemory({
           householdId: sender.householdId,
           personId: m.personId,
           kind,
           content,
+          basis,
+          statedBy: sender.personId,
+          subjectKey,
+          factTo: factTo && !Number.isNaN(factTo.getTime()) ? factTo : null,
           sourceEventId: lastEventId,
+          embedding,
         });
         return { ok: true };
+      },
+    }),
+
+    recall: tool({
+      description:
+        "按意思翻以前记下的东西。**说法不一样但说的是一件事时用这个**——" +
+        "「半夜切菜声音大」「凌晨厨房一直有人」「宵夜把我吵醒」" +
+        "字面完全不同，但都是同一类问题，SQL 查不出来。\n" +
+        "上下文里默认只给你当前住户的档案，更早的、别人的、" +
+        "已经过期的都要靠这个翻。",
+      inputSchema: z.object({
+        query: z.string().describe("用一句话说你想找什么"),
+      }),
+      execute: async ({ query }) => {
+        let vec: number[] | null = null;
+        try {
+          vec = await embedOne(query);
+        } catch {
+          return { ok: false, reason: "算不出向量，这次查不了" };
+        }
+        const hits = await repo.recallMemories({
+          householdId: sender.householdId,
+          queryVector: vec,
+        });
+        return {
+          count: hits.length,
+          memories: hits.map((h) => ({
+            who: h.who,
+            content: h.content,
+            // 让模型看见这条是事实还是推断，别拿推断当证据
+            basis: h.basis === "inferred" ? "推测（不是事实）" : "本人说的",
+          })),
+        };
       },
     }),
 

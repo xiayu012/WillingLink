@@ -167,12 +167,20 @@ export async function getMembers(
       -- 这里写死白名单的话，模型记了新类别也读不出来——静默失效，
       -- 而且要到有人发现「它明明记过却不知道」时才暴露。
       -- 只排掉 summary：那是给人看的汇总，不是关于这个人的事实。
+      -- **推断要标出来。** 混着读会让 AI 把自己的猜测当事实，
+      -- 再基于它推新的猜测——几年下来不可逆地跑偏。
+      -- 同时按 fact_to 过滤掉已经过期的事实（「这周上夜班」到期就不该再读）。
       coalesce(
-        (select array_agg(mem.content order by mem.created_at)
+        (select array_agg(
+                  case when mem.basis = 'inferred'
+                       then '（推测）' || mem.content
+                       else mem.content end
+                order by mem.created_at)
            from coliving.memory mem
           where mem.person_id = p.id
             and mem.valid_to is null
-            and mem.kind <> 'summary'),
+            and mem.kind <> 'summary'
+            and (mem.fact_to is null or mem.fact_to > now())),
         '{}'
       ) as notes
     from coliving.membership m
@@ -482,63 +490,120 @@ export async function saveRule(args: {
 }
 
 /**
- * 记一条长期记忆。**同一个人同一件事只留最新的一条。**
+ * 记一条长期记忆。
  *
- * 不去重的后果实测过：「傍晚六点半开始做晚饭」被换着措辞记了五遍，
- * 而这些 notes 每一轮都进上下文。**鼓励它多记之后，重复会滚雪球。**
+ * ## 三件事必须分开，否则记忆会被自己污染
  *
- * 去重用 pg_trgm 的相似度，不是精确相等——模型每次措辞都不一样
- * （「六点半左右」「傍晚六点半」「六点半开始做晚饭」）。
- * 命中就把旧的置为失效再插新的：**保留历史，不覆盖**，
- * 跟成员关系、规则的处理方式一致。
+ * **basis**：`stated` 当事人自己说的 · `observed` 系统观察到的 ·
+ * `inferred` **你推出来的**。「我上夜班」是 stated，
+ * 「所以他白天睡觉」是 inferred。混在一起存，几年下来 AI 会把自己的
+ * 猜测读回去当事实、再基于它推新的——**不可逆地越跑越偏**。
+ *
+ * **subjectKey**：同一个人 + 同一个主题只留一条当前有效。
+ * 3 月说「11点睡」、8 月说「凌晨3点回」不是两条并列的记忆，
+ * 是后者**取代**前者。按主题键取代比按文本相似度可靠得多——
+ * 中文改写的三元组相似度会掉到 0.05，根本认不出是同一件事。
+ *
+ * **factFrom / factTo**：这条事实在**世界里**的有效期，
+ * 跟 valid_from/valid_to（记录的有效期）是两回事。
+ * 「这周上夜班」和「长期上夜班」的 factTo 完全不同。
+ *
+ * 取代不删除：旧行填 valid_to + superseded_by，
+ * 这样才答得出「他什么时候改的作息」。
  */
 export async function noteMemory(args: {
   householdId: string;
   personId?: string | null;
   kind: string;
   content: string;
+  /** 默认 stated。**推断一定要显式填 inferred** */
+  basis?: "stated" | "observed" | "inferred";
+  /** 谁说的。可能不是这条记忆的主人（室友转述） */
+  statedBy?: string | null;
+  /** 主题键，同人同主题只留一条当前有效 */
+  subjectKey?: string | null;
+  factFrom?: Date | null;
+  factTo?: Date | null;
   confidence?: number | null;
   sourceEventId?: string | null;
-}): Promise<void> {
-  await db().begin(async (tx) => {
-    if (args.personId) {
-      /**
-       * 阈值 0.2 是量出来的，不是拍的。同一个人的记忆两两比：
-       *   同义改写  0.600 / 0.600 / 0.318 / 0.053
-       *   不相干的  全部 0.000（作息 vs 健康 vs 偏好 vs 另一件作息）
-       * 中文三元组对语序很敏感，所以同义也可能掉到很低；
-       * 但**不相干的是干净的 0**，所以阈值取低是安全的。
-       */
+  /** 语义召回用。算不出来就不给，不影响写入 */
+  embedding?: number[] | null;
+}): Promise<string> {
+  const basis = args.basis ?? "stated";
+  return await db().begin(async (tx) => {
+    const [row] = await tx<{ id: string }[]>`
+      insert into coliving.memory
+        (household_id, person_id, kind, content, basis, stated_by,
+         subject_key, fact_from, fact_to, confidence, source_event_id, embedding)
+      values (${args.householdId}, ${args.personId ?? null}, ${args.kind},
+              ${args.content}, ${basis}, ${args.statedBy ?? null},
+              ${args.subjectKey ?? null}, ${args.factFrom ?? null},
+              ${args.factTo ?? null},
+              ${args.confidence ?? (basis === "inferred" ? 0.5 : 0.85)},
+              ${args.sourceEventId ?? null},
+              ${args.embedding ? `[${args.embedding.join(",")}]` : null}::vector)
+      returning id
+    `;
+
+    if (args.personId && args.subjectKey) {
+      // 同人同主题的旧记忆被取代。**不删**——留着才答得出「他什么时候改的」
       await tx`
         update coliving.memory
-        set valid_to = now()
+        set valid_to = now(), superseded_by = ${row.id}
         where person_id = ${args.personId}
+          and subject_key = ${args.subjectKey}
           and valid_to is null
+          and id <> ${row.id}
+      `;
+    } else if (args.personId) {
+      // 没给主题键时退回文本相似度。**弱**：中文改写会掉到 0.05，
+      // 所以工具描述里要求模型尽量给 subjectKey
+      await tx`
+        update coliving.memory
+        set valid_to = now(), superseded_by = ${row.id}
+        where person_id = ${args.personId} and valid_to is null
+          and id <> ${row.id}
           and similarity(content, ${args.content}) > 0.2
       `;
+    }
 
-      /**
-       * 再加一道总量闸：一个人最多留 10 条生效记忆，超了把最老的挤掉。
-       * 相似度去重挡不住「换个角度说同一件事」，而这些 notes **每一轮都进
-       * 上下文**——没有上限的话，用得越久提示词越肿、越贵、越容易跑偏。
-       */
+    if (args.personId) {
+      // 总量闸：notes 每轮都进上下文，没上限的话用得越久提示词越肿
       await tx`
         update coliving.memory set valid_to = now()
         where id in (
           select id from coliving.memory
           where person_id = ${args.personId} and valid_to is null
-          order by created_at desc offset 9
+          order by created_at desc offset 10
         )
       `;
     }
-    await tx`
-      insert into coliving.memory
-        (household_id, person_id, kind, content, confidence, source_event_id)
-      values (${args.householdId}, ${args.personId ?? null}, ${args.kind},
-              ${args.content}, ${args.confidence ?? 0.8},
-              ${args.sourceEventId ?? null})
-    `;
+    return row.id;
   });
+}
+
+/**
+ * 语义召回长期记忆。**「之前是不是也发生过类似的事」用 SQL 查不了**——
+ * 说法千变万化（半夜切菜／凌晨有人／别晚上做饭／宵夜吵醒我），
+ * 字面完全不同但说的是一件事。这是向量该干的活。
+ */
+export async function recallMemories(args: {
+  householdId: string;
+  queryVector: number[];
+  limit?: number;
+}): Promise<
+  Array<{ who: string | null; kind: string; content: string; basis: string }>
+> {
+  const vec = `[${args.queryVector.join(",")}]`;
+  return await db()`
+    select p.display_name as who, m.kind, m.content, m.basis
+    from coliving.memory m
+    left join coliving.person p on p.id = m.person_id
+    where m.household_id = ${args.householdId}
+      and m.embedding is not null
+    order by m.embedding <=> ${vec}::vector
+    limit ${args.limit ?? 5}
+  ` as never;
 }
 
 // ── 按需展开的查询（Context Builder 默认不带，模型要了才查）──────────────────

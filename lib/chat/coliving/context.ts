@@ -80,6 +80,16 @@ export async function buildContext(
   );
   lines.push("");
 
+  // 它一直在处理「周四」「这周」「明天」这类说法，却从来不知道今天几号——
+  // 实测把「周四姐姐来住」的失效日算成了三个月前。
+  const now = new Date();
+  const week = "日一二三四五六"[now.getDay()];
+  lines.push(
+    `## 现在是 ${now.toISOString().slice(0, 10)} 星期${week} ` +
+      `${now.toTimeString().slice(0, 5)}（太平洋时间）`
+  );
+  lines.push("");
+
   lines.push("## 当前渠道");
   lines.push(
     channel === "wecom"
