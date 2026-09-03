@@ -607,6 +607,40 @@ export async function runColivingTurn(args: {
       },
     }),
 
+    confirmRoster: tool({
+      description:
+        "有人告诉你这屋一共住几个人时，**立刻调这个把它记下来**。" +
+        "记下来之后你就不会再问第二遍。\n" +
+        "**不记 = 下一轮你还会问同一个问题**，问到第三遍对方就烦了（真发生过）。",
+      inputSchema: z.object({
+        total: z.number().describe("对方说的总人数"),
+        complete: z
+          .boolean()
+          .describe(
+            "名册是否已经齐了（登记的人数 == 他说的总数）。" +
+              "还差人没拿到号码就填 false"
+          ),
+      }),
+      execute: async ({ total, complete }) => {
+        const known = ctx.members.filter((m) => m.resides !== false).length;
+        await repo.setRosterComplete(sender.householdId, complete);
+        await repo.noteMemory({
+          householdId: sender.householdId,
+          kind: "fact",
+          content: `${sender.name}说这屋一共住 ${total} 人`,
+          sourceEventId: lastEventId,
+        });
+        return {
+          ok: true,
+          known,
+          note:
+            complete && known < total
+              ? `注意：他说 ${total} 人，但名册上只有 ${known} 个。还差 ${total - known} 个人的号码。`
+              : "记下了，以后不会再问这个",
+        };
+      },
+    }),
+
     renamePerson: tool({
       description:
         "改掉某个人的显示名。**在对话里自然听出真名时才用**——" +

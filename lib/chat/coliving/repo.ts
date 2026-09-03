@@ -1122,6 +1122,30 @@ export async function isRosterComplete(householdId: string): Promise<boolean> {
   return h?.roster_complete ?? false;
 }
 
+/**
+ * 最近发给**这栋房子里每个人**的消息（不只是当前这条会话线）。
+ *
+ * 没有这个，AI 只看得见跟当前这个人的往来，**根本不知道自己刚给别人
+ * 发过什么**。真实后果：房东每说一句就触发一轮，每轮都去问 2号
+ * 「你几点做饭」，一连问了四次，其中两次是在人家已经答过之后。
+ */
+export async function recentOutbound(
+  householdId: string,
+  limit = 12
+): Promise<
+  Array<{ to: string; body: string; sentAt: Date; direction: string }>
+> {
+  return await db()`
+    select p.display_name as "to", m.body, m.sent_at as "sentAt", m.direction
+    from coliving.message m
+    join coliving.conversation c on c.id = m.conversation_id
+    join coliving.person p on p.id = m.person_id
+    where c.household_id = ${householdId}
+    order by m.sent_at desc
+    limit ${limit}
+  ` as never;
+}
+
 export async function setRosterComplete(
   householdId: string,
   complete: boolean

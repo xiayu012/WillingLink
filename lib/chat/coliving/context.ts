@@ -6,6 +6,7 @@ import {
   getOpenCases,
   isRosterComplete,
   type Member,
+  recentOutbound,
   type Sender,
 } from "./repo";
 
@@ -42,12 +43,17 @@ export async function buildContext(
   channel = "sms",
   opts: { justJoined?: boolean } = {}
 ): Promise<ColivingContext> {
-  const [members, rules, openCases, rosterComplete] = await Promise.all([
-    getMembers(sender.householdId, channel),
-    getActiveRules(sender.householdId),
-    getOpenCases(sender.householdId),
-    isRosterComplete(sender.householdId),
-  ]);
+  const [members, rules, openCases, rosterComplete, recentRaw] =
+    await Promise.all([
+      getMembers(sender.householdId, channel),
+      getActiveRules(sender.householdId),
+      getOpenCases(sender.householdId),
+      isRosterComplete(sender.householdId),
+      recentOutbound(sender.householdId),
+    ]);
+
+  // 查出来是新到旧，展示时倒回正序，读起来才是一条时间线
+  const recent = [...recentRaw].reverse();
 
   const lines: string[] = [];
 
@@ -138,7 +144,8 @@ export async function buildContext(
     rosterComplete
       ? "**名册已确认完整**，分配共用资源就按上面确认住在这里的人数算。"
       : "**⚠️ 名册还没确认过完整性。** 分配共用资源之前，" +
-          "要么先问一句这屋一共住几个人，要么在给方案时说清这是按目前知道的人算的。" +
+          "要么先问一句这屋一共住几个人（**问到了立刻用 confirmRoster 记下来**，" +
+          "不记的话下一轮你还会再问一遍），要么在给方案时说清这是按目前知道的人算的。" +
           "**不要笃定地说「三个人分」，除非你真的确认过只有三个人。**"
   );
   lines.push(
@@ -205,6 +212,19 @@ export async function buildContext(
     );
   }
   lines.push("");
+
+  if (recent.length) {
+    lines.push("## 你最近跟这屋里的人说过什么（含发给别人的）");
+    lines.push(
+      "**看清楚再开口。** 已经问过的别再问一遍，已经答过你的别当没答。"
+    );
+    for (const r of recent) {
+      const t = r.sentAt.toISOString().slice(11, 16);
+      const who = r.direction === "inbound" ? `${r.to} 说` : `你对 ${r.to} 说`;
+      lines.push(`- ${t} ${who}：${r.body.replace(/\n/g, " ").slice(0, 60)}`);
+    }
+    lines.push("");
+  }
 
   lines.push("## 你还能查什么（默认没给你，需要才查）");
   lines.push(

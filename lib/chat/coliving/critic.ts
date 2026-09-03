@@ -112,19 +112,34 @@ export async function critique(args: CriticInput): Promise<Verdict> {
       ],
     });
 
-    const m = result.text.match(/\{[\s\S]*?\}/);
-    if (!m) {
-      return PASS;
+    // **贪婪匹配到最后一个 }**。非贪婪会在 why 字段里的中文引号处截断，
+    // 解析失败 → 静默放行，等于这道闸白装（实测踩过）。
+    const m = result.text.match(/\{[\s\S]*\}/);
+    if (m) {
+      try {
+        const parsed = JSON.parse(m[0]) as Partial<Verdict>;
+        if (parsed.pass === false) {
+          return {
+            pass: false,
+            broke: String(parsed.broke ?? ""),
+            why: String(parsed.why ?? ""),
+          };
+        }
+        return PASS;
+      } catch {
+        // JSON 还是坏的 —— 退回看关键词，别整个放弃
+      }
     }
-    const parsed = JSON.parse(m[0]) as Partial<Verdict>;
-    if (parsed.pass !== false) {
-      return PASS;
+    // 兜底：模型有时不给 JSON，直接说了理由。
+    // **只在明确说了不合格时才打回**，含糊的一律放行。
+    if (/"?pass"?\s*[:：]\s*false|不合格|违反了?第/.test(result.text)) {
+      return {
+        pass: false,
+        broke: result.text.match(/第\s*(\d+)\s*条/)?.[1] ?? "?",
+        why: result.text.replace(/[\s\S]*?[:：]/, "").slice(0, 80).trim(),
+      };
     }
-    return {
-      pass: false,
-      broke: String(parsed.broke ?? ""),
-      why: String(parsed.why ?? ""),
-    };
+    return PASS;
   } catch (error) {
     console.log(
       "[critic] 判不了，放行：",
