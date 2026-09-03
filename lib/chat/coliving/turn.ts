@@ -1026,10 +1026,60 @@ export async function runColivingTurn(args: {
    */
   let raw = deliveredReply as string | null;
   if (!raw) {
-    const texts = result.steps
-      .map((s) => s.text?.trim())
-      .filter((t): t is string => Boolean(t));
-    raw = texts.at(-1) ?? "";
+    /**
+     * 没调 sendReply 的情况**不是模型不想交付，是 MAX_STEPS 按步数算，
+     * 不是按工具调用数算**——花几步纯思考（不调工具）就可能在真正调用
+     * sendReply 之前把预算耗尽。真实发生过：三次同类测试里有一次，
+     * 工具列表只有 findSimilarCases,logEvent,decide，最后一段自由文本
+     * 是「方便这两天一起转我一下吗」——像是没写完的思考片段，不是
+     * 打算发出去的话，却被当成正文发给了用户（金钱话题上这种误发
+     * 风险更高）。
+     *
+     * 补一次**强制调用 sendReply** 的小调用兜底，而不是继续信任自由文本：
+     * 带着到这里为止的完整上下文（含所有工具调用与结果），逼它把已经
+     * 想好的结论交付成一句正文。这比"猜哪段文字是正文"可靠得多。
+     */
+    try {
+      const forced = await generateText({
+        model: getLanguageModel(modelId),
+        system: [
+          {
+            role: "system" as const,
+            content: doctrine,
+            providerOptions: {
+              anthropic: { cacheControl: { type: "ephemeral" } },
+            },
+          },
+          ...(runtime ? [{ role: "system" as const, content: runtime }] : []),
+        ],
+        messages: [
+          ...history,
+          { role: "user" as const, content: args.text },
+          ...result.response.messages,
+          {
+            role: "user" as const,
+            content:
+              "【系统提示】上面的判断和操作都已经做完了，你还没有交付正文。" +
+              "现在只做一件事：调 sendReply，把要发给对方的那句话交出来。",
+          },
+        ],
+        tools: { sendReply: tools.sendReply },
+        toolChoice: { type: "tool", toolName: "sendReply" },
+      });
+      raw = deliveredReply ?? "";
+    } catch (error) {
+      console.log(
+        "[turn] 强制 sendReply 兜底失败，退回自由文本：",
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+    // 连强制兜底都没拿到正文，才退到最后一段自由文本——双重保险，不是主路径
+    if (!raw) {
+      const texts = result.steps
+        .map((s) => s.text?.trim())
+        .filter((t): t is string => Boolean(t));
+      raw = texts.at(-1) ?? "";
+    }
   }
   let reply = stripMarkdown(raw.trim());
 
