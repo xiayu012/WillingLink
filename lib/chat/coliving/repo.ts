@@ -241,8 +241,9 @@ export async function appendMessage(args: {
   body: string;
   externalMessageId?: string | null;
   communicationId?: string | null;
-}): Promise<void> {
-  await db()`
+  /** 返回消息 id，调用方要用它把「人类回应」关联回对应的沟通 */
+}): Promise<string | null> {
+  const rows = await db()<{ id: string }[]>`
     insert into coliving.message
       (conversation_id, person_id, direction, channel, body,
        external_message_id, communication_id)
@@ -250,7 +251,33 @@ export async function appendMessage(args: {
             ${args.channel}, ${args.body},
             ${args.externalMessageId ?? null}, ${args.communicationId ?? null})
     on conflict do nothing
+    returning id
   `;
+  return rows[0]?.id ?? null;
+}
+
+/**
+ * 这个人有没有一条还等着他回话的沟通。**只读，不改状态。**
+ *
+ * 用在轮次开始时：让模型知道「他这句多半是在回你之前问的那件事」。
+ * 这比事后关联更值钱——它直接防住「明明问过、他也答了，下一轮又问一遍」。
+ */
+export async function pendingCommunication(
+  personId: string,
+  withinHours = 72
+): Promise<{ purpose: string | null; body: string; sentAt: Date } | null> {
+  const rows = await db()<
+    { purpose: string | null; body: string; sentAt: Date }[]
+  >`
+    select purpose, body, sent_at as "sentAt"
+    from coliving.communication
+    where to_person_id = ${personId}
+      and status = 'sent'
+      and responded_at is null
+      and sent_at > now() - (${withinHours} || ' hours')::interval
+    order by sent_at desc limit 1
+  `;
+  return rows[0] ?? null;
 }
 
 /** 最近几轮对话，按时间正序返回，喂给模型当 history */
@@ -387,17 +414,20 @@ export async function recordDecision(args: {
   modelId?: string | null;
   doctrineModules?: string[];
   contextChars?: number | null;
+  /** 当时喂给模型的运行时上下文原文。**判断对不对取决于它当时看到了什么** */
+  contextSnapshot?: string | null;
 }): Promise<string> {
   const rows = await db()<{ id: string }[]>`
     insert into coliving.decision
       (household_id, case_id, event_id, kind, target_person_ids, intent,
-       rationale, model_id, doctrine_modules, context_chars)
+       rationale, model_id, doctrine_modules, context_chars,
+       context_snapshot)
     values (${args.householdId}, ${args.caseId ?? null}, ${args.eventId ?? null},
             ${args.kind}, ${db().array(args.targetPersonIds ?? [])}::uuid[],
             ${args.intent ?? null}, ${args.rationale ?? null},
             ${args.modelId ?? null},
             ${db().array(args.doctrineModules ?? [])}::text[],
-            ${args.contextChars ?? null})
+            ${args.contextChars ?? null}, ${args.contextSnapshot ?? null})
     returning id
   `;
   return rows[0].id;
@@ -661,13 +691,21 @@ export async function nearbyObservations(args: {
   return await db()`
     select o.kind, o.summary, o.observed_at as "observedAt",
            o.severity, o.confidence,
-           round(st_distance(o.geog, pl.geog)::numeric)::int as "distanceM"
+           coalesce(round(st_distance(o.geog, pl.geog)::numeric)::int, 0)
+             as "distanceM"
     from coliving.household h
     join coliving.dwelling d on d.id = h.dwelling_id
     join coliving.place pl on pl.id = d.place_id
+    -- 两种匹配都算：
+    --   ① 有经纬度时按距离（外部数据源、传感器）
+    --   ② **没经纬度时按同一个地点**（住户自己报的，我们通常只知道「这栋房子」）
+    -- 只留 ① 的话，住户报的观察永远查不出来——表写了也白写。
     join coliving.observation o
-      on o.geog is not null and pl.geog is not null
-     and st_dwithin(o.geog, pl.geog, coalesce(o.radius_m, 500))
+      on (
+           (o.geog is not null and pl.geog is not null
+            and st_dwithin(o.geog, pl.geog, coalesce(o.radius_m, 500)))
+        or (o.geog is null and o.place_id = pl.id)
+         )
     where h.id = ${args.householdId}
       and (${args.kind ?? null}::text is null or o.kind = ${args.kind ?? null})
       and o.observed_at between
@@ -1364,4 +1402,74 @@ export async function findPersonByName(
     members.find((m) => trimmed.includes(m.name) || m.name.includes(trimmed)) ??
     null
   );
+}
+
+/**
+ * 把住户刚发来的这条消息，关联到**是哪条沟通引出来的**。
+ *
+ * 设计稿第十四点那条链里的「Human Response」那一环。
+ * **刻意不交给模型判断**：这是确定性的时间与收件人匹配，代码做得又准又免费；
+ * 交给模型只会时灵时不灵，而这条链断了就再也补不回来。
+ *
+ * 判据：这个人最近一条**已发出、还没人回应**的沟通，且在时间窗内。
+ * 超过窗口就当他不是在回那条，宁可不关联也不要错关联。
+ */
+export async function linkResponse(args: {
+  personId: string;
+  messageId: string;
+  withinHours?: number;
+}): Promise<{ communicationId: string; purpose: string | null } | null> {
+  const rows = await db()<
+    { communicationId: string; purpose: string | null }[]
+  >`
+    update coliving.communication
+    set responded_at = now(), response_message_id = ${args.messageId}
+    where id = (
+      select id from coliving.communication
+      where to_person_id = ${args.personId}
+        and status = 'sent'
+        and responded_at is null
+        and sent_at > now() - (${args.withinHours ?? 72} || ' hours')::interval
+      order by sent_at desc
+      limit 1
+    )
+    returning id as "communicationId", purpose
+  `;
+  return rows[0] ?? null;
+}
+
+/**
+ * 记一条环境观察。**属于地点和时间，不属于某个人**（设计稿第三点）。
+ *
+ * 住户说「外面今天特别臭」——这既是一个 Event（他报告了这件事），
+ * 也是一条关于**这个地点**的观察。后者能长期留在这个地点上：
+ * 几年后住户全换了，这栋房子的环境史还在；
+ * 附近几栋房子也能共用同一条外部事件。
+ */
+export async function recordObservation(args: {
+  householdId: string;
+  kind: string;
+  summary: string;
+  observedAt?: Date | null;
+  endsAt?: Date | null;
+  severity?: number | null;
+  source?: "resident" | "sensor" | "external" | "inferred";
+  sourcePersonId?: string | null;
+}): Promise<string> {
+  const rows = await db()<{ id: string }[]>`
+    insert into coliving.observation
+      (kind, place_id, observed_at, ends_at, severity, confidence,
+       source, source_person_id, summary)
+    select ${args.kind}, d.place_id,
+           ${args.observedAt ?? new Date()}, ${args.endsAt ?? null},
+           ${args.severity ?? null},
+           ${args.source === "resident" ? 0.7 : 0.9},
+           ${args.source ?? "resident"}, ${args.sourcePersonId ?? null},
+           ${args.summary}
+    from coliving.household h
+    join coliving.dwelling d on d.id = h.dwelling_id
+    where h.id = ${args.householdId}
+    returning id
+  `;
+  return rows[0].id;
 }

@@ -41,7 +41,10 @@ export type ColivingContext = {
 export async function buildContext(
   sender: Sender,
   channel = "sms",
-  opts: { justJoined?: boolean } = {}
+  opts: {
+    justJoined?: boolean;
+    answering?: { purpose: string | null; body: string; sentAt: Date } | null;
+  } = {}
 ): Promise<ColivingContext> {
   const [members, rules, openCases, rosterComplete, recentRaw] =
     await Promise.all([
@@ -110,6 +113,19 @@ export async function buildContext(
       "不要为了收集意见就把一件事拆成到处问。"
   );
   lines.push("");
+
+  if (opts.answering) {
+    const a = opts.answering;
+    lines.push("## 他这句多半是在回你之前问的事");
+    lines.push(
+      `${a.sentAt.toISOString().slice(5, 16).replace("T", " ")} 你问他：` +
+        `${a.body.replace(/\s+/g, " ").slice(0, 70)}`
+    );
+    lines.push(
+      "**当成回答来读，别当成新话题。** 他答了就把答案收好，不要再问一遍。"
+    );
+    lines.push("");
+  }
 
   if (opts.justJoined) {
     // 只陈述事实。**怎么说是准则的事**（见 tenancy.md〈第一次接触〉），

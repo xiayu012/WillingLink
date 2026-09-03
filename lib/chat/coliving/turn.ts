@@ -202,10 +202,18 @@ export async function runColivingTurn(args: {
   });
   const history = await repo.getRecentTurns(conversationId);
 
+  /**
+   * 他这句多半是在回我们之前问的什么。**在轮次开始时就要知道**——
+   * 这直接防住「明明问过、他也答了，下一轮又问一遍」那类 bug。
+   * 事后关联（linkResponse）只是为了留档，防重复要靠这一步。
+   */
+  const answering = await repo.pendingCommunication(sender.personId);
+
   // 「刚进来」= 这条会话线上还没有过任何来往。比记一个标志位可靠：
   // 不管他是自己发来的第一条，还是回复我们主动发的第一条，都算。
   const ctx = await buildContext(sender, channel, {
     justJoined: history.length === 0,
+    answering,
   });
   const modelId = args.modelId ?? colivingModelId();
 
@@ -243,6 +251,7 @@ export async function runColivingTurn(args: {
         modelId,
         doctrineModules: loadedModuleIds,
         contextChars: chars,
+        contextSnapshot: ctx.text,
       });
     }
     return decisionId;
@@ -749,6 +758,86 @@ export async function runColivingTurn(args: {
       },
     }),
 
+    closeCase: tool({
+      description:
+        "一件事了结了就用这个收尾。**上下文里「还没了结的事」那一栏里的东西，" +
+        "只要看得出已经过去了，就该收掉**——住户说好了、不再提了、" +
+        "或者你安排完之后没再出问题。" +
+        "不收的话那件事会一直挂着，你以后每轮都被它干扰，" +
+        "而且**「后来怎么样了」这个问题永远没有答案**。",
+      inputSchema: z.object({
+        caseId: z.string().describe("上下文里那一栏给的 id"),
+        kind: z
+          .enum([
+            "resolved",
+            "improved",
+            "recurred",
+            "worsened",
+            "no_response",
+            "escalated",
+            "withdrawn",
+          ])
+          .describe(
+            "resolved=彻底解决 · improved=好转但没根治 · recurred=又犯了 · " +
+              "worsened=更糟了 · no_response=没人理这事 · " +
+              "escalated=转给房东了 · withdrawn=提的人自己撤了"
+          ),
+        note: z.string().describe("一句话说清后来怎么样了"),
+        sentiment: z
+          .number()
+          .optional()
+          .describe("住户对处理结果的反应：-1 不满 / 0 中性 / 1 满意。看不出就不填"),
+      }),
+      execute: async ({ caseId, kind, note, sentiment }) => {
+        if (!(await repo.caseExists(sender.householdId, caseId))) {
+          return { ok: false, reason: "没有这件事，别编 id" };
+        }
+        await repo.updateCase({
+          caseId,
+          status: kind === "recurred" || kind === "worsened" ? "open" : "resolved",
+          resolution: note,
+        });
+        await repo.recordOutcome({
+          caseId,
+          kind,
+          note,
+          sentiment: sentiment ?? null,
+        });
+        return { ok: true };
+      },
+    }),
+
+    noteObservation: tool({
+      description:
+        "记一条**关于这个地方**的环境观察：气味、噪音、施工、天气、外面的动静。" +
+        "住户说「外面今天特别臭」「楼下在施工」——这既是他报告的一件事" +
+        "（那个用 logEvent），**也是关于这栋房子所在位置的一条事实**。" +
+        "分开记的好处：几年后住户全换了，这个地方的环境史还在；" +
+        "而且以后有人抱怨噪音时，你能查到当时外面是不是真有动静，" +
+        "**不至于把外面的事算到室友头上**。",
+      inputSchema: z.object({
+        kind: z
+          .string()
+          .describe("odor / noise / construction / weather / air_quality 等"),
+        summary: z.string().describe("一句话：什么现象、大概什么时候"),
+        severity: z
+          .number()
+          .optional()
+          .describe("0 到 1，多严重。说不好就不填"),
+      }),
+      execute: async ({ kind, summary, severity }) => {
+        await repo.recordObservation({
+          householdId: sender.householdId,
+          kind,
+          summary,
+          severity: severity ?? null,
+          source: "resident",
+          sourcePersonId: sender.personId,
+        });
+        return { ok: true };
+      },
+    }),
+
     recall: tool({
       description:
         "按意思翻以前记下的东西。**说法不一样但说的是一件事时用这个**——" +
@@ -1045,13 +1134,18 @@ export async function runColivingTurn(args: {
   }
 
   // ── 落库：入站消息、回复本身也算一次 communication ──
-  await repo.appendMessage({
+  const inboundId = await repo.appendMessage({
     conversationId,
     personId: sender.personId,
     direction: "inbound",
     channel,
     body: args.text,
   });
+  // 设计稿第十四点的「Human Response」那一环：把他的回话接回是哪条沟通引出来的。
+  // **确定性匹配，不交给模型**——链断了就再也补不回来。
+  if (inboundId) {
+    await repo.linkResponse({ personId: sender.personId, messageId: inboundId });
+  }
 
   let replyCommunicationId: string | null = null;
   if (reply) {
