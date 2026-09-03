@@ -243,11 +243,18 @@ export async function runColivingTurn(args: {
   const contacted = new Set<string>();
 
   /** 没调 decide 就直接说话时，兜底补一条，保证链路完整（设计稿第十四点） */
-  const ensureDecision = async (kind: string): Promise<string> => {
+  const ensureDecision = async (
+    kind: string,
+    intent?: string | null
+  ): Promise<string> => {
     if (!decisionId) {
       decisionId = await repo.recordDecision({
         householdId: sender.householdId,
         kind,
+        // 兜底记录也别留空。像 contactPerson 那样，调用方手里往往已经有
+        // purpose 这类描述——之前没传，实测跑出过一条 intent/rationale
+        // 全 null 的 decision，审计的时候看不出这轮到底在干什么。
+        intent: intent ?? null,
         modelId,
         doctrineModules: loadedModuleIds,
         contextChars: chars,
@@ -460,7 +467,7 @@ export async function runColivingTurn(args: {
         }
         contacted.add(target.personId);
 
-        const did = await ensureDecision("contact_one");
+        const did = await ensureDecision("contact_one", purpose);
         // 模型常先说「只回复本人」，转头又来联系别人。判断记录要跟实际行为对得上。
         await repo.upgradeDecisionKind(
           did,
