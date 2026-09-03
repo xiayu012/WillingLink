@@ -1073,18 +1073,34 @@ export type PendingRule = {
   objected: string[];
 };
 
-/** 还没走完一轮征询的规则——主动发起的 cron 靠它找活干 */
+/**
+ * 还没走完一轮征询的规则——主动发起的 cron 靠它找活干。
+ *
+ * **现场算，不靠 consulted_at 这个标志位。** 判据就是这条规则名下，
+ * 名册上还住着的人里，有没有谁既不在 agreed_by 也不在 objected 里；
+ * 有就是没走完，没有就是走完了——跟 getActiveRules 里 pendingNames
+ * 用的是同一套算法，两处不该有两套真相。
+ */
 export async function rulesNeedingConsult(
   householdId: string
 ): Promise<PendingRule[]> {
   return await db()<PendingRule[]>`
-    select id, kind, statement,
-           consulted as "consulted", agreed_by as "agreedBy", objected as "objected"
-    from coliving.rule
-    where household_id = ${householdId}
-      and status in ('proposed','active')
-      and consulted_at is null
-    order by valid_from
+    select r.id, r.kind, r.statement,
+           r.consulted as "consulted", r.agreed_by as "agreedBy",
+           r.objected as "objected"
+    from coliving.rule r
+    where r.household_id = ${householdId}
+      and r.status in ('proposed','active')
+      and exists (
+        select 1 from coliving.membership mb
+        join coliving.person p on p.id = mb.person_id
+        where mb.household_id = r.household_id
+          and mb.valid_to is null
+          and mb.resides is not false
+          and not (p.id = any(r.agreed_by))
+          and not (p.id = any(r.objected))
+      )
+    order by r.valid_from
   `;
 }
 
@@ -1308,15 +1324,33 @@ export async function finishOutreachRun(args: {
 // ── 运维 / 调试用 ────────────────────────────────────────────────────────────
 
 /**
- * 名册确认过完整没有。**默认 false**——房东给几个号码我们就有几个，
- * 不代表这栋房子只住这几个人。共用资源怎么分直接建立在这个数上，
- * 所以不确认就不能笃定地说「三个人分」。
+ * 名册收没收全。**现场算，不缓存判断结果**（deduce, don't store）。
+ *
+ * 曾经是模型自己判断再传一个 `complete: boolean`——它经常算错：
+ * 代码手里明明有 declared_size 和当前成员数两个数字，却要模型自己去比。
+ * 现在只比这两个数，代码算，模型不参与这一步判断。
  */
-export async function isRosterComplete(householdId: string): Promise<boolean> {
-  const [h] = await db()<{ roster_complete: boolean }[]>`
-    select roster_complete from coliving.household where id = ${householdId}
+export async function rosterStatus(householdId: string): Promise<{
+  declaredSize: number | null;
+  knownCount: number;
+  complete: boolean;
+}> {
+  const [row] = await db()<
+    { declaredSize: number | null; knownCount: number }[]
+  >`
+    select h.declared_size as "declaredSize",
+           (select count(*)::int from coliving.membership mb
+             where mb.household_id = h.id and mb.valid_to is null
+               and mb.resides is not false) as "knownCount"
+    from coliving.household h where h.id = ${householdId}
   `;
-  return h?.roster_complete ?? false;
+  const declaredSize = row?.declaredSize ?? null;
+  const knownCount = row?.knownCount ?? 0;
+  return {
+    declaredSize,
+    knownCount,
+    complete: declaredSize !== null && knownCount >= declaredSize,
+  };
 }
 
 /**
@@ -1343,12 +1377,13 @@ export async function recentOutbound(
   ` as never;
 }
 
-export async function setRosterComplete(
+/** 记一个人说的"这屋一共住几个"。只存这一个数字，**不存判断结果** */
+export async function setDeclaredSize(
   householdId: string,
-  complete: boolean
+  total: number
 ): Promise<void> {
   await db()`
-    update coliving.household set roster_complete = ${complete}
+    update coliving.household set declared_size = ${total}
     where id = ${householdId}
   `;
 }

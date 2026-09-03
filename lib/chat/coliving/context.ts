@@ -4,7 +4,7 @@ import {
   getActiveRules,
   getMembers,
   getOpenCases,
-  isRosterComplete,
+  rosterStatus,
   type Member,
   recentOutbound,
   type Sender,
@@ -46,14 +46,13 @@ export async function buildContext(
     answering?: { purpose: string | null; body: string; sentAt: Date } | null;
   } = {}
 ): Promise<ColivingContext> {
-  const [members, rules, openCases, rosterComplete, recentRaw] =
-    await Promise.all([
-      getMembers(sender.householdId, channel),
-      getActiveRules(sender.householdId),
-      getOpenCases(sender.householdId),
-      isRosterComplete(sender.householdId),
-      recentOutbound(sender.householdId),
-    ]);
+  const [members, rules, openCases, roster, recentRaw] = await Promise.all([
+    getMembers(sender.householdId, channel),
+    getActiveRules(sender.householdId),
+    getOpenCases(sender.householdId),
+    rosterStatus(sender.householdId),
+    recentOutbound(sender.householdId),
+  ]);
 
   // 查出来是新到旧，展示时倒回正序，读起来才是一条时间线
   const recent = [...recentRaw].reverse();
@@ -167,9 +166,13 @@ export async function buildContext(
     }
   }
   lines.push(
-    rosterComplete
+    roster.complete
       ? "**名册已确认完整**，分配共用资源就按上面确认住在这里的人数算。"
-      : "**⚠️ 名册还没确认过完整性。** 分配共用资源之前，" +
+      : roster.declaredSize !== null
+        ? `**⚠️ 有人说过这屋一共住 ${roster.declaredSize} 人，` +
+          `但名册上只有 ${roster.knownCount} 个。** ` +
+          `还差 ${roster.declaredSize - roster.knownCount} 个人的号码，问到了就用 addResident 加进来。`
+        : "**⚠️ 名册还没确认过完整性。** 分配共用资源之前，" +
           "要么先问一句这屋一共住几个人（**问到了立刻用 confirmRoster 记下来**，" +
           "不记的话下一轮你还会再问一遍），要么在给方案时说清这是按目前知道的人算的。" +
           "**不要笃定地说「三个人分」，除非你真的确认过只有三个人。**"
@@ -214,7 +217,7 @@ export async function buildContext(
       // **结论由代码给，不让模型自己数人头。** 它拿名单去减人会算错，
       // 而且每一轮都要重算——确定性的账不该进提示词。
       let state: string;
-      if (r.consultedAt || r.pendingNames.length === 0) {
+      if (r.pendingNames.length === 0) {
         state =
           r.objectedCount > 0
             ? `**都表过态了**（同意 ${r.agreedCount}，有异议 ${r.objectedCount}）—— 有异议就调整后再走一遍`

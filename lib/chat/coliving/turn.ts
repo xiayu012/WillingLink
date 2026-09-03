@@ -626,34 +626,27 @@ export async function runColivingTurn(args: {
 
     confirmRoster: tool({
       description:
-        "有人告诉你这屋一共住几个人时，**立刻调这个把它记下来**。" +
-        "记下来之后你就不会再问第二遍。\n" +
-        "**不记 = 下一轮你还会问同一个问题**，问到第三遍对方就烦了（真发生过）。",
+        "有人告诉你这屋一共住几个人时，立刻调这个记下那个数字。" +
+        "记下来之后你就不会再问第二遍。" +
+        "只管把数字说对，齐没齐由系统自己比，不用你算——" +
+        "你不用管名册上现在有几个、也不用判断够不够。",
       inputSchema: z.object({
-        total: z.number().describe("对方说的总人数"),
-        complete: z
-          .boolean()
-          .describe(
-            "名册是否已经齐了（登记的人数 == 他说的总数）。" +
-              "还差人没拿到号码就填 false"
-          ),
+        total: z.number().describe("对方说的总人数，就这一个数字"),
       }),
-      execute: async ({ total, complete }) => {
-        const known = ctx.members.filter((m) => m.resides !== false).length;
-        await repo.setRosterComplete(sender.householdId, complete);
+      execute: async ({ total }) => {
+        await repo.setDeclaredSize(sender.householdId, total);
         await repo.noteMemory({
           householdId: sender.householdId,
           kind: "fact",
           content: `${sender.name}说这屋一共住 ${total} 人`,
           sourceEventId: lastEventId,
         });
+        const status = await repo.rosterStatus(sender.householdId);
         return {
           ok: true,
-          known,
-          note:
-            complete && known < total
-              ? `注意：他说 ${total} 人，但名册上只有 ${known} 个。还差 ${total - known} 个人的号码。`
-              : "记下了，以后不会再问这个",
+          note: status.complete
+            ? "记下了，名册已经齐了，以后不会再问这个"
+            : `记下了，还差 ${total - status.knownCount} 个人的号码`,
         };
       },
     }),
