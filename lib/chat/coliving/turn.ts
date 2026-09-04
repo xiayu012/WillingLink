@@ -165,6 +165,13 @@ export async function runColivingTurn(args: {
   modelId?: string;
 }): Promise<TurnOutcome> {
   const channel = args.channel ?? "sms";
+  /**
+   * 这一轮开始的时刻。**批判器查"最近跟他之间的往来"时要用这个当截止线**——
+   * 本轮自己发出去的消息，执行工具时就已经写进库了，审稿时如果不排除
+   * 本轮自己刚写的，`recentOutbound` 会把这条消息自己算成"最近的往来"，
+   * 判成"重复发送"（跟自己比对，当然一模一样）。
+   */
+  const turnStartedAt = new Date();
   const sender = await repo.resolveSender(channel, args.from);
 
   /**
@@ -1193,10 +1200,35 @@ export async function runColivingTurn(args: {
   );
 
   // 出站消息先审、先落定"拦没拦"——回复的审稿要用得上这个结果（见下）。
+  /**
+   * **生成器能看见"最近跟这屋里的人说过什么"（context.ts 渲染进了
+   * ctx.text），批判器一直看不见。** 生产上真出过：AI 给两位住户发了
+   * "你一般几点做饭"，70 秒后又因为房东发来一条新消息，把同一句问话
+   * 原样又发了一遍——两人都还没来得及答第一条。生成器的 doctrine 里
+   * 明明写着"已经问过的别再问一遍"，但批判器审这条重复消息时，`facts`
+   * 里只有名册和本轮工具，压根没有"最近对这个人说过什么"这个信息，
+   * 判不出"这是重复"。跟今天早些时候修的名册过期快照是同一类问题：
+   * 批判器缺的不是判断力，是生成器已经有、批判器没有的那份事实。
+   * 这里现查一份较宽的最近往来记录，按收信人过滤后喂给对应的批判器
+   * 调用。
+   */
+  const recentForCritique = await repo.recentOutbound(sender.householdId, 24);
   const outboundVerdicts = await Promise.all(
-    outbound.map((o) =>
-      critique({
-        to: outboundNames.get(o.personId) ?? "某位住户",
+    outbound.map((o) => {
+      const targetName = outboundNames.get(o.personId) ?? "某位住户";
+      const withThisPerson = recentForCritique
+        // **必须早于本轮开始**——本轮自己刚发的（含正在审的这条本身）
+        // 都已经写进库了，不排除的话批判器会拿这条消息跟它自己比对。
+        .filter((r) => r.to === targetName && r.sentAt < turnStartedAt)
+        .slice(0, 6)
+        .map(
+          (r) =>
+            `${r.direction === "inbound" ? "他说" : "你对他说"}：${r.body
+              .replace(/\n/g, " ")
+              .slice(0, 60)}`
+        );
+      return critique({
+        to: targetName,
         /**
          * 共用者规矩、针对个人的事、中性打招呼，三种判法完全不同。
          * **"被说到的人"这个角色是给纠纷场景准备的**——刚加进系统、
@@ -1219,10 +1251,13 @@ export async function runColivingTurn(args: {
             ? `\n这是对共用者一样的规矩；模型声明的共用范围：${
                 o.sharedWith ?? "（没说清是哪些人 —— 这本身就是问题）"
               }`
-            : ""),
+            : "") +
+          (withThisPerson.length
+            ? `\n最近跟他之间的往来（新到旧）：\n${withThisPerson.join("\n")}`
+            : "\n最近没有跟他之间的往来记录"),
         draft: o.text,
-      })
-    )
+      });
+    })
   );
   // 出站那些不重写（重写要重跑整轮），但**不合格就不发**，并留痕。
   // 宁可少发一条，也不发一条会让人觉得被冤枉的。
