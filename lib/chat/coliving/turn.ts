@@ -651,6 +651,115 @@ export async function runColivingTurn(args: {
       },
     }),
 
+    notePartyAffected: tool({
+      description:
+        "标记某个人被这件事影响到，即使他还没开口表过态。" +
+        "**涉及多个人的事，只要看得出会影响到谁，就顺手标一下**——" +
+        "不止是已经说话的人，还没抢开口的、方案会改到他作息的人也算。\n" +
+        "这跟 recordPosition 不是一回事：那个记的是「说过什么」，" +
+        "这个记的是「跟这件事有没有利害关系」，即使他什么都没说。" +
+        "结案时会拿这份名单核对是不是每个人都通知到了结果。",
+      inputSchema: z.object({
+        caseId: z.string().describe("上下文里那一栏给的 id"),
+        name: z.string().describe("被影响到的人"),
+        reason: z.string().optional().describe("为什么算他一个，一句话"),
+      }),
+      execute: async ({ caseId, name, reason }) => {
+        if (!(await repo.caseExists(sender.householdId, caseId))) {
+          return { ok: false, reason: "没有这件事，别编 id" };
+        }
+        const m = await repo.findPersonByName(sender.householdId, name);
+        if (!m) {
+          return { ok: false, reason: `房子里没有叫「${name}」的人` };
+        }
+        await repo.addCaseParty({
+          caseId,
+          householdId: sender.householdId,
+          personId: m.personId,
+          reason: reason ?? null,
+        });
+        return { ok: true };
+      },
+    }),
+
+    recordShare: tool({
+      description:
+        "把算好的份额存下来（三道闸第一条：几个人分/每人多少/差多少）。" +
+        "**同一件事下次再被提起时，先查这里有没有存过，不要重新心算一遍**——" +
+        "重新算容易跟上次说的对不上。分完之后调这个，一种资源、每个人一条。",
+      inputSchema: z.object({
+        caseId: z.string().describe("上下文里那一栏给的 id"),
+        resource: z.string().describe("分的是什么，比如「周一到周五晚间灶台时段」"),
+        name: z.string().describe("分给谁"),
+        amount: z.number().describe("这个人分到多少"),
+        unit: z.string().describe("单位，比如「分钟」「次/周」"),
+        rationale: z
+          .string()
+          .optional()
+          .describe("不是均分时必填：为什么这个人多/少（作息硬约束/医疗需要/既有约定）"),
+      }),
+      execute: async ({ caseId, resource, name, amount, unit, rationale }) => {
+        if (!(await repo.caseExists(sender.householdId, caseId))) {
+          return { ok: false, reason: "没有这件事，别编 id" };
+        }
+        const m = await repo.findPersonByName(sender.householdId, name);
+        if (!m) {
+          return { ok: false, reason: `房子里没有叫「${name}」的人` };
+        }
+        await repo.recordCaseShare({
+          caseId,
+          householdId: sender.householdId,
+          resource,
+          personId: m.personId,
+          amount,
+          unit,
+          rationale: rationale ?? null,
+        });
+        return { ok: true };
+      },
+    }),
+
+    scheduleReminder: tool({
+      description:
+        "给未来某个时间点安排一件「到时候要主动开口」的事——比如轮换制度" +
+        "规定的「下次该换人了」「下个月同一天该重新问一遍偏好」。" +
+        "**这是你唯一能让自己在没人说话的情况下、未来某一刻主动联系人的办法**，" +
+        "不调这个，事情就只能靠住户自己想起来问你，而三道闸第二条明确要求" +
+        "「轮换周期不得短于一个月，且每次都由你主动提醒」——不主动提醒就是没" +
+        "过这道闸。到点后由后台任务扫描触发，不需要你自己盯着时间。",
+      inputSchema: z.object({
+        description: z.string().describe("到时候要做的事，一句话，写清楚背景"),
+        dueAt: z.string().describe("到期时间，ISO 8601 格式或「YYYY-MM-DD」"),
+        name: z
+          .string()
+          .optional()
+          .describe("这件事主要跟谁有关，不填就是整栋房子的事"),
+        ruleId: z.string().optional().describe("跟某条规则有关就填它的 id"),
+      }),
+      execute: async ({ description, dueAt, name, ruleId }) => {
+        const due = new Date(dueAt);
+        if (Number.isNaN(due.getTime())) {
+          return { ok: false, reason: "dueAt 不是能解析的时间，别编格式" };
+        }
+        let personId: string | null = null;
+        if (name) {
+          const m = await repo.findPersonByName(sender.householdId, name);
+          if (!m) {
+            return { ok: false, reason: `房子里没有叫「${name}」的人` };
+          }
+          personId = m.personId;
+        }
+        const id = await repo.scheduleReminder({
+          householdId: sender.householdId,
+          personId,
+          ruleId: ruleId ?? null,
+          description,
+          dueAt: due,
+        });
+        return { ok: true, obligationId: id };
+      },
+    }),
+
     recordPosition: tool({
       description:
         "记下某个人对一件未结的事表过的态（想要什么/拒绝了什么），" +
@@ -920,8 +1029,24 @@ export async function runColivingTurn(args: {
               "resolved 时必须把每一条都过一遍填在这里，一条都不能漏。** " +
               "没记过表态的事不用填这个。"
           ),
+        notifiedParties: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "本轮已经用 contactPerson 通知过结果的人名。" +
+              "**结果通知不是通过本轮 contactPerson 发的、而是之前对话里已经" +
+              "说清楚了，才需要在这里手动列**——本轮真的调用 contactPerson 的会" +
+              "自动核对，不用重复填。"
+          ),
       }),
-      execute: async ({ caseId, kind, note, sentiment, accounting }) => {
+      execute: async ({
+        caseId,
+        kind,
+        note,
+        sentiment,
+        accounting,
+        notifiedParties,
+      }) => {
         if (!(await repo.caseExists(sender.householdId, caseId))) {
           return { ok: false, reason: "没有这件事，别编 id" };
         }
@@ -958,6 +1083,45 @@ export async function runColivingTurn(args: {
               honored: a.honored,
               resolutionNote: a.note ?? null,
             });
+          }
+
+          // 通知覆盖率核对：这件事标过"影响到谁"的名单，逐个查是不是
+          // 本轮真的联系过（contacted 集合，来自本轮的 contactPerson 调用），
+          // 或者模型显式声明"之前已经说过了"（notifiedParties）。
+          const parties = await repo.getCaseParties(caseId);
+          const explicitlyNotified = new Set<string>();
+          for (const n of notifiedParties ?? []) {
+            const m = await repo.findPersonByName(sender.householdId, n);
+            if (m) {
+              explicitlyNotified.add(m.personId);
+            }
+          }
+          const stillUnnotified = parties.filter(
+            (p) =>
+              p.notified !== true &&
+              !contacted.has(p.personId) &&
+              p.personId !== sender.personId &&
+              !explicitlyNotified.has(p.personId)
+          );
+          if (stillUnnotified.length > 0) {
+            return {
+              ok: false,
+              reason:
+                "这件事标过受影响的人，收口前每个人都要知道最终结果：" +
+                stillUnnotified.map((p) => p.personName).join("、") +
+                " 还没被通知到。本轮用 contactPerson 逐个告诉他们结果，" +
+                "或者如果之前已经说过了，在 notifiedParties 里列出来再收口。",
+            };
+          }
+          for (const p of parties) {
+            const nowNotified =
+              p.notified === true ||
+              contacted.has(p.personId) ||
+              p.personId === sender.personId ||
+              explicitlyNotified.has(p.personId);
+            if (nowNotified && p.notified !== true) {
+              await repo.markCasePartyNotified(caseId, p.personId, true);
+            }
           }
         }
         await repo.updateCase({

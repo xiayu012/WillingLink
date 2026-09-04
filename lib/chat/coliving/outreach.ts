@@ -330,6 +330,40 @@ export async function runOutreachForHousehold(
     jobs.push({ job: "onboarding", considered: fresh.length, acted });
   }
 
+  // ── 4. 到期的提醒 —— scheduleReminder 存的、时间到了要主动开口的事 ─────
+  {
+    const runId = await repo.startOutreachRun({ householdId, job: "obligation_due" });
+    const due = await repo.dueObligations(householdId);
+    let acted = 0;
+    for (const o of due) {
+      // 有指定人就找他，没指定就找房东（这件事是整栋房子的，房东是默认联系人，
+      // 跟"房东是权威"无关——只是找不到更具体的人时，总要有个收件人）
+      const who = o.personId
+        ? residents.find((m) => m.personId === o.personId)
+        : residents.find((m) => m.role === "landlord");
+      if (!who) {
+        continue;
+      }
+      const ok = await send({
+        householdId,
+        person: who,
+        purpose: "到了之前约好要主动提醒的时间点",
+        brief:
+          `之前记下的一件事，到了该开口的时间：${o.description}。` +
+          `目的：按这件事本来的意图，现在主动联系他。`,
+        decisionKind: "observe",
+        rationale: `obligation ${o.id} 到期（${o.dueAt?.toISOString().slice(0, 10) ?? "未知"}）`,
+        out: messages,
+      });
+      if (ok) {
+        await repo.markObligationDone(o.id);
+        acted++;
+      }
+    }
+    await repo.finishOutreachRun({ runId, considered: due.length, acted });
+    jobs.push({ job: "obligation_due", considered: due.length, acted });
+  }
+
   return { household: label, jobs, messages };
 }
 

@@ -2,7 +2,9 @@ import "server-only";
 
 import {
   getActiveRules,
+  getCaseParties,
   getCasePositions,
+  getCaseShares,
   getMembers,
   getOpenCases,
   rosterStatus,
@@ -69,6 +71,18 @@ export async function buildContext(
       openCases.map(
         async (c) => [c.id, await getCasePositions(c.id)] as const
       )
+    )
+  );
+  // 同样的道理：受影响的人（不一定表过态）和已经算好的份额，
+  // 都在结案时要用到，提前铺开省得模型漏查
+  const partiesByCase = new Map(
+    await Promise.all(
+      openCases.map(async (c) => [c.id, await getCaseParties(c.id)] as const)
+    )
+  );
+  const sharesByCase = new Map(
+    await Promise.all(
+      openCases.map(async (c) => [c.id, await getCaseShares(c.id)] as const)
     )
   );
 
@@ -297,14 +311,38 @@ export async function buildContext(
         const accounted = p.honored === null ? "" : p.honored ? "（已满足）" : "（未满足）";
         lines.push(`    · ${p.personName}${kindLabel}：${p.statement}${accounted}`);
       }
+      const parties = partiesByCase.get(c.id) ?? [];
+      if (parties.length) {
+        const names = parties.map(
+          (p) => `${p.personName}${p.notified ? "（已通知结果）" : ""}`
+        );
+        lines.push(`    · 影响到：${names.join("、")}`);
+      }
+      const shares = sharesByCase.get(c.id) ?? [];
+      if (shares.length) {
+        const byResource = new Map<string, typeof shares>();
+        for (const s of shares) {
+          const arr = byResource.get(s.resource) ?? [];
+          arr.push(s);
+          byResource.set(s.resource, arr);
+        }
+        for (const [resource, rows] of byResource) {
+          const parts = rows.map(
+            (s) => `${s.personName} ${s.amount}${s.unit}${s.rationale ? `（${s.rationale}）` : ""}`
+          );
+          lines.push(`    · 已算好「${resource}」：${parts.join("；")}`);
+        }
+      }
     }
     lines.push(
       "**这一轮的话如果是上面某件事的后续，用它的 id，不要另开一件。**"
     );
     lines.push(
-      "**上面缩进列出的是已经记录过的表态（谁想要什么/拒绝了什么/你许过什么承诺）。" +
-        "开新方案前先看一眼，别跟自己或别人说过的话对不上；" +
-        "有新的表态就用 recordPosition 记下来，别只放在这轮对话里。**"
+      "**上面缩进列出的是已经记录过的表态（谁想要什么/拒绝了什么/你许过什么承诺）、" +
+        "被影响到的人、以及已经算好的份额。** 开新方案前先看一眼，别跟自己或别人" +
+        "说过的话对不上、别重新心算一遍份额；有新的表态用 recordPosition 记，" +
+        "有新的受影响的人用 notePartyAffected 记，算好份额用 recordShare 记，" +
+        "别只放在这轮对话里。"
     );
   }
   lines.push("");

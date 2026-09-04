@@ -461,6 +461,146 @@ export async function accountCasePosition(args: {
   `;
 }
 
+// ── ② 案子影响到谁：结案时核对"都通知到了吗" ─────────────────────────────
+
+export type CaseParty = {
+  id: string;
+  personId: string;
+  personName: string;
+  reason: string | null;
+  notified: boolean | null;
+};
+
+/** upsert：同一个人在同一件事里多次标记，只留最后一次的 reason */
+export async function addCaseParty(args: {
+  caseId: string;
+  householdId: string;
+  personId: string;
+  reason?: string | null;
+}): Promise<void> {
+  await db()`
+    insert into coliving.case_party (case_id, household_id, person_id, reason)
+    values (${args.caseId}, ${args.householdId}, ${args.personId}, ${args.reason ?? null})
+    on conflict (case_id, person_id) do update set reason = excluded.reason
+  `;
+}
+
+export async function getCaseParties(caseId: string): Promise<CaseParty[]> {
+  return await db()<CaseParty[]>`
+    select cp.id, cp.person_id as "personId", p.display_name as "personName",
+           cp.reason, cp.notified
+    from coliving.case_party cp
+    join coliving.person p on p.id = cp.person_id
+    where cp.case_id = ${caseId}
+    order by cp.created_at asc
+  `;
+}
+
+export async function markCasePartyNotified(
+  caseId: string,
+  personId: string,
+  notified: boolean
+): Promise<void> {
+  await db()`
+    update coliving.case_party set notified = ${notified}
+    where case_id = ${caseId} and person_id = ${personId}
+  `;
+}
+
+// ── ④ 算好的份额：存一次，以后的轮次直接读，不用重新心算 ──────────────────
+
+export type CaseShare = {
+  id: string;
+  resource: string;
+  personId: string;
+  personName: string;
+  amount: number;
+  unit: string;
+  rationale: string | null;
+};
+
+export async function recordCaseShare(args: {
+  caseId: string;
+  householdId: string;
+  resource: string;
+  personId: string;
+  amount: number;
+  unit: string;
+  rationale?: string | null;
+}): Promise<string> {
+  const rows = await db()<{ id: string }[]>`
+    insert into coliving.case_share
+      (case_id, household_id, resource, person_id, amount, unit, rationale)
+    values (${args.caseId}, ${args.householdId}, ${args.resource}, ${args.personId},
+            ${args.amount}, ${args.unit}, ${args.rationale ?? null})
+    returning id
+  `;
+  return rows[0].id;
+}
+
+export async function getCaseShares(caseId: string): Promise<CaseShare[]> {
+  return await db()<CaseShare[]>`
+    select cs.id, cs.resource, cs.person_id as "personId", p.display_name as "personName",
+           cs.amount, cs.unit, cs.rationale
+    from coliving.case_share cs
+    join coliving.person p on p.id = cs.person_id
+    where cs.case_id = ${caseId}
+    order by cs.resource, cs.created_at asc
+  `;
+}
+
+// ── ③ 提醒自己：把 obligation 这张表接上电 ────────────────────────────────
+
+export type DueObligation = {
+  id: string;
+  householdId: string;
+  personId: string | null;
+  personName: string | null;
+  ruleId: string | null;
+  description: string;
+  dueAt: Date | null;
+};
+
+export async function scheduleReminder(args: {
+  householdId: string;
+  personId?: string | null;
+  ruleId?: string | null;
+  description: string;
+  dueAt: Date;
+}): Promise<string> {
+  const rows = await db()<{ id: string }[]>`
+    insert into coliving.obligation
+      (household_id, person_id, rule_id, description, due_at)
+    values (${args.householdId}, ${args.personId ?? null}, ${args.ruleId ?? null},
+            ${args.description}, ${args.dueAt})
+    returning id
+  `;
+  return rows[0].id;
+}
+
+/** 到期且还没处理的提醒。outreach.ts 的 obligation_due job 用这个扫描。 */
+export async function dueObligations(householdId: string): Promise<DueObligation[]> {
+  return await db()<DueObligation[]>`
+    select o.id, o.household_id as "householdId", o.person_id as "personId",
+           p.display_name as "personName", o.rule_id as "ruleId",
+           o.description, o.due_at as "dueAt"
+    from coliving.obligation o
+    left join coliving.person p on p.id = o.person_id
+    where o.household_id = ${householdId}
+      and o.status = 'pending'
+      and o.due_at <= now()
+    order by o.due_at asc
+  `;
+}
+
+export async function markObligationDone(id: string): Promise<void> {
+  await db()`
+    update coliving.obligation
+    set status = 'done', completed_at = now()
+    where id = ${id}
+  `;
+}
+
 export async function recordOutcome(args: {
   caseId: string;
   kind: string;
