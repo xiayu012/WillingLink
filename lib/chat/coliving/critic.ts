@@ -95,6 +95,11 @@ export async function critique(args: CriticInput): Promise<Verdict> {
             "你对着下面的清单逐条查，只报**真正的违反**。\n" +
             "你不写替代方案，只说第几条、为什么。\n\n" +
             rubric(),
+          // 这段逐字不变（rubric 只在改动doctrine时才变），
+          // 一轮对话里批判器常被调好几次（每条 contactPerson 各审一次+
+          // 回复本身再审一次），不开缓存等于每次都全价重发这179行清单。
+          // 跟主生成路径（turn.ts）同一个做法，之前漏做了。
+          providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
         },
       ],
       messages: [

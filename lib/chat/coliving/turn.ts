@@ -1599,7 +1599,13 @@ export async function runColivingTurn(args: {
         await generateText({
           model: getLanguageModel(modelId),
           system: [
-            { role: "system" as const, content: doctrine },
+            {
+              role: "system" as const,
+              content: doctrine,
+              // 跟主生成调用、下面的force-sendReply同一个道理：
+              // 这段一轮里可能被重发好几次，逐字不变，该开缓存
+              providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+            },
             { role: "system" as const, content: runtime },
           ],
           messages: [
@@ -1821,7 +1827,13 @@ export async function runColivingTurn(args: {
       await generateText({
         model: getLanguageModel(modelId),
         system: [
-          { role: "system" as const, content: doctrine },
+          {
+            role: "system" as const,
+            content: doctrine,
+            // 同上：这一轮如果批判器打回，这段会跟主生成调用共享
+            // 同一份 doctrine 内容，开缓存能命中主调用已经写入的那份
+            providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+          },
           { role: "system" as const, content: runtime },
         ],
         messages: [

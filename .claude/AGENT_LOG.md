@@ -12,6 +12,64 @@
 
 ---
 
+## 2026-09-04 · 三处漏掉的 prompt cache 断点：批判器 + 两条特殊路径
+
+**背景**：用户经历"工具能瘦身"这件事后说"我很不懂AI工程，请你再看看
+还有什么能大幅改善运转速度、token成本、聪明程度"。逐项盘点几个常见
+杠杆（prompt caching、模型选择、上下文冗余、工具schema冗长），
+系统性查代码而不是凭印象猜。
+
+**发现（真实的漏洞，不是假设）**：主生成调用（`turn.ts` 里最主要那次
+`generateText`）和主动发起调用（`outreach.ts`）都正确用了 Anthropic
+prompt cache breakpoint（`cacheControl: { type: "ephemeral" }`）；但
+排查发现**三处遗漏**：
+
+1. **`critic.ts` 的批判器调用，从一开始就没有开缓存。** 批判器带的是
+   179 行的 `rubric.md`，一轮对话里可能被调好几次——每条 `contactPerson`
+   发出的消息各审一次、回复本身再审一次，三人协调场景常见 3-4 次
+   批判器调用，**每次都全价重发这段几乎不变的清单**。
+2. **`turn.ts` 里"加完室友强制打招呼"那条补发路径**（`c328ae8` 那次
+   加的），system 里带的是完整 `doctrine`（跟主生成同一份内容），
+   但没有开缓存。
+3. **`turn.ts` 里批判器打回后的重写路径**（`ce234a6` 那次加的
+   `contactPerson` 二选一逻辑所在的那段），同样带完整 `doctrine`
+   却没开缓存。
+
+**根因**：这两条特殊路径都是本会话今天新加的（分别对应 c328ae8 和
+ce234a6 两次修复），加的时候只关注功能对不对，没有对照主生成调用的
+既有写法把缓存断点也加上——是遗漏，不是设计上刻意不缓存。
+
+**修法**：三处都补上跟主生成调用一致的
+`providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } }`。
+
+**验证**：直接调批判器用的那段 system prompt连续跑 3 次，读
+`providerMetadata.anthropic.usage`——第一次
+`cache_creation_input_tokens: 4000`（写入，贵，1.25倍价），第二、三次
+都变成 `cache_read_input_tokens: 4000`（命中，0.1倍价），
+`cache_creation` 归零。按 Anthropic 定价，rubric 这部分成本从"每次
+全价"降到"只有第一次要多付 25%，之后降到十分之一"，一轮对话审
+3-4 次的场景下这部分能省 70-80%。`tsc --noEmit`、`brain:inspect`、
+`scheduling:inspect` 均干净，不影响功能。
+
+**排查过、判断暂不动的几处（如实记录，不是漏查）**：
+
+- `outreach.ts` 的 cron 发起路径本来就有缓存，不用改。
+- `getRecentTurns` 拉最近 12 条对话历史，量有上限，不是失控增长，
+  不需要动。
+- `buildContext`/`assembleSystemPrompt` 每轮各只调一次，被后续所有
+  `generateText` 调用（主生成、强制补发、重写）复用，没有重复计算。
+- **工具的 `describe()` 文字总量偏大**（80 处 `describe` 调用），
+  工具 schema 不走 system 的 cache breakpoint（是 API 请求里单独的
+  `tools` 参数），理论上瘦身能省字数——**但没有动**：这些描述文字
+  正是这个会话反复在修的那类真实事故的"免疫力"来源（工具描述不够
+  具体，模型就更容易漏调/错调），瘦身收益不确定、风险明确，需要
+  逐个工具判断而不是一刀切，这次先不碰，留给以后专门评估。
+- **批判器换更便宜模型**：本会话更早验证过一次（deepseek-v4-flash
+  审核反而比 sonnet 慢近3倍），这次开了缓存不改变那个结论——缓存
+  降低的是 sonnet 自己的成本，不构成"重新评估换模型"的新理由。
+
+---
+
 ## 2026-09-04 · 工具列表按需摘取：21个工具不再每轮全摆，减负 + 顺便省钱
 
 **背景**：用户听完"LLM注意力/组合优化"那次科普后，追问工具调用数量的
