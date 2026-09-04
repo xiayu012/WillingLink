@@ -114,14 +114,18 @@ export async function POST(request: Request) {
         }
       };
 
-      if (outcome.reply) {
-        await deliver(from, outcome.reply, outcome.replyCommunicationId);
-      }
-
-      // 主动发给房子里其他人的（杠杆二）
-      for (const msg of outcome.outbound) {
-        await deliver(msg.to, msg.text, msg.communicationId);
-      }
+      // 给本人的回复 + 主动发给房子里其他人的（杠杆二），互不依赖，并发发出去。
+      // 以前是 for 循环挨个 await，三个人就是三倍的短信网络延迟串在一起；
+      // Twilio 的 sendSms 调用之间没有先后关系，改并发是纯 I/O 层面的提速，
+      // 不影响任何一条短信的内容或落库顺序（markCommunication 各写各的行）。
+      await Promise.all([
+        outcome.reply
+          ? deliver(from, outcome.reply, outcome.replyCommunicationId)
+          : Promise.resolve(),
+        ...outcome.outbound.map((msg) =>
+          deliver(msg.to, msg.text, msg.communicationId)
+        ),
+      ]);
 
       console.log(
         "[twilio]",

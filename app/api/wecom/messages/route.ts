@@ -194,13 +194,14 @@ export async function POST(request: Request) {
         }
       };
 
-      if (outcome.reply) {
-        await deliver(fromUser, outcome.reply, outcome.replyCommunicationId);
-      }
-      // 主动发给房子里其他人的（杠杆二）；他们得也有 wecom 地址才收得到
-      for (const m of outcome.outbound) {
-        await deliver(m.to, m.text, m.communicationId);
-      }
+      // 给本人的回复 + 主动发给房子里其他人的（杠杆二，得也有 wecom 地址才收得到），
+      // 互不依赖，并发发出去，跟 twilio 那条路由同样的提速逻辑。
+      await Promise.all([
+        outcome.reply
+          ? deliver(fromUser, outcome.reply, outcome.replyCommunicationId)
+          : Promise.resolve(),
+        ...outcome.outbound.map((m) => deliver(m.to, m.text, m.communicationId)),
+      ]);
 
       console.log(
         "[wecom]",
