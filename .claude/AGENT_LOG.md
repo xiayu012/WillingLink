@@ -12,6 +12,74 @@
 
 ---
 
+## 2026-09-04 · 工具列表按需摘取：21个工具不再每轮全摆，减负 + 顺便省钱
+
+**背景**：用户听完"LLM注意力/组合优化"那次科普后，追问工具调用数量的
+行业常见上限，进而推演出"大规模场景可能天然需要多智能体"这个结论，
+最后问"我们看看如何减负，说不定还能顺便省钱"。
+
+**现状盘点**：这个大脑现在有 21 个工具，全部常驻、每一轮不管聊什么
+话题都摆给模型——这正好踩在业界公认"工具调用可靠性开始退化"的临界区
+（10-20个以内稳，20-50个开始明显退化）。而且这不是纸上谈兵：**这个
+会话早些时候真出过一次实锤事故**（c328ae8）——往工具列表连续加了5个
+新工具后，"加完室友必须打招呼"这条被挤掉，模型没调 `contactPerson`。
+
+**做法**：把21个工具按"这一轮是否几乎必然用得上"分三组：
+
+- **核心链路（6个，永远常驻）**：`decide` `sendReply` `logEvent`
+  `contactPerson` `remember` `addResident`。`addResident` 单独拎出来
+  跟核心链路绑在一起，**不放进按话题路由的情境组**——这是吸取
+  c328ae8 的教训：房东随时可能突然报个号码，不一定伴着"入住"这类
+  字眼，漏摆这一个工具的代价（联系不上新住户）远比多摆一个工具的
+  注意力成本高，宁可常驻也不赌路由能不能命中。
+- **查询类（5个，永远常驻）**：`noteObservation` `recall`
+  `lookupHistory` `findSimilarCases` `checkEnvironment`——本来就是
+  低频、模型主动判断"要不要查"的工具，彼此功能区分度高，常驻不构成
+  额外的选择负担。
+- **情境组（10个，按信号动态决定摆不摆）**：优先用**结构信号**，
+  比纯话题关键词更准（不会因为这一轮没提到相关字眼就漏摆）——
+  `closeCase` 看 `ctx.openCaseIds` 是否非空（不看话题，钱类/安全类
+  结案不会被"这轮是不是聊冲突"卡住）；`confirmRoster` 看
+  `!ctx.roster.complete`；`renamePerson` 看是否有人还顶着占位名
+  （`nameConfirmed === false`）。其余用**话题信号**兜底：
+  `proposeRule`/`recordStance`/`scheduleReminder` 在 `loadedModuleIds`
+  命中 `tenancy` 或 `conflict` 时摆出来；`pickSchedule`/`recordShare`/
+  `notePartyAffected`/`recordPosition`（多方冲突/排班专用）只在命中
+  `conflict` 时摆出来。
+
+**实现**：`turn.ts` 里 `tools` 对象本身不变（21个工具全部定义好，
+`redo`/强制补发那几处特殊路径还是直接引用 `tools.xxx` 单独工具，不受
+影响），新增 `activeTools`——按上面的规则从 `tools` 里挑子集，只有这个
+挑出来的子集才传给主生成的 `generateText` 调用。**批判器打回后的重写
+路径、加完室友的强制补发路径，都不经过这层过滤**（它们本来就是显式
+指定单个工具、`toolChoice` 锁死，不受工具数量堆积的影响，也不需要
+过滤）。
+
+**验证**：
+- 简单事实查询场景（"垃圾是周几倒"）：`toolsUsed` 只有
+  `decide`/`sendReply`，没有多余的情境组工具混进来。
+- 报室友号码场景（回归 c328ae8）：`addResident` 正确常驻可用，
+  `contactPerson` 正确被触发（这次消息被批判器合理拦下，是措辞质量
+  问题，不是本次改动的责任范围，且系统正确用将来时说"我会试着联系
+  他"，没有撒谎）。
+- 真实排班冲突场景（回归 `pickSchedule` 那次修复）：`modules` 正确
+  命中 `conflict`，`toolsUsed` 里 `pickSchedule` 正确出现并被调用——
+  工具过滤没有挡住这条已经验证过的链路。
+- `tsc --noEmit` 无新增类型错误（过程中踩了一次 TS 类型收窄的坑：
+  用 `Partial<typeof tools>` 声明情境工具子集会导致 `generateText`
+  返回的 `step.toolCalls` 类型被错误地推断成"可能是 undefined"，
+  改用跟 `redoTools` 那次同样的 `Record<string, (typeof tools)[keyof
+  typeof tools]>` 显式类型 + 命令式赋值才消除），`brain:inspect`
+  11/11、`scheduling:inspect` 9/9 均通过。
+
+**顺便验证了"省钱"这半句**：工具数量减少直接降低每次工具调用往返时
+系统提示词里工具 schema 部分占用的 token（每个工具的 description +
+inputSchema 都要随着每一步工具调用重新计入上下文）。没有单独跑量化
+对比（这次改动的主要目的是可靠性，省钱是自然结果，不是本次验证重点），
+但方向上必然是省的——工具 schema 越少，每一步重复计入的 token 越少。
+
+---
+
 ## 2026-09-04 · 打磨排班算法：不走模型额度自测20用例，找到并修复一个真实算法 bug
 
 **背景**：用户听懂了上一节"组合优化交给代码算"的道理，明确要求把这条

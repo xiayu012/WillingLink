@@ -1400,6 +1400,77 @@ export async function runColivingTurn(args: {
   };
 
   /**
+   * **工具列表按需摘取，不是每轮把全部 21 个都摆给模型。**
+   *
+   * 起因：这个会话往工具列表里连续加了 5 个新工具，21 个工具挤在一起后
+   * 出过一次真实回归——"加完室友必须打招呼"这条被挤掉，模型没调
+   * `contactPerson`（见 c328ae8）。工具数量超过一二十个之后，主流模型
+   * 选错、漏选工具的概率明显上升，这不是这一个模型的问题，是这类"工具
+   * 太多、注意力被稀释"的通病。跟情境模块按话题动态加载是同一个思路——
+   * `assembleSystemPrompt` 早就在做"不相关的准则不塞进上下文"，工具
+   * 列表现在补上同一层过滤。
+   *
+   * 分三组：
+   *
+   *   **① 核心链路（5个，永远常驻）**：`decide` `sendReply` `logEvent`
+   *   `contactPerson` `remember`——几乎每一轮都会用到，缺一个就断链路。
+   *
+   *   **② 查询类（5个，永远常驻）**：`noteObservation` `recall`
+   *   `lookupHistory` `findSimilarCases` `checkEnvironment`——本来就是
+   *   低频、模型主动判断"要不要查"的工具，常驻不算浪费注意力（它们
+   *   之间功能区分度高，不容易互相选错）。
+   *
+   *   **③ 情境组（11个，按结构信号或话题信号决定要不要摆出来）**：
+   *   优先用**结构信号**（比纯话题关键词更准，不会因为这一轮没提到
+   *   相关字眼就漏摆）——`closeCase` 只要 `openCaseIds` 非空就摆
+   *   （不看话题：钱类、安全类结案都不会被"这轮聊的是不是冲突"卡住）；
+   *   `addResident`/`confirmRoster` 只要名册没收全就摆（不看话题：
+   *   房东随时可能突然报个号码，不一定伴着"入住"这类字眼）；
+   *   `renamePerson` 只要有人还顶着占位名就摆。其余用话题信号
+   *   （`loadedModuleIds` 是不是命中了 `tenancy`/`conflict`）兜底。
+   */
+  const hasUnconfirmedName = ctx.members.some((m) => !m.nameConfirmed);
+  const topicHitsTenancy = loadedModuleIds.includes("tenancy");
+  const topicHitsConflict = loadedModuleIds.includes("conflict");
+  // addResident 不放进"话题命中才摆"的情境组——它是真实事故的教训
+  // （c328ae8）：房东随时可能突然报个号码，不一定伴着"入住"这类字眼，
+  // 漏摆这一个工具的后果（联系不上新住户）比多摆一个工具的注意力
+  // 成本高得多，所以跟核心链路一样常驻。
+  const activeTools: Record<string, (typeof tools)[keyof typeof tools]> = {
+    decide: tools.decide,
+    sendReply: tools.sendReply,
+    logEvent: tools.logEvent,
+    contactPerson: tools.contactPerson,
+    remember: tools.remember,
+    addResident: tools.addResident,
+    noteObservation: tools.noteObservation,
+    recall: tools.recall,
+    lookupHistory: tools.lookupHistory,
+    findSimilarCases: tools.findSimilarCases,
+    checkEnvironment: tools.checkEnvironment,
+  };
+  if (ctx.openCaseIds.length > 0) {
+    activeTools.closeCase = tools.closeCase;
+  }
+  if (!ctx.roster.complete) {
+    activeTools.confirmRoster = tools.confirmRoster;
+  }
+  if (hasUnconfirmedName) {
+    activeTools.renamePerson = tools.renamePerson;
+  }
+  if (topicHitsTenancy || topicHitsConflict) {
+    activeTools.proposeRule = tools.proposeRule;
+    activeTools.recordStance = tools.recordStance;
+    activeTools.scheduleReminder = tools.scheduleReminder;
+  }
+  if (topicHitsConflict) {
+    activeTools.pickSchedule = tools.pickSchedule;
+    activeTools.recordShare = tools.recordShare;
+    activeTools.notePartyAffected = tools.notePartyAffected;
+    activeTools.recordPosition = tools.recordPosition;
+  }
+
+  /**
    * 系统提示词拆成两条，**缓存断点卡在中间**。
    *
    * 这是本模块最大的一笔省钱：带工具的一轮对话不是一次调用，而是每调一次工具
@@ -1418,7 +1489,7 @@ export async function runColivingTurn(args: {
       ...(runtime ? [{ role: "system" as const, content: runtime }] : []),
     ],
     messages: [...history, { role: "user" as const, content: args.text }],
-    tools,
+    tools: activeTools,
     // 交付了正文就收工；没交付则最多跑到步数上限
     stopWhen: [hasToolCall("sendReply"), stepCountIs(MAX_STEPS)],
   });
