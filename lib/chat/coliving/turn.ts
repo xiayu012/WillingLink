@@ -298,7 +298,8 @@ export async function runColivingTurn(args: {
         "**每一轮都要调这个。** 说清楚你这次的治理判断：要不要介入、找谁、" +
         "想达成什么、为什么。这是判断本身，跟你实际说出口的话分开记录。\n" +
         "**可以和 logEvent 在同一次里一起调**，不必等它返回——" +
-        "两者互不依赖，一起调能少一次往返。",
+        "但如果是同一件未了结的事，caseId 两边都要各自填，" +
+        "别指望一边设好了另一边就能用（两个工具经常并发跑，谁先谁后不确定）。",
       inputSchema: z.object({
         kind: z
           .enum([
@@ -321,7 +322,11 @@ export async function runColivingTurn(args: {
         caseId: z
           .string()
           .optional()
-          .describe("如果是某件未了结事情的后续，填它的 id"),
+          .describe(
+            "如果是某件未了结事情的后续，填它的 id。**这轮如果同时调了 " +
+              "logEvent，那边也要单独填同一个 id**——两个工具经常同一轮" +
+              "并发调用，谁先跑完不确定，指望这边先设好共享状态给那边用会漏。"
+          ),
       }),
       execute: async ({ kind, intent, rationale, caseId }) => {
         // 模型会编 id。编的 id 插 communication 时会撞外键、整轮崩掉，
@@ -357,7 +362,11 @@ export async function runColivingTurn(args: {
     logEvent: tool({
       description:
         "记录发生了一件事。**判断为无需处理时也要记**，把理由写进 detail——" +
-        "不作为同样必须可被复核。需要持续跟进的事，同时把 openCase 设为 true。",
+        "不作为同样必须可被复核。需要持续跟进的事，同时把 openCase 设为 true。\n" +
+        "**是某件「还没了结的事」的后续，就填 caseId，不要只填 openCase。** " +
+        "别指望同一轮里调 decide 时填的 caseId 会自动传到这边——" +
+        "两个工具经常并发跑，谁先谁后不确定，各自填各自的（真实发生过：" +
+        "同一件事因为这个开出了两条一模一样标题的 case）。",
       inputSchema: z.object({
         kind: z
           .string()
@@ -377,10 +386,17 @@ export async function runColivingTurn(args: {
           .array(z.string())
           .optional()
           .describe("这件事说的是谁（房子里的人名）"),
+        caseId: z
+          .string()
+          .optional()
+          .describe(
+            "如果这是「还没了结的事」列表里某一条的后续，填它的 id——" +
+              "跟 decide 用同一个，这边要单独填一遍。"
+          ),
         openCase: z
           .boolean()
           .optional()
-          .describe("是否需要开一件事持续跟进"),
+          .describe("是全新的事、需要持续跟进，才设为 true；有 caseId 就不要设"),
         caseTitle: z.string().optional().describe("openCase 时给它起个短标题"),
       }),
       execute: async (a) => {
@@ -390,6 +406,16 @@ export async function runColivingTurn(args: {
           if (m) {
             aboutIds.push(m.personId);
           }
+        }
+        // 显式传入的 caseId 优先于共享变量：decide 那边即使这轮也在填，
+        // 并发执行下谁先落地不确定，不能靠"对方应该已经设好了"。
+        if (
+          a.caseId &&
+          !activeCaseId &&
+          (await repo.caseExists(sender.householdId, a.caseId))
+        ) {
+          activeCaseId = a.caseId;
+          await repo.touchCase(a.caseId);
         }
         if (a.openCase && !activeCaseId) {
           activeCaseId = await repo.openCase({
