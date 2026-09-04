@@ -1114,19 +1114,9 @@ export async function runColivingTurn(args: {
     ctx.members.map((m) => [m.personId, m.name] as const)
   );
 
-  const verdicts = await Promise.all([
-    critique({
-      to: sender.name,
-      role: senderRole,
-      said: args.text,
-      facts:
-        baseFacts +
-        (outbound.length
-          ? `\n同一轮还会发给别人：${outbound.map((o) => `→${o.text}`).join(" ／ ")}`
-          : "\n这一轮没有联系任何其他人"),
-      draft: reply,
-    }),
-    ...outbound.map((o) =>
+  // 出站消息先审、先落定"拦没拦"——回复的审稿要用得上这个结果（见下）。
+  const outboundVerdicts = await Promise.all(
+    outbound.map((o) =>
       critique({
         to: outboundNames.get(o.personId) ?? "某位住户",
         // 共用者规矩和针对个人的事，判法完全不同
@@ -1141,13 +1131,11 @@ export async function runColivingTurn(args: {
             : ""),
         draft: o.text,
       })
-    ),
-  ]);
-
-  const verdict = verdicts[0];
+    )
+  );
   // 出站那些不重写（重写要重跑整轮），但**不合格就不发**，并留痕。
   // 宁可少发一条，也不发一条会让人觉得被冤枉的。
-  for (const [i, v] of verdicts.slice(1).entries()) {
+  for (const [i, v] of outboundVerdicts.entries()) {
     if (!v.pass) {
       const msg = outbound[i];
       console.log("[critic] 拦下一条出站：", v.broke, v.why, msg.text);
@@ -1160,10 +1148,43 @@ export async function runColivingTurn(args: {
     }
   }
 
+  /**
+   * 回复的审稿放在出站之后（不能并发）：**回复如果说"我去联系他了"，
+   * 得先知道那条联系有没有真的发出去。** 第10轮踩过——contactPerson
+   * 那条被上面拦下之后，回复里仍然说"我先去听听阿伟那边怎么说"，
+   * 这句话在这一轮里其实没发生。把拦截结果喂给回复的批判器，
+   * 让 rubric 第7条能查出这种"工具调过、消息没送到"的落差。
+   */
+  const verdict = await critique({
+    to: sender.name,
+    role: senderRole,
+    said: args.text,
+    facts:
+      baseFacts +
+      (outbound.length
+        ? `\n同一轮还联系了别人：${outbound
+            .map(
+              (o) =>
+                `→${o.blocked ? "【这条被审稿拦下，没有发出去】" : ""}${o.text}`
+            )
+            .join(" ／ ")}`
+        : "\n这一轮没有联系任何其他人"),
+    draft: reply,
+  });
+
   if (!verdict.pass) {
     console.log("[critic] 打回：", verdict.broke, verdict.why);
     try {
-      const redo = await generateText({
+      /**
+       * **重写也要强制走 sendReply，不能信任自由文本。**
+       * 第10轮踩过：模型不认同审稿意见时，`redo.text` 里出现的不是重写的
+       * 正文，是跟审稿意见对质的话（"不能说我重写，这个判断需要你这边
+       * 重新看一下"），这段话原样当成正文发给了住户。跟第7轮
+       * MAX_STEPS 兜底那次是同一类错误——自由文本里混着不是给住户看的话，
+       * 靠猜不可靠。逼它显式调用 sendReply 交付，不给它把辩解写进正文的空间。
+       */
+      deliveredReply = null;
+      await generateText({
         model: getLanguageModel(modelId),
         system: [
           { role: "system" as const, content: doctrine },
@@ -1177,11 +1198,13 @@ export async function runColivingTurn(args: {
             role: "user" as const,
             content:
               `【这不是住户说的，是审稿意见】\n你刚才那条第${verdict.broke}条不合格：` +
-              `${verdict.why}\n重写一条，只输出要发出去的正文。`,
+              `${verdict.why}\n重写一条，调 sendReply 把要发给对方的那句话交出来。`,
           },
         ],
+        tools: { sendReply: tools.sendReply },
+        toolChoice: { type: "tool", toolName: "sendReply" },
       });
-      const fixed = stripMarkdown(redo.text.trim());
+      const fixed = stripMarkdown((deliveredReply ?? "").trim());
       if (fixed) {
         reply = fixed;
       }
