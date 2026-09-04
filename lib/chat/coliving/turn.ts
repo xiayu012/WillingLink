@@ -1643,6 +1643,27 @@ export async function runColivingTurn(args: {
        * 转述猜着改。
        */
       deliveredReply = null;
+      /**
+       * **第7条（承诺的事这轮做了没）打回时，正确的修法可能不是换个说法，
+       * 是真的去做。** 以前这里无论打回原因是什么，重写都只给
+       * `sendReply` 一个工具、`toolChoice` 锁死——逼它不敢在正文里撒谎，
+       * 但代价是就算它想改口去真的联系人，工具都不在手上，唯一能做的
+       * 只有把"我这就去说"改成"我会去说"，承诺依然没兑现，只是换了
+       * 时态骗过检查。这本身就是"死代码杜绝新人必须联系到"那次改动
+       * （c328ae8）之后仍然留着的同一类缺口，这次一并补上。
+       *
+       * 只在打回原因确实是第7条时才多给 `contactPerson`——其余11条
+       * （角色错位、编造事实、语气问题等）都是纯措辞问题，重写只需要
+       * 换种说法，不需要、也不该借机去联系别人（避免打回原因跟第7条
+       * 无关时也顺手多发消息，扩大这段代码的影响面）。
+       */
+      const isBrokenPromise = verdict.broke.trim() === "7";
+      const redoTools: Record<string, (typeof tools)[keyof typeof tools]> = {
+        sendReply: tools.sendReply,
+      };
+      if (isBrokenPromise) {
+        redoTools.contactPerson = tools.contactPerson;
+      }
       await generateText({
         model: getLanguageModel(modelId),
         system: [
@@ -1658,17 +1679,33 @@ export async function runColivingTurn(args: {
             content:
               `【这不是住户说的，是审稿意见】\n你刚才那条第${verdict.broke}条不合格：` +
               `${verdict.why}\n\n【这一轮的事实，重写要跟这个对得上】\n${replyFacts}\n\n` +
+              (isBrokenPromise
+                ? "你说了要联系某个人，但这轮实际没有联系到——" +
+                  "**现在先调 contactPerson 把这个人真的联系到**，联系成功后" +
+                  "再调 sendReply，回复里就可以如实说已经联系了。" +
+                  "只有联系不上（对方不在名册里、没有联系方式，或者" +
+                  "contactPerson 返回失败）才允许直接调 sendReply，并把回复" +
+                  "改成如实反映「联系不上」这件事，不能说成已经联系到了。\n\n" +
+                  "如果这次重写你判断不需要联系任何人（比如原本的判断就是" +
+                  "错的，这一步压根不该承诺去联系谁），直接改措辞、调 " +
+                  "sendReply 也可以——不强制一定要调 contactPerson，只是" +
+                  "不能既不联系人、又在回复里说得像已经联系过了。\n\n"
+                : "") +
               "重写一条，调 sendReply 把要发给对方的那句话交出来。" +
-              "上面事实里标了「被审稿拦下，没有发出去」的联系，这轮就是没有发生——" +
-              "不管用什么时态描述，都不能说成已经联系到了或者正在联系。" +
-              "具体说：『我正/正在/已经/这就跟他说/商量/联系』这类话都不能用" +
-              "（第16轮踩过：把『正在』换成『正去』照样是同一个问题，" +
-              "文字游戏绕不开这条），只能用明确还没发生、稍后才做的说法，" +
-              "比如『我会去跟他说』『打算联系他』『这事我记下了，回头去问』。",
+              "上面事实里标了「被审稿拦下，没有发出去」的联系，" +
+              (isBrokenPromise
+                ? "如果你没有在这次重写里用 contactPerson 补上，"
+                : "") +
+              "这轮就是没有发生——不管用什么时态描述，都不能说成已经联系到了" +
+              "或者正在联系。具体说：『我正/正在/已经/这就跟他说/商量/联系』" +
+              "这类话都不能用（第16轮踩过：把『正在』换成『正去』照样是同一个" +
+              "问题，文字游戏绕不开这条），只能用明确还没发生、稍后才做的" +
+              "说法，比如『我会去跟他说』『打算联系他』『这事我记下了，回头去问』。",
           },
         ],
-        tools: { sendReply: tools.sendReply },
-        toolChoice: { type: "tool", toolName: "sendReply" },
+        tools: redoTools,
+        toolChoice: "required",
+        stopWhen: [hasToolCall("sendReply"), stepCountIs(3)],
       });
       const fixed = stripMarkdown((deliveredReply ?? "").trim());
       if (fixed) {
