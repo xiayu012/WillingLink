@@ -261,7 +261,7 @@ export async function runColivingTurn(args: {
    * 硬套"被说到的人"会把中性的自我介绍当成指控来审，见下面
    * critique 那段的说明。
    */
-  const newlyAdded = new Set<string>();
+  const newlyAdded = new Map<string, string>();
 
   /** 没调 decide 就直接说话时，兜底补一条，保证链路完整（设计稿第十四点） */
   const ensureDecision = async (
@@ -825,7 +825,7 @@ export async function runColivingTurn(args: {
             note: note ?? null,
           });
           if (r.created) {
-            newlyAdded.add(r.personId);
+            newlyAdded.set(r.personId, r.name);
           }
           return {
             ok: true,
@@ -1410,6 +1410,67 @@ export async function runColivingTurn(args: {
     }
   }
   let reply = stripMarkdown(raw.trim());
+
+  /**
+   * **代码强制，不再是提示词劝说**：这一轮新加进来的人，
+   * 只要还没被联系过，这里就再补一步，强制调 contactPerson。
+   *
+   * 起因：`addResident` 工具描述里一直写着"加完这个人这一轮就要打招呼"，
+   * 靠模型自己记得去调 `contactPerson`。这条本来在真实场景里跑得住
+   * （见 ca23e45 那次修复，连续验证 3/3 次），但**后来两次会话往
+   * 工具列表里加了 `recordPosition`/`notePartyAffected`/`recordShare`/
+   * `scheduleReminder` 四个新工具**，模型这一轮要在更多选项里分配步数，
+   * "加完人就打招呼"这条不带强制力的提示被挤掉——生产上真实复现：
+   * `addResident` 调用了两次，`contactPerson` 一次没调，回复里却说
+   * "回头会联系他们打个招呼"，批判器也正确抓到了这个落差（第7条：
+   * 说了要联系但本轮没有对应的工具调用），**但批判器打回后的重写路径
+   * 只会强制换一种说法，不会强制真的去联系**——所以最后送出去的还是
+   * 一句"回头联系"的空话，人从头到尾没收到消息。
+   *
+   * 靠提示词改法（不管改措辞、改工具顺序、加免责声明）都只是让这类
+   * 回归"这次不复现了"，下次工具列表一变又可能挤掉。这里直接用代码把
+   * "新人必须被联系到"钉死：不管模型这一轮记不记得、不管批判器抓没抓到，
+   * 只要 newlyAdded 里有人还没进 contacted，就强制再跑一次只带
+   * contactPerson 这一个工具的生成，逼模型对每个漏掉的人各发一条。
+   */
+  const uncontactedNew = [...newlyAdded.keys()].filter(
+    (id) => !contacted.has(id)
+  );
+  if (uncontactedNew.length > 0) {
+    const names = uncontactedNew
+      .map((id) => newlyAdded.get(id))
+      .filter((n): n is string => !!n);
+    if (names.length > 0) {
+      try {
+        await generateText({
+          model: getLanguageModel(modelId),
+          system: [
+            { role: "system" as const, content: doctrine },
+            { role: "system" as const, content: runtime },
+          ],
+          messages: [
+            ...history,
+            { role: "user" as const, content: args.text },
+            {
+              role: "user" as const,
+              content:
+                `【这不是住户说的，是系统提醒】这一轮刚加进系统、但还没被联系过的人：` +
+                `${names.join("、")}。每个人都要调一次 contactPerson 主动打个招呼、` +
+                "说清楚你是谁——不套模板，措辞自己定。有几个人就调几次。",
+            },
+          ],
+          tools: { contactPerson: tools.contactPerson },
+          toolChoice: { type: "tool", toolName: "contactPerson" },
+          stopWhen: stepCountIs(names.length),
+        });
+      } catch (error) {
+        console.log(
+          "[turn] 强制打招呼补发失败：",
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+  }
 
   /**
    * 发出去之前过一道批判器（宪法层）。
