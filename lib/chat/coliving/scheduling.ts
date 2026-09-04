@@ -82,8 +82,18 @@ export type SlotPlan = {
  * 8! = 40320，几毫秒内算完，没必要上更复杂的算法）。
  *
  * 每种排列按顺序把人依次排进窗口：每个人的开始时间取
- * 「max(硬约束的最早开始时间, 前一个人结束的时间)」——
- * 这保证硬约束不会被违反，同时尽量往前排、不留空当。
+ * 「max(硬约束的最早开始时间, 前一个人结束的时间)」得到**最早可行时刻**，
+ * 再从最后一个人开始**往回松弛**：只要不违反"不早于自己的最早开始时间"
+ * 和"不能晚到挤进下一个人的时段"，就把每个人的开始时刻朝自己的偏好挪。
+ *
+ * **为什么需要这一步（真实踩过的坑）**：只贪心从前往后堆、从不回头调整，
+ * 会漏掉"窗口有富余空当时，应该把空当让给最接近这里的偏好"这种情形。
+ * 例：窗口 17:00 起，老张 17:30 起硬占 90 分钟，小刘偏好 18:00、只要
+ * 15 分钟——纯贪心会把小刘怼在窗口最前面（17:00-17:15，偏离偏好 60
+ * 分钟），但小刘其实可以贴着老张开始前排（17:15-17:30，偏离只剩 45
+ * 分钟；如果窗口起点更早、空当更大，甚至能让小刘正好卡在 17:45-18:00，
+ * 偏离归零）——**贪心从前往后堆永远发现不了这种"该往后挪半步"的解**，
+ * 必须再来一遍从后往前的松弛调整。
  *
  * 返回**先按满意度（totalPreferenceGapMinutes 从小到大）、
  * 再按最晚结束时刻（从小到大）**排序的全部方案。
@@ -97,18 +107,45 @@ export function findSchedulePlans(
   }
   const plans: SlotPlan[] = [];
   for (const order of permutations(constraints)) {
+    // 第一遍：贪心从前往后堆，得到每个人的「最早可行开始时刻」
     let cursor = windowStartMinutes;
-    const assignments: SlotAssignment[] = [];
+    const earliest: { start: number; end: number }[] = [];
     for (const c of order) {
       const start = Math.max(cursor, windowStartMinutes + c.earliestStartMinutes);
+      const end = start + c.durationMinutes;
+      earliest.push({ start, end });
+      cursor = end;
+    }
+
+    // 第二遍：从最后一个人开始往回松弛，把每个人尽量挪向自己的偏好，
+    // 但不早于「最早可行开始时刻」，也不晚到让自己的结束时刻超过
+    // 下一个人（松弛后）的开始时刻。
+    const finalStart = new Array<number>(order.length);
+    let nextStart = Number.POSITIVE_INFINITY; // 松弛后，右边那个人的开始时刻上限
+    for (let i = order.length - 1; i >= 0; i--) {
+      const c = order[i];
+      const lowerBound = earliest[i].start;
+      const upperBound = nextStart - c.durationMinutes; // 不能挤到下一个人
+      const preferred =
+        c.preferredStartMinutes === undefined
+          ? lowerBound
+          : windowStartMinutes + c.preferredStartMinutes;
+      // 在 [lowerBound, upperBound] 区间内，选离 preferred 最近的点
+      const start = Math.min(Math.max(preferred, lowerBound), upperBound);
+      finalStart[i] = start;
+      nextStart = start;
+    }
+
+    const assignments: SlotAssignment[] = order.map((c, i) => {
+      const start = finalStart[i];
       const end = start + c.durationMinutes;
       const preferenceGapMinutes =
         c.preferredStartMinutes === undefined
           ? null
           : Math.abs(start - (windowStartMinutes + c.preferredStartMinutes));
-      assignments.push({ name: c.name, startMinutes: start, endMinutes: end, preferenceGapMinutes });
-      cursor = end;
-    }
+      return { name: c.name, startMinutes: start, endMinutes: end, preferenceGapMinutes };
+    });
+
     const latestEndMinutes = Math.max(...assignments.map((a) => a.endMinutes));
     const totalPreferenceGapMinutes = assignments.reduce(
       (sum, a) => sum + (a.preferenceGapMinutes ?? 0),

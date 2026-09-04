@@ -27,6 +27,7 @@
     "wanted-recall-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/wanted-recall-eval.ts",
     "answer-coverage-eval": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/answer-coverage-eval.ts",
     "brain:inspect": "tsx scripts/brain-inspect.ts",
+    "scheduling:inspect": "tsx scripts/scheduling-inspect.ts",
     "twilio:selftest": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/twilio-selftest.ts",
     "twilio:inspect": "tsx scripts/twilio-inspect.ts",
     "coliving:sim": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/coliving-sim.ts",
