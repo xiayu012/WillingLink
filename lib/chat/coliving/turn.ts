@@ -10,6 +10,7 @@ import { assertCanWrite } from "./guard";
 import { colivingModelId } from "./model";
 import { embedOne } from "./embedding";
 import * as repo from "./repo";
+import { bestSchedulePlans, formatMinutes } from "./scheduling";
 
 /**
  * 一轮对话最多几步工具。比以前长：现在一轮里可能要
@@ -679,6 +680,88 @@ export async function runColivingTurn(args: {
           reason: reason ?? null,
         });
         return { ok: true };
+      },
+    }),
+
+    pickSchedule: tool({
+      description:
+        "把一段连续时间窗口，按几个人各自的硬约束（最早能开始、需要多久）" +
+        "和可选的软偏好（他说的\"最合适\"的时间），排出候选方案。\n" +
+        "**给两个人以上排一段连续时段时，先调这个，不要自己心算排列组合**" +
+        "——排列越多，靠人脑猜「谁排前面、谁排后面最好」越容易漏掉更好的" +
+        "排法（真实事故：把唯一有硬约束的人默认排最前面，结果把唯一说了" +
+        "偏好时间的人挤到了他不想要的时段，其实换个顺序两人都能满足）。" +
+        "返回的候选按「最多人接近自己偏好」排序，**但选哪个、要不要用，" +
+        "还是你自己判断**——比如某人虽然排列上吃亏但这次特殊情况可以" +
+        "谅解，这类人际判断这个工具不管，只负责把有哪些排法摆出来。",
+      inputSchema: z.object({
+        windowLabel: z.string().describe("这段窗口叫什么，比如「傍晚厨房时段」"),
+        windowStart: z.string().describe("窗口起点，HH:MM 格式，比如「18:00」"),
+        people: z
+          .array(
+            z.object({
+              name: z.string().describe("这个人的名字"),
+              durationMinutes: z.number().describe("他需要占用多久，单位分钟"),
+              earliestStart: z
+                .string()
+                .optional()
+                .describe(
+                  "他最早能开始的时间，HH:MM。这是硬约束，不填就当作窗口一开始就能开始"
+                ),
+              preferredStart: z
+                .string()
+                .optional()
+                .describe(
+                  "他自己说的\"最合适\"的开始时间，HH:MM。这是软偏好，" +
+                    "不是硬约束——不填就不参与满意度打分"
+                ),
+            })
+          )
+          .min(2)
+          .describe("至少两个人，一个人不需要排"),
+      }),
+      execute: async ({ windowLabel, windowStart, people }) => {
+        const toMinutes = (hhmm: string): number => {
+          const [h, m] = hhmm.split(":").map(Number);
+          return h * 60 + m;
+        };
+        const windowStartMinutes = toMinutes(windowStart);
+        const constraints = people.map((p) => ({
+          name: p.name,
+          durationMinutes: p.durationMinutes,
+          earliestStartMinutes: p.earliestStart
+            ? Math.max(0, toMinutes(p.earliestStart) - windowStartMinutes)
+            : 0,
+          preferredStartMinutes: p.preferredStart
+            ? toMinutes(p.preferredStart) - windowStartMinutes
+            : undefined,
+        }));
+        const plans = bestSchedulePlans(windowStartMinutes, constraints, 3);
+        if (plans.length === 0) {
+          return { ok: false, reason: "没排出候选，检查一下 people 是不是填对了" };
+        }
+        return {
+          ok: true,
+          windowLabel,
+          candidates: plans.map((p, i) => ({
+            rank: i + 1,
+            order: p.order,
+            slots: p.assignments.map(
+              (a) =>
+                `${a.name}：${formatMinutes(a.startMinutes)}-${formatMinutes(a.endMinutes)}` +
+                (a.preferenceGapMinutes !== null
+                  ? a.preferenceGapMinutes === 0
+                    ? "（正好是他偏好的时间）"
+                    : `（比他说的偏好晚/早了约${a.preferenceGapMinutes}分钟）`
+                  : "")
+            ),
+            latestEnd: formatMinutes(p.latestEndMinutes),
+            note:
+              i === 0
+                ? "这是让最多人接近自己偏好的排法"
+                : "备选，满意度略低于第一个",
+          })),
+        };
       },
     }),
 
