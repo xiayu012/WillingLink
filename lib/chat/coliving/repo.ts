@@ -400,6 +400,67 @@ export async function touchCase(caseId: string): Promise<void> {
   `;
 }
 
+export type CasePosition = {
+  id: string;
+  personId: string;
+  personName: string;
+  kind: "preference" | "rejection" | "commitment";
+  statement: string;
+  createdAt: Date;
+  honored: boolean | null;
+  resolutionNote: string | null;
+};
+
+/**
+ * 记一条表态：谁想要什么/拒绝了什么，或者 AI 自己许下的承诺。
+ * 只在这一步写 statement/kind，honored 留 null——「还没被交代」，
+ * 要等 closeCase 时被工具校验逼着填。
+ */
+export async function recordCasePosition(args: {
+  caseId: string;
+  householdId: string;
+  personId: string;
+  kind: "preference" | "rejection" | "commitment";
+  statement: string;
+}): Promise<string> {
+  const rows = await db()<{ id: string }[]>`
+    insert into coliving.case_position (case_id, household_id, person_id, kind, statement)
+    values (${args.caseId}, ${args.householdId}, ${args.personId}, ${args.kind}, ${args.statement})
+    returning id
+  `;
+  return rows[0].id;
+}
+
+export async function getCasePositions(caseId: string): Promise<CasePosition[]> {
+  return await db()<CasePosition[]>`
+    select cp.id, cp.person_id as "personId", p.display_name as "personName",
+           cp.kind, cp.statement, cp.created_at as "createdAt",
+           cp.honored, cp.resolution_note as "resolutionNote"
+    from coliving.case_position cp
+    join coliving.person p on p.id = cp.person_id
+    where cp.case_id = ${caseId}
+    order by cp.created_at asc
+  `;
+}
+
+/**
+ * 结案时把每条表态交代清楚：满足没满足、为什么。
+ * **不校验"必须全部交代"——那是工具执行层（turn.ts）的活**，这里只管落库。
+ */
+export async function accountCasePosition(args: {
+  positionId: string;
+  honored: boolean;
+  resolutionNote?: string | null;
+}): Promise<void> {
+  await db()`
+    update coliving.case_position
+    set honored = ${args.honored},
+        resolution_note = ${args.resolutionNote ?? null},
+        accounted_at = now()
+    where id = ${args.positionId}
+  `;
+}
+
 export async function recordOutcome(args: {
   caseId: string;
   kind: string;

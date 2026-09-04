@@ -2,6 +2,7 @@ import "server-only";
 
 import {
   getActiveRules,
+  getCasePositions,
   getMembers,
   getOpenCases,
   rosterStatus,
@@ -59,6 +60,17 @@ export async function buildContext(
     rosterStatus(sender.householdId),
     recentOutbound(sender.householdId),
   ]);
+
+  // 每件未结的事都可能记了表态（谁想要什么/拒绝了什么/AI 许过什么承诺）——
+  // 这里一次性取出来，铺在下面的「还没了结的事」里，不用模型另外调工具查，
+  // 免得它忘了查、进而忘了曾经说过的话（起因见 coliving-world-11.sql）
+  const positionsByCase = new Map(
+    await Promise.all(
+      openCases.map(
+        async (c) => [c.id, await getCasePositions(c.id)] as const
+      )
+    )
+  );
 
   // 查出来是新到旧，展示时倒回正序，读起来才是一条时间线
   const recent = [...recentRaw].reverse();
@@ -278,9 +290,21 @@ export async function buildContext(
         `- ${c.title}（${c.kind}，${c.status}${c.severity ? `，${c.severity}` : ""}，` +
           `最近动静 ${c.lastActivityAt.toISOString().slice(0, 10)}）id=${c.id}`
       );
+      const positions = positionsByCase.get(c.id) ?? [];
+      for (const p of positions) {
+        const kindLabel =
+          p.kind === "preference" ? "想要" : p.kind === "rejection" ? "拒绝" : "你许过";
+        const accounted = p.honored === null ? "" : p.honored ? "（已满足）" : "（未满足）";
+        lines.push(`    · ${p.personName}${kindLabel}：${p.statement}${accounted}`);
+      }
     }
     lines.push(
       "**这一轮的话如果是上面某件事的后续，用它的 id，不要另开一件。**"
+    );
+    lines.push(
+      "**上面缩进列出的是已经记录过的表态（谁想要什么/拒绝了什么/你许过什么承诺）。" +
+        "开新方案前先看一眼，别跟自己或别人说过的话对不上；" +
+        "有新的表态就用 recordPosition 记下来，别只放在这轮对话里。**"
     );
   }
   lines.push("");

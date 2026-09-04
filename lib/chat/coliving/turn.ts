@@ -651,6 +651,43 @@ export async function runColivingTurn(args: {
       },
     }),
 
+    recordPosition: tool({
+      description:
+        "记下某个人对一件未结的事表过的态（想要什么/拒绝了什么），" +
+        "或者你自己对某个人许下的承诺（比如「优先排给你」）。" +
+        "**涉及多方、可能有冲突的事，说了就记，不要指望自己在后面几轮里还记得**。\n" +
+        "上下文「还没了结的事」里每件事下面缩进列出的就是已经记过的表态——" +
+        "开新方案前先看那里，别漏看、别自相矛盾。",
+      inputSchema: z.object({
+        caseId: z.string().describe("上下文里那一栏给的 id"),
+        name: z.string().describe("说这句话的人，或者你许诺的对象"),
+        kind: z
+          .enum(["preference", "rejection", "commitment"])
+          .describe(
+            "preference=他说想要什么 · rejection=他明确拒绝了什么 · " +
+              "commitment=你自己对他许下的承诺"
+          ),
+        statement: z.string().describe("一句话，念给当事人听的那种，不是内部黑话"),
+      }),
+      execute: async ({ caseId, name, kind, statement }) => {
+        if (!(await repo.caseExists(sender.householdId, caseId))) {
+          return { ok: false, reason: "没有这件事，别编 id" };
+        }
+        const m = await repo.findPersonByName(sender.householdId, name);
+        if (!m) {
+          return { ok: false, reason: `房子里没有叫「${name}」的人` };
+        }
+        await repo.recordCasePosition({
+          caseId,
+          householdId: sender.householdId,
+          personId: m.personId,
+          kind,
+          statement,
+        });
+        return { ok: true };
+      },
+    }),
+
     addResident: tool({
       description:
         "把一个手机号加进这栋房子。**拿到号码就加，不要等**——" +
@@ -866,10 +903,62 @@ export async function runColivingTurn(args: {
           .number()
           .optional()
           .describe("住户对处理结果的反应：-1 不满 / 0 中性 / 1 满意。看不出就不填"),
+        accounting: z
+          .array(
+            z.object({
+              positionId: z.string().describe("上下文里表态那一行的 id"),
+              honored: z.boolean().describe("这条表态最后有没有被满足/兑现"),
+              note: z
+                .string()
+                .optional()
+                .describe("honored=false 时必填：为什么没能满足，怎么跟对方说的"),
+            })
+          )
+          .optional()
+          .describe(
+            "**这件事下面如果记过表态（想要什么/拒绝了什么/你许过什么承诺），" +
+              "resolved 时必须把每一条都过一遍填在这里，一条都不能漏。** " +
+              "没记过表态的事不用填这个。"
+          ),
       }),
-      execute: async ({ caseId, kind, note, sentiment }) => {
+      execute: async ({ caseId, kind, note, sentiment, accounting }) => {
         if (!(await repo.caseExists(sender.householdId, caseId))) {
           return { ok: false, reason: "没有这件事，别编 id" };
+        }
+        if (kind === "resolved") {
+          const positions = await repo.getCasePositions(caseId);
+          const unaccounted = positions.filter((p) => p.honored === null);
+          if (unaccounted.length > 0) {
+            const covered = new Set((accounting ?? []).map((a) => a.positionId));
+            const missing = unaccounted.filter((p) => !covered.has(p.id));
+            if (missing.length > 0) {
+              return {
+                ok: false,
+                reason:
+                  "这件事记过表态，收口前每一条都要交代：" +
+                  missing
+                    .map((p) => `${p.personName}「${p.statement}」（id=${p.id}）`)
+                    .join("；") +
+                  "。在 accounting 里逐条填 honored 和必要的 note，再收口。",
+              };
+            }
+          }
+          const missingNote = (accounting ?? []).find(
+            (a) => a.honored === false && !a.note?.trim()
+          );
+          if (missingNote) {
+            return {
+              ok: false,
+              reason: `id=${missingNote.positionId} 那条没满足，必须写 note 说清楚为什么、怎么跟对方交代的`,
+            };
+          }
+          for (const a of accounting ?? []) {
+            await repo.accountCasePosition({
+              positionId: a.positionId,
+              honored: a.honored,
+              resolutionNote: a.note ?? null,
+            });
+          }
         }
         await repo.updateCase({
           caseId,
@@ -882,7 +971,14 @@ export async function runColivingTurn(args: {
           note,
           sentiment: sentiment ?? null,
         });
-        return { ok: true };
+        return {
+          ok: true,
+          note:
+            kind === "resolved" && (accounting ?? []).length > 0
+              ? "交代完了。**收口前后要给所有相关的人发一条最终消息**——" +
+                "包括表态没被满足的人，不能只通知满足了的那些人。"
+              : undefined,
+        };
       },
     }),
 
