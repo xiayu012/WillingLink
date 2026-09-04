@@ -1157,11 +1157,17 @@ export async function closeConsultation(ruleId: string): Promise<void> {
  *
  * 判据是确定性的：名册上没有 `resides = false` 的人里，
  * 每一个都出现在 agreed_by 或 objected 里。
+ *
+ * **但「表态齐了」不等于「都同意了」**——调用方要能区分「全同意，定下来
+ * 了」和「有人反对，得改」，不能看到 done=true 就当成尘埃落定（真实发生
+ * 过：recordStance 的返回提示原样写死"这条规则已经定下来"，一个人同意
+ * 都没有、只有一条异议，也被这么告诉模型），所以额外把 objectedCount
+ * 带出去。
  */
 export async function closeConsultationIfComplete(
   ruleId: string
-): Promise<boolean> {
-  const rows = await db()<{ id: string }[]>`
+): Promise<{ done: boolean; objectedCount: number }> {
+  const rows = await db()<{ id: string; objected_count: number }[]>`
     update coliving.rule r
     set consulted_at = now(), status = 'active'
     where r.id = ${ruleId}
@@ -1175,9 +1181,11 @@ export async function closeConsultationIfComplete(
           and not (p.id = any(r.agreed_by))
           and not (p.id = any(r.objected))
       )
-    returning r.id
+    returning r.id, coalesce(array_length(r.objected, 1), 0) as objected_count
   `;
-  return rows.length > 0;
+  return rows.length > 0
+    ? { done: true, objectedCount: rows[0].objected_count }
+    : { done: false, objectedCount: 0 };
 }
 
 // ── 主动发起的候选 ───────────────────────────────────────────────────────────

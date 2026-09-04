@@ -610,12 +610,20 @@ export async function runColivingTurn(args: {
           stance,
         });
         // 齐了就自动收口。**不靠模型判断**——它会一直以为还没问全。
-        const done = await repo.closeConsultationIfComplete(target);
+        // **齐了不等于都同意**：有异议也会走到这一步，提示语要分开说，
+        // 不能不管有没有异议都说"定下来了"（第15轮踩过：一个人同意都
+        // 没有、只有一条异议，也曾经被这么告诉模型）。
+        const { done, objectedCount } = await repo.closeConsultationIfComplete(
+          target
+        );
         return {
           ok: true,
           note: done
-            ? "所有人都表过态了，**这条规则已经定下来**。不用再问任何人，" +
-              "把最终结果告诉大家就行。"
+            ? objectedCount > 0
+              ? "所有人都表过态了，**但有人不同意**，这条规则还没定下来——" +
+                "根据异议调整方案，再走一轮征询，不要当成已成立说出去。"
+              : "所有人都表过态了，**这条规则已经定下来**。不用再问任何人，" +
+                "把最终结果告诉大家就行。"
             : undefined,
         };
       },
