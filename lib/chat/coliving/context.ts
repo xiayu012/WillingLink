@@ -36,6 +36,12 @@ export type ColivingContext = {
   text: string;
   members: Member[];
   openCaseIds: string[];
+  /**
+   * 生成器靠这个判断"该不该问总人数"，批判器也需要同一份数据——
+   * 否则批判器只看得到 members 列表里已知的几个名字，会把「名册没收全，
+   * 该问总人数」的合法提问，误判成"人数明明知道、何必再问"（第18轮踩过）。
+   */
+  roster: { declaredSize: number | null; knownCount: number; complete: boolean };
 };
 
 export async function buildContext(
@@ -307,5 +313,6 @@ export async function buildContext(
     text: lines.join("\n"),
     members,
     openCaseIds: openCases.map((c) => c.id),
+    roster,
   };
 }

@@ -1132,8 +1132,15 @@ export async function runColivingTurn(args: {
     ? ("报告问题的人" as const)
     : ("不确定" as const);
 
+  // **名册上有几个名字，不等于总人数已经确认。** 批判器只看得到下面这行
+  // 列出的名字，容易把"名册还没收全、该问总人数"的合法提问，误判成
+  // "人数明明知道、何必再问"——第18轮踩过：3个名字都在案，但没人明确
+  // 说过"我们一共3个人"，模型问总人数被批判器错当成多余问题打回。
+  const rosterNote = ctx.roster.complete
+    ? "（总人数已确认）"
+    : "（⚠️ 总人数还没确认过，问一句「一共住几个人」不算多余）";
   const baseFacts =
-    `名册上的人：${ctx.members.map((m) => m.name).join("、")}\n` +
+    `名册上的人：${ctx.members.map((m) => m.name).join("、")}${rosterNote}\n` +
     `本轮调用的工具：${toolsUsed.join("、") || "无"}`;
 
   /**
