@@ -1181,20 +1181,22 @@ export async function runColivingTurn(args: {
    * 这句话在这一轮里其实没发生。把拦截结果喂给回复的批判器，
    * 让 rubric 第7条能查出这种"工具调过、消息没送到"的落差。
    */
+  const replyFacts =
+    baseFacts +
+    (outbound.length
+      ? `\n同一轮还联系了别人：${outbound
+          .map(
+            (o) =>
+              `→${o.blocked ? "【这条被审稿拦下，没有发出去】" : ""}${o.text}`
+          )
+          .join(" ／ ")}`
+      : "\n这一轮没有联系任何其他人");
+
   const verdict = await critique({
     to: sender.name,
     role: senderRole,
     said: args.text,
-    facts:
-      baseFacts +
-      (outbound.length
-        ? `\n同一轮还联系了别人：${outbound
-            .map(
-              (o) =>
-                `→${o.blocked ? "【这条被审稿拦下，没有发出去】" : ""}${o.text}`
-            )
-            .join(" ／ ")}`
-        : "\n这一轮没有联系任何其他人"),
+    facts: replyFacts,
     draft: reply,
   });
 
@@ -1208,6 +1210,16 @@ export async function runColivingTurn(args: {
        * 重新看一下"），这段话原样当成正文发给了住户。跟第7轮
        * MAX_STEPS 兜底那次是同一类错误——自由文本里混着不是给住户看的话，
        * 靠猜不可靠。逼它显式调用 sendReply 交付，不给它把辩解写进正文的空间。
+       *
+       * **重写这一版不会再被批判器复查，所以喂给它的事实不能只是
+       * `verdict.why` 那句转述。** 第14轮踩过：原稿因为"这就去跟大宝
+       * 立规矩"被第7条打回（那条联系确实被拦、没发出去），重写把
+       * "这就去"换成了"这轮我跟他说完"——时态从将来时改成了过去时，
+       * 依据的还是同一个没发生的事实，只是换了个说法就绕开了"现在时/
+       * 将来时才查"这条判定规则。原因是重写时只看到 verdict.why 的转述，
+       * 没有原始 facts 里"【这条被审稿拦下，没有发出去】"这句硬事实——
+       * 直接把 facts 带进来，让它对着同一份事实改，而不是对着别人的
+       * 转述猜着改。
        */
       deliveredReply = null;
       await generateText({
@@ -1224,7 +1236,10 @@ export async function runColivingTurn(args: {
             role: "user" as const,
             content:
               `【这不是住户说的，是审稿意见】\n你刚才那条第${verdict.broke}条不合格：` +
-              `${verdict.why}\n重写一条，调 sendReply 把要发给对方的那句话交出来。`,
+              `${verdict.why}\n\n【这一轮的事实，重写要跟这个对得上】\n${replyFacts}\n\n` +
+              "重写一条，调 sendReply 把要发给对方的那句话交出来。" +
+              "上面事实里标了「被审稿拦下，没有发出去」的联系，这轮就是没有发生——" +
+              "不管用什么时态描述，都不能说成已经联系到了或者正在联系。",
           },
         ],
         tools: { sendReply: tools.sendReply },
