@@ -120,6 +120,12 @@ export type OutboundMessage = {
    * 一个卫生间、另几个人用另一个，系统并不知道这个结构。
    */
   sharedWith?: string | null;
+  /**
+   * 收信人是这一轮才刚加进系统的，这条八成是中性的自我介绍，跟任何
+   * 纠纷无关。审稿据此不套"被说到的人"这个角色——那是给纠纷场景
+   * 准备的，套在打招呼上会把中性内容当指控来审。
+   */
+  isIntroduction?: boolean;
 };
 
 export type TurnOutcome = {
@@ -241,6 +247,14 @@ export async function runColivingTurn(args: {
   const outbound: OutboundMessage[] = [];
   const toolsUsed: string[] = [];
   const contacted = new Set<string>();
+  /**
+   * 这一轮里新加进来、这轮之前压根不存在的人。**批判器的四种角色
+   * （报告的人/被说到的人/共用者通知的对象/受影响的其他人）全都假定
+   * 这条消息跟一件具体纠纷有关**——但刚加进来打招呼跟纠纷毫无关系，
+   * 硬套"被说到的人"会把中性的自我介绍当成指控来审，见下面
+   * critique 那段的说明。
+   */
+  const newlyAdded = new Set<string>();
 
   /** 没调 decide 就直接说话时，兜底补一条，保证链路完整（设计稿第十四点） */
   const ensureDecision = async (
@@ -531,6 +545,7 @@ export async function runColivingTurn(args: {
           communicationId,
           sharedRule: scope === "shared",
           sharedWith: sharedWith ?? null,
+          isIntroduction: newlyAdded.has(target.personId),
         });
         return { ok: true, sentTo: target.name };
       },
@@ -633,7 +648,11 @@ export async function runColivingTurn(args: {
       description:
         "把一个手机号加进这栋房子。**拿到号码就加，不要等**——" +
         "房东（或别人）在对话里报出室友号码时用这个。" +
-        "加完他就能收到消息了。名字不知道就别填，占位符不影响任何事。",
+        "加完他就能收到消息了。名字不知道就别填，占位符不影响任何事。\n" +
+        "**加完这一个人，这一轮就要用 contactPerson 主动跟他打个招呼**" +
+        "（工具结果会给你他的名字）——他还不认识你，别等他先开口、" +
+        "也别拖到下一轮。一次报了好几个号码，就一个一个都打招呼，" +
+        "不要因为要打的招呼多就漏掉。",
       inputSchema: z.object({
         phone: z.string().describe("手机号，原样填，系统会自己规范化"),
         name: z.string().optional().describe("对方说了名字才填，没说就留空"),
@@ -652,11 +671,19 @@ export async function runColivingTurn(args: {
             role: (role ?? "tenant") as repo.Role,
             note: note ?? null,
           });
+          if (r.created) {
+            newlyAdded.add(r.personId);
+          }
           return {
             ok: true,
             created: r.created,
+            name: r.name,
             note: r.created
-              ? "已加入，现在可以用 contactPerson 联系他了"
+              ? `已加入，系统给他起的名字是「${r.name}」——没听到真名之前，` +
+                "调 contactPerson 时 name 参数就填这个（不是发给他的话里出现这个，" +
+                "消息正文不能提占位名，只是拿它当查找用的 key）。他还完全不" +
+                "认识你，现在就用 contactPerson 主动打个招呼、说清楚你是谁——" +
+                "不要等到有事才第一次联系他。说什么由你自己定，不用套模板。"
               : "这个号码本来就在房子里",
           };
         } catch (e) {
@@ -1170,11 +1197,24 @@ export async function runColivingTurn(args: {
     outbound.map((o) =>
       critique({
         to: outboundNames.get(o.personId) ?? "某位住户",
-        // 共用者规矩和针对个人的事，判法完全不同
-        role: o.sharedRule ? "共用者通知的对象" : "被说到的人",
+        /**
+         * 共用者规矩、针对个人的事、中性打招呼，三种判法完全不同。
+         * **"被说到的人"这个角色是给纠纷场景准备的**——刚加进系统、
+         * 这一轮才第一次联系的人，跟任何纠纷都还扯不上关系，硬套这个
+         * 角色会把中性的自我介绍当成"针对他的指控"来审，产生假阳性。
+         */
+        role: o.isIntroduction
+          ? "不确定"
+          : o.sharedRule
+            ? "共用者通知的对象"
+            : "被说到的人",
         said: "",
         facts:
           `${baseFacts}\n这条是主动发的，起因是 ${sender.name} 说：${args.text}` +
+          (o.isIntroduction
+            ? "\n这个人是这一轮才刚加进系统的，这条是第一次联系、" +
+              "自我介绍性质，不是在回应任何投诉或纠纷"
+            : "") +
           (o.sharedRule
             ? `\n这是对共用者一样的规矩；模型声明的共用范围：${
                 o.sharedWith ?? "（没说清是哪些人 —— 这本身就是问题）"

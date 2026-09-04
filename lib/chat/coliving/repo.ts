@@ -917,28 +917,37 @@ export async function addResident(args: {
   name?: string | null;
   role?: Role;
   note?: string | null;
-}): Promise<{ personId: string; created: boolean }> {
+}): Promise<{ personId: string; created: boolean; name: string }> {
   const phone = normalizePhone(args.phone);
   if (!phone) {
     throw new Error("手机号无法解析");
   }
   return await db().begin(async (tx) => {
-    const [existing] = await tx<{ person_id: string }[]>`
-      select person_id from coliving.person_contact
-      where kind = 'sms' and value = ${phone} limit 1`;
+    const [existing] = await tx<{ person_id: string; display_name: string }[]>`
+      select pc.person_id, p.display_name from coliving.person_contact pc
+      join coliving.person p on p.id = pc.person_id
+      where pc.kind = 'sms' and pc.value = ${phone} limit 1`;
     if (existing) {
       const [inHouse] = await tx<{ id: string }[]>`
         select id from coliving.membership
         where household_id = ${args.householdId}
           and person_id = ${existing.person_id} and valid_to is null limit 1`;
       if (inHouse) {
-        return { personId: existing.person_id, created: false };
+        return {
+          personId: existing.person_id,
+          created: false,
+          name: existing.display_name,
+        };
       }
       await tx`
         insert into coliving.membership (household_id, person_id, role, resides)
         values (${args.householdId}, ${existing.person_id},
                 ${args.role ?? "tenant"}, true)`;
-      return { personId: existing.person_id, created: false };
+      return {
+        personId: existing.person_id,
+        created: false,
+        name: existing.display_name,
+      };
     }
 
     // 占位名按人数编号，但**模型会并行调多次 addResident**——
@@ -948,9 +957,10 @@ export async function addResident(args: {
     const [n] = await tx<{ c: number }[]>`
       select count(*)::int as c from coliving.membership
       where household_id = ${args.householdId} and valid_to is null`;
+    const displayName = args.name?.trim() || `${n.c + 1}号住客`;
     const [p] = await tx<{ id: string }[]>`
       insert into coliving.person (display_name, onboarded_at)
-      values (${args.name?.trim() || `${n.c + 1}号住客`}, now()) returning id`;
+      values (${displayName}, now()) returning id`;
     await tx`
       insert into coliving.person_contact (person_id, kind, value, is_primary)
       values (${p.id}, 'sms', ${phone}, true)`;
@@ -958,7 +968,7 @@ export async function addResident(args: {
       insert into coliving.membership (household_id, person_id, role, resides, note)
       values (${args.householdId}, ${p.id}, ${args.role ?? "tenant"}, true,
               ${args.note ?? null})`;
-    return { personId: p.id, created: true };
+    return { personId: p.id, created: true, name: displayName };
   });
 }
 
