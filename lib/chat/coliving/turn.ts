@@ -848,10 +848,24 @@ export async function runColivingTurn(args: {
         "记下某个人对一件未结的事表过的态（想要什么/拒绝了什么），" +
         "或者你自己对某个人许下的承诺（比如「优先排给你」）。" +
         "**涉及多方、可能有冲突的事，说了就记，不要指望自己在后面几轮里还记得**。\n" +
-        "上下文「还没了结的事」里每件事下面缩进列出的就是已经记过的表态——" +
-        "开新方案前先看那里，别漏看、别自相矛盾。",
+        "**这件事现在有没有正式立案都能用**——真实事故：房东随口说" +
+        "「七点用厨房最合适」时还没有任何冲突浮现、没有开案，那句偏好" +
+        "没被记下来，几轮之后真的要排班时，模型对着房东说「你的时间还" +
+        "没确认」，其实房东早说过了。**任何人随口提到的时段偏好、态度，" +
+        "只要以后可能用得上，当场就记，不用等这件事升级成一个正式的" +
+        "「未结的事」才记**——不确定要不要立案就不填 caseId，留空即可。\n" +
+        "上下文「还没了结的事」里每件事下面缩进列出的、以及「还没归到" +
+        "具体事情上的表态」里列出的，都是已经记过的——开新方案前先看" +
+        "那里，别漏看、别自相矛盾。",
       inputSchema: z.object({
-        caseId: z.string().describe("上下文里那一栏给的 id"),
+        caseId: z
+          .string()
+          .optional()
+          .describe(
+            "这条表态属于上下文里哪件「未结的事」，填它的 id。" +
+              "这件事还没立案、只是随口提到的偏好，就不填——" +
+              "不确定的时候，不填比编一个 id 安全。"
+          ),
         name: z.string().describe("说这句话的人，或者你许诺的对象"),
         kind: z
           .enum(["preference", "rejection", "commitment"])
@@ -862,7 +876,7 @@ export async function runColivingTurn(args: {
         statement: z.string().describe("一句话，念给当事人听的那种，不是内部黑话"),
       }),
       execute: async ({ caseId, name, kind, statement }) => {
-        if (!(await repo.caseExists(sender.householdId, caseId))) {
+        if (caseId && !(await repo.caseExists(sender.householdId, caseId))) {
           return { ok: false, reason: "没有这件事，别编 id" };
         }
         const m = await repo.findPersonByName(sender.householdId, name);
@@ -870,7 +884,7 @@ export async function runColivingTurn(args: {
           return { ok: false, reason: `房子里没有叫「${name}」的人` };
         }
         await repo.recordCasePosition({
-          caseId,
+          caseId: caseId ?? null,
           householdId: sender.householdId,
           personId: m.personId,
           kind,

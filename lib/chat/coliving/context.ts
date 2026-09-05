@@ -7,6 +7,7 @@ import {
   getCaseShares,
   getMembers,
   getOpenCases,
+  getStandalonePositions,
   rosterStatus,
   type Member,
   recentOutbound,
@@ -55,13 +56,15 @@ export async function buildContext(
     answering?: { purpose: string | null; body: string; sentAt: Date } | null;
   } = {}
 ): Promise<ColivingContext> {
-  const [members, rules, openCases, roster, recentRaw] = await Promise.all([
-    getMembers(sender.householdId, channel),
-    getActiveRules(sender.householdId),
-    getOpenCases(sender.householdId),
-    rosterStatus(sender.householdId),
-    recentOutbound(sender.householdId),
-  ]);
+  const [members, rules, openCases, roster, recentRaw, standalonePositions] =
+    await Promise.all([
+      getMembers(sender.householdId, channel),
+      getActiveRules(sender.householdId),
+      getOpenCases(sender.householdId),
+      rosterStatus(sender.householdId),
+      recentOutbound(sender.householdId),
+      getStandalonePositions(sender.householdId),
+    ]);
 
   // 每件未结的事都可能记了表态（谁想要什么/拒绝了什么/AI 许过什么承诺）——
   // 这里一次性取出来，铺在下面的「还没了结的事」里，不用模型另外调工具查，
@@ -346,6 +349,24 @@ export async function buildContext(
     );
   }
   lines.push("");
+
+  if (standalonePositions.length) {
+    lines.push("## 还没归到具体事情上的表态");
+    lines.push(
+      "**这些是有人随口提到的偏好/态度，当时还没有对应的「未结的事」，" +
+        "所以没有 case id。** 真实事故：房东随口说过「七点用厨房最合适」，" +
+        "那时候没有冲突浮现，几轮之后真的要排班时，模型却说「你的时间" +
+        "还没确认」——房东早说过了，只是没被结构化记住，靠对话记录" +
+        "自己找就漏了。**开新方案、判断谁的时段偏好之前，先看这里**，" +
+        "别重新去问已经说过的人。"
+    );
+    for (const p of standalonePositions) {
+      const kindLabel =
+        p.kind === "preference" ? "想要" : p.kind === "rejection" ? "拒绝" : "你许过";
+      lines.push(`- ${p.personName}${kindLabel}：${p.statement}`);
+    }
+    lines.push("");
+  }
 
   if (recent.length) {
     lines.push("## 你最近跟这屋里的人说过什么（含发给别人的）");

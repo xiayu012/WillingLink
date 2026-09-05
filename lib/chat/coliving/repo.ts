@@ -415,9 +415,17 @@ export type CasePosition = {
  * 记一条表态：谁想要什么/拒绝了什么，或者 AI 自己许下的承诺。
  * 只在这一步写 statement/kind，honored 留 null——「还没被交代」，
  * 要等 closeCase 时被工具校验逼着填。
+ *
+ * **caseId 可以不填**：真实事故——房东在案子还没开出来之前随口说
+ * "七点用厨房最合适"，那时候没有冲突浮现、没有 openCase，这句偏好就
+ * 没地方记，只能靠 recentOutbound 的滚动窗口纯文字流水账，几轮之后
+ * 窗口一滚就没了，等真正需要排班时模型对着房东说"你的时间还没确认"——
+ * 这句话本身是错的，房东早说过了。caseId 为 null 代表"这是一条独立于
+ * 任何具体案子的表态"，案子后来真的开出来，可以按 personId 查出这条
+ * 记录参考，不需要事先预判"这句话以后会不会变成一个案子"。
  */
 export async function recordCasePosition(args: {
-  caseId: string;
+  caseId?: string | null;
   householdId: string;
   personId: string;
   kind: "preference" | "rejection" | "commitment";
@@ -425,7 +433,7 @@ export async function recordCasePosition(args: {
 }): Promise<string> {
   const rows = await db()<{ id: string }[]>`
     insert into coliving.case_position (case_id, household_id, person_id, kind, statement)
-    values (${args.caseId}, ${args.householdId}, ${args.personId}, ${args.kind}, ${args.statement})
+    values (${args.caseId ?? null}, ${args.householdId}, ${args.personId}, ${args.kind}, ${args.statement})
     returning id
   `;
   return rows[0].id;
@@ -440,6 +448,28 @@ export async function getCasePositions(caseId: string): Promise<CasePosition[]> 
     join coliving.person p on p.id = cp.person_id
     where cp.case_id = ${caseId}
     order by cp.created_at asc
+  `;
+}
+
+/**
+ * 独立于任何案子、还没被归到某个 case 下的表态——按房子查全部
+ * （不按人过滤，因为一次排班冲突常常涉及好几个人，一次性看全比
+ * 逐个查更不容易漏）。**这是 context.ts 渲染进运行时上下文用的**，
+ * 让模型开新案子/排方案前，先看看有没有人已经随口说过偏好。
+ */
+export async function getStandalonePositions(
+  householdId: string,
+  limit = 20
+): Promise<CasePosition[]> {
+  return await db()<CasePosition[]>`
+    select cp.id, cp.person_id as "personId", p.display_name as "personName",
+           cp.kind, cp.statement, cp.created_at as "createdAt",
+           cp.honored, cp.resolution_note as "resolutionNote"
+    from coliving.case_position cp
+    join coliving.person p on p.id = cp.person_id
+    where cp.household_id = ${householdId} and cp.case_id is null
+    order by cp.created_at desc
+    limit ${limit}
   `;
 }
 
