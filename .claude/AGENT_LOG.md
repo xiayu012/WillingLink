@@ -12,6 +12,72 @@
 
 ---
 
+## 2026-09-05 · 研究 DialOp，抄回来一条：共识不能跨方案版本继承
+
+**用户要求**：研究 jlin816/dialop 的 MediationGame/MediationEnv，
+把它的业务状态机抄进来。（用户还提了 Habermas Machine、Vercel Community
+Agent 作为二三名，这一轮只做了 DialOp。）
+
+**读的是源码不是转述**（`envs/mediation.py`、`games/mediation.py`、
+`envs/base_env.py`）。DialOp mediation 的 primitive：
+
+- 两个 vroom：human0↔agent、human1↔agent，**不是三个人一个群**
+- `can_propose=(player == 'agent')`：只有 agent 能提整体方案
+- `can_respond=(player != 'agent')`：真人只能 accept/reject
+- `must_respond`：有待决方案时，真人必须先表态才能说别的
+- `all(self.accepts)` 才结束
+- **任何人 reject → `_reset_proposal_state()` 清空所有人的 accept**
+- 每人有 `shared_calendar` / `unshared_calendar`（私有信息分离）
+
+**对照下来，WillingLink 已经有的**：私聊信道（短信天然一对一）、
+只有 AI 能 `proposeRule`、`recordStance` 记 agreed/objected、
+`closeConsultationIfComplete` 判全员表态、`pickSchedule` 对应候选枚举、
+`getBlockedComms` 大致对应 must_respond。**架构确实已经走到同一形态。**
+
+**唯一实质缺口**：改方案时旧同意怎么办，DialOp 是结构清零，
+WillingLink 是**交给模型在 `agreedByNames` 里自己决定**，代码不设防。
+
+### 为什么这条值得堵
+
+破坏是静默的。A 同意"十点版"→ AI 改"十二点版"仍把 A 算作同意 →
+`closeConsultationIfComplete` 判"全票通过、定下来了"→ 不报任何错。
+而这正是系统自己会走的路径：`context.ts` 在有异议时明确指示模型
+"有异议就调整后再走一遍"，却没有任何东西保证再走那一遍是从零开始。
+
+### 诚实记录：两次都没复现，这不是在修观察到的 bug
+
+- 第一次：4 轮完整对话，模型压根没调到 `proposeRule`（一路卡在
+  contactPerson 被拦），规则表全空，测不到。
+- 第二次：用 repo 直接把状态摆到 v1/A同意/B反对，只跑一轮让 AI 修订。
+  模型**做对了**——拒绝单方面改规则，把房东记成 objected，回
+  "改成十二点得另两位也同意才算数"。
+
+所以定位是：**把"每次都要重新赌一遍的正确"变成结构上不可能**，
+不是修 bug。按 CLAUDE.md「没找到真问题就别硬造一个改」，这条如果当成
+bug 修是不合规的；当成架构不变量补齐才成立，也符合"确定性归代码"。
+
+### 改法与验证
+
+`saveRule` 比对同 kind 现行规则的 statement，不同即认定改方案，
+新行 `agreed_by` 强制清空（调用方传什么都不作数），返回 `revisedFrom`；
+`proposeRule` 据此明确告诉模型"之前的同意已作废、每个人重新问一遍"。
+statement 相同则不清空，避免重复调用误伤。
+
+新增 `pnpm consent:inspect`——**确定性、不调模型、几秒钟**。
+为什么单独做个脚本而不写成 eval 场景：用对话测不稳定（上面两次都没
+走到那个状态），而这条不变量的破坏又是静默的，必须在 repo 层钉死。
+6 条断言含两个关键边界：故意传入陈旧同意会被清空、statement 没变不误伤。
+
+### 还没做的（用户提到但这轮没动）
+
+- **Habermas Machine**（DeepMind，Apache 2.0）：多候选 → 各自立场排序 →
+  Schulze social choice 聚合 → critique → 修订。真要做的是"生成多个候选
+  方案让各方分别评价"，比现在 `pickSchedule` 只把第一候选喂给批判器更完整。
+- **`must_respond` 硬化**：现在待决方案的追问靠 `getBlockedComms` +
+  模型判断，DialOp 是硬约束。没有证据表明现在这样出过问题，先不动。
+
+---
+
 ## 2026-09-05 · 快照重放上线，顺带挖出「语料库从第二次跑批起就是脏的」
 
 **用户要的**：真正的 Conversation Replay——不是从零重演对话，而是
