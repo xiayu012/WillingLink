@@ -30,6 +30,7 @@
     "coliving-snapshot": "cross-env NODE_OPTIONS=--conditions=react-server COLIVING_LOCAL_WRITE=1 tsx scripts/coliving-snapshot.ts",
     "brain:inspect": "tsx scripts/brain-inspect.ts",
     "scheduling:inspect": "tsx scripts/scheduling-inspect.ts",
+    "consent:inspect": "cross-env NODE_OPTIONS=--conditions=react-server COLIVING_LOCAL_WRITE=1 tsx scripts/consent-inspect.ts",
     "twilio:selftest": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/twilio-selftest.ts",
     "twilio:inspect": "tsx scripts/twilio-inspect.ts",
     "coliving:sim": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/coliving-sim.ts",

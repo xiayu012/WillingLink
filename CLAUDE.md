@@ -185,6 +185,7 @@ AI工程。看看还有什么东西是能大幅改善运转速度、token成本�
 | `pnpm comment-reply-eval` | 评论成品：角色、格式、字数、幂等 | 动了 comment-reply 链路或提示词 |
 | `pnpm redact-eval` | 出站剔联系方式、分割线、字数上限 | 动了 xhs adapter 的出站处理 |
 | `pnpm coliving-eval` | 合租房大脑：结构性回归（工具有没有调对、回复/出站消息有没有踩过去的坑）| 动了 `lib/chat/coliving/` 或 `lib/ai/brains/coliving/`。语料在 `lib/chat/coliving/evals/scenarios/`，**只增不减**——抓到新的真实 bug 就整理成一条场景提交进去，见 `docs/coliving-parallel-testing-plan.md` |
+| `pnpm consent:inspect` | 共识不变量：方案一改，之前的同意必须作废 | 动了 `saveRule` / `recordConsultation` / `closeConsultationIfComplete`。**不调模型、几秒钟**，改这几个函数就顺手跑一下 |
 
 场景有两种跑法，**区别很重要**：
 

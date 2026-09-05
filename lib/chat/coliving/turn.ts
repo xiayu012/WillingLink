@@ -647,7 +647,7 @@ export async function runColivingTurn(args: {
             agreed.push(m.personId);
           }
         }
-        const ruleId = await repo.saveRule({
+        const { ruleId, revisedFrom } = await repo.saveRule({
           householdId: sender.householdId,
           kind,
           statement,
@@ -660,6 +660,12 @@ export async function runColivingTurn(args: {
           ok: true,
           ruleId,
           note:
+            (revisedFrom
+              ? `**这是改方案，不是原来那条**（原来是「${revisedFrom}」）。` +
+                "方案变了，之前谁同意过一律作废、已经清空了——" +
+                "他们同意的是旧方案，没见过这一版。**每个人都要重新问一遍**，" +
+                "包括之前已经点过头的人。别说「大家都同意了」。\n"
+              : "") +
             `这条规则要问过这 ${residents.length} 个住在这里的人才算成立：` +
             `${residents.map((m) => m.name).join("、")}。` +
             "还没问的，用 contactPerson 去问。",
