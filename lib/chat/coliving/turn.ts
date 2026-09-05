@@ -737,14 +737,27 @@ export async function runColivingTurn(args: {
                 .string()
                 .optional()
                 .describe(
-                  "他最早能开始的时间，HH:MM。这是硬约束，不填就当作窗口一开始就能开始"
+                  "他最早能开始的时间，HH:MM。**只在他明确说了『不能更早』" +
+                    "『最早只能几点』这类话、或者有客观原因（几点下班到家、" +
+                    "几点才有空）时才填这个**——填了就是硬约束，算法会当成" +
+                    "绝对不能突破的墙。**他只是随口说了个平时几点做的习惯**" +
+                    "（比如「我一般6:30」），不代表不能更早，那种情况填" +
+                    "`preferredStart`，不要填这个。真实事故：把一句随口的" +
+                    "习惯时间填成了硬约束，跟另一个人的硬约束互相顶死，排出来" +
+                    "的结果一个人被拖到很晚——填错这个字段，算法怎么排都救不了，" +
+                    "因为算法是在一道被人为收紧的题目上找最优解。不填就当作" +
+                    "窗口一开始就能开始。"
                 ),
               preferredStart: z
                 .string()
                 .optional()
                 .describe(
-                  "他自己说的\"最合适\"的开始时间，HH:MM。这是软偏好，" +
-                    "不是硬约束——不填就不参与满意度打分"
+                  "他自己说的\"最合适\"或者\"平时习惯\"的开始时间，HH:MM。" +
+                    "**这是软偏好，不是硬约束**——算法会尽量往这个时间靠，" +
+                    "但排不到也不会报错，不会顶死整个方案。**大多数人报的" +
+                    "时间应该填在这里，不是 earliestStart**——除非有明确的" +
+                    "'不能更早'的理由，默认当软偏好处理更安全。不填就不参与" +
+                    "满意度打分。"
                 ),
             })
           )
@@ -756,18 +769,51 @@ export async function runColivingTurn(args: {
           const [h, m] = hhmm.split(":").map(Number);
           return h * 60 + m;
         };
+        /**
+         * **窗口起点不完全信模型给的，代码自动往前拉一段，只会让结果
+         * 更好、不会更差。**
+         *
+         * 真实事故：三人厨房排班，模型把 `windowStart` 填成了跟硬约束者
+         * 的 `earliestStart` 一样的时刻（都是18:00）——这样一来18:00
+         * 之前压根没有窗口空间，两个只要半小时、没有硬约束的人只能被
+         * 挤到硬约束者后面，其中一人被推到20:00之后。**排列算法本身
+         * 没问题**（`findSchedulePlans` 会穷举全部排列找最优解），问题
+         * 是**喂给算法的窗口边界被模型算错了**——算法是在一道被人为
+         * 缩窄的题目上找到的"最优解"，题目本身就出错了。
+         *
+         * 这跟"组合优化交给代码算，不要靠模型心算"是同一条原则的新
+         * 变种：上次是排列顺序不能靠模型猜，这次是**问题的输入边界也
+         * 不能完全信模型给的**——窗口起点这种"要不要留出提前量"的判断，
+         * 同样是可以用代码兜底的空间计算，不该指望提示词反复提醒模型
+         * "窗口要留够"就能稳定做对。
+         *
+         * 修法：统计"没有硬约束、理论上随时能开始"的那些人一共需要
+         * 多久，代码自动把窗口起点往前拉这么多（封顶3小时，避免拉到
+         * 荒谬的凌晨时刻）——**这么做不会让任何人的结果变差**：算法
+         * 依然会穷举全部排列，如果提前这段窗口对最终结果没帮助，算法
+         * 自己会算出跟不提前时一样的答案；只有在提前真的能让灵活的人
+         * 挪到硬约束者前面、从而避免有人被推到窗口末尾之后时，算法才
+         * 会用上这段提前量。往前拉窗口是纯粹的"多给一个选项"，不是
+         * "强迫用这个选项"。
+         */
         const windowStartMinutes = toMinutes(windowStart);
+        const flexiblePeopleDuration = people
+          .filter((p) => !p.earliestStart)
+          .reduce((sum, p) => sum + p.durationMinutes, 0);
+        const pullBackMinutes = Math.min(flexiblePeopleDuration, 180);
+        const effectiveWindowStartMinutes = windowStartMinutes - pullBackMinutes;
+
         const constraints = people.map((p) => ({
           name: p.name,
           durationMinutes: p.durationMinutes,
           earliestStartMinutes: p.earliestStart
-            ? Math.max(0, toMinutes(p.earliestStart) - windowStartMinutes)
+            ? Math.max(0, toMinutes(p.earliestStart) - effectiveWindowStartMinutes)
             : 0,
           preferredStartMinutes: p.preferredStart
-            ? toMinutes(p.preferredStart) - windowStartMinutes
+            ? toMinutes(p.preferredStart) - effectiveWindowStartMinutes
             : undefined,
         }));
-        const plans = bestSchedulePlans(windowStartMinutes, constraints, 3);
+        const plans = bestSchedulePlans(effectiveWindowStartMinutes, constraints, 3);
         if (plans.length === 0) {
           return { ok: false, reason: "没排出候选，检查一下 people 是不是填对了" };
         }
@@ -781,9 +827,50 @@ export async function runColivingTurn(args: {
             .map((a) => `${a.name} ${formatMinutes(a.startMinutes)}-${formatMinutes(a.endMinutes)}`)
             .join("，")}`
         );
+        /**
+         * **两个以上硬约束互相顶死，结果被拖得很晚时，提醒回头核实——
+         * 这类结果，往前拉窗口救不了，只有"这个约束是不是真的硬"这个
+         * 判断错了才会造成。**
+         *
+         * 真实事故：2号住客说的"我6:30，然后使用半个小时"是随口说的
+         * 习惯，不是像3号住客"我最早必须18:00开始，因为下班18:00到家"
+         * 那样明确的硬约束，但模型把两者同样填成了 `earliestStart`。
+         * 两个硬约束一旦互相冲突（都要求"不能比这更早"，但物理上排不
+         * 下），算法不管往前拉多少窗口都没用——因为问题不在窗口边界，
+         * 在于**这个约束本来可能就不该算硬的**，这属于语言判断，不是
+         * 计算，代码不替模型拍板（这个项目一贯的边界：计算交给代码，
+         * 判断留给模型），**但可以把"猜错的代价"摆出来，让模型有机会
+         * 自己回头核实，而不是闷头把猜错的结果直接排出去**。
+         *
+         * 判法：硬约束的人数 ≥ 2 时，algorithmically 没有办法进一步优化
+         * （多个硬约束天然会顶到较晚的时刻），提醒模型这类情况下"结果
+         * 拖得晚，未必是排列算法的锅，先回头确认每个人的约束是不是真的
+         * 说了'不能更早'，而不是随口提了个时间"。
+         */
+        const hardConstraintCount = people.filter((p) => p.earliestStart).length;
+        const noteParts: string[] = [];
+        if (pullBackMinutes > 0) {
+          noteParts.push(
+            `你填的窗口起点是 ${windowStart}，但为了给没有硬约束的人留出空间，` +
+              `实际算的时候把窗口往前拉到了 ${formatMinutes(effectiveWindowStartMinutes)}` +
+              "——下面候选里出现早于你填的起点的时段是正常的，按候选里的时间发消息即可。"
+          );
+        }
+        if (hardConstraintCount >= 2) {
+          noteParts.push(
+            "**这次有两个以上的人带了硬约束（earliestStart）。** 排出来的结果如果" +
+              "把人拖到了比较晚的时段，往前拉窗口是救不了的——多个硬约束互相顶着，" +
+              "算法已经是在这些约束下能找到的最优解了。这时候先回头想一下：这几个" +
+              "硬约束是不是真的听到了'我最早只能几点''不能比这更早'这类明确的话，" +
+              "还是有人只是随口说了个习惯时间（那种该填 preferredStart，不是" +
+              "earliestStart）——填错会让算法在一道被人为收紧的题目上瞎耗，" +
+              "怎么排都排不出好结果。"
+          );
+        }
         return {
           ok: true,
           windowLabel,
+          ...(noteParts.length > 0 ? { note: noteParts.join("\n") } : {}),
           candidates: plans.map((p, i) => ({
             rank: i + 1,
             order: p.order,
