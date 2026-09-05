@@ -1851,7 +1851,13 @@ export async function runColivingTurn(args: {
   const rosterNote = liveRoster.complete
     ? "（总人数已确认）"
     : "（⚠️ 总人数还没确认过，问一句「一共住几个人」不算多余）";
-  const baseFacts =
+  /**
+   * 做成函数而不是一次性 const：`toolsUsed`/`scheduleResults` 在排班
+   * 追加重写循环里会继续变化（重写时真的调用了 `pickSchedule`），
+   * 喂给下一轮重写的事实必须是当时最新的，不能是这个函数第一次
+   * 被调用时的快照。
+   */
+  const renderBaseFacts = () =>
     `名册上的人：${ctx.members.map((m) => m.name).join("、")}${rosterNote}\n` +
     `本轮调用的工具：${toolsUsed.join("、") || "无"}` +
     (scheduleResults.length
@@ -1859,6 +1865,7 @@ export async function runColivingTurn(args: {
         "不能把一个人连续的时段拆成两段中间留空当（做饭中途不能停下来），" +
         "也不能写出跟这里的时间对不上的数字。"
       : "");
+  const baseFacts = renderBaseFacts();
 
   /**
    * **每一条出站消息都要审，不只是回复。**
@@ -2025,10 +2032,66 @@ export async function runColivingTurn(args: {
     if (hourMatch) return `${hourMatch[1].padStart(2, "0")}:${hourMatch[2] ? "30" : "00"}`;
     return raw;
   };
-  const replyTimeMentions = (reply.match(timePattern) ?? []).map(normalizeTime);
-  const timeMentionCount = replyTimeMentions.length;
-  const claimedScheduleInText =
-    timeMentionCount >= 2 && scheduleResults.length === 0;
+  /**
+   * 排班硬规则的判定逻辑抽成函数，**给定文本就能独立判定**——不依赖
+   * 闭包里某个特定时刻的快照。这样重写完之后可以原样再调一次，不用
+   * 把判定逻辑复制一份。
+   *
+   * **`computedTimes` 必须在函数内现算，不能在外层算一次存成 const**：
+   * 如果重写时模型真的调用了 `pickSchedule`（这正是我们想让它做的事），
+   * `scheduleResults` 会被追加新结果，但一次性快照的 `computedTimes`
+   * 不会跟着更新——判定会一直用重写前那份（可能是空的）旧集合，
+   * 永远判定不合格，白白烧掉重试次数。
+   *
+   * 三种不合格：
+   * 1. 调了 recordShare（分配了资源）但没调过 pickSchedule——心算/瞎猜的分配
+   * 2. 正文里两个以上时刻、没调过 pickSchedule——编排班
+   * 3. 调了 pickSchedule，但正文时刻跟算出来的对不上——编了新时段
+   */
+  function checkScheduleHardRule(
+    text: string
+  ): { broke: "0"; why: string } | null {
+    const computedTimes = new Set(
+      scheduleResults.flatMap((s) => (s.match(/([01]\d|2[0-3]):[0-5]\d/g) ?? []))
+    );
+    const mentions = (text.match(timePattern) ?? []).map(normalizeTime);
+    if (toolsUsed.includes("recordShare") && scheduleResults.length === 0) {
+      return {
+        broke: "0",
+        why:
+          "这一轮调用了 recordShare（分配了一份共用资源），但从没调用过" +
+          " pickSchedule 去算这次分配——这是自己心算/瞎猜出来的分配，" +
+          "不是排列组合算出来的。",
+      };
+    }
+    if (mentions.length >= 2 && scheduleResults.length === 0) {
+      return {
+        broke: "0",
+        why:
+          "回复正文里出现了两个以上具体时刻，像是在给多人排时间表，" +
+          "但这一轮从没调用过 pickSchedule——这些时间点是编出来的，" +
+          "不是算出来的，必须先调 pickSchedule 排出方案再回复。",
+      };
+    }
+    if (
+      scheduleResults.length > 0 &&
+      mentions.length > 0 &&
+      mentions.some((t) => !computedTimes.has(t))
+    ) {
+      return {
+        broke: "0",
+        why:
+          "回复里提到的时刻跟 pickSchedule 算出的方案对不上——" +
+          `工具算出的时刻是：${[...computedTimes].join("、")}，` +
+          "回复里必须原样用这些时刻，不能改写、不能编一个新的、" +
+          "也不能用「A或B之间」这种模糊表达来回避精确对齐，也不能同时" +
+          "提两个不同版本的时段让对方猜哪个是最终结果。",
+      };
+    }
+    return null;
+  }
+
+  const scheduleHardRuleHit = checkScheduleHardRule(reply);
 
   /**
    * **2026-09-05 再补充**：`pickSchedule` 确实被调用了，但交付的回复
@@ -2045,35 +2108,8 @@ export async function runColivingTurn(args: {
    * 算出的时刻，回复里出现任何不在这个集合里的时刻，就一定是编的，
    * 没有"批判器可能误判"的空间。
    */
-  const computedTimes = new Set(
-    scheduleResults.flatMap((s) => (s.match(/([01]\d|2[0-3]):[0-5]\d/g) ?? []))
-  );
-  const replyTimesNotComputed =
-    scheduleResults.length > 0 &&
-    replyTimeMentions.length > 0 &&
-    replyTimeMentions.some((t) => !computedTimes.has(t));
-
-  const claimedShareWithoutScheduling =
-    (toolsUsed.includes("recordShare") || claimedScheduleInText) &&
-    scheduleResults.length === 0;
-
-  const verdict = claimedShareWithoutScheduling || replyTimesNotComputed
-    ? {
-        pass: false,
-        broke: "0",
-        why: toolsUsed.includes("recordShare") && scheduleResults.length === 0
-          ? "这一轮调用了 recordShare（分配了一份共用资源），但从没调用过" +
-            " pickSchedule 去算这次分配——这是自己心算/瞎猜出来的分配，" +
-            "不是排列组合算出来的。"
-          : replyTimesNotComputed
-          ? "回复里提到的时刻跟 pickSchedule 算出的方案对不上——" +
-            `工具算出的时刻是：${[...computedTimes].join("、")}，` +
-            "回复里必须原样用这些时刻，不能改写、不能编一个新的、" +
-            "也不能用「A或B之间」这种模糊表达来回避精确对齐。"
-          : "回复正文里出现了两个以上具体时刻，像是在给多人排时间表，" +
-            "但这一轮从没调用过 pickSchedule——这些时间点是编出来的，" +
-            "不是算出来的，必须先调 pickSchedule 排出方案再回复。",
-      }
+  const verdict = scheduleHardRuleHit
+    ? { pass: false as const, ...scheduleHardRuleHit }
     : await critique({
         to: sender.name,
         role: senderRole,
@@ -2138,8 +2174,24 @@ export async function runColivingTurn(args: {
        * 被打开（`isBrokenPromise` 为 false 时 `redoTools` 还是只有
        * `sendReply`），影响面没有扩大到无关的打回场景。
        */
+      /**
+       * **`broke==="0"` 时额外无条件塞 `pickSchedule`，不能只 spread
+       * `activeTools`。** `pickSchedule` 进不进 `activeTools`，取决于
+       * 路由用本轮消息原文猜的话题（`topicHitsConflict`）——真实复现过：
+       * 硬规则已经判定"这轮需要排班却没调"，但路由没猜中冲突话题时，
+       * `activeTools` 里压根没有它，重写还是巧妇难为无米之炊。
+       * 硬规则命中本身就是比路由关键词匹配更可靠的信号。
+       */
       const redoTools: Record<string, (typeof tools)[keyof typeof tools]> =
-        isBrokenPromise ? { ...activeTools, sendReply: tools.sendReply } : { sendReply: tools.sendReply };
+        isBrokenPromise
+          ? {
+              ...activeTools,
+              ...(verdict.broke.trim() === "0"
+                ? { pickSchedule: tools.pickSchedule }
+                : {}),
+              sendReply: tools.sendReply,
+            }
+          : { sendReply: tools.sendReply };
       // 重写期间如果调用 contactPerson，新消息会 push 到这同一个
       // outbound 数组——记下重写前的长度，重写完只审"新增的那一截"，
       // 不重复审已经审过、已经落定的那些
@@ -2207,6 +2259,100 @@ export async function runColivingTurn(args: {
       const fixed = stripMarkdown((deliveredReply ?? "").trim());
       if (fixed) {
         reply = fixed;
+      }
+
+      /**
+       * **排班时段不对齐是代码可验证的客观事实，不是主观分歧——
+       * 值得比"有限复核"多给几次机会。**
+       *
+       * 2026-09-05 真实复现：三人厨房场景里，批判器连续两次正确打回
+       * "回复时段跟 pickSchedule 算出的对不上"，重写完还是没对齐
+       * （把新旧两个版本的时段拼在一句话里，读起来自相矛盾），"有限
+       * 复核"只查一次就放弃，这条自相矛盾的消息原样发给了住户。
+       *
+       * 为什么这里可以打破"只重写一次"的惯例：`checkScheduleHardRule`
+       * 判的是纯字符串匹配（回复里的时刻在不在 `computedTimes` 集合里），
+       * **不存在"批判器可能理解错"的空间**——`pickSchedule` 算出的时刻
+       * 是唯一真值。主观分歧才有"越改越糟、不如老实发出去"的顾虑，
+       * 客观错字不存在这个顾虑，多试几次只会更接近正确答案，不会更糟。
+       * 复查本身也不花模型调用（正则匹配），只有真要重写时才调模型。
+       *
+       * 有界（最多再试 2 次）而不是循环到通过：万一 `pickSchedule` 的
+       * 结果本身就没法用大白话说清楚（理论上不应该，但留个上限保险），
+       * 不能真的死循环。
+       */
+      let scheduleAttempts = 0;
+      while (checkScheduleHardRule(reply) && scheduleAttempts < 2) {
+        scheduleAttempts++;
+        const stillWrong = checkScheduleHardRule(reply)!;
+        console.log(
+          `[schedule-retry] 第${scheduleAttempts}次追加重写：`,
+          stillWrong.why
+        );
+        const retryOutboundLen = outbound.length;
+        deliveredReply = null;
+        /**
+         * **必须显式塞 `tools.pickSchedule`，不能只 spread `activeTools`。**
+         * 第一版这里犯了跟"没调 pickSchedule 就编时段"完全同类的错——
+         * 如果失败原因是"压根没调过 pickSchedule"，光靠重写措辞救不回来，
+         * 模型结构上就没有调用它的能力，两次重试等于白烧。
+         *
+         * 光 spread `activeTools` 还不够：`pickSchedule` 是否在
+         * `activeTools` 里，取决于路由用**本轮消息原文**匹配到的话题
+         * （`topicHitsConflict`，见 `routeOn: args.text`）——真实复现过，
+         * 像"我随时都行，半小时够了"这种回应句本身不含"厨房/排班"关键词，
+         * 路由判不出冲突话题，`pickSchedule` 从一开始就不在 `activeTools`
+         * 里，重试拿到的还是同一个空集合，两次重试仍然白烧。
+         *
+         * 但"排班硬规则命中"这件事本身就是"这一轮需要排班"的**确定信号**，
+         * 比路由靠关键词猜话题可靠得多——命中就无条件把 `pickSchedule`
+         * 塞进这次重写的工具集，不依赖路由判断对不对。
+         */
+        await generateText({
+          model: getLanguageModel(modelId),
+          system: [
+            {
+              role: "system" as const,
+              content: doctrine,
+              providerOptions: {
+                anthropic: { cacheControl: { type: "ephemeral" } },
+              },
+            },
+            { role: "system" as const, content: runtime },
+          ],
+          messages: [
+            ...history,
+            { role: "user" as const, content: args.text },
+            { role: "assistant" as const, content: reply },
+            {
+              role: "user" as const,
+              content:
+                `【这不是住户说的，是代码核对结果】\n${stillWrong.why}\n\n` +
+                `【这一轮的事实】\n${renderBaseFacts()}\n\n` +
+                "如果事实里没有 pickSchedule 算出的方案，先调 pickSchedule" +
+                "把候选排出来，再照着结果说话——不要在正文里自己心算时段。" +
+                "只说一个版本的时段，不要同时提新旧两个版本让对方猜、" +
+                "不要用「或者」「之间」这类模糊词回避精确对齐。" +
+                "最后调 sendReply 把改好的这句话交出来。",
+            },
+          ],
+          tools: {
+            ...activeTools,
+            pickSchedule: tools.pickSchedule,
+            sendReply: tools.sendReply,
+          },
+          toolChoice: "required",
+          // 可能要先调 pickSchedule 再 sendReply，给够 2 步的余量
+          stopWhen: [hasToolCall("sendReply"), stepCountIs(3)],
+        });
+        const retryFixed = stripMarkdown((deliveredReply ?? "").trim());
+        if (retryFixed) {
+          reply = retryFixed;
+        }
+        const retryNewOutbound = outbound.slice(retryOutboundLen);
+        if (retryNewOutbound.length > 0) {
+          await critiqueAndMarkOutbound(retryNewOutbound);
+        }
       }
 
       /**
