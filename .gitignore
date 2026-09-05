@@ -53,5 +53,6 @@ twa/keystore/
 
 # Search eval reports (generated artifacts)
 tests/search-eval/reports/
+tests/coliving-eval/reports/
 scripts/_tmp-*
 scripts/tmp-*

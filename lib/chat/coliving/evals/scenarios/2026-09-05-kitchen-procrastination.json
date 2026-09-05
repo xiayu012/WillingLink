@@ -1,0 +1,19 @@
+{
+  "id": "kitchen-procrastination-2026-09-05",
+  "source": "生产事故：用户真实收到的短信里，AI 对时段已定死的住户说\"另外两位我会去商量，回头有了结果再告诉你\"，信息其实早就齐全（谁占多少、剩下窗口多大、另外两位是谁都已知），却没有真正排方案/联系人。core.md 闸五 + rubric 延后承诺检查、以及重写路径通用化（7342775）都是为了修这个类别的问题。",
+  "household": { "label": "评测-厨房拖延" },
+  "people": [
+    { "phone": "+15550001001", "name": "房东", "role": "landlord" },
+    { "phone": "+15550001002", "name": "2号住客", "role": "tenant" },
+    { "phone": "+15550001003", "name": "3号住客", "role": "tenant" }
+  ],
+  "turns": [
+    { "from": "+15550001002", "text": "我18点到家，只能18点开始做饭，要做两小时" },
+    { "from": "+15550001001", "text": "我七点用厨房最合适" },
+    { "from": "+15550001003", "text": "我随时都行，做饭半小时就够" }
+  ],
+  "expect": {
+    "mustUseAnyOfTools": ["pickSchedule", "contactPerson"],
+    "replyMustNotMatch": ["[0-9]号住客"]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "forgotten-preference-2026-09-05",
+  "source": "生产事故：房东在冲突还没浮现前随口说过\"七点用厨房最合适\"，几轮之后真的要排班时，AI 却说\"你的时间还没确认\"——房东早说过了，只是当时没有开案，recordPosition 曾经要求必须绑 caseId，这句偏好没被结构化记住。修法见 coliving-world-13.sql（case_id 允许为空）+ coliving-world-15.sql 之前那次改动。这条场景要防的是回归：以后任何改动，都不能让\"随口说的偏好丢失\"这个 bug 再出现。",
+  "household": { "label": "评测-偏好遗忘" },
+  "people": [
+    { "phone": "+15550002001", "name": "房东", "role": "landlord" },
+    { "phone": "+15550002002", "name": "住客甲", "role": "tenant" },
+    { "phone": "+15550002003", "name": "住客乙", "role": "tenant" }
+  ],
+  "turns": [
+    { "from": "+15550002002", "text": "我18点到家，只能18点开始做饭，要做两小时" },
+    { "from": "+15550002001", "text": "我七点用厨房最合适" },
+    { "from": "+15550002003", "text": "我随时都行，做饭半小时就够" }
+  ],
+  "expect": {
+    "replyMustNotMatch": ["还没确认", "时间.{0,4}还没(说|回)", "还不知道.{0,6}时间"],
+    "mustUseAnyOfTools": ["pickSchedule", "contactPerson"]
+  }
+}

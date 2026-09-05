@@ -184,6 +184,7 @@ AI工程。看看还有什么东西是能大幅改善运转速度、token成本�
 | `pnpm search-recall-eval` | "库里有却说没有"（漏召回） | 同上，且怀疑筛严了 —— search-eval 对这一类**结构性失明**，因为它的 ground truth 和运行时共用同一个谓词 |
 | `pnpm comment-reply-eval` | 评论成品：角色、格式、字数、幂等 | 动了 comment-reply 链路或提示词 |
 | `pnpm redact-eval` | 出站剔联系方式、分割线、字数上限 | 动了 xhs adapter 的出站处理 |
+| `pnpm coliving-eval` | 合租房大脑：结构性回归（工具有没有调对、回复/出站消息有没有踩过去的坑）| 动了 `lib/chat/coliving/` 或 `lib/ai/brains/coliving/`。语料在 `lib/chat/coliving/evals/scenarios/`，**只增不减**——抓到新的真实 bug 就整理成一条场景提交进去，见 `docs/coliving-parallel-testing-plan.md` |
 
 改一行提示词、修个类型、调个注释——不用跑。真要发布前动过搜索核心逻辑，
 再跑对应那一两个。

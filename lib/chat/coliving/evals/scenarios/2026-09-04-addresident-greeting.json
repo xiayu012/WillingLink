@@ -1,0 +1,14 @@
+{
+  "id": "addresident-greeting-2026-09-04",
+  "source": "生产事故：房东报了两位租客的手机号，AI 一直以来会在同一轮主动跟新住户打招呼（contactPerson），但工具列表堆到21个后这条被挤掉，模型调了 addResident 却没有跟着调 contactPerson。修法：c328ae8——加室友这个动作代码级强制补发打招呼，不能只靠提示词提醒。这条场景要防的是回归：以后工具列表再变化，这条硬约束不能松。",
+  "household": { "label": "评测-加人打招呼" },
+  "people": [
+    { "phone": "+15550003001", "name": "房东", "role": "landlord" }
+  ],
+  "turns": [
+    { "from": "+15550003001", "text": "这栋房子还住了两个人，一个电话是 15550003002，一个是 15550003003" }
+  ],
+  "expect": {
+    "mustUseTools": ["addResident", "contactPerson"]
+  }
+}

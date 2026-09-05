@@ -4741,3 +4741,91 @@ userscript (`tools/xhs-guide/userscript/xhs-guide.user.js`, 现 0.13.4)
 这次同时在这个盲区里发现了三个不同表现的真实问题（提示语给的话术
 矛盾、重写不复查、重写新发的消息不审核）——说明"审核链条本身有没有
 缺口"这件事，值得作为体检清单的一条常驻检查项，不止这一次。
+
+---
+
+## 2026-09-05 · 并行能力检查 + 落地 docs/coliving-parallel-testing-plan.md 阶段一、二
+
+**背景**：用户问当前 Claude Code 是否支持 Agent Teams/subagents/Dynamic
+Workflows，想让我当 Lead Agent 统筹多个并行 subagent 干活。查完汇报：
+`Agent` 工具（含 `isolation: "worktree"`）真实可用，"Agent Teams"
+（`SendMessage`/`TaskStop` 提到的"teammate"）只有协议痕迹、没有对应的
+"建团队"工具，这个普通会话里启动不了。最高可用模式是"Lead Agent（我）
++ 多个 worktree 隔离的独立 subagent，我做整合"。用户选择先执行早前
+写好但一直没启用的 `docs/coliving-parallel-testing-plan.md`（那份计划
+文档本身写的是"以后想实施了再叫我干活"，这次就是那个时机）。
+
+**先核对现状有没有变化**（计划文档自己要求的第一步）：模型选型仍是
+`deepseek-v4-flash`（没变），数据库 migration 已经到第15批（计划写
+的时候可能更少，不影响这次要建的评测基础设施），`search-eval.ts` 等
+现成风格可以照抄。
+
+**做了阶段一（语料化+并行跑批）+ 阶段二（结构性检查自动化）**：
+
+- `lib/chat/coliving/evals/schema.ts`：场景 JSON 的类型定义 +
+  `validateScenario` 格式校验。`expect` 字段全部是**结构性**断言
+  （工具有没有调、回复/出站消息有没有命中某个正则），不引入额外的
+  模型调用做语义判分——跟计划里"能用代码判的绝不用模型判"一致。
+- `lib/chat/coliving/evals/scenarios/*.json`：**4 个场景，全部来自
+  这个会话里真实发生过的生产事故**，不是编的 Reddit 场景（早前25轮
+  的具体对话原文已经不在手上，重新编等于伪造语料）：
+  1. `kitchen-procrastination-2026-09-05`——厨房排班拖延（今天核心
+     修复对象）
+  2. `forgotten-preference-2026-09-05`——房东偏好被遗忘
+     （coliving-world-13.sql 那次修复）
+  3. `addresident-greeting-2026-09-04`——加室友必须打招呼
+     （c328ae8）
+  4. `noise-complaint-neutral-2026-09-04`——投诉中立性基线
+     （项目早期就有的核心防线，不是这个会话新修的，但值得固化）
+- `scripts/coliving-eval.ts`：批量 runner，风格照抄 `search-eval.ts`
+  （`--scenario`/`--concurrency`/`--limit` 参数，报告写 JSON 到
+  `tests/coliving-eval/reports/`，已加进 `.gitignore`）。**不再
+  `pnpm coliving:db --purge`**——每个场景各自 `createTestHousehold`，
+  `household_id` 天然隔离，这就是计划里说的"解开当前唯一串行点"。
+  简单的并发限制（cursor+worker 池），没有引入 p-limit 依赖。
+- `package.json` 加 `coliving-eval` 脚本，`CLAUDE.md` 评测脚本表
+  加对应一行。
+
+**真实跑了一次验证并行确实生效**（不是只看代码就当完成）：4 个场景，
+`--concurrency 4`，总耗时 296.9 秒——**恰好等于其中最慢那个场景单独
+跑完的时间**（kitchen-procrastination 一个场景就要 296.9 秒，因为它
+有3轮真实模型对话）。如果是串行执行，四个场景耗时相加会接近 580 秒，
+接近两倍。这证明并发是真实生效的，不是摆设。4/4 场景全部通过。
+
+**跑批过程中意外抓到两个真实发现，如实记录**：
+
+1. **`forgotten-preference` 场景的断言本身写窄了**——它只检查"有没有
+   说'时间还没确认'"这一个症状，第一次真实跑批时，这条场景**表面
+   通过**（没说这句话），但读它的实际回复"厨房时间我会先排一版试试，
+   到时候也会问你和另两位的意见"——这本身就是同一天在追的拖延问题
+   的另一种表现（`toolsUsed` 里确实没有 `pickSchedule`）。**已修**：
+   给这条场景补上 `mustUseAnyOfTools: ["pickSchedule", "contactPerson"]`
+   这条更根本的检查——这是纯测试语料的改动，不碰业务代码。
+2. **`kitchen-procrastination` 场景技术上通过了**（`pickSchedule`/
+   `contactPerson` 都被调用，排出了具体方案），**但仔细看最终回复**：
+   "你八点到八点半用厨房，另一位六点到八点。房东那边我晚点去对时间"
+   ——两位租客的时段排定了，但**房东的时段被单独延后确认**，即使
+   房东在更早一轮已经明确说过"我七点用厨房最合适"。这是一个更细微、
+   残留的拖延变体，**没有在这次修**——这是业务代码层面的问题（不属于
+   这次"搭建并行评测基础设施"的任务范围，用户明确说了"先不要修改
+   业务代码"），留给下次专门排查这类问题时处理。这份评测报告
+   （`tests/coliving-eval/reports/2026-09-05.json`）已经把这条完整
+   记录下来，下次回归跑批时这条场景会持续暴露这个残留问题，不会
+   被遗忘。
+
+**验证**：`tsc --noEmit`、`brain:inspect` 11/11、`scheduling:inspect`
+9/9 均干净。语料文件格式全部通过 `validateScenario` 校验。
+
+**这次没做的（阶段三、四、五，按计划的节奏，不必一次建完）**：
+- 阶段三（子代理并行审查语义合规性）——语料库现在只有4条，人工/我自己
+  读得过来，量不到需要子代理分摊的程度。
+- 阶段四（多个真实 bug 并行修复，用 worktree 隔离子代理）——这次跑批
+  发现的两个问题都不是"急需立刻修"的独立大 bug，且用户明确说了这次
+  先不碰业务代码。
+- Neon 数据库分支隔离——计划里写明"到那个规模再上"，现在几十条场景
+  的量级，共用测试库+household_id隔离完全够用。
+
+**语料只增不减，从这一刻开始生效**：以后任何改动 `lib/chat/coliving/`
+或 `lib/ai/brains/coliving/`，都应该在改完之后跑一次 `pnpm coliving-eval`
+全量回归（不只是新场景），照 CLAUDE.md 评测脚本表"按需跑"的原则，
+不是每次改动都要跑，但值得跑的时候要跑全量。
