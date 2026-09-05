@@ -93,23 +93,73 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
   const repo = await import("../lib/chat/coliving/repo");
   const turn = await import("../lib/chat/coliving/turn");
 
-  const { householdId } = await repo.createTestHousehold(
-    `evals-${scenario.id}-${Date.now()}`
-  );
-  for (const p of scenario.people) {
-    await repo.addResident({
-      householdId,
-      phone: p.phone,
-      name: p.name,
-      role: p.role,
-      note: null,
-    });
+  let householdId: string;
+  /** 快照场景专用：槽位号 → 本次恢复实际可用的号 */
+  let phoneRewrite: Record<string, string> = {};
+  if (scenario.snapshot) {
+    // ── 快照重放：状态是冻住恢复出来的，不重演历史轮次 ──────────────
+    const { restoreSnapshot } = await import(
+      "../lib/chat/coliving/evals/snapshot"
+    );
+    const snapPath = path.join(
+      process.cwd(),
+      "lib/chat/coliving/evals/snapshots",
+      `${scenario.snapshot}.json`
+    );
+    const snap = JSON.parse(readFileSync(snapPath, "utf8"));
+    const restored = await restoreSnapshot(snap);
+    householdId = restored.householdId;
+    // 场景里写的是**槽位号**（稳定、可提交进 git），实际发消息要用这次
+    // 恢复现生成的号——不换就会认成陌生号码，走完全不同的路径，
+    // 静默测了个寂寞。写错号直接报错，不静默跳过。
+    phoneRewrite = restored.phoneMap;
+    for (const [i, t] of scenario.turns.entries()) {
+      if (!phoneRewrite[t.from]) {
+        throw new Error(
+          `场景 ${scenario.id} 的 turns[${i}].from（${t.from}）不是快照 ` +
+            `${scenario.snapshot} 里的槽位号。可用槽位号：${Object.keys(phoneRewrite).join("、")}`
+        );
+      }
+    }
+  } else {
+    const created = await repo.createTestHousehold(
+      `evals-${scenario.id}-${Date.now()}`
+    );
+    householdId = created.householdId;
+    // 场景里写的号码是**槽位号**，每次跑换成本次独有的真号——
+    // 写死号码反复跑批会让同一个号挂上多栋屋子，`resolveSender` 的
+    // `limit 1` 就会任意认进旧屋子，测的是被上次污染过的状态。
+    // 详见 evals/phones.ts 开头那次真实事故。
+    const { makeLivePhones, collectSlotPhones } = await import(
+      "../lib/chat/coliving/evals/phones"
+    );
+    phoneRewrite = makeLivePhones(
+      collectSlotPhones({ people: scenario.people, turns: scenario.turns })
+    );
+    for (const p of scenario.people ?? []) {
+      await repo.addResident({
+        householdId,
+        phone: phoneRewrite[p.phone] ?? p.phone,
+        name: p.name,
+        role: p.role,
+        note: null,
+      });
+    }
+    await repo.setDeclaredSize(householdId, (scenario.people ?? []).length);
   }
-  await repo.setDeclaredSize(householdId, scenario.people.length);
 
+  // 正文里的号码也要换：`addresident-greeting` 那条场景把号码写在消息里
+  // （"一个电话是 155…"），只换 from 不换正文，模型会去加一个上次跑批
+  // 留下的旧号，等于没测到"加人"这个动作
+  const { rewritePhonesInText } = await import(
+    "../lib/chat/coliving/evals/phones"
+  );
   let last: Awaited<ReturnType<typeof turn.runColivingTurn>> | null = null;
   for (const t of scenario.turns) {
-    last = await turn.runColivingTurn({ from: t.from, text: t.text });
+    last = await turn.runColivingTurn({
+      from: phoneRewrite[t.from] ?? t.from,
+      text: rewritePhonesInText(t.text, phoneRewrite),
+    });
   }
   if (!last) {
     throw new Error(`场景 ${scenario.id} 没有任何 turns`);

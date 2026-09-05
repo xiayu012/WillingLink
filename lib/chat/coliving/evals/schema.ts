@@ -59,8 +59,22 @@ export type EvalScenario = {
   id: string;
   /** 这个场景是哪来的——生产事故就写事故描述，编的场景就写设计意图 */
   source: string;
-  household: { label: string };
-  people: ScenarioPerson[];
+  /**
+   * **快照重放**：填 `snapshots/` 下的文件名（不带 .json），这一轮就不再
+   * 从零建屋，而是把那个时刻的完整世界状态恢复出来，只跑 `turns` 里的消息。
+   *
+   * 跟"从零演一遍"的区别（这是这个字段存在的全部理由）：多轮场景里
+   * 从零重演，中间某一轮新代码反应不一样，后面几轮就跟着分叉，最后测的
+   * 是"新代码对一条被重新演绎的对话的处理"。快照重放没有中间轮次，
+   * 状态是冻住的，测的就是"新代码对那个历史时刻的处理"。
+   *
+   * 填了这个字段时，`household`/`people` 不用填（状态来自快照），
+   * `turns[].from` 要用快照 `phoneMap` 里的**测试号**（跑
+   * `pnpm coliving-snapshot` 时会打印出来）。
+   */
+  snapshot?: string;
+  household?: { label: string };
+  people?: ScenarioPerson[];
   turns: ScenarioTurn[];
   expect?: ScenarioExpectation;
 };
@@ -70,15 +84,24 @@ export function validateScenario(s: unknown, filename: string): EvalScenario {
   const obj = s as Record<string, unknown>;
   if (typeof obj?.id !== "string" || !obj.id) errors.push("缺 id");
   if (typeof obj?.source !== "string" || !obj.source) errors.push("缺 source");
-  if (!obj?.household || typeof (obj.household as { label?: unknown })?.label !== "string") {
-    errors.push("缺 household.label");
+
+  // 快照场景的人和屋子都来自快照文件，不在这里重复声明；
+  // 从零演的场景两样都必须齐（否则建不出屋子）
+  const isSnapshot = typeof obj?.snapshot === "string" && obj.snapshot;
+  if (!isSnapshot) {
+    if (!obj?.household || typeof (obj.household as { label?: unknown })?.label !== "string") {
+      errors.push("缺 household.label（不是快照场景就必须填）");
+    }
+    if (!Array.isArray(obj?.people) || obj.people.length === 0) {
+      errors.push("people 必须是非空数组（不是快照场景就必须填）");
+    }
   }
-  if (!Array.isArray(obj?.people) || obj.people.length === 0) {
-    errors.push("people 必须是非空数组");
-  }
+
   if (!Array.isArray(obj?.turns) || obj.turns.length === 0) {
     errors.push("turns 必须是非空数组");
-  } else {
+  } else if (!isSnapshot) {
+    // 快照场景的号码要对着快照的 phoneMap 校验，那要读文件，
+    // 放在 runner 里恢复完再查（见 coliving-eval.ts），这里只查从零演的
     const phones = new Set(
       (obj.people as ScenarioPerson[] | undefined)?.map((p) => p.phone) ?? []
     );
