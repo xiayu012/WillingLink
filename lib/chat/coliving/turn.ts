@@ -1818,12 +1818,25 @@ export async function runColivingTurn(args: {
        * 无关时也顺手多发消息，扩大这段代码的影响面）。
        */
       const isBrokenPromise = verdict.broke.trim() === "7";
-      const redoTools: Record<string, (typeof tools)[keyof typeof tools]> = {
-        sendReply: tools.sendReply,
-      };
-      if (isBrokenPromise) {
-        redoTools.contactPerson = tools.contactPerson;
-      }
+      /**
+       * **根治，不再按"哪种具体动作"逐个开口子。**
+       *
+       * 第7条（承诺没兑现）连续在同一个会话里改了三次：先只给
+       * `contactPerson`（ce234a6，覆盖"该联系人却没联系"）；接着发现
+       * "该排方案却没排" 也是第7条命中，被迫单独再给 `pickSchedule`；
+       * 这个模式会一直重复——以后随便一个新工具、只要它对应"某个该做
+       * 的具体动作"，都可能在批判器抓到"承诺没兑现"时被同样漏掉，
+       * 每次都要我回来手动加一行。**这不是缺一行代码，是这条路径的
+       * 设计本身在按"动作种类"枚举，而动作种类是枚举不完的。**
+       *
+       * 改法：第7条命中时，直接给重写**跟主生成一样的完整工具集**，
+       * 不再判断"是哪种动作"——模型自己知道该调哪个工具去把承诺兑现，
+       * 不需要代码替它猜。多给的这些工具在其余12条打回原因下依然不会
+       * 被打开（`isBrokenPromise` 为 false 时 `redoTools` 还是只有
+       * `sendReply`），影响面没有扩大到无关的打回场景。
+       */
+      const redoTools: Record<string, (typeof tools)[keyof typeof tools]> =
+        isBrokenPromise ? { ...activeTools, sendReply: tools.sendReply } : { sendReply: tools.sendReply };
       await generateText({
         model: getLanguageModel(modelId),
         system: [
@@ -1846,21 +1859,21 @@ export async function runColivingTurn(args: {
               `【这不是住户说的，是审稿意见】\n你刚才那条第${verdict.broke}条不合格：` +
               `${verdict.why}\n\n【这一轮的事实，重写要跟这个对得上】\n${replyFacts}\n\n` +
               (isBrokenPromise
-                ? "你说了要联系某个人，但这轮实际没有联系到——" +
-                  "**现在先调 contactPerson 把这个人真的联系到**，联系成功后" +
-                  "再调 sendReply，回复里就可以如实说已经联系了。" +
-                  "只有联系不上（对方不在名册里、没有联系方式，或者" +
-                  "contactPerson 返回失败）才允许直接调 sendReply，并把回复" +
-                  "改成如实反映「联系不上」这件事，不能说成已经联系到了。\n\n" +
-                  "如果这次重写你判断不需要联系任何人（比如原本的判断就是" +
-                  "错的，这一步压根不该承诺去联系谁），直接改措辞、调 " +
-                  "sendReply 也可以——不强制一定要调 contactPerson，只是" +
-                  "不能既不联系人、又在回复里说得像已经联系过了。\n\n"
+                ? "你承诺了一件事，但这轮实际没有做到——**现在真的去做**：" +
+                  "该联系人、该排方案、该记什么，你手上有跟正常这一轮" +
+                  "一样的全部工具，自己判断该调哪个，做完再调 `sendReply` " +
+                  "交付，回复里就可以如实说已经做了。只有确实做不了（联系" +
+                  "不上、缺必需的信息）才允许直接调 `sendReply`，并把回复" +
+                  "改成如实反映「做不了/还缺什么」，不能说成已经做完了。\n\n" +
+                  "如果这次重写你判断这一步根本不该承诺做这件事（原本的" +
+                  "判断就是错的），直接改措辞、调 `sendReply` 也可以——" +
+                  "不强制一定要先调别的工具，只是不能既没做事、又在回复里" +
+                  "说得像已经做完了。\n\n"
                 : "") +
               "重写一条，调 sendReply 把要发给对方的那句话交出来。" +
               "上面事实里标了「被审稿拦下，没有发出去」的联系，" +
               (isBrokenPromise
-                ? "如果你没有在这次重写里用 contactPerson 补上，"
+                ? "如果你没有在这次重写里真的把该做的事做了，"
                 : "") +
               "这轮就是没有发生——不管用什么时态描述，都不能说成已经联系到了" +
               "或者正在联系。具体说：『我正/正在/已经/这就跟他说/商量/联系』" +
@@ -1871,7 +1884,11 @@ export async function runColivingTurn(args: {
         ],
         tools: redoTools,
         toolChoice: "required",
-        stopWhen: [hasToolCall("sendReply"), stepCountIs(3)],
+        // 第7条这条路径现在拿到的是完整工具集，可能需要比"只有
+        // contactPerson"时更多步（比如先 recordPosition 再 pickSchedule
+        // 再 sendReply），预算从 3 步放宽到 4 步，仍然远低于主生成的
+        // MAX_STEPS=6——这是补救性的单次重写，不该比正常一轮更奢侈。
+        stopWhen: [hasToolCall("sendReply"), stepCountIs(4)],
       });
       const fixed = stripMarkdown((deliveredReply ?? "").trim());
       if (fixed) {
