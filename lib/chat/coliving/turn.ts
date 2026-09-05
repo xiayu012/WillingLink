@@ -326,6 +326,38 @@ export async function runColivingTurn(args: {
           .describe("短信正文。短、具体、纯文本，不要 markdown 符号"),
       }),
       execute: async ({ text }) => {
+        /**
+         * **代码级拦一道，不只靠提示词那句"不要放思考过程"。**
+         *
+         * 真实事故（黑客级并行测试抓到，2026-09-05）：一轮里既要回复
+         * 当前这个人、又要用 `contactPerson` 联系别人时，模型把路由
+         * 思考直接当成了 `sendReply` 的正文——真实出现过两次：
+         * 「（这条不要发出去，只是确认给另一位的那条这次真正发出）」、
+         * 「（这条发住客A，本轮不面向他）」。这不是"没调 sendReply、
+         * 退回自由文本"那条老路径（那条已经有安全网），是**模型明确
+         * 调用了 sendReply，参数就是这段内部批注**——提示词里"不要放
+         * 思考过程"这句话没能拦住。
+         *
+         * 两次真实泄漏的文字有同一个干净的结构特征：**整条消息被一对
+         * 括号从头到尾包住**——这在真实要发给住户的短信里几乎不会
+         * 出现，是"内部批注"的清晰信号，用它做校验比猜测语义关键词
+         * 更可靠。命中就拒绝这次交付，让模型在同一轮里重新说清楚
+         * 真正要发的话，不是静默放行一条不该被人看到的内部笔记。
+         */
+        const trimmed = text.trim();
+        const fullyParenthesized =
+          (trimmed.startsWith("（") && trimmed.endsWith("）")) ||
+          (trimmed.startsWith("(") && trimmed.endsWith(")"));
+        if (fullyParenthesized) {
+          return {
+            ok: false,
+            reason:
+              "这条整体被括号包住，读起来像是你写给自己看的内部批注" +
+              "（比如「这条不要发出去」「这条发给谁」这类），不是真正要" +
+              "发给对方的短信正文。重新想一句要发出去的话，不要用括号" +
+              "包住整句。",
+          };
+        }
         deliveredReply = text;
         return { ok: true };
       },
@@ -1694,6 +1726,15 @@ export async function runColivingTurn(args: {
         tools: { sendReply: tools.sendReply },
         toolChoice: { type: "tool", toolName: "sendReply" },
       });
+      // 补上：这次强制重试自己的工具调用之前从没被记进 toolsUsed——
+      // 安全网确实兜住了、消息也送达了，但事后完全看不出这一轮其实是
+      // 靠安全网兜住的，会掩盖"主生成为什么没能正常交付"这条排查线索
+      // （这个会话反复靠 toolsUsed 诊断问题，这是真实存在的盲区）。
+      for (const step of forced.steps) {
+        for (const call of step.toolCalls ?? []) {
+          toolsUsed.push(call.toolName);
+        }
+      }
       raw = deliveredReply ?? "";
     } catch (error) {
       console.log(
