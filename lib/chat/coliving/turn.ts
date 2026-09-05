@@ -2017,22 +2017,59 @@ export async function runColivingTurn(args: {
    * 大概率是在编排班——直接判不合格，逼它老实调工具去算。
    */
   const timePattern = /([01]?\d|2[0-3])[:：][0-5]\d|([01]?\d|2[0-3])点(半)?/g;
-  const timeMentionCount = (reply.match(timePattern) ?? []).length;
+  /** 把 "18点"/"18点半"/"18:00" 统一成 "HH:MM"，方便跟 formatMinutes 的输出比对 */
+  const normalizeTime = (raw: string): string => {
+    const colonMatch = raw.match(/^([01]?\d|2[0-3])[:：]([0-5]\d)$/);
+    if (colonMatch) return `${colonMatch[1].padStart(2, "0")}:${colonMatch[2]}`;
+    const hourMatch = raw.match(/^([01]?\d|2[0-3])点(半)?$/);
+    if (hourMatch) return `${hourMatch[1].padStart(2, "0")}:${hourMatch[2] ? "30" : "00"}`;
+    return raw;
+  };
+  const replyTimeMentions = (reply.match(timePattern) ?? []).map(normalizeTime);
+  const timeMentionCount = replyTimeMentions.length;
   const claimedScheduleInText =
     timeMentionCount >= 2 && scheduleResults.length === 0;
+
+  /**
+   * **2026-09-05 再补充**：`pickSchedule` 确实被调用了，但交付的回复
+   * 时段跟工具算出的方案对不上——真实复现过：批判器（rubric 6.6）连续
+   * 三次正确打回同一个"时段编造/对不上"的问题，但"有限复核"只给一次
+   * 重写机会，重写完还是编了个新时段（甚至写成"16:30-17:00（或17:30到
+   * 18:00之间）"这种和稀泥的双重表达来绕开精确匹配），批判器查出来了
+   * 也没法再拦一次，回复原样发出去。
+   *
+   * 用同样的思路加代码级硬校验：把 `scheduleResults` 里 `formatMinutes`
+   * 吐出来的 `HH:MM` 全部收集成一个集合，回复里提到的每一个时刻
+   * （标准化后）都必须落在这个集合里——一个对不上就判不合格。
+   * 这比批判器的语义判断更严，但正确：`pickSchedule` 只会返回它真实
+   * 算出的时刻，回复里出现任何不在这个集合里的时刻，就一定是编的，
+   * 没有"批判器可能误判"的空间。
+   */
+  const computedTimes = new Set(
+    scheduleResults.flatMap((s) => (s.match(/([01]\d|2[0-3]):[0-5]\d/g) ?? []))
+  );
+  const replyTimesNotComputed =
+    scheduleResults.length > 0 &&
+    replyTimeMentions.length > 0 &&
+    replyTimeMentions.some((t) => !computedTimes.has(t));
 
   const claimedShareWithoutScheduling =
     (toolsUsed.includes("recordShare") || claimedScheduleInText) &&
     scheduleResults.length === 0;
 
-  const verdict = claimedShareWithoutScheduling
+  const verdict = claimedShareWithoutScheduling || replyTimesNotComputed
     ? {
         pass: false,
         broke: "0",
-        why: toolsUsed.includes("recordShare")
+        why: toolsUsed.includes("recordShare") && scheduleResults.length === 0
           ? "这一轮调用了 recordShare（分配了一份共用资源），但从没调用过" +
             " pickSchedule 去算这次分配——这是自己心算/瞎猜出来的分配，" +
             "不是排列组合算出来的。"
+          : replyTimesNotComputed
+          ? "回复里提到的时刻跟 pickSchedule 算出的方案对不上——" +
+            `工具算出的时刻是：${[...computedTimes].join("、")}，` +
+            "回复里必须原样用这些时刻，不能改写、不能编一个新的、" +
+            "也不能用「A或B之间」这种模糊表达来回避精确对齐。"
           : "回复正文里出现了两个以上具体时刻，像是在给多人排时间表，" +
             "但这一轮从没调用过 pickSchedule——这些时间点是编出来的，" +
             "不是算出来的，必须先调 pickSchedule 排出方案再回复。",
