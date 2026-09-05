@@ -1983,13 +1983,67 @@ export async function runColivingTurn(args: {
           .join(" ／ ")}`
       : "\n这一轮没有联系任何其他人");
 
-  const verdict = await critique({
-    to: sender.name,
-    role: senderRole,
-    said: args.text,
-    facts: replyFacts,
-    draft: reply,
-  });
+  /**
+   * **代码级硬规则，不靠批判器的语义判断，也不靠文本猜测。**
+   *
+   * 真实事故（2026-09-05，用户明确要求"没调 pickSchedule 就直接拒绝
+   * 交付"）：干净复现同一道约束题时，`pickSchedule` 的窗口拉伸修复
+   * 确实生效（灵活的人被正确排在硬约束者前面）；但用户展示的另一条
+   * 真实对话里，AI 完全没考虑"排在前面"这个选项，读起来像是**压根
+   * 没调用排班工具、直接在自由文本里口算**出了"只剩20点这档"——
+   * 同一道题，有时候真算、有时候瞎猜，说明"要不要调 pickSchedule"
+   * 这件事本身不稳定，靠提示词反复提醒不管用。
+   *
+   * 用什么当"是不是在分配共用资源"的信号：**不靠解析文本猜测**——
+   * "那位""另一位"这类委婉指代是准则要求的正确写法，文本关键词匹配
+   * 根本抓不住。改成看模型自己的工具调用：`recordShare` 的语义就是
+   * "分完之后调这个"（工具描述原话），**只要模型调用了 `recordShare`，
+   * 就说明它自己判断"这是一次分配决定"**——如果这个判断成立、却从没
+   * 调用过 `pickSchedule` 来算这次分配，那这次分配就是自己心算/瞎猜
+   * 的，不是算出来的。
+   *
+   * 命中就直接判定不合格，**不再额外跑一次批判器模型调用去二次确认**
+   * ——这条本身就是确定性的代码判断，问模型"这条合不合格"反而多此一举、
+   * 多花一次调用。
+   *
+   * **2026-09-05 补充**：光靠 `recordShare` 不够——真实复现过一种更隐蔽
+   * 的路径：模型压根没调用任何"分配类"工具，直接在回复正文里写死
+   * 两个时间点（"18点起""17:30到18:00"），把后一个说成是"另一个住户"
+   * 排在前面——读起来完全是自由文本口算，不经过任何结构化信号。
+   * 这种情况批判器事后能查出来（rubric 第2/6/7条），但只有一次重写
+   * 机会，查出来了也不一定改得对，"有限复核"设计下这条回复原样发出去
+   * 了。加一条纯文本结构信号兜底：回复正文里出现两处以上
+   * `HH:MM`/`HH点`这种时刻表达、且这一轮从没调用过 `pickSchedule`，
+   * 大概率是在编排班——直接判不合格，逼它老实调工具去算。
+   */
+  const timePattern = /([01]?\d|2[0-3])[:：][0-5]\d|([01]?\d|2[0-3])点(半)?/g;
+  const timeMentionCount = (reply.match(timePattern) ?? []).length;
+  const claimedScheduleInText =
+    timeMentionCount >= 2 && scheduleResults.length === 0;
+
+  const claimedShareWithoutScheduling =
+    (toolsUsed.includes("recordShare") || claimedScheduleInText) &&
+    scheduleResults.length === 0;
+
+  const verdict = claimedShareWithoutScheduling
+    ? {
+        pass: false,
+        broke: "0",
+        why: toolsUsed.includes("recordShare")
+          ? "这一轮调用了 recordShare（分配了一份共用资源），但从没调用过" +
+            " pickSchedule 去算这次分配——这是自己心算/瞎猜出来的分配，" +
+            "不是排列组合算出来的。"
+          : "回复正文里出现了两个以上具体时刻，像是在给多人排时间表，" +
+            "但这一轮从没调用过 pickSchedule——这些时间点是编出来的，" +
+            "不是算出来的，必须先调 pickSchedule 排出方案再回复。",
+      }
+    : await critique({
+        to: sender.name,
+        role: senderRole,
+        said: args.text,
+        facts: replyFacts,
+        draft: reply,
+      });
 
   if (!verdict.pass) {
     console.log("[critic] 打回：", verdict.broke, verdict.why);
@@ -2027,7 +2081,9 @@ export async function runColivingTurn(args: {
        * 换种说法，不需要、也不该借机去联系别人（避免打回原因跟第7条
        * 无关时也顺手多发消息，扩大这段代码的影响面）。
        */
-      const isBrokenPromise = verdict.broke.trim() === "7";
+      // "0" 是代码判定的硬规则（分了资源却没算过），"7" 是批判器判的
+      // 承诺没兑现——两者都需要重写时拿到完整工具集，不能只给 sendReply
+      const isBrokenPromise = verdict.broke.trim() === "7" || verdict.broke.trim() === "0";
       /**
        * **根治，不再按"哪种具体动作"逐个开口子。**
        *
@@ -2070,7 +2126,10 @@ export async function runColivingTurn(args: {
           {
             role: "user" as const,
             content:
-              `【这不是住户说的，是审稿意见】\n你刚才那条第${verdict.broke}条不合格：` +
+              `【这不是住户说的，是审稿意见】\n` +
+              (verdict.broke.trim() === "0"
+                ? "你刚才那条不合格（代码判定，不是准则第几条）：\n"
+                : `你刚才那条第${verdict.broke}条不合格：\n`) +
               `${verdict.why}\n\n【这一轮的事实，重写要跟这个对得上】\n${replyFacts}\n\n` +
               (isBrokenPromise
                 ? "你承诺了一件事，但这轮实际没有做到——**现在真的去做**：" +
