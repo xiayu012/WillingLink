@@ -256,6 +256,22 @@ export async function runColivingTurn(args: {
   const toolsUsed: string[] = [];
   const contacted = new Set<string>();
   /**
+   * 每次调用 `pickSchedule` 真正算出来的排第一候选，原样记下来。
+   *
+   * 起因（2026-09-04 真实事故复测发现）：`pickSchedule` 算法本身没有
+   * 拆分连续时段的逻辑（每个人必然分到一段连续区间），但真实跑批时
+   * 出现过"把一个人连续两小时拆成两段、中间空半小时"这种荒谬结果——
+   * 说明不是算法算错了，是**模型调完工具、拿到正确答案之后，写消息
+   * 时没有照抄工具返回的数字，自己心算/瞎编了一版**。而批判器当时
+   * `baseFacts` 里只有"本轮调用的工具：pickSchedule、contactPerson…"
+   * 这样一份工具名单，**看不到 pickSchedule 到底算出了什么**，没法
+   * 拿草稿里写的时段跟工具的真实返回值核对，只能凭常识判断"这个结果
+   * 看着对不对"——常识判断能抓到"拆两段不合理"这种明显问题，但抓不到
+   * "工具说的是A，消息却写了B"这种更隐蔽的不一致。这里把工具真实
+   * 算出的候选摆进 `baseFacts`，批判器就能做那种更精确的核对。
+   */
+  const scheduleResults: string[] = [];
+  /**
    * 这一轮里新加进来、这轮之前压根不存在的人。**批判器的四种角色
    * （报告的人/被说到的人/共用者通知的对象/受影响的其他人）全都假定
    * 这条消息跟一件具体纠纷有关**——但刚加进来打招呼跟纠纷毫无关系，
@@ -755,6 +771,16 @@ export async function runColivingTurn(args: {
         if (plans.length === 0) {
           return { ok: false, reason: "没排出候选，检查一下 people 是不是填对了" };
         }
+        // 只记排第一的候选——那是工具建议的方案，供批判器核对草稿里
+        // 写的时段跟这个对不对得上（不代表模型必须用这个候选，模型
+        // 可能有正当理由选了别的候选，但那种情况下批判器读到的事实
+        // 和草稿本来就该讲清楚"为什么不用第一候选"，不构成误判）。
+        const top = plans[0];
+        scheduleResults.push(
+          `「${windowLabel}」算出的方案：${top.assignments
+            .map((a) => `${a.name} ${formatMinutes(a.startMinutes)}-${formatMinutes(a.endMinutes)}`)
+            .join("，")}`
+        );
         return {
           ok: true,
           windowLabel,
@@ -1699,7 +1725,12 @@ export async function runColivingTurn(args: {
     : "（⚠️ 总人数还没确认过，问一句「一共住几个人」不算多余）";
   const baseFacts =
     `名册上的人：${ctx.members.map((m) => m.name).join("、")}${rosterNote}\n` +
-    `本轮调用的工具：${toolsUsed.join("、") || "无"}`;
+    `本轮调用的工具：${toolsUsed.join("、") || "无"}` +
+    (scheduleResults.length
+      ? `\n${scheduleResults.join("\n")}\n草稿里写的时段必须跟这个对得上——` +
+        "不能把一个人连续的时段拆成两段中间留空当（做饭中途不能停下来），" +
+        "也不能写出跟这里的时间对不上的数字。"
+      : "");
 
   /**
    * **每一条出站消息都要审，不只是回复。**
