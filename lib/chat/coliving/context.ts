@@ -7,6 +7,7 @@ import {
   getCaseShares,
   getMembers,
   getOpenCases,
+  getBlockedComms,
   getStandalonePositions,
   rosterStatus,
   type Member,
@@ -56,15 +57,23 @@ export async function buildContext(
     answering?: { purpose: string | null; body: string; sentAt: Date } | null;
   } = {}
 ): Promise<ColivingContext> {
-  const [members, rules, openCases, roster, recentRaw, standalonePositions] =
-    await Promise.all([
-      getMembers(sender.householdId, channel),
-      getActiveRules(sender.householdId),
-      getOpenCases(sender.householdId),
-      rosterStatus(sender.householdId),
-      recentOutbound(sender.householdId),
-      getStandalonePositions(sender.householdId),
-    ]);
+  const [
+    members,
+    rules,
+    openCases,
+    roster,
+    recentRaw,
+    standalonePositions,
+    blocked,
+  ] = await Promise.all([
+    getMembers(sender.householdId, channel),
+    getActiveRules(sender.householdId),
+    getOpenCases(sender.householdId),
+    rosterStatus(sender.householdId),
+    recentOutbound(sender.householdId),
+    getStandalonePositions(sender.householdId),
+    getBlockedComms(sender.householdId),
+  ]);
 
   // 每件未结的事都可能记了表态（谁想要什么/拒绝了什么/AI 许过什么承诺）——
   // 这里一次性取出来，铺在下面的「还没了结的事」里，不用模型另外调工具查，
@@ -297,6 +306,37 @@ export async function buildContext(
     );
   }
   lines.push("");
+
+  // **在等谁回话**——放在「还没了结的事」前面，因为它比案子列表更可行动：
+  // 案子告诉你"有这么件事"，这份清单告诉你"这件事此刻卡在谁身上"。
+  // 这两天反复出的"说了跟进却没下文""同一个问题问两遍"，根子就是
+  // 以前从来没有这份清单（见 coliving-world-15.sql）。
+  if (blocked.length) {
+    lines.push("## 你在等谁回话");
+    lines.push(
+      "**这些是你问出去、明确要对方回、但还没等到的。** " +
+        "开口之前先看这里：别再问同一个人同一件事，也别把已经在等的事" +
+        "当成还没做。"
+    );
+    for (const b of blocked) {
+      const waited =
+        b.waitedHours < 1
+          ? "刚发出去不到一小时"
+          : b.waitedHours < 24
+            ? `等了 ${b.waitedHours} 小时`
+            : `等了 ${Math.floor(b.waitedHours / 24)} 天`;
+      const flag = b.overdue ? "**⚠️ 已超过合理等待** " : "";
+      const about = b.caseTitle ? `〔${b.caseTitle}〕` : "";
+      lines.push(
+        `- ${flag}在等 ${b.toName} 回：${about}${b.purpose ?? b.body.slice(0, 40)}（${waited}）`
+      );
+    }
+    lines.push(
+      "**标了超时的，说明等得够久了**——可以再提一次（`act` 填 remind），" +
+        "或者换个不依赖他回话的办法把事情往前推。**不要就这么挂着不管。**"
+    );
+    lines.push("");
+  }
 
   lines.push("## 还没了结的事");
   if (openCases.length === 0) {

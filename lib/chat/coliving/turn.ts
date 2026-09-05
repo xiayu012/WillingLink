@@ -491,8 +491,19 @@ export async function runColivingTurn(args: {
           .describe(
             "真正要发出去的短信正文。短、具体、直接说事。不提是谁反映的。"
           ),
+        act: z
+          .enum(["ask", "inform", "propose", "confirm", "remind", "escalate"])
+          .describe(
+            "**这条是在干什么**（决定系统要不要盯着他回音）：\n" +
+              "ask=在问他一个问题，等他答 · inform=告知，他不用回 · " +
+              "propose=提方案征求意见 · confirm=请他确认（事关钱/时间/" +
+              "权利时用）· remind=之前说过的再提一次 · escalate=转给房东。\n" +
+              "**填错的代价**：该等的填成 inform，系统不会盯着，这件事" +
+              "就会悄无声息地烂在那里——这两天反复出的「说了跟进却没" +
+              "下文」正是这么来的。"
+          ),
       }),
-      execute: async ({ name, purpose, scope, sharedWith, message: raw }) => {
+      execute: async ({ name, purpose, scope, sharedWith, act, message: raw }) => {
         const message = stripMarkdown(raw);
         const target = await repo.findPersonByName(sender.householdId, name);
         if (!target) {
@@ -529,6 +540,10 @@ export async function runColivingTurn(args: {
           channel,
           purpose,
           body: message,
+          act,
+          // ask/propose/confirm 都是把球踢给对方、等他回；
+          // inform/remind/escalate 不占用"在等谁"这份清单
+          expectsReply: act === "ask" || act === "propose" || act === "confirm",
         });
         // 也要写进对方自己的会话线。否则下次他发消息过来，
         // 我们看不到自己曾经对他说过什么——他却记得。

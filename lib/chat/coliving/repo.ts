@@ -711,6 +711,26 @@ export async function upgradeDecisionKind(
 }
 
 /** Decision 产生的实际外呼。先落库（queued），发送成功再回写。 */
+export type CommunicationAct =
+  | "ask"
+  | "inform"
+  | "propose"
+  | "confirm"
+  | "remind"
+  | "escalate";
+
+/**
+ * 按言语行为推出「什么时候之前该有回音」。**不让模型填具体时间**——
+ * 它会乱填（第十五批的设计决定）。只有真的在等的那几类才有时限。
+ */
+function replyDueFor(act: CommunicationAct | null, expectsReply: boolean): Date | null {
+  if (!expectsReply || !act) {
+    return null;
+  }
+  const hours = act === "remind" ? 12 : act === "ask" || act === "confirm" ? 24 : null;
+  return hours === null ? null : new Date(Date.now() + hours * 3600 * 1000);
+}
+
 export async function queueCommunication(args: {
   householdId: string;
   decisionId?: string | null;
@@ -719,16 +739,72 @@ export async function queueCommunication(args: {
   channel: string;
   purpose?: string | null;
   body: string;
+  /** 这条是什么言语行为。决定要不要盯回音、盯多久 */
+  act?: CommunicationAct | null;
+  /** 要不要盯着对方回音。**默认 false**，见 coliving-world-15.sql 的说明 */
+  expectsReply?: boolean;
 }): Promise<string> {
+  const act = args.act ?? null;
+  const expectsReply = args.expectsReply ?? false;
   const rows = await db()<{ id: string }[]>`
     insert into coliving.communication
-      (household_id, decision_id, case_id, to_person_id, channel, purpose, body)
+      (household_id, decision_id, case_id, to_person_id, channel, purpose, body,
+       act, expects_reply, reply_due_at)
     values (${args.householdId}, ${args.decisionId ?? null},
             ${args.caseId ?? null}, ${args.toPersonId}, ${args.channel},
-            ${args.purpose ?? null}, ${args.body})
+            ${args.purpose ?? null}, ${args.body},
+            ${act}, ${expectsReply}, ${replyDueFor(act, expectsReply)})
     returning id
   `;
   return rows[0].id;
+}
+
+export type BlockedComm = {
+  toName: string;
+  purpose: string | null;
+  body: string;
+  act: CommunicationAct | null;
+  sentAt: Date;
+  replyDueAt: Date | null;
+  caseTitle: string | null;
+  /** 已经等了多少小时（整数，向下取整） */
+  waitedHours: number;
+  overdue: boolean;
+};
+
+/**
+ * **阻塞清单**：这栋房子现在有哪些事，卡在等某个人回话。
+ *
+ * 这是第十五批的核心产出——敏捷站会那块 blocker board 的等价物。
+ * 在这之前，"我在等谁"这件事从来没有被结构化过：`pendingCommunication`
+ * 是按人查的（"这个人有没有待回应的"），回答不了"厨房排班这件事现在
+ * 卡在谁身上、卡了多久"。AI 只能每轮重读聊天记录临时拼，于是反复
+ * 出现"说了回头跟进然后就没下文""同一个问题问了两遍"。
+ *
+ * 只算真正在等的：发出去了（sent）、明确要回音（expects_reply）、
+ * 还没人回（responded_at is null）。不需要回复的通知不进这张清单，
+ * 否则会被噪音淹没。
+ */
+export async function getBlockedComms(
+  householdId: string,
+  limit = 10
+): Promise<BlockedComm[]> {
+  return await db()<BlockedComm[]>`
+    select p.display_name as "toName", c.purpose, c.body, c.act,
+           c.sent_at as "sentAt", c.reply_due_at as "replyDueAt",
+           cf.title as "caseTitle",
+           floor(extract(epoch from (now() - c.sent_at)) / 3600)::int as "waitedHours",
+           (c.reply_due_at is not null and c.reply_due_at < now()) as overdue
+    from coliving.communication c
+    join coliving.person p on p.id = c.to_person_id
+    left join coliving.case_file cf on cf.id = c.case_id
+    where c.household_id = ${householdId}
+      and c.status = 'sent'
+      and c.expects_reply = true
+      and c.responded_at is null
+    order by c.sent_at asc
+    limit ${limit}
+  `;
 }
 
 export async function markCommunication(args: {
@@ -1780,7 +1856,14 @@ export async function linkResponse(args: {
         and status = 'sent'
         and responded_at is null
         and sent_at > now() - (${args.withinHours ?? 72} || ' hours')::interval
-      order by sent_at desc
+      -- **在等回复的那条优先**，其次才是最近的一条。
+      -- 2026-09-05 实测发现的老 bug：以前只按 sent_at desc 取最近一条，
+      -- 如果先问了个问题、又发了条不用回的通知，住户的回话会被算到
+      -- 那条通知头上，**真正在等的问句永远清不掉**，于是它会一直留在
+      -- 阻塞清单里，AI 以为还没人回、可能再问一遍。
+      -- 这个 bug 一直存在，只是在 expects_reply 字段加进来之前
+      -- 根本无从表达"哪条才是真的在等"。
+      order by (expects_reply = true) desc, sent_at desc
       limit 1
     )
     returning id as "communicationId", purpose
