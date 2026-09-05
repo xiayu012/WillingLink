@@ -1727,66 +1727,84 @@ export async function runColivingTurn(args: {
    * 调用。
    */
   const recentForCritique = await repo.recentOutbound(sender.householdId, 24);
-  const outboundVerdicts = await Promise.all(
-    outbound.map((o) => {
-      const targetName = outboundNames.get(o.personId) ?? "某位住户";
-      const withThisPerson = recentForCritique
-        // **必须早于本轮开始**——本轮自己刚发的（含正在审的这条本身）
-        // 都已经写进库了，不排除的话批判器会拿这条消息跟它自己比对。
-        .filter((r) => r.to === targetName && r.sentAt < turnStartedAt)
-        .slice(0, 6)
-        .map(
-          (r) =>
-            `${r.direction === "inbound" ? "他说" : "你对他说"}：${r.body
-              .replace(/\n/g, " ")
-              .slice(0, 60)}`
-        );
-      return critique({
-        to: targetName,
-        /**
-         * 共用者规矩、针对个人的事、中性打招呼，三种判法完全不同。
-         * **"被说到的人"这个角色是给纠纷场景准备的**——刚加进系统、
-         * 这一轮才第一次联系的人，跟任何纠纷都还扯不上关系，硬套这个
-         * 角色会把中性的自我介绍当成"针对他的指控"来审，产生假阳性。
-         */
-        role: o.isIntroduction
-          ? "不确定"
-          : o.sharedRule
-            ? "共用者通知的对象"
-            : "被说到的人",
-        said: "",
-        facts:
-          `${baseFacts}\n这条是主动发的，起因是 ${sender.name} 说：${args.text}` +
-          (o.isIntroduction
-            ? "\n这个人是这一轮才刚加进系统的，这条是第一次联系、" +
-              "自我介绍性质，不是在回应任何投诉或纠纷"
-            : "") +
-          (o.sharedRule
-            ? `\n这是对共用者一样的规矩；模型声明的共用范围：${
-                o.sharedWith ?? "（没说清是哪些人 —— 这本身就是问题）"
-              }`
-            : "") +
-          (withThisPerson.length
-            ? `\n最近跟他之间的往来（新到旧）：\n${withThisPerson.join("\n")}`
-            : "\n最近没有跟他之间的往来记录"),
-        draft: o.text,
-      });
-    })
-  );
-  // 出站那些不重写（重写要重跑整轮），但**不合格就不发**，并留痕。
-  // 宁可少发一条，也不发一条会让人觉得被冤枉的。
-  for (const [i, v] of outboundVerdicts.entries()) {
-    if (!v.pass) {
-      const msg = outbound[i];
-      console.log("[critic] 拦下一条出站：", v.broke, v.why, msg.text);
-      await repo.markCommunication({
-        communicationId: msg.communicationId,
-        status: "skipped",
-        error: `审稿不合格 第${v.broke}条：${v.why}`,
-      });
-      msg.blocked = true;
+
+  /**
+   * 抽成函数是因为**这条审核不止跑一次**——2026-09-05 发现的真实漏洞：
+   * 批判器打回回复、进入重写阶段时，重写拿到了完整工具集（含
+   * `contactPerson`），如果它这时候才调用 `contactPerson` 发消息，
+   * 那条消息是在这批审核**跑完之后**才被 push 进 `outbound` 的，
+   * 从头到尾没有经过任何审核就会被投递——等于重写阶段发的消息拿到了
+   * "先斩后奏、永不复核"的特权，反而是全流程里唯一没人把关的一条。
+   * 抽出来是为了重写结束后能对新增的那部分再跑一遍同样的检查，
+   * 不新写一份逻辑、不产生"两条审核标准不一致"的风险。
+   */
+  // TS 的控制流窄化过不了闭包边界（sender 在函数顶部已经判过非空），
+  // 这里显式存一份非空引用给闭包用，不然每处 sender.xxx 都会报"可能为 null"
+  const senderName = sender.name;
+  async function critiqueAndMarkOutbound(msgs: OutboundMessage[]): Promise<void> {
+    const verdicts = await Promise.all(
+      msgs.map((o) => {
+        const targetName = outboundNames.get(o.personId) ?? "某位住户";
+        const withThisPerson = recentForCritique
+          // **必须早于本轮开始**——本轮自己刚发的（含正在审的这条本身）
+          // 都已经写进库了，不排除的话批判器会拿这条消息跟它自己比对。
+          .filter((r) => r.to === targetName && r.sentAt < turnStartedAt)
+          .slice(0, 6)
+          .map(
+            (r) =>
+              `${r.direction === "inbound" ? "他说" : "你对他说"}：${r.body
+                .replace(/\n/g, " ")
+                .slice(0, 60)}`
+          );
+        return critique({
+          to: targetName,
+          /**
+           * 共用者规矩、针对个人的事、中性打招呼，三种判法完全不同。
+           * **"被说到的人"这个角色是给纠纷场景准备的**——刚加进系统、
+           * 这一轮才第一次联系的人，跟任何纠纷都还扯不上关系，硬套这个
+           * 角色会把中性的自我介绍当成"针对他的指控"来审，产生假阳性。
+           */
+          role: o.isIntroduction
+            ? "不确定"
+            : o.sharedRule
+              ? "共用者通知的对象"
+              : "被说到的人",
+          said: "",
+          facts:
+            `${baseFacts}\n这条是主动发的，起因是 ${senderName} 说：${args.text}` +
+            (o.isIntroduction
+              ? "\n这个人是这一轮才刚加进系统的，这条是第一次联系、" +
+                "自我介绍性质，不是在回应任何投诉或纠纷"
+              : "") +
+            (o.sharedRule
+              ? `\n这是对共用者一样的规矩；模型声明的共用范围：${
+                  o.sharedWith ?? "（没说清是哪些人 —— 这本身就是问题）"
+                }`
+              : "") +
+            (withThisPerson.length
+              ? `\n最近跟他之间的往来（新到旧）：\n${withThisPerson.join("\n")}`
+              : "\n最近没有跟他之间的往来记录"),
+          draft: o.text,
+        });
+      })
+    );
+    // 出站那些不重写（重写要重跑整轮），但**不合格就不发**，并留痕。
+    // 宁可少发一条，也不发一条会让人觉得被冤枉的。
+    for (const [i, v] of verdicts.entries()) {
+      if (!v.pass) {
+        const msg = msgs[i];
+        console.log("[critic] 拦下一条出站：", v.broke, v.why, msg.text);
+        await repo.markCommunication({
+          communicationId: msg.communicationId,
+          status: "skipped",
+          error: `审稿不合格 第${v.broke}条：${v.why}`,
+        });
+        msg.blocked = true;
+      }
     }
   }
+
+  await critiqueAndMarkOutbound(outbound);
 
   /**
    * 回复的审稿放在出站之后（不能并发）：**回复如果说"我去联系他了"，
@@ -1870,6 +1888,10 @@ export async function runColivingTurn(args: {
        */
       const redoTools: Record<string, (typeof tools)[keyof typeof tools]> =
         isBrokenPromise ? { ...activeTools, sendReply: tools.sendReply } : { sendReply: tools.sendReply };
+      // 重写期间如果调用 contactPerson，新消息会 push 到这同一个
+      // outbound 数组——记下重写前的长度，重写完只审"新增的那一截"，
+      // 不重复审已经审过、已经落定的那些
+      const outboundLenBeforeRedo = outbound.length;
       await generateText({
         model: getLanguageModel(modelId),
         system: [
@@ -1895,13 +1917,18 @@ export async function runColivingTurn(args: {
                 ? "你承诺了一件事，但这轮实际没有做到——**现在真的去做**：" +
                   "该联系人、该排方案、该记什么，你手上有跟正常这一轮" +
                   "一样的全部工具，自己判断该调哪个，做完再调 `sendReply` " +
-                  "交付，回复里就可以如实说已经做了。只有确实做不了（联系" +
-                  "不上、缺必需的信息）才允许直接调 `sendReply`，并把回复" +
-                  "改成如实反映「做不了/还缺什么」，不能说成已经做完了。\n\n" +
-                  "如果这次重写你判断这一步根本不该承诺做这件事（原本的" +
-                  "判断就是错的），直接改措辞、调 `sendReply` 也可以——" +
-                  "不强制一定要先调别的工具，只是不能既没做事、又在回复里" +
-                  "说得像已经做完了。\n\n"
+                  "交付，回复里就可以如实说已经做了。\n\n" +
+                  "**只有两种情况允许不调工具、直接改措辞**：" +
+                  "①确实做不了（联系不上、对方不在名册里）；" +
+                  "②这一步所需的信息本来就不全，且**你已经在更早的轮次" +
+                  "或本轮别的步骤里问过了**，现在只是等对方回——" +
+                  "这种情况可以说「等他们回」，但不能是「这轮才第一次" +
+                  "意识到该问、却决定不问、只说回头再问」这种拖延。\n\n" +
+                  "**不属于上面两种情况、只是嫌麻烦不想现在做，一律不" +
+                  "合格**——「这事我记下了，回头去问」「打算联系他」这类" +
+                  "说法只有在真符合①②时才能用，不是随便换个时态就能用的" +
+                  "免检词。用了这类说法，回复里必须同时体现②的条件成立" +
+                  "（比如提一句「之前问过」「还没等到回音」），不能空说。\n\n"
                 : "") +
               "重写一条，调 sendReply 把要发给对方的那句话交出来。" +
               "上面事实里标了「被审稿拦下，没有发出去」的联系，" +
@@ -1911,8 +1938,7 @@ export async function runColivingTurn(args: {
               "这轮就是没有发生——不管用什么时态描述，都不能说成已经联系到了" +
               "或者正在联系。具体说：『我正/正在/已经/这就跟他说/商量/联系』" +
               "这类话都不能用（第16轮踩过：把『正在』换成『正去』照样是同一个" +
-              "问题，文字游戏绕不开这条），只能用明确还没发生、稍后才做的" +
-              "说法，比如『我会去跟他说』『打算联系他』『这事我记下了，回头去问』。",
+              "问题，文字游戏绕不开这条）。",
           },
         ],
         tools: redoTools,
@@ -1926,6 +1952,58 @@ export async function runColivingTurn(args: {
       const fixed = stripMarkdown((deliveredReply ?? "").trim());
       if (fixed) {
         reply = fixed;
+      }
+
+      /**
+       * **重写期间新发的消息，补审一遍。** 2026-09-05 真实发现：
+       * 重写拿到完整工具集后，如果这时候才调 `contactPerson`，那条
+       * 消息是在最初那批出站审核跑完之后才 push 进 `outbound` 的，
+       * 从来没被检查过就会直接投递——反而是全流程里唯一没人把关的。
+       */
+      const newOutbound = outbound.slice(outboundLenBeforeRedo);
+      if (newOutbound.length > 0) {
+        await critiqueAndMarkOutbound(newOutbound);
+      }
+
+      /**
+       * **重写的结果也要再查一遍，不能写完就当合格。** 2026-09-05
+       * 真实发现：批判器打回"承诺没兑现"、给了完整工具集重写，但重写
+       * 可以选择"这一步不该做"这条路径、只换个措辞就蒙混过去
+       * ——比如信息明明不全、这轮也没去问，却直接说"回头去问"，
+       * 这类话在字面上是将来时、不撒谎，但违反了 core.md 闸五
+       * （信息不全时延后必须先问）。**这条路径以前完全没人复查**，
+       * 重写永远被当成"改完就对"。
+       *
+       * 只查一次，不循环重写——查出还是不合格，说明这条内容本身
+       * 有分歧（可能是批判器过严，也可能是模型确实拧不过来），
+       * 死循环重写只会越改越糟，倒不如老实发出去、把这次分歧记下来，
+       * 好过用户完全收不到回复。**这是有意的"有限复核"，不是查漏。**
+       */
+      const newReplyFacts =
+        baseFacts +
+        (outbound.length
+          ? `\n同一轮还联系了别人：${outbound
+              .map(
+                (o) =>
+                  `→${o.blocked ? "【这条被审稿拦下，没有发出去】" : ""}${o.text}`
+              )
+              .join(" ／ ")}`
+          : "\n这一轮没有联系任何其他人");
+      const redoVerdict = await critique({
+        to: sender.name,
+        role: senderRole,
+        said: args.text,
+        facts: newReplyFacts,
+        draft: reply,
+      });
+      if (!redoVerdict.pass) {
+        // 不再重写第二次——记录下来，老实把这条发出去。
+        // 「有消息总好过没消息」的原则同样适用于这里。
+        console.log(
+          "[critic] 重写后复核仍不合格（只记录，不再重写）：",
+          redoVerdict.broke,
+          redoVerdict.why
+        );
       }
     } catch (error) {
       // 改不动就用原来那条——有消息总好过没消息
