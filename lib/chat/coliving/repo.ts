@@ -169,14 +169,30 @@ export async function getMembers(
       -- 这里写死白名单的话，模型记了新类别也读不出来——静默失效，
       -- 而且要到有人发现「它明明记过却不知道」时才暴露。
       -- 只排掉 summary：那是给人看的汇总，不是关于这个人的事实。
-      -- **推断要标出来。** 混着读会让 AI 把自己的猜测当事实，
-      -- 再基于它推新的猜测——几年下来不可逆地跑偏。
+      -- **推断和单方指控都要标出来。** 混着读会让 AI 把自己的猜测、
+      -- 或者别人对他的指控，当成已确认的事实，再基于它推新的——
+      -- 几年下来不可逆地跑偏。
+      --
+      -- third_party 那一支是 2026-09-05 补的：stated_by 字段第七批
+      -- 就存下来了，但这里从来没读过它——**数据在库里，模型却看不到**，
+      -- 于是"A 说 B 半夜吵"在 B 的档案里读起来跟 B 自己承认的一样。
+      -- 这跟宪法第九条（一方的说法不是事实）是同一件事，之前只有提示词
+      -- 在管，现在渲染层也把来源摆出来。
       -- 同时按 fact_to 过滤掉已经过期的事实（「这周上夜班」到期就不该再读）。
       coalesce(
         (select array_agg(
-                  case when mem.basis = 'inferred'
-                       then '（推测）' || mem.content
-                       else mem.content end
+                  case
+                    when mem.basis = 'inferred'
+                      then '（推测）' || mem.content
+                    when mem.basis = 'third_party'
+                      then '（' ||
+                           coalesce(
+                             (select sp.display_name from coliving.person sp
+                               where sp.id = mem.stated_by),
+                             '别人'
+                           ) || '说的，本人没确认过）' || mem.content
+                    else mem.content
+                  end
                 order by mem.created_at)
            from coliving.memory mem
           where mem.person_id = p.id
@@ -791,9 +807,12 @@ export async function noteMemory(args: {
   personId?: string | null;
   kind: string;
   content: string;
-  /** 默认 stated。**推断一定要显式填 inferred** */
-  basis?: "stated" | "observed" | "inferred";
-  /** 谁说的。可能不是这条记忆的主人（室友转述） */
+  /**
+   * 默认 stated。**推断一定要显式填 inferred**；
+   * **别人说他的（A 投诉 B 那类）填 third_party**——那不是他自己承认的
+   */
+  basis?: "stated" | "observed" | "inferred" | "third_party";
+  /** 谁说的。可能不是这条记忆的主人（室友转述、A 投诉 B） */
   statedBy?: string | null;
   /** 主题键，同人同主题只留一条当前有效 */
   subjectKey?: string | null;

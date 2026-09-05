@@ -1021,13 +1021,17 @@ export async function runColivingTurn(args: {
           ),
         content: z.string().describe("一句话，写事实"),
         basis: z
-          .enum(["stated", "observed", "inferred"])
+          .enum(["stated", "observed", "inferred", "third_party"])
           .describe(
             "**这条是怎么来的，必须诚实**：stated=当事人自己说的 · " +
-              "observed=你从系统记录里看到的 · inferred=**你推出来的**。\n" +
-              "「我上夜班」是 stated；「所以他白天睡觉」是 inferred。\n" +
-              "把推断标成 stated，几年后你会把自己的猜测当事实读回去，" +
-              "再基于它推新的——**记忆会被自己污染，而且回不去了**。"
+              "observed=你从系统记录里看到的 · inferred=**你推出来的** · " +
+              "third_party=**别人说他的，他自己还没确认过**。\n" +
+              "「我上夜班」是 stated；「所以他白天睡觉」是 inferred；\n" +
+              "**A 跟你说「B 半夜老在厨房打电话」，给 B 记的这条是 " +
+              "third_party，不是 stated**——B 从头到尾没说过话。\n" +
+              "把推断或别人的指控标成 stated，几个月后没人记得那只是" +
+              "单方说法，你会把它当确认过的事实读回去，再基于它推新的" +
+              "——**记忆会被自己污染，而且回不去了**。"
           ),
         subjectKey: z
           .string()
