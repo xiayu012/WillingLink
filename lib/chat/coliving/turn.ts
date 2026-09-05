@@ -1783,7 +1783,7 @@ export async function runColivingTurn(args: {
       .filter((n): n is string => !!n);
     if (names.length > 0) {
       try {
-        await generateText({
+        const forcedContact = await generateText({
           model: getLanguageModel(modelId),
           system: [
             {
@@ -1810,6 +1810,14 @@ export async function runColivingTurn(args: {
           toolChoice: { type: "tool", toolName: "contactPerson" },
           stopWhen: stepCountIs(names.length),
         });
+        // 同一个盲区（2026-09-05 泛化排班硬规则时才发现原来不止一处）：
+        // 这次强制补发自己的工具调用之前没被记进 toolsUsed，外部看不出
+        // "新人已经被联系到"到底是主生成做的还是这条安全网兜住的。
+        for (const step of forcedContact.steps) {
+          for (const call of step.toolCalls ?? []) {
+            toolsUsed.push(call.toolName);
+          }
+        }
       } catch (error) {
         console.log(
           "[turn] 强制打招呼补发失败：",
@@ -2023,13 +2031,42 @@ export async function runColivingTurn(args: {
    * `HH:MM`/`HH点`这种时刻表达、且这一轮从没调用过 `pickSchedule`，
    * 大概率是在编排班——直接判不合格，逼它老实调工具去算。
    */
-  const timePattern = /([01]?\d|2[0-3])[:：][0-5]\d|([01]?\d|2[0-3])点(半)?/g;
-  /** 把 "18点"/"18点半"/"18:00" 统一成 "HH:MM"，方便跟 formatMinutes 的输出比对 */
+  /**
+   * **2026-09-05 补：中文数字的钟点也要认。** 真实复现过：回复写
+   * "六点到八点"，这条正则原来只认阿拉伯数字（"6点"/"18:00"），
+   * 中文数字被漏检——不是走到了 `checkFactFidelity` 却判错，是**根本
+   * 没进这条判断**，掉回了原来那条"批判器主观判断+只给一次重写机会"
+   * 的老路径，可靠性又退回了今天最开始要解决的那个问题。**同一件事，
+   * 数字写法不同就能绕开检测，检测规则必须跟着输入的所有写法走全，
+   * 不能只顾着最常见的那种。**
+   */
+  const CN_DIGIT: Record<string, number> = {
+    零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5,
+    六: 6, 七: 7, 八: 8, 九: 9, 十: 10, 十一: 11, 十二: 12,
+  };
+  const cnHourPattern = "(?:十[一二]|[一二三四五六七八九十两])";
+  const timePattern = new RegExp(
+    `([01]?\\d|2[0-3])[:：][0-5]\\d|([01]?\\d|2[0-3])点(半)?|${cnHourPattern}点(半)?`,
+    "g"
+  );
+  /**
+   * 把 "18点"/"18点半"/"18:00"/"六点"/"六点半" 统一成 "HH:MM"，
+   * 方便跟 formatMinutes 的输出比对。
+   *
+   * **中文数字不做上午/下午换算**，直接按字面值当小时数——这是跟阿拉伯
+   * 数字保持一致的取舍：现有逻辑对"8点"也不判断是不是指晚上8点该写
+   * 20:00，两者都是字面值直传，不引入新的不一致。
+   */
   const normalizeTime = (raw: string): string => {
     const colonMatch = raw.match(/^([01]?\d|2[0-3])[:：]([0-5]\d)$/);
     if (colonMatch) return `${colonMatch[1].padStart(2, "0")}:${colonMatch[2]}`;
     const hourMatch = raw.match(/^([01]?\d|2[0-3])点(半)?$/);
     if (hourMatch) return `${hourMatch[1].padStart(2, "0")}:${hourMatch[2] ? "30" : "00"}`;
+    const cnMatch = raw.match(new RegExp(`^(${cnHourPattern})点(半)?$`));
+    if (cnMatch) {
+      const hour = CN_DIGIT[cnMatch[1]];
+      return `${String(hour).padStart(2, "0")}:${cnMatch[2] ? "30" : "00"}`;
+    }
     return raw;
   };
   /**
@@ -2091,7 +2128,67 @@ export async function runColivingTurn(args: {
     return null;
   }
 
-  const scheduleHardRuleHit = checkScheduleHardRule(reply);
+  /**
+   * **2026-09-05 泛化：这不是排班专属的病，是"模型转述一个代码已经
+   * 知道答案的事实"这整类动作的病，换个事实换个马甲会反复发作。**
+   *
+   * 排班场景堵的是"转述算出来的数字"；这里堵的是同一种病的另一个马甲：
+   * "转述这一轮联系有没有真的发出去"——今天测试里出现频率**比排班数字
+   * 对不上还高**：一轮又一轮，模型说"我已经联系他了""正在跟他说""这就
+   * 去问"，而 facts 明明白白写着那条 `contactPerson` 消息被审稿拦下、
+   * 根本没发出去。以前这类只靠批判器（rubric 第7条）主观判断，"有限
+   * 复核"同样只给一次重写机会，重写完继续这么说也只能老实发出去。
+   *
+   * 判定不需要语义理解——**这一轮有没有被拦下的出站消息**是代码已知的
+   * 硬事实（`outbound[].blocked`），"回复里有没有用现在时/将来时声称
+   * 联系成功"是可枚举的措辞（这份措辞清单本来就已经写进了下面 redo
+   * 的提示词里，只是以前只当"提醒"用，没有当"检查"用）。
+   *
+   * **不要求精确对应"声称联系的是哪一位"**——只要这一轮有任意一条
+   * 出站被拦，回复里又出现任意一个"声称联系成功"的表达，就判不合格。
+   * 宁可稍微宽松触发、多重写一次，也不要因为想精确匹配"是不是说的
+   * 就是被拦的那条"而放过真正的谎言（拦截通常发生在唯一一条出站上，
+   * 精确匹配带来的收益很小，复杂度却要高一截）。
+   */
+  const claimedContactSuccessPattern =
+    /(我|这|马上|现在)?(正|正在|已经|这就|刚刚?|刚才)(跟|和|给|去跟|去和|去给)?.{0,6}(说|商量|联系|问|通知|沟通|确认|谈|提|讲|劝)/;
+  function checkFalseContactClaim(
+    text: string
+  ): { broke: "0"; why: string } | null {
+    const anyBlocked = outbound.some((o) => o.blocked);
+    if (anyBlocked && claimedContactSuccessPattern.test(text)) {
+      const blockedTargets = outbound
+        .filter((o) => o.blocked)
+        .map((o) => o.personId)
+        .join("、");
+      return {
+        broke: "0",
+        why:
+          "回复里像是在说这一轮已经/正在联系到某人，但这一轮发给" +
+          `（person_id: ${blockedTargets}）的消息被审稿拦下，没有发出去` +
+          "——这一轮这件事没有发生，不管用什么时态描述都不能说成已经" +
+          "联系到了或者正在联系，老实说清楚这一步还没做成，或者换一种" +
+          "确实做了的事来说。",
+      };
+    }
+    return null;
+  }
+
+  /**
+   * **代码级硬规则的统一入口。** 以后再发现第三种"模型转述代码已知
+   * 事实却转述错"的马甲（比如分摊金额），往这个数组里加一个检查函数
+   * 就够了，不需要重新搭一套"检测+重写"的脚手架——脚手架（下面的
+   * `verdict` 判定、`isBrokenPromise` 给完整工具集、追加重写循环）
+   * 是通用的，各个检查函数只负责回答"这条文本符合我要防的那种转述
+   * 失真吗"。
+   */
+  function checkFactFidelity(
+    text: string
+  ): { broke: "0"; why: string } | null {
+    return checkScheduleHardRule(text) ?? checkFalseContactClaim(text);
+  }
+
+  const factFidelityHit = checkFactFidelity(reply);
 
   /**
    * **2026-09-05 再补充**：`pickSchedule` 确实被调用了，但交付的回复
@@ -2108,8 +2205,8 @@ export async function runColivingTurn(args: {
    * 算出的时刻，回复里出现任何不在这个集合里的时刻，就一定是编的，
    * 没有"批判器可能误判"的空间。
    */
-  const verdict = scheduleHardRuleHit
-    ? { pass: false as const, ...scheduleHardRuleHit }
+  const verdict = factFidelityHit
+    ? { pass: false as const, ...factFidelityHit }
     : await critique({
         to: sender.name,
         role: senderRole,
@@ -2196,7 +2293,7 @@ export async function runColivingTurn(args: {
       // outbound 数组——记下重写前的长度，重写完只审"新增的那一截"，
       // 不重复审已经审过、已经落定的那些
       const outboundLenBeforeRedo = outbound.length;
-      await generateText({
+      const redoResult = await generateText({
         model: getLanguageModel(modelId),
         system: [
           {
@@ -2256,37 +2353,59 @@ export async function runColivingTurn(args: {
         // MAX_STEPS=6——这是补救性的单次重写，不该比正常一轮更奢侈。
         stopWhen: [hasToolCall("sendReply"), stepCountIs(4)],
       });
+      /**
+       * **同一个盲区，第三处发现（2026-09-05）：** 主生成、MAX_STEPS
+       * 兜底、强制打招呼补发都已经在聚合 `toolsUsed`，唯独这条"第一层
+       * 重写"从一开始就没聚合过——今天泛化排班硬规则时用 `coliving-eval`
+       * 全量跑批才暴露：重写期间真的调用了 `pickSchedule`/`contactPerson`、
+       * `scheduleResults`/`outbound` 都确实被更新了，但外部看到的
+       * `toolsUsed` 里没有它们，`mustUseAnyOfTools` 这类断言会**误判
+       * 失败**——不是这次改动引入了新 bug，是这次改动第一次让"重写期间
+       * 调用工具"这条路径被真实触发到了，才照见这个一直存在的盲区。
+       */
+      for (const step of redoResult.steps) {
+        for (const call of step.toolCalls ?? []) {
+          toolsUsed.push(call.toolName);
+        }
+      }
       const fixed = stripMarkdown((deliveredReply ?? "").trim());
       if (fixed) {
         reply = fixed;
       }
 
       /**
-       * **排班时段不对齐是代码可验证的客观事实，不是主观分歧——
-       * 值得比"有限复核"多给几次机会。**
+       * **代码可验证的客观事实转述失真，不是主观分歧——值得比"有限
+       * 复核"多给几次机会。这段循环不是排班专属的，是给
+       * `checkFactFidelity` 里所有检查函数通用的收尾。**
        *
-       * 2026-09-05 真实复现：三人厨房场景里，批判器连续两次正确打回
-       * "回复时段跟 pickSchedule 算出的对不上"，重写完还是没对齐
-       * （把新旧两个版本的时段拼在一句话里，读起来自相矛盾），"有限
-       * 复核"只查一次就放弃，这条自相矛盾的消息原样发给了住户。
+       * 2026-09-05 真实复现（排班）：三人厨房场景里，批判器连续两次
+       * 正确打回"回复时段跟 pickSchedule 算出的对不上"，重写完还是
+       * 没对齐（把新旧两个版本的时段拼在一句话里，读起来自相矛盾），
+       * "有限复核"只查一次就放弃，这条自相矛盾的消息原样发给了住户。
        *
-       * 为什么这里可以打破"只重写一次"的惯例：`checkScheduleHardRule`
-       * 判的是纯字符串匹配（回复里的时刻在不在 `computedTimes` 集合里），
-       * **不存在"批判器可能理解错"的空间**——`pickSchedule` 算出的时刻
-       * 是唯一真值。主观分歧才有"越改越糟、不如老实发出去"的顾虑，
-       * 客观错字不存在这个顾虑，多试几次只会更接近正确答案，不会更糟。
-       * 复查本身也不花模型调用（正则匹配），只有真要重写时才调模型。
+       * 同一天泛化出第二个马甲（联系状态）：测试里出现频率比排班数字
+       * 对不上还高——模型说"我已经联系他了""正在跟他说"，而 facts
+       * 明明白白写着那条 `contactPerson` 消息被拦下、没发出去。
+       * 两者是同一种病：**转述一个代码已经知道答案的事实，转述错了**。
        *
-       * 有界（最多再试 2 次）而不是循环到通过：万一 `pickSchedule` 的
-       * 结果本身就没法用大白话说清楚（理论上不应该，但留个上限保险），
-       * 不能真的死循环。
+       * 为什么这里可以打破"只重写一次"的惯例：`checkFactFidelity` 里
+       * 每个检查函数判的都是纯代码可验证的事实（时刻在不在
+       * `pickSchedule` 算出的集合里、出站消息有没有真的被拦），
+       * **不存在"批判器可能理解错"的空间**。主观分歧才有"越改越糟、
+       * 不如老实发出去"的顾虑，客观事实不存在这个顾虑，多试几次只会
+       * 更接近正确答案，不会更糟。复查本身也不花模型调用（纯代码判断），
+       * 只有真要重写时才调模型。
+       *
+       * 有界（最多再试 2 次）而不是循环到通过：万一某个检查函数本身
+       * 就没法通过话术满足（理论上不应该，但留个上限保险），不能真的
+       * 死循环。
        */
-      let scheduleAttempts = 0;
-      while (checkScheduleHardRule(reply) && scheduleAttempts < 2) {
-        scheduleAttempts++;
-        const stillWrong = checkScheduleHardRule(reply)!;
+      let factFidelityAttempts = 0;
+      while (checkFactFidelity(reply) && factFidelityAttempts < 2) {
+        factFidelityAttempts++;
+        const stillWrong = checkFactFidelity(reply)!;
         console.log(
-          `[schedule-retry] 第${scheduleAttempts}次追加重写：`,
+          `[fact-fidelity-retry] 第${factFidelityAttempts}次追加重写：`,
           stillWrong.why
         );
         const retryOutboundLen = outbound.length;
@@ -2304,11 +2423,13 @@ export async function runColivingTurn(args: {
          * 路由判不出冲突话题，`pickSchedule` 从一开始就不在 `activeTools`
          * 里，重试拿到的还是同一个空集合，两次重试仍然白烧。
          *
-         * 但"排班硬规则命中"这件事本身就是"这一轮需要排班"的**确定信号**，
-         * 比路由靠关键词猜话题可靠得多——命中就无条件把 `pickSchedule`
-         * 塞进这次重写的工具集，不依赖路由判断对不对。
+         * 但"硬规则命中"这件事本身就是"这一轮需要这个工具"的**确定
+         * 信号**，比路由靠关键词猜话题可靠得多——命中就无条件把
+         * `pickSchedule` 塞进这次重写的工具集，不依赖路由判断对不对。
+         * `contactPerson` 本身就是核心链路常驻工具（见工具分层注释），
+         * 不受路由影响，不需要额外补。
          */
-        await generateText({
+        const retryResult = await generateText({
           model: getLanguageModel(modelId),
           system: [
             {
@@ -2333,6 +2454,9 @@ export async function runColivingTurn(args: {
                 "把候选排出来，再照着结果说话——不要在正文里自己心算时段。" +
                 "只说一个版本的时段，不要同时提新旧两个版本让对方猜、" +
                 "不要用「或者」「之间」这类模糊词回避精确对齐。" +
+                "如果是联系状态的问题：这一轮没发出去就是没发出去，" +
+                "老实说清楚还没联系到，或者说清楚接下来打算怎么做，" +
+                "不能用任何时态说成已经联系到了或者正在联系。" +
                 "最后调 sendReply 把改好的这句话交出来。",
             },
           ],
@@ -2345,6 +2469,15 @@ export async function runColivingTurn(args: {
           // 可能要先调 pickSchedule 再 sendReply，给够 2 步的余量
           stopWhen: [hasToolCall("sendReply"), stepCountIs(3)],
         });
+        // 同一个盲区第四处——这条循环本身是这次泛化才新写的，写的时候
+        // 就该顺手聚合，结果还是漏了，说明这个盲区已经不是"忘了"这么
+        // 简单，值得往后每次新增 generateText 调用时，把"这次调用的
+        // toolCalls 有没有推进 toolsUsed"当成写完就要检查的一项。
+        for (const step of retryResult.steps) {
+          for (const call of step.toolCalls ?? []) {
+            toolsUsed.push(call.toolName);
+          }
+        }
         const retryFixed = stripMarkdown((deliveredReply ?? "").trim());
         if (retryFixed) {
           reply = retryFixed;
