@@ -829,48 +829,14 @@ export async function markCommunication(args: {
  * 同 kind 的旧规则**不删除**，而是 retire 掉——保留历史而不是覆盖历史。
  * `agreedBy` 是 Ostrom 那条：规则由住的人参与形成才活得下来，所以要记谁同意过。
  */
-/**
- * 存一条规则。同 kind 的旧规则退休，插入新行。
- *
- * ## 方案一改，之前的同意全部作废（代码保证，不靠模型自觉）
- *
- * 「同意」是对**某一个具体方案**的同意，不是对「这个话题」的同意。
- * A 同意了"十点安静"，B 反对，AI 改成"十二点安静"——**A 从没见过十二点
- * 这一版**，把他算作同意就是伪造共识，而且会一路伪造到
- * `closeConsultationIfComplete` 判定"全票通过、这条定下来了"。
- *
- * 原来这件事完全交给模型：`proposeRule` 的 `agreedByNames` 传谁就是谁，
- * 代码不管。模型多数时候会做对（实测两次它都拒绝顺延，主动说"改了就得
- * 重新问过"），但**这属于每次都要重新赌一遍的正确**。
- *
- * 抄的是 DialOp（jlin816/dialop）mediation 的做法：那边只要有一个人
- * reject，`_reset_proposal_state()` 立刻把**所有人**的 accept 清空，
- * agent 必须拿新方案从头征询。共识不能跨方案版本继承——这是结构保证，
- * 不是提示词提醒。
- *
- * 所以这里：statement 跟同 kind 的现行规则**不一样**，就是改方案，
- * 新行的 agreed_by 一律清空，调用方传什么都不作数。
- * statement 一模一样（重复调用）则照传入的值走，不误伤。
- */
 export async function saveRule(args: {
   householdId: string;
   kind: string;
   statement: string;
   agreedBy?: string[];
   sourceCaseId?: string | null;
-}): Promise<{ ruleId: string; revisedFrom: string | null }> {
+}): Promise<string> {
   return await db().begin(async (tx) => {
-    const [prev] = await tx<{ statement: string }[]>`
-      select statement from coliving.rule
-      where household_id = ${args.householdId}
-        and kind = ${args.kind}
-        and status = 'active'
-      limit 1
-    `;
-    // 改了方案 → 之前那一版的同意作废，从零再征询一轮
-    const isRevision = Boolean(prev && prev.statement !== args.statement);
-    const agreed = isRevision ? [] : (args.agreedBy ?? []);
-
     await tx`
       update coliving.rule
       set status = 'retired', valid_to = now()
@@ -882,14 +848,11 @@ export async function saveRule(args: {
       insert into coliving.rule
         (household_id, kind, statement, status, agreed_by, source_case_id)
       values (${args.householdId}, ${args.kind}, ${args.statement}, 'active',
-              ${tx.array(agreed)}::uuid[],
+              ${tx.array(args.agreedBy ?? [])}::uuid[],
               ${args.sourceCaseId ?? null})
       returning id
     `;
-    return {
-      ruleId: rows[0].id,
-      revisedFrom: isRevision ? prev.statement : null,
-    };
+    return rows[0].id;
   });
 }
 
