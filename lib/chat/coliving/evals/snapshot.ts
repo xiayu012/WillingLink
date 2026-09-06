@@ -388,3 +388,129 @@ export async function restoreSnapshot(snap: Snapshot): Promise<{
     await sql.end();
   }
 }
+
+/**
+ * 删掉一栋**恢复出来的**测试屋，连同它名下所有数据。
+ *
+ * 影子跑（`lib/chat/coliving/shadow.ts`）每处理一条真实短信就恢复一栋
+ * 副本，跑完必须删掉，否则真实流量会在库里堆出成千上万栋僵尸测试屋。
+ *
+ * **只删 `is_test = true` 的房子**，这是硬闸：这个函数是按 household_id
+ * 删数据的，万一调用方传错 id（比如把真实房子的 id 传进来），
+ * 后果是把真人的世界删掉——所以先验，不是测试屋直接抛错。
+ *
+ * 删除顺序是 `TABLES` 的**倒序**：TABLES 的正序是按外键依赖排的插入
+ * 顺序，倒过来就是安全的删除顺序，不用再手写一份、也不会随 schema
+ * 变化而漂移。
+ *
+ * **但顺序对还不够——必须先把要删的 id 全部查出来，再开始删。**
+ * 第一版直接照着 `TABLES[].where` 倒序 `delete ... where <子查询>`，
+ * 漏删了一大半：那些 where 是**为抓取写的**，好几条依赖别的表
+ * （`person` 的作用域要查 `membership`、`room`/`dwelling` 要查
+ * `household`）。倒序删的时候，被依赖的那张表往往已经删空了，
+ * 子查询返回 0 行，于是那批数据静默留在库里——影子跑每处理一条真实
+ * 短信就漏一栋僵尸测试屋。**先查后删**（下面的 `ids` 预取）之后，
+ * 每张表删的是一份固定的 id 列表，跟删除进度无关，不会再受影响。
+ */
+export async function dropRestoredHousehold(householdId: string): Promise<void> {
+  const sql = db();
+  try {
+    const [hh] = await sql<{ is_test: boolean }[]>`
+      select is_test from coliving.household where id = ${householdId}`;
+    if (!hh) return; // 已经没了，当成功
+    if (!hh.is_test) {
+      throw new Error(
+        `[snapshot] 拒绝删除非测试屋 ${householdId}——这个函数只能删恢复出来的副本`
+      );
+    }
+
+    // ── ① 先按抓取时的作用域，把每张表要删的主键全查出来 ──────────────
+    //     这一步**在任何删除发生之前**跑完，所以子查询看到的还是完整数据
+    const ids: Record<string, string[]> = {};
+    let personIds: string[] = [];
+    for (const t of TABLES) {
+      let where = t.where.replaceAll(":hh", `'${householdId}'::uuid`);
+      if (where.includes("SUBQ_PERSON")) {
+        where = where.replace(
+          "SUBQ_PERSON",
+          personIds.length
+            ? personIds.map((id) => `'${id}'::uuid`).join(",")
+            : "null"
+        );
+      }
+      const rows = await sql.unsafe<{ id: string }[]>(
+        `select id from coliving.${t.name} where ${where}`
+      );
+      ids[t.name] = rows.map((r) => r.id);
+      if (t.name === "person") personIds = ids[t.name];
+    }
+
+    // ── ② 再按外键倒序删 ─────────────────────────────────────────────
+    await sql.begin(async (tx) => {
+      /**
+       * 先断开自引用/环形引用，否则单条 DELETE 里 PG 逐行查约束时，
+       * 删到"被同批另一行引用"的那一行就会炸。跟 `restoreSnapshot`
+       * 里 `DEFERRED` 处理的是同一组列，方向相反。
+       */
+      if (ids.memory?.length) {
+        await tx.unsafe(
+          `update coliving.memory set superseded_by = null where id = any($1::uuid[])`,
+          [ids.memory as never]
+        );
+      }
+      if (ids.communication?.length) {
+        await tx.unsafe(
+          `update coliving.communication set response_message_id = null where id = any($1::uuid[])`,
+          [ids.communication as never]
+        );
+      }
+
+      /**
+       * **`person` / `person_contact` 不能无条件删。**
+       *
+       * 一个人可以同时属于多栋房子（评测语料共用号码时真实发生过），
+       * 而 `ids.person` 收的是"跟这栋房子有关联"的人——里面可能有人
+       * 在别的房子还有 membership。直接删会撞
+       * `membership_person_id_fkey`，整个事务回滚、一栋都删不掉
+       * （第一版就是这么失败的，20 栋僵尸屋没删成）。
+       *
+       * 正确做法：等这栋房子的 membership 删完之后，再看哪些人变成了
+       * "不属于任何房子"的孤儿，只删孤儿。跨房子共享的人留着，
+       * 他在别的房子里还活着。
+       */
+      for (const t of [...TABLES].reverse()) {
+        if (t.name === "person" || t.name === "person_contact") continue;
+        const list = ids[t.name];
+        if (!list || list.length === 0) continue;
+        await tx.unsafe(`delete from coliving.${t.name} where id = any($1::uuid[])`, [
+          list as never,
+        ]);
+      }
+
+      const ourPeople = ids.person ?? [];
+      if (ourPeople.length > 0) {
+        const orphans = await tx.unsafe<{ id: string }[]>(
+          `select p.id from coliving.person p
+           where p.id = any($1::uuid[])
+             and not exists (
+               select 1 from coliving.membership m where m.person_id = p.id
+             )`,
+          [ourPeople as never]
+        );
+        const orphanIds = orphans.map((o) => o.id);
+        if (orphanIds.length > 0) {
+          // 联系方式跟着人走：人还在别的房子里活着就不能动他的号码
+          await tx.unsafe(
+            `delete from coliving.person_contact where person_id = any($1::uuid[])`,
+            [orphanIds as never]
+          );
+          await tx.unsafe(`delete from coliving.person where id = any($1::uuid[])`, [
+            orphanIds as never,
+          ]);
+        }
+      }
+    });
+  } finally {
+    await sql.end();
+  }
+}

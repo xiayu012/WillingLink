@@ -114,6 +114,8 @@ export type OutboundMessage = {
   communicationId: string;
   /** 审稿没过，调用方不要投递（已在库里标成 skipped 并写明原因） */
   blocked?: boolean;
+  /** 被拦下的理由。给评测报告页显示用——`blocked` 只说"拦了"，这个说"为什么" */
+  blockReason?: string;
   /** 这条是对**共用者**一样的规矩，不是针对他个人的事。审稿据此判角色 */
   sharedRule?: boolean;
   /**
@@ -133,8 +135,17 @@ export type TurnOutcome = {
   reply: string;
   /** 回复给发信人本人的那条，也算一次 communication */
   replyCommunicationId: string | null;
-  /** 主动发给房子里其他人的（杠杆二） */
+  /** 主动发给房子里其他人的（杠杆二）。**已滤掉审稿拦下的，拿到就能发** */
   outbound: OutboundMessage[];
+  /**
+   * **含被审稿拦下的那些**，只读、不要拿去投递。
+   *
+   * `outbound` 必须保持"拿到就能发"的语义，所以被拦下的消息对外
+   * 完全不可见——但"这条为什么被拦"恰恰是复核时最该看到的东西
+   * （评测报告页要显示它，人要据此判断审稿拦得对不对）。
+   * 分成两个字段，投递安全和可观测性都不牺牲。
+   */
+  allOutbound: OutboundMessage[];
   decisionId: string | null;
   modules: string[];
   promptChars: number;
@@ -193,6 +204,7 @@ export async function runColivingTurn(args: {
       reply: UNKNOWN_REPLY,
       replyCommunicationId: null,
       outbound: [],
+      allOutbound: [],
       decisionId: null,
       modules: [],
       promptChars: 0,
@@ -1974,6 +1986,10 @@ export async function runColivingTurn(args: {
           error: `审稿不合格 第${v.broke}条：${v.why}`,
         });
         msg.blocked = true;
+        // 拦截理由也留在对象上：调用方（评测报告页）要把"为什么被拦"
+        // 显示给人看——那是审稿系统真的在起作用的证据，只标一个 blocked
+        // 布尔值等于把最有价值的部分丢了
+        msg.blockReason = `第${v.broke}条：${v.why}`;
       }
     }
   }
@@ -2589,6 +2605,15 @@ export async function runColivingTurn(args: {
     replyCommunicationId,
     // 审稿拦下的不交给调用方投递
     outbound: outbound.filter((o) => !o.blocked),
+    /**
+     * **含被拦下的那些**，只读、不要拿去投递。
+     *
+     * 上面那个 `outbound` 必须保持过滤后的语义（调用方拿到就发），
+     * 所以被拦下的消息以前对外完全不可见——但"这条为什么被拦"恰恰是
+     * 复核时最该看到的东西（评测报告页要显示它，用户要据此判断审稿
+     * 拦得对不对）。分成两个字段，投递安全和可观测性都不牺牲。
+     */
+    allOutbound: outbound,
     decisionId,
     modules: loadedModuleIds,
     promptChars: chars,

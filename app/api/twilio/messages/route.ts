@@ -6,6 +6,7 @@ import {
   toErrorResponse,
 } from "@/lib/chat/adapter";
 import { markCommunication } from "@/lib/chat/coliving/repo";
+import { runShadowTurn, shadowEnabled } from "@/lib/chat/coliving/shadow";
 import { runColivingTurn } from "@/lib/chat/coliving/turn";
 import { emptyTwiml, sendSms, verifyTwilioSignature } from "@/lib/chat/twilio";
 
@@ -91,6 +92,11 @@ export async function POST(request: Request) {
     }
   }
 
+  // **必须在生产版本开跑之前取这个时刻**：影子跑用它给快照截断，
+  // 冻的是"这条消息进来之前"的世界。取晚了会把生产版本这一轮自己写的
+  // decision/message 混进快照，候选版本等于看着答案答题。
+  const arrivedAt = new Date();
+
   after(async () => {
     try {
       const outcome = await runColivingTurn({ channel: "sms", from, text: body });
@@ -142,6 +148,35 @@ export async function POST(request: Request) {
           usage: outcome.usage,
         })
       );
+
+      /**
+       * **影子跑排在最后：短信已经发完了，这之后无论出什么事都不影响住户。**
+       *
+       * 它会把这栋房子在这条消息进来之前的完整世界状态冻成快照、恢复成
+       * 一栋测试屋副本、让候选版本在副本上把这条消息重跑一遍，结果只落
+       * `coliving.shadow_run`，**一条短信都不发**（见 shadow.ts 的四条
+       * 安全性质）。这样真实流量会自动沉淀成可重放的语料。
+       *
+       * 默认关闭（`COLIVING_SHADOW=1` 才开）：它让一轮总耗时大致翻倍，
+       * 而这条路由的 `maxDuration` 是有限的。
+       */
+      if (shadowEnabled()) {
+        await runShadowTurn({
+          channel: "sms",
+          from,
+          text: body,
+          arrivedAt,
+          productionReply: outcome.reply,
+          productionTools: outcome.toolsUsed,
+        }).catch((error) => {
+          // shadow.ts 内部已经全程兜住异常，这里是第二层保险——
+          // 影子永远不该让这条路由报错
+          console.log(
+            "[twilio] 影子跑异常（已忽略）：",
+            error instanceof Error ? error.message : String(error)
+          );
+        });
+      }
     } catch (error) {
       const name = error instanceof Error ? error.name : "UnknownError";
       const message = error instanceof Error ? error.message : String(error);

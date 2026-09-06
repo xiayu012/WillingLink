@@ -28,6 +28,7 @@ process.env.COLIVING_LOCAL_WRITE = "1";
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import type { JudgeFinding } from "../lib/chat/coliving/evals/judge";
 import type { EvalScenario } from "../lib/chat/coliving/evals/schema";
 import { validateScenario } from "../lib/chat/coliving/evals/schema";
 
@@ -39,6 +40,11 @@ function argValue(name: string): string | null {
 const SCENARIO_FILTER = argValue("scenario");
 const CONCURRENCY = Number(argValue("concurrency") ?? 4);
 const LIMIT = Number(argValue("limit") ?? Number.POSITIVE_INFINITY);
+/**
+ * 语义验收（L2/L3）默认开。关掉的场合：只想快速看结构性断言、或者
+ * 判定器本身正在被调试——它每个场景多一次模型调用，跑批会慢一点。
+ */
+const JUDGE_OFF = process.argv.includes("--judge-off");
 
 // ── 加载 + 校验语料 ──────────────────────────────────────────────────────
 const SCENARIOS_DIR = path.join(
@@ -78,10 +84,34 @@ async function runWithConcurrency<T, R>(
 }
 
 // ── 单个场景的结果 ───────────────────────────────────────────────────────
+/**
+ * 一轮的完整记录。**每一轮都存，不只是最后一轮**——报告页要按聊天记录
+ * 的形式给人看（`scripts/coliving-report.ts`），语义验收器也要读完整
+ * 上下文才能判"这句话是不是泄漏了上一轮才说的事"。
+ */
+type TurnRecord = {
+  fromName: string;
+  fromRole: string;
+  said: string;
+  reply: string;
+  toolsUsed: string[];
+  outbound: Array<{
+    toName: string;
+    text: string;
+    blocked: boolean;
+    blockReason?: string;
+  }>;
+};
+
 type ScenarioResult = {
   id: string;
+  source: string;
   pass: boolean;
   failures: string[];
+  /** 完整文字稿，给报告页和语义验收用 */
+  turns: TurnRecord[];
+  /** 大模型语义验收（L2/L3）。`--judge-off` 或判定器挂了就没有这一项 */
+  judge?: { pass: boolean; findings: JudgeFinding[] };
   lastReply: string;
   toolsUsed: string[];
   outboundTexts: string[];
@@ -154,11 +184,34 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
   const { rewritePhonesInText } = await import(
     "../lib/chat/coliving/evals/phones"
   );
+  // 名字/角色查一次就够，用来把 person_id 翻译成人能读的名字
+  const members = await repo.getMembers(householdId);
+  const nameOf = (personId: string) =>
+    members.find((m) => m.personId === personId)?.name ?? "（未知）";
+  const roleOf = (phone: string) =>
+    members.find((m) => m.address === phone)?.role ?? "tenant";
+
   let last: Awaited<ReturnType<typeof turn.runColivingTurn>> | null = null;
+  const transcript: TurnRecord[] = [];
   for (const t of scenario.turns) {
-    last = await turn.runColivingTurn({
-      from: phoneRewrite[t.from] ?? t.from,
-      text: rewritePhonesInText(t.text, phoneRewrite),
+    const livePhone = phoneRewrite[t.from] ?? t.from;
+    const said = rewritePhonesInText(t.text, phoneRewrite);
+    last = await turn.runColivingTurn({ from: livePhone, text: said });
+    transcript.push({
+      fromName:
+        members.find((m) => m.address === livePhone)?.name ?? livePhone,
+      fromRole: roleOf(livePhone),
+      said,
+      reply: last.reply,
+      toolsUsed: last.toolsUsed,
+      // 用 allOutbound 而不是 outbound：被审稿拦下的那些也要进文字稿，
+      // 它们是复核时最该看的部分（"这条为什么没发出去"）
+      outbound: last.allOutbound.map((o) => ({
+        toName: nameOf(o.personId),
+        text: o.text,
+        blocked: Boolean(o.blocked),
+        blockReason: o.blockReason,
+      })),
     });
   }
   if (!last) {
@@ -222,10 +275,57 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
     }
   }
 
+  /**
+   * **语义验收（L2/L3）：结构性断言抓不到的那一层。**
+   *
+   * 上面那些断言查的是"工具调没调、正则匹不匹配"——确定性、便宜、可靠，
+   * 但看不出"这句话虽然没违反任何正则，但读起来在拱火"，也看不出
+   * "AI 没直接点名，可是透露的信息足以让乙推断出是甲投诉的"。
+   * 那类问题只有读懂人话才能发现，所以交给一次独立的模型判定。
+   *
+   * **判定失败不覆盖结构性结论**：`pass` 仍然只由结构性断言决定，
+   * judge 的结果单独放在 `judge` 字段里。理由是这一层天然有误报
+   * （子代理自己也指出：它看不到 pickSchedule 的候选，"排得不近人情"
+   * 这类判断最容易误伤），让它直接把场景判红会让跑批变得不可信——
+   * 先让人看着它的意见，攒够信心再考虑要不要让它参与 gate。
+   */
+  let judge: { pass: boolean; findings: JudgeFinding[] } | undefined;
+  if (!JUDGE_OFF) {
+    try {
+      const { judgeConversation } = await import(
+        "../lib/chat/coliving/evals/judge"
+      );
+      judge = await judgeConversation({
+        scenarioId: scenario.id,
+        source: scenario.source,
+        roster: members.map((m) => ({ name: m.name, role: m.role })),
+        turns: transcript.map((t) => ({
+          fromName: t.fromName,
+          said: t.said,
+          reply: t.reply,
+          outbound: t.outbound.map((o) => ({
+            toName: o.toName,
+            text: o.text,
+            blocked: o.blocked,
+          })),
+        })),
+      });
+    } catch (error) {
+      // 判定器挂了不该让整个跑批失败——它是附加信息，不是门禁
+      console.log(
+        `[judge] ${scenario.id} 判定失败（跳过）：`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+
   return {
     id: scenario.id,
+    source: scenario.source,
     pass: failures.length === 0,
     failures,
+    turns: transcript,
+    judge,
     lastReply: last.reply,
     toolsUsed,
     outboundTexts,
