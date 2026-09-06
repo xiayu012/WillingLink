@@ -21,6 +21,36 @@ export function countAcceptedOutbound(messages: Array<{ blocked?: boolean }>): n
   return messages.filter((m) => !m.blocked).length;
 }
 
+/**
+ * 送到住户手里那句最终回复，最后一次审稿的结论是否站得住——
+ * `verified:false`（没真的跑起来判过）或 `pass:false`（判过、不合格）
+ * 都算门禁失败，不能让"批判器明知不合格但代码照样发了"在跑批里显示绿灯。
+ */
+export function evaluateReplyReview(
+  review: { verified: boolean; pass: boolean; broke: string; why: string } | undefined
+): string[] {
+  if (!review) {
+    return ["缺少 replyReview——这一轮的最终回复没有可核验的审稿结论"];
+  }
+  if (!review.verified) {
+    return ["最终回复的审稿未验证（verified=false），不能算通过"];
+  }
+  if (!review.pass) {
+    return [`最终回复审稿不合格：第${review.broke || "?"}条：${review.why}`];
+  }
+  return [];
+}
+
+export function evaluateTurnReplyReviews(
+  reviews: Array<
+    { verified: boolean; pass: boolean; broke: string; why: string } | undefined
+  >
+): string[] {
+  return reviews.flatMap((review, index) =>
+    evaluateReplyReview(review).map((failure) => `第${index + 1}轮：${failure}`)
+  );
+}
+
 export type ScenarioTurn = {
   /** 发信人手机号，必须在 people 里 */
   from: string;

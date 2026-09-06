@@ -1,0 +1,18 @@
+{
+  "id": "laundry-negotiation-2026-09-06",
+  "source": "合成回归：把相同公平原则迁移到非厨房资源，长时使用者没有固定开始硬约束时不应天然优先；同一选定候选贯穿所有征询。",
+  "household": { "label": "评测-洗衣机资源协调" },
+  "people": [
+    { "phone": "+15550009201", "name": "阿林", "role": "tenant" },
+    { "phone": "+15550009202", "name": "阿周", "role": "tenant" },
+    { "phone": "+15550009203", "name": "阿陈", "role": "tenant" }
+  ],
+  "turns": [
+    { "from": "+15550009201", "text": "今晚三个人要用同一台洗衣机，请你协调。阿林20点后可以，完整程序80分钟，习惯20点就洗但不是必须。阿周20点后都可以，用20分钟。阿陈20点后也可以，20点40开始最合适，用20分钟。信息都齐了，请排一个具体的公平方案，分别问另外两个人愿不愿意，不要直接定死。" }
+  ],
+  "expect": {
+    "minAcceptedOutbound": 2,
+    "mustUseTools": ["pickSchedule", "chooseSchedule", "contactPerson"],
+    "replyMustNotMatch": ["阿林.{0,12}20[:：]?00.{0,8}21[:：]?20", "[0-9]号住客"]
+  }
+}

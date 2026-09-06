@@ -1,0 +1,21 @@
+{
+  "id": "missing-duration-outreach-2026-09-06",
+  "source": "合成回归：多人厨房协调只缺另一位住户的使用时长时，必须本轮直接联系缺信息的人，不能只确认收到、只问当前住户姓名，或说以后再收齐信息。",
+  "household": { "label": "评测-缺时长立即联系" },
+  "people": [
+    { "phone": "+15550009301", "name": "小陈", "role": "tenant" },
+    { "phone": "+15550009302", "name": "老孙", "role": "landlord" },
+    { "phone": "+15550009303", "name": "小林", "role": "tenant" }
+  ],
+  "turns": [
+    {
+      "from": "+15550009301",
+      "text": "今晚三个人要协调厨房。我随时都行，做饭半小时；小林确认只能18点开始、连续两小时；老孙确认19点最合适，但还没说做多久。现在只缺老孙的使用时长，请你直接问他，别让我转告，也别说以后再问。"
+    }
+  ],
+  "expect": {
+    "minAcceptedOutbound": 1,
+    "mustUseTools": ["contactPerson"],
+    "replyMustNotMatch": ["回头|稍后|以后再|后面再", "[0-9]号住客"]
+  }
+}

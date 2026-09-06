@@ -34,7 +34,12 @@ import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { JudgeResult } from "../lib/chat/coliving/evals/judge";
 import type { EvalScenario } from "../lib/chat/coliving/evals/schema";
-import { countAcceptedOutbound, validateScenario } from "../lib/chat/coliving/evals/schema";
+import {
+  countAcceptedOutbound,
+  evaluateTurnReplyReviews,
+  validateScenario,
+} from "../lib/chat/coliving/evals/schema";
+import type { ReplyReview } from "../lib/chat/coliving/turn";
 
 // ── CLI args ─────────────────────────────────────────────────────────────
 function argValue(name: string): string | null {
@@ -104,7 +109,9 @@ type TurnRecord = {
   fromRole: string;
   said: string;
   reply: string;
+  replyReview: ReplyReview;
   toolsUsed: string[];
+  scheduleFacts: string[];
   outbound: Array<{
     toName: string;
     text: string;
@@ -126,6 +133,8 @@ type ScenarioResult = {
    * 处理"没验收"这个状态，不能因为字段不存在就悄悄当没发生过、算作通过。
    */
   judge: JudgeResult;
+  /** 最终回复最后一次审稿的结论——见 lib/chat/coliving/turn.ts 的 ReplyReview */
+  replyReview: ReplyReview;
   lastReply: string;
   toolsUsed: string[];
   outboundTexts: string[];
@@ -217,7 +226,9 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
       fromRole: roleOf(livePhone),
       said,
       reply: last.reply,
+      replyReview: last.replyReview,
       toolsUsed: last.toolsUsed,
+      scheduleFacts: last.scheduleFacts,
       // 用 allOutbound 而不是 outbound：被审稿拦下的那些也要进文字稿，
       // 它们是复核时最该看的部分（"这条为什么没发出去"）
       outbound: last.allOutbound.map((o) => ({
@@ -227,6 +238,21 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
         blockReason: o.blockReason,
       })),
     });
+    // 隔离评测不调用 Twilio，但下一轮必须看到与生产一致的“已经发出、
+    // 正在等回复”状态。否则 buildContext 的阻塞清单为空，模型会把上一轮
+    // 已问过的问题再问一遍，测出来的是评测器失真，不是产品行为。
+    for (const message of last.outbound) {
+      await repo.markCommunication({
+        communicationId: message.communicationId,
+        status: "sent",
+      });
+    }
+    if (last.replyCommunicationId) {
+      await repo.markCommunication({
+        communicationId: last.replyCommunicationId,
+        status: "sent",
+      });
+    }
   }
   if (!last) {
     throw new Error(`场景 ${scenario.id} 没有任何 turns`);
@@ -275,16 +301,16 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
       failures.push(`出站消息命中了不该出现的模式「${pattern}」：${hit.slice(0, 80)}`);
     }
   }
+  /**
+   * **批判器明知最终回复不合格，代码照样发了——这个门禁堵这个漏洞。**
+   * `runColivingTurn` 已经把打回/重写/最终修正的真实结论算成了
+   * `replyReview`；这里不重新判断，只核对这个结论本身站不站得住，
+   * 不合格或没验证过都计入结构性失败，让"批判器打回但总门禁绿色"
+   * 不再可能发生。
+   */
+  failures.push(...evaluateTurnReplyReviews(transcript.map((turn) => turn.replyReview)));
+
   if (exp.minBlockedComms !== undefined) {
-    // 测试脚本没有真正走 Twilio 发送，需要先标 sent 才能进阻塞清单——
-    // 跟生产路径（webhook 里的 deliver()）一致地补这一步，
-    // 否则 getBlockedComms 的 status='sent' 条件永远不成立
-    for (const m of last.outbound) {
-      await repo.markCommunication({ communicationId: m.communicationId, status: "sent" });
-    }
-    if (last.replyCommunicationId) {
-      await repo.markCommunication({ communicationId: last.replyCommunicationId, status: "sent" });
-    }
     const blockedAfter = await repo.getBlockedComms(householdId);
     if (blockedAfter.length < exp.minBlockedComms) {
       failures.push(
@@ -328,6 +354,7 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
           fromName: t.fromName,
           said: t.said,
           reply: t.reply,
+          facts: t.scheduleFacts,
           outbound: t.outbound.map((o) => ({
             toName: o.toName,
             text: o.text,
@@ -352,11 +379,74 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
     failures,
     turns: transcript,
     judge,
+    replyReview: last.replyReview,
     lastReply: last.reply,
     toolsUsed,
     outboundTexts,
     ms: Date.now() - start,
   };
+}
+
+/**
+ * 单个场景的基础设施故障也必须落进报告。否则模型网关超时会让整批直接
+ * 退出，已经完成的场景和失败原因一起丢失，看起来反而像“没有红灯”。
+ */
+async function runScenarioSafely(scenario: EvalScenario): Promise<ScenarioResult> {
+  const start = Date.now();
+  try {
+    return await runScenario(scenario);
+  } catch (error) {
+    const reason = (() => {
+      if (error instanceof Error) {
+        const own = [error.name, error.message.trim()].filter(Boolean).join(": ");
+        const aggregate = error instanceof AggregateError
+          ? error.errors
+              .map((item) =>
+                item instanceof Error
+                  ? [item.name, item.message.trim()].filter(Boolean).join(": ")
+                  : String(item)
+              )
+              .filter(Boolean)
+              .join(" | ")
+          : "";
+        const cause = error.cause instanceof Error
+          ? [error.cause.name, error.cause.message.trim()].filter(Boolean).join(": ")
+          : error.cause
+            ? String(error.cause)
+            : "";
+        return [own, aggregate && `errors=${aggregate}`, cause && `cause=${cause}`]
+          .filter(Boolean)
+          .join("; ") ||
+          "Error（无错误文本）";
+      }
+      const text = String(error).trim();
+      if (text) return text;
+      try {
+        return JSON.stringify(error) || "未知异常（无错误文本）";
+      } catch {
+        return "未知异常（无法序列化）";
+      }
+    })();
+    console.log(`[scenario] ${scenario.id} 执行失败（写入红灯报告）：${reason}`);
+    return {
+      id: scenario.id,
+      source: scenario.source,
+      pass: false,
+      failures: [`场景执行异常：${reason}`],
+      turns: [],
+      judge: { pass: false, verified: false, findings: [] },
+      replyReview: {
+        verified: false,
+        pass: false,
+        broke: "",
+        why: `场景执行异常：${reason}`,
+      },
+      lastReply: "",
+      toolsUsed: [],
+      outboundTexts: [],
+      ms: Date.now() - start,
+    };
+  }
 }
 
 async function main() {
@@ -370,7 +460,11 @@ async function main() {
   );
 
   const start = Date.now();
-  const results = await runWithConcurrency(scenarios, CONCURRENCY, runScenario);
+  const results = await runWithConcurrency(
+    scenarios,
+    CONCURRENCY,
+    runScenarioSafely
+  );
   const totalMs = Date.now() - start;
 
   /**

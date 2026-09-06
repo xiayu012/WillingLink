@@ -104,6 +104,8 @@ function judgeModelId(): string {
   );
 }
 
+const JUDGE_TIMEOUT_MS = Number(process.env.COLIVING_JUDGE_TIMEOUT_MS ?? 120_000);
+
 /** 复用大脑自己的 doctrine 加载（带缓存），不另开一套读文件的路子 */
 function doctrineText(moduleId: string): string {
   const brain = getBrain("coliving");
@@ -286,16 +288,34 @@ function buildTranscript(turns: JudgeTurn[]): {
       `${t.fromName}（住户）说：${t.said || "（没说话，是 AI 主动发起的）"}`,
       `AI 回他：${t.reply || "（这一轮没有回复）"}`,
     ];
+    if (t.facts?.length) {
+      lines.push(
+        "【内部工具算出的依据，仅供核对；不是发给住户的话】：\n" +
+          t.facts.join("\n")
+      );
+    }
 
+    /**
+     * **同一个人这一轮可能被写了不止一条**（第一条被审稿拦下，AI 当场
+     * 改写重发第二条）。真实踩过：判定器只看到"写给小陈的第一条被拦"，
+     * 没往下读到"写给小陈的第二条其实发出去了"，就判定"小陈根本没收到
+     * 消息、AI 在撒谎"——但转写稿里两条都在，且顺序就是先拦后成。
+     * 给同一收信人的第 2 条起标上"第几次尝试"，把这条时间线摆明，
+     * 不指望判定器自己数。
+     */
+    const attemptSeen = new Map<string, number>();
     for (const o of t.outbound) {
+      const attempt = (attemptSeen.get(o.toName) ?? 0) + 1;
+      attemptSeen.set(o.toName, attempt);
+      const attemptNote = attempt > 1 ? `（对${o.toName}的第${attempt}次尝试）` : "";
       if (o.blocked) {
         blockedParts.push(o.text);
         lines.push(
-          `AI 同一轮还写给 ${o.toName}【被审稿拦下，没有真的发出去】：${o.text}`
+          `AI 同一轮还写给 ${o.toName}${attemptNote}【被审稿拦下，没有真的发出去】：${o.text}`
         );
       } else {
         deliveredParts.push(o.text);
-        lines.push(`AI 同一轮还主动发给 ${o.toName}：${o.text}`);
+        lines.push(`AI 同一轮还主动发给 ${o.toName}${attemptNote}：${o.text}`);
       }
     }
 
@@ -373,7 +393,8 @@ function locateQuote(
  */
 function sanitize(
   raw: Array<z.infer<typeof findingSchema>>,
-  haystacks: TurnHaystack[]
+  haystacks: TurnHaystack[],
+  turns: JudgeTurn[]
 ): JudgeFinding[] {
   const out: JudgeFinding[] = [];
   const seen = new Set<string>();
@@ -400,6 +421,59 @@ function sanitize(
       locateQuote(quote, [haystacks[f.turnIndex]]) !== null;
     const turnIndex = modelIndexValid ? f.turnIndex : found.turnIndex;
 
+    // “某对象的消息被拦/没发出”是结构化记录能直接证伪的事实。模型曾把
+    // blocked:false 的真实出站幻读成“被审稿拦下”，不能因为它引用了同轮
+    // 回复原文，就让这条与出站状态矛盾的推理混过引用校验。
+    const claimsNotDelivered =
+      /(?:被.{0,8}拦|没有(?:真的)?发|没(?:有)?发|未发|没有收到)/.test(f.issue);
+    const contradictsDeliveredOutbound =
+      claimsNotDelivered &&
+      turns[turnIndex]?.outbound.some(
+        (message) =>
+          !message.blocked &&
+          message.toName.length >= 2 &&
+          f.issue.includes(message.toName)
+      );
+    if (contradictsDeliveredOutbound) {
+      console.log(
+        `[judge] 丢弃一条与结构化出站状态矛盾的 finding（${f.severity}）：` +
+          f.issue.slice(0, 100)
+      );
+      continue;
+    }
+
+    // “这一轮没有联系人/没有任何推进”也是结构化出站记录能直接证伪的
+    // 事实。这里只丢弃明确否认联系或实际推进的 finding；如果它批评联系
+    // 对象、内容或力度不对，仍保留给语义层判断。
+    const claimsNoContactOrProgress =
+      /(?:没有|没|未)(?:真正|实际|实质性?)?(?:推进|联系)|(?:没有|没|未)[^，。；]{0,12}(?:联系人|联系任何人)/.test(
+        f.issue
+      );
+    const hasAcceptedOutbound = turns[turnIndex]?.outbound.some(
+      (message) => !message.blocked
+    );
+    if (claimsNoContactOrProgress && hasAcceptedOutbound) {
+      console.log(
+        `[judge] 丢弃一条与本轮实际出站动作矛盾的 finding（${f.severity}）：` +
+          f.issue.slice(0, 100)
+      );
+      continue;
+    }
+
+    // “还没有成功发给……”是在明确承认未送达，不可能同时构成“把未发生
+    // 的联系冒充成已发生”。模型曾把这个否定句整句引用后作出相反结论。
+    const quoteExplicitlySaysNotDelivered =
+      /(?:还)?没有成功发|还没(?:有)?发|没发成|未发/.test(quote);
+    const issueClaimsFalseSuccess =
+      /冒充已发生|声称(?:已经|正在|刚)|以为.{0,12}(?:已经|正在)/.test(f.issue);
+    if (quoteExplicitlySaysNotDelivered && issueClaimsFalseSuccess) {
+      console.log(
+        `[judge] 丢弃一条把明确未送达误读成已送达的 finding（${f.severity}）：` +
+          f.issue.slice(0, 100)
+      );
+      continue;
+    }
+
     const located = modelIndexValid
       ? locateQuote(quote, [haystacks[f.turnIndex]])!
       : found;
@@ -424,6 +498,8 @@ export type JudgeTurn = {
   said: string;
   /** AI 回给他的话 */
   reply: string;
+  /** 代码/工具产生的只读依据；不能作为 finding 的原文引用。 */
+  facts?: string[];
   /** 同一轮 AI 主动发给别人的消息 */
   outbound: Array<{ toName: string; text: string; blocked: boolean }>;
 };
@@ -432,7 +508,7 @@ export type JudgeTurn = {
 export function finalizeJudgment(raw: JudgeFinding[], turns: JudgeTurn[]): JudgeResult {
   if (turns.length === 0) return { ...NOT_JUDGED, findings: [] };
   const { haystacks } = buildTranscript(turns);
-  const findings = sanitize(raw, haystacks);
+  const findings = sanitize(raw, haystacks, turns);
   // 模型报了问题却没有任何可核验引用，不能把解析失败伪装成无问题。
   if (raw.some((f) => !f.quote.trim() || !f.issue.trim() || !locateQuote(f.quote.trim(), haystacks))) {
     return { ...NOT_JUDGED, findings };
@@ -459,6 +535,7 @@ export async function judgeConversation(args: {
 
   try {
     const result = await generateText({
+      abortSignal: AbortSignal.timeout(JUDGE_TIMEOUT_MS),
       model: getLanguageModel(judgeModelId()),
       // 判定要的是稳定，不是花样：同一段对话两次跑批结论飘来飘去，
       // 这层就没法当回归门禁用了。

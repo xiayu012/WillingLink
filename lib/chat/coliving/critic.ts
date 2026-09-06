@@ -38,6 +38,8 @@ import { colivingModelId } from "./model";
  */
 
 export type Verdict = {
+  /** 是否真的从批判器拿到并解析出了明确结论。 */
+  verified: boolean;
   pass: boolean;
   /** 第几条不合格 */
   broke: string;
@@ -45,13 +47,27 @@ export type Verdict = {
   why: string;
 };
 
-const PASS: Verdict = { pass: true, broke: "", why: "" };
+const PASS: Verdict = { verified: true, pass: true, broke: "", why: "" };
+/** 生产上继续投递，但评测不能把关闭、异常或含糊输出冒充成已验收。 */
+const UNVERIFIED_PASS: Verdict = {
+  verified: false,
+  pass: true,
+  broke: "",
+  why: "批判器没有返回可解析的明确结论",
+};
+
+function normalizeRuleId(value: unknown): string {
+  const raw = String(value ?? "").trim();
+  return raw.match(/\d+(?:\.\d+)?/)?.[0] ?? raw.replace(/^第|条$/g, "");
+}
 
 function criticModelId(): string {
   return (
     process.env.COLIVING_CRITIC_MODEL?.trim() || "anthropic/claude-sonnet-4.5"
   );
 }
+
+const CRITIC_TIMEOUT_MS = Number(process.env.COLIVING_CRITIC_TIMEOUT_MS ?? 120_000);
 
 function rubric(): string {
   const brain = getBrain("coliving");
@@ -81,11 +97,12 @@ export type CriticInput = {
 
 export async function critique(args: CriticInput): Promise<Verdict> {
   if (process.env.COLIVING_CRITIC_OFF === "1" || !args.draft.trim()) {
-    return PASS;
+    return UNVERIFIED_PASS;
   }
 
   try {
     const result = await generateText({
+      abortSignal: AbortSignal.timeout(CRITIC_TIMEOUT_MS),
       model: getLanguageModel(criticModelId()),
       system: [
         {
@@ -111,7 +128,8 @@ export async function critique(args: CriticInput): Promise<Verdict> {
             `【他刚才说的话】${args.said || "（没说话，是我们主动发的）"}\n` +
             `【这一轮已知的事实】\n${args.facts}\n\n` +
             `【待发出的消息】\n${args.draft}\n\n` +
-            "只回一行 JSON：\n" +
+            "只回一行 JSON，不要先写别的再写 JSON，也不要写完一个结论后" +
+            "自己反悔又补一个——只有一段 JSON，写之前想清楚：\n" +
             '{"pass":true} 或 {"pass":false,"broke":"第几条","why":"一句话"}\n' +
             "why 里要引用消息原文时，不要加引号，直接说是哪句话——" +
             "引号会把 JSON 撑破（真出过：模型自己引用了一句话，" +
@@ -120,45 +138,81 @@ export async function critique(args: CriticInput): Promise<Verdict> {
       ],
     });
 
-    // **贪婪匹配到最后一个 }**。非贪婪会在 why 字段里的中文引号处截断，
-    // 解析失败 → 静默放行，等于这道闸白装（实测踩过）。
-    const m = result.text.match(/\{[\s\S]*\}/);
-    if (m) {
+    /**
+     * **取最后一个能解析的 JSON 对象，不是从第一个 `{` 到最后一个 `}`
+     * 贪婪吞一整段。**
+     *
+     * 真实复现（2026-09-06）：提示词写了"只回一行 JSON"，但批判器有时
+     * 会先写一段自我纠正的思考——先给一版判断，中途"让我重新核对"，
+     * 再给一版最终结论，一次回复里出现**两个**独立的 ```json``` 代码块。
+     * 旧的 `/\{[\s\S]*\}/` 贪婪匹配会从第一段的 `{` 一路吞到第二段的
+     * 最后一个 `}`，把两段 JSON 粘成一整坨解析不了的乱码——解析失败后
+     * 掉进下面的关键词兜底，兜底又从这坨乱码里硬抠出前半段（被自己推翻
+     * 的那版）的"第X条"和只到 100 字就被截断的 why，产生了这次真实
+     * 见到的"第第6.6条条"这种重复字符的乱码判词，且用的是模型已经
+     * 自己否定掉的旧结论——批判器最终真正的答案（往往是 pass:true）
+     * 反而被吞掉了。
+     *
+     * 修法：抓所有形如单层 `{...}` 的候选（这个 schema 只有
+     * pass/broke/why 三个字符串/布尔字段，不会有嵌套花括号），从**最后
+     * 一个**往前找，第一个能 `JSON.parse` 成功、且带了 `pass` 字段的
+     * 就是模型的最终结论——自我纠正之后的最后一段代表它真正想说的话。
+     */
+    const jsonCandidates = [...result.text.matchAll(/\{[^{}]*\}/g)].map(
+      (x) => x[0]
+    );
+    for (let i = jsonCandidates.length - 1; i >= 0; i--) {
       try {
-        const parsed = JSON.parse(m[0]) as Partial<Verdict>;
+        const parsed = JSON.parse(jsonCandidates[i]) as Partial<Verdict>;
+        if (typeof parsed.pass !== "boolean") {
+          continue;
+        }
         if (parsed.pass === false) {
+          const broke = normalizeRuleId(parsed.broke);
+          // rubric 明定：单独的客服腔/自我介绍冗余只是风格问题，不足以拦截。
+          if (broke === "13") {
+            return PASS;
+          }
           return {
+            verified: true,
             pass: false,
-            broke: String(parsed.broke ?? ""),
+            broke,
             why: String(parsed.why ?? ""),
           };
         }
         return PASS;
       } catch {
-        // JSON 还是坏的 —— 退回看关键词，别整个放弃
+        // 这一段 JSON 是坏的（多半是 why 里带了没转义的引号）——
+        // 继续往前找上一段，别整个放弃。
       }
     }
-    // 兜底：模型有时不给 JSON，直接说了理由。
+    // 兜底：模型有时不给 JSON，直接说了理由。**只看回复最后一段**——
+    // 理由同上，自我纠正的话早先的草稿不能算数。
     // **只在明确说了不合格时才打回**，含糊的一律放行。
-    if (/"?pass"?\s*[:：]\s*false|不合格|违反了?第/.test(result.text)) {
+    const tail = result.text.slice(-300);
+    if (/"?pass"?\s*[:：]\s*false|不合格|违反了?第/.test(tail)) {
       // 先试着从坏掉的 JSON 里精确抠 why 字段（模型在 why 里加了引号，
       // 把 JSON 撑破时最常见），抠不到才退回粗暴截断。
-      const whyField = result.text.match(/"why"\s*:\s*"([\s\S]*?)"\s*\}?\s*$/);
+      const whyField = tail.match(/"why"\s*:\s*"([\s\S]*?)"\s*\}?\s*$/);
       return {
+        verified: true,
         pass: false,
-        broke: result.text.match(/第\s*(\d+)\s*条/)?.[1] ?? "?",
+        broke: tail.match(/第\s*(\d+(?:\.\d+)?)\s*条/)?.[1] ?? "?",
         why: (
-          whyField?.[1] ?? result.text.replace(/[\s\S]*?[:：]/, "")
+          whyField?.[1] ?? tail.replace(/[\s\S]*?[:：]/, "")
         ).slice(0, 100).trim(),
       };
     }
-    return PASS;
+    return UNVERIFIED_PASS;
   } catch (error) {
     console.log(
       "[critic] 判不了，放行：",
       error instanceof Error ? error.message : String(error)
     );
-    return PASS;
+    return {
+      ...UNVERIFIED_PASS,
+      why: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 

@@ -10,13 +10,82 @@ import { assertCanWrite } from "./guard";
 import { colivingModelId } from "./model";
 import { embedOne } from "./embedding";
 import * as repo from "./repo";
-import { bestSchedulePlans, formatMinutes } from "./scheduling";
+import {
+  bestSchedulePlans,
+  checkScheduleSlotConsistency,
+  describeFairnessGain,
+  findSchedulePlans,
+  formatMinutes,
+  selectScheduleCandidate,
+  type ScheduleSelection,
+} from "./scheduling";
 
 /**
  * 一轮对话最多几步工具。比以前长：现在一轮里可能要
  * 判断 → 查历史 → 开 case → 联系另一个人 → 记规则。
  */
 const MAX_STEPS = 6;
+const HH_MM_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+const TURN_MODEL_TIMEOUT_MS = Number(
+  process.env.COLIVING_TURN_MODEL_TIMEOUT_MS ?? 120_000
+);
+
+function turnAbortSignal(): AbortSignal {
+  return AbortSignal.timeout(TURN_MODEL_TIMEOUT_MS);
+}
+
+export function hasDeferredCoordination(text: string): boolean {
+  return text.split(/[。！？!?\n]/).some(
+    (clause) =>
+      (
+        /我[^。！？!?\n]{0,24}(?:会|先|再|回头|稍后|马上|这就|现在就|准备|打算|正在|还在)[^。！？!?\n]{0,20}(?:问|联系|核实|找|商量|收)/.test(
+          clause
+        ) &&
+        /(?:其他|另外|几位|大家|他们|她们|房东|住户|室友|对方|两位)/.test(
+          clause
+        )
+      ) ||
+      /(?:后面|之后|以后|回头|稍后)[^。！？!?\n]{0,20}(?:排|安排|协调|联系|询问|问)/.test(
+        clause
+      )
+  );
+}
+
+/**
+ * `还在`（"我还在问另外两位"）跟 `正在/已经` 一样，字面上是在声称一件
+ * 正在发生的联系动作，容易让人以为这轮确实发出去了——同样要按"声称
+ * 联系完成/进行中"处理，才能被下面的 accepted-outbound 分支替换成
+ * 精确点名的 `buildContactProgressReply`。跟 `会/稍后/回头` 这类真正
+ * 面向未来、还没开始的措辞区分开——那些不在这个标记列表里，
+ * 保留原样，不算这里要拦的"误导性在途声称"。
+ */
+const CLAIMED_CONTACT_COMPLETION_PATTERN =
+  /(?:(?:我|这边|马上|现在)?(?:正|正在|已经|这就|刚刚?|刚才|还在)(?:跟|和|给|去跟|去和|去给)?.{0,6}(?:发|说|商量|联系|问|通知|沟通|确认|谈|提|讲|劝)|(?:我|这边)[^。！？!?\n]{0,12}(?:问|联系|找|跟[^。！？!?\n]{0,6}(?:说|确认|核实|商量))[^。！？!?\n]{0,6}了)/;
+
+export function claimsContactCompletion(text: string): boolean {
+  return CLAIMED_CONTACT_COMPLETION_PATTERN.test(text);
+}
+
+function isGeneratedResidentName(name: string): boolean {
+  return /^\d+号住客$/.test(name.trim());
+}
+
+export function extractExplicitFixedStart(statement: string): number | null {
+  const clause = statement.match(/(?:只能|必须|固定(?:在)?)[^，。；]{0,12}/)?.[0];
+  if (!clause) return null;
+  const hhmm = clause.match(/(\d{1,2})[:：]([0-5]\d)/);
+  const hourText = clause.match(/(\d{1,2})点(半|[0-5]?\d分?)?/);
+  const hour = Number(hhmm?.[1] ?? hourText?.[1]);
+  const minute = hhmm
+    ? Number(hhmm[2])
+    : hourText?.[2] === "半"
+      ? 30
+      : Number(hourText?.[2]?.replace("分", "") ?? 0);
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return null;
+  }
+  return hour * 60 + minute;
+}
 
 export type TurnUsage = {
   steps: number;
@@ -131,8 +200,31 @@ export type OutboundMessage = {
   isIntroduction?: boolean;
 };
 
+/**
+ * 最终发出去那条回复，实际经过审稿的结果——不是"调用过 critique"，
+ * 是"送到住户手里的这句话，最后一次核对的结论"。
+ *
+ * 起因：以前批判器打回、重写、重写后复核仍不合格时，代码只打日志、
+ * 老实把消息发出去（"有消息总好过没消息"），但外部（eval/汇总）完全
+ * 看不到这件事发生过——一条批判器明知不合格的消息，跑批照样显示绿灯。
+ * 现在把这个结论显式吐出来，调用方自己决定要不要因此判失败。
+ */
+export type ReplyReview = {
+  /** 批判器是不是真跑起来给出了结论——见 critic.ts 的"默认放行"三条兜底，这里只反映"跑没跑"，不代表"跑起来了就等于没问题" */
+  verified: boolean;
+  /** 最终这句话有没有过审 */
+  pass: boolean;
+  /** 不合格时是第几条/规则 id；合格是空串 */
+  broke: string;
+  why: string;
+};
+
 export type TurnOutcome = {
   reply: string;
+  /** 送到住户手里那句话最后一次审稿的结论，见 `ReplyReview` */
+  replyReview: ReplyReview;
+  /** 本轮排班工具算出并选定的事实，供离线判定器理解依据，不用于投递。 */
+  scheduleFacts: string[];
   /** 回复给发信人本人的那条，也算一次 communication */
   replyCommunicationId: string | null;
   /** 主动发给房子里其他人的（杠杆二）。**已滤掉审稿拦下的，拿到就能发** */
@@ -202,6 +294,10 @@ export async function runColivingTurn(args: {
   if (!sender) {
     return {
       reply: UNKNOWN_REPLY,
+      // 硬编码文案，压根没过大脑，也就没有审稿这回事——当合格处理，
+      // 不能让调用方误以为这是一条没验证过的模型输出。
+      replyReview: { verified: true, pass: true, broke: "", why: "" },
+      scheduleFacts: [],
       replyCommunicationId: null,
       outbound: [],
       allOutbound: [],
@@ -283,6 +379,21 @@ export async function runColivingTurn(args: {
    * 算出的候选摆进 `baseFacts`，批判器就能做那种更精确的核对。
    */
   const scheduleResults: string[] = [];
+  /** `pickSchedule` 按窗口名存下真实候选，供 `chooseSchedule` 核对编号合法性。 */
+  const scheduleCandidatesByLabel = new Map<string, ReturnType<typeof bestSchedulePlans>>();
+  /**
+   * 这一轮已经拍板要用的方案，按窗口名存。**这是跨消息一致性的唯一
+   * 依据**——`contactPerson` 给参与者发排班消息时，代码拿这里的时段
+   * 跟它填的 `scheduleSlot` 做结构化比对（字符串相等，不猜语义），
+   * 对不上直接拒绝执行，不静默发出去。
+   *
+   * 起因（2026-09-06 真实复现）：`pickSchedule` 一次给 5 个候选，模型
+   * 分别给两个人发 `contactPerson` 时各自"心算"了一遍要用哪个候选，
+   * 两条消息拼出来的时段来自不同候选，回复又用了第三套组合——批判器
+   * 三条全拦，因为没有任何单一候选能同时解释这三条消息。根治靠"选定"
+   * 这一步：选完之后所有消息只认这一个方案，不再各自去猜。
+   */
+  const selectedSchedules = new Map<string, ScheduleSelection>();
   /**
    * 这一轮里新加进来、这轮之前压根不存在的人。**批判器的四种角色
    * （报告的人/被说到的人/共用者通知的对象/受影响的其他人）全都假定
@@ -562,12 +673,93 @@ export async function runColivingTurn(args: {
               "就会悄无声息地烂在那里——这两天反复出的「说了跟进却没" +
               "下文」正是这么来的。"
           ),
+        scheduleWindowLabel: z
+          .string()
+          .optional()
+          .describe(
+            "这条消息在告诉他排班时段时填——跟 `chooseSchedule` 用的同一个" +
+              "窗口名。填了这个，`scheduleSlot` 也必须填，代码会核对是不是" +
+              "跟已选方案里他的时段完全一致，不一致会拒绝执行、这条不会发出去。"
+          ),
+        scheduleSlot: z
+          .object({
+            start: z
+              .string()
+              .regex(HH_MM_PATTERN)
+              .describe("这条消息里告诉他的开始时间，HH:MM"),
+            end: z
+              .string()
+              .regex(HH_MM_PATTERN)
+              .describe("这条消息里告诉他的结束时间，HH:MM"),
+          })
+          .optional()
+          .describe("跟 scheduleWindowLabel 一起填。不用在这条消息里重复解释全案，代码只核对数字对不对。"),
       }),
-      execute: async ({ name, purpose, scope, sharedWith, act, message: raw }) => {
-        const message = stripMarkdown(raw);
+      execute: async ({
+        name,
+        purpose,
+        scope,
+        sharedWith,
+        act,
+        message: raw,
+        scheduleWindowLabel,
+        scheduleSlot,
+      }) => {
+        let message = stripMarkdown(raw);
         const target = await repo.findPersonByName(sender.householdId, name);
         if (!target) {
           return { ok: false, reason: `房子里没有叫「${name}」的人` };
+        }
+        // 本轮已为这个参与者计算排班时，联系必须绑定到选定候选。
+        // 不靠正文时间格式判断（“六点半”等中文写法会绕过）；无关事项拆到
+        // 下一轮处理，换取同一轮排班绝不跨候选拼接的确定性。
+        const relevantWindows = [...scheduleCandidatesByLabel.entries()]
+          .filter(([, candidates]) =>
+            candidates.some((candidate) =>
+              candidate.assignments.some((assignment) => assignment.name === name)
+            )
+          )
+          .map(([label]) => label);
+        if (relevantWindows.length > 0 && !scheduleWindowLabel && !scheduleSlot) {
+          const selected = relevantWindows.find((label) => selectedSchedules.has(label));
+          return {
+            ok: false,
+            reason: selected
+              ? `这轮已为${name}选定「${selected}」方案；必须填写 scheduleWindowLabel 和 scheduleSlot，代码才能核对同一候选`
+              : `这轮已为${name}算过排班；先用 chooseSchedule 选定一个候选，再带 scheduleWindowLabel 和 scheduleSlot 联系`,
+          };
+        }
+        /**
+         * **结构化核对，不猜正文里的数字。** 真实事故：同一轮里给两个人
+         * 分别发排班消息，各自"心算"了一遍要用哪个候选，两条消息拼出来
+         * 的时段来自不同候选，回复又用了第三套——批判器只能挨条拦，
+         * 因为没有单一候选能同时解释三条消息。选定之后用这两个参数核对，
+         * 对不上直接拒绝执行，不进 outbound、不占用这轮对这个人的联系名额。
+         */
+        if (scheduleWindowLabel || scheduleSlot) {
+          if (!scheduleWindowLabel || !scheduleSlot) {
+            return { ok: false, reason: "scheduleWindowLabel 和 scheduleSlot 必须一起填" };
+          }
+          const selected = selectedSchedules.get(scheduleWindowLabel);
+          if (!selected) {
+            return {
+              ok: false,
+              reason: `「${scheduleWindowLabel}」还没有用 chooseSchedule 选定方案，先选定再联系人`,
+            };
+          }
+          const consistency = checkScheduleSlotConsistency(selected, name, scheduleSlot);
+          if (!consistency.ok) {
+            return { ok: false, reason: `${consistency.reason}。改成一致的时段再发，不能私自改动已选方案。` };
+          }
+          // 排班数字已经由代码核对，正文也从同一结构化参数生成，避免模型
+          // 把一次建议写成“固定/天天”，或在自然语言里重新心算错时间。
+          const salutation = isGeneratedResidentName(target.name)
+            ? ""
+            : `${target.name}，`;
+          message =
+            `${salutation}关于${scheduleWindowLabel}，我先提出一个待确认的安排：` +
+            `你用 ${scheduleSlot.start}-${scheduleSlot.end}。这不是定案；你愿意吗？` +
+            "如果不合适直接告诉我，我会根据大家的回复继续协调。";
         }
         if (target.personId === sender.personId) {
           return {
@@ -760,52 +952,48 @@ export async function runColivingTurn(args: {
 
     pickSchedule: tool({
       description:
-        "把一段连续时间窗口，按几个人各自的硬约束（最早能开始、需要多久）" +
-        "和可选的软偏好（他说的\"最合适\"的时间），排出候选方案。\n" +
-        "**给两个人以上排一段连续时段时，先调这个，不要自己心算排列组合**" +
-        "——排列越多，靠人脑猜「谁排前面、谁排后面最好」越容易漏掉更好的" +
-        "排法（真实事故：把唯一有硬约束的人默认排最前面，结果把唯一说了" +
-        "偏好时间的人挤到了他不想要的时段，其实换个顺序两人都能满足）。" +
-        "返回的候选按「最多人接近自己偏好」排序，**但选哪个、要不要用，" +
-        "还是你自己判断**——比如某人虽然排列上吃亏但这次特殊情况可以" +
-        "谅解，这类人际判断这个工具不管，只负责把有哪些排法摆出来。",
+        "为多人连续使用同一资源计算排班；不要自行心算。硬约束绝不突破，" +
+        "软偏好用于比较公平负担（偏离分钟数/本人使用时长）。候选1是初始" +
+        "提议的唯一选择，候选2-5仅供比较。算完立刻调用 chooseSchedule；" +
+        "若有人补充限制或不同意，更新 people 后重新计算。",
       inputSchema: z.object({
         windowLabel: z.string().describe("这段窗口叫什么，比如「傍晚厨房时段」"),
-        windowStart: z.string().describe("窗口起点，HH:MM 格式，比如「18:00」"),
+        windowStart: z
+          .string()
+          .regex(HH_MM_PATTERN)
+          .describe("窗口起点，HH:MM 格式，比如「18:00」"),
         people: z
           .array(
             z.object({
               name: z.string().describe("这个人的名字"),
-              durationMinutes: z.number().describe("他需要占用多久，单位分钟"),
+              durationMinutes: z.number().int().positive().describe("需要占用的分钟数"),
               earliestStart: z
                 .string()
+                .regex(HH_MM_PATTERN)
                 .optional()
                 .describe(
-                  "他最早能开始的时间，HH:MM。**只在他明确说了『不能更早』" +
-                    "『最早只能几点』这类话、或者有客观原因（几点下班到家、" +
-                    "几点才有空）时才填这个**——填了就是硬约束，算法会当成" +
-                    "绝对不能突破的墙。**他只是随口说了个平时几点做的习惯**" +
-                    "（比如「我一般6:30」），不代表不能更早，那种情况填" +
-                    "`preferredStart`，不要填这个。真实事故：把一句随口的" +
-                    "习惯时间填成了硬约束，跟另一个人的硬约束互相顶死，排出来" +
-                    "的结果一个人被拖到很晚——填错这个字段，算法怎么排都救不了，" +
-                    "因为算法是在一道被人为收紧的题目上找最优解。不填就当作" +
-                    "窗口一开始就能开始。"
+                  "最早能开始的 HH:MM。仅用于明确的可用下界（如尚未到家/" +
+                    "明确说不能更早）；一般习惯填 preferredStart。"
                 ),
               preferredStart: z
                 .string()
+                .regex(HH_MM_PATTERN)
                 .optional()
                 .describe(
-                  "他自己说的\"最合适\"或者\"平时习惯\"的开始时间，HH:MM。" +
-                    "**这是软偏好，不是硬约束**——算法会尽量往这个时间靠，" +
-                    "但排不到也不会报错，不会顶死整个方案。**大多数人报的" +
-                    "时间应该填在这里，不是 earliestStart**——除非有明确的" +
-                    "'不能更早'的理由，默认当软偏好处理更安全。不填就不参与" +
-                    "满意度打分。"
+                  "最合适或平时习惯的 HH:MM；这是可让步的软偏好。"
+                ),
+              latestStart: z
+                .string()
+                .regex(HH_MM_PATTERN)
+                .optional()
+                .describe(
+                  "最晚能开始的 HH:MM，仅用于真正钉死的时间。与 earliestStart" +
+                    "相同表示只能此刻开始。"
                 ),
             })
           )
           .min(2)
+          .max(8)
           .describe("至少两个人，一个人不需要排"),
       }),
       execute: async ({ windowLabel, windowStart, people }) => {
@@ -824,37 +1012,117 @@ export async function runColivingTurn(args: {
          */
         const windowStartMinutes = toMinutes(windowStart);
 
-        const constraints = people.map((p) => ({
-          name: p.name,
-          durationMinutes: p.durationMinutes,
-          earliestStartMinutes: p.earliestStart
-            ? Math.max(0, toMinutes(p.earliestStart) - windowStartMinutes)
-            : 0,
-          preferredStartMinutes: p.preferredStart
-            ? toMinutes(p.preferredStart) - windowStartMinutes
-            : undefined,
-        }));
-        const plans = bestSchedulePlans(windowStartMinutes, constraints, 3);
+        // 明确说过“只能/必须/固定在某时开始”的历史表态属于硬事实，不能
+        // 因生成模型这次漏填 latestStart 就退化成可随意后移的软条件。
+        const storedPositions = [
+          ...(await repo.getStandalonePositions(sender.householdId)),
+          ...(
+            await Promise.all(
+              ctx.openCaseIds.map((caseId) => repo.getCasePositions(caseId))
+            )
+          ).flat(),
+        ];
+
+        const constraints = people.map((p) => {
+          const recordedFixedStart = storedPositions
+            .filter((position) => position.personName === p.name)
+            .map((position) => extractExplicitFixedStart(position.statement))
+            .find((value): value is number => value !== null);
+          const explicitEarliest = p.earliestStart
+            ? toMinutes(p.earliestStart)
+            : undefined;
+          const explicitLatest = p.latestStart
+            ? toMinutes(p.latestStart)
+            : undefined;
+          const fixedStart = recordedFixedStart;
+          return {
+            name: p.name,
+            durationMinutes: p.durationMinutes,
+            earliestStartMinutes:
+              fixedStart !== undefined
+                ? fixedStart - windowStartMinutes
+                : explicitEarliest !== undefined
+                  ? Math.max(0, explicitEarliest - windowStartMinutes)
+                  : 0,
+            latestStartMinutes:
+              fixedStart !== undefined
+                ? fixedStart - windowStartMinutes
+                : explicitLatest !== undefined
+                  ? explicitLatest - windowStartMinutes
+                  : undefined,
+            preferredStartMinutes: p.preferredStart
+              ? toMinutes(p.preferredStart) - windowStartMinutes
+              : undefined,
+          };
+        });
+        /**
+         * **候选数不再写死 3。** 公平尺度换成 worstPreferenceRatio 之后，
+         * 真正公平的那个候选未必排在前三——多给几个不会让模型挑花眼
+         * （candidates 只是给它核对用，不是选择题选项），但要能覆盖到
+         * 真正的最优解，5 个比 3 个更稳，穷举本身几毫秒级，不心疼这点算力。
+         */
+        const plans = bestSchedulePlans(windowStartMinutes, constraints, 5);
         if (plans.length === 0) {
-          return { ok: false, reason: "没排出候选，检查一下 people 是不是填对了" };
+          const hasLatest = constraints.some(
+            (constraint) => constraint.latestStartMinutes !== undefined
+          );
+          return {
+            ok: false,
+            reason: hasLatest
+              ? "没排出候选——填的 earliestStart/latestStart 这些硬约束互相顶死，" +
+                "物理上排不进这个窗口，回头跟当事人确认是不是真的都是钉死的时间"
+              : "没排出候选，检查一下 people 是不是填对了",
+          };
         }
+        // 重新排一次这个窗口，之前选定的方案就作废——不能让 chooseSchedule
+        // 继续指向一个已经不存在的旧候选集合。
+        scheduleCandidatesByLabel.set(windowLabel, plans);
+        selectedSchedules.delete(windowLabel);
+        /**
+         * **候选1跟"长占用者排最前面"这种直觉排法比，公平在哪——代码算好，
+         * 模型只转述。** 真实事故：排法本身完全正确，回复却编了一句
+         * "要让两位短时长者各多等两小时以上"来解释为什么选这个候选——
+         * 不是排错了，是模型自己心算"这个候选比别的方案好在哪"时编了数字。
+         * `describeFairnessGain` 是纯代码比较，直接把这句话准备好。
+         */
+        const longestName = [...constraints].sort(
+          (a, b) => b.durationMinutes - a.durationMinutes
+        )[0]?.name;
+        const baselinePlan = findSchedulePlans(windowStartMinutes, constraints).find(
+          (plan) => plan.order[0] === longestName
+        );
+        const fairnessRationale = baselinePlan
+          ? describeFairnessGain(baselinePlan, plans[0], constraints)
+          : null;
+
         /**
          * **记下全部候选，不是只记第一名。**
          *
-         * 本工具的 description 明确写了"返回的候选…选哪个、要不要用，
-         * 还是你自己判断"——`scheduleResults` 是喂给批判器（rubric 6.6）
-         * 的结构化事实，不是拿来做正则硬匹配的"唯一正确答案"：批判器
-         * 能理解语义，知道选候选二/三、或者做出有依据的公平让步都站得住，
-         * 只要草稿说清楚了为什么不用第一候选。
-         *
-         * 全部候选都是算法真实穷举出来的方案（不是模型编的），一并交出去
-         * 让批判器核对人和时段、以及整套方案本身站不站得住。
+         * 初始提议现在强制走 `chooseSchedule` 选候选1（`selectScheduleCandidate`
+         * 会拒绝其他编号），候选2-5不再是模型可以凭理由选用的选项，只是
+         * 给批判器和人核对"候选1确实更公平"用的对照——`scheduleResults`
+         * 是喂给批判器（rubric 6.6）的结构化事实，全部候选都是算法真实
+         * 穷举出来的方案（不是模型编的），一并交出去方便核对整套方案
+         * 站不站得住。
          */
-        for (const p of plans) {
+        for (const [i, p] of plans.entries()) {
+          const worseBy = p.totalPreferenceGapMinutes - plans[0].totalPreferenceGapMinutes;
           scheduleResults.push(
-            `「${windowLabel}」候选方案：${p.assignments
-              .map((a) => `${a.name} ${formatMinutes(a.startMinutes)}-${formatMinutes(a.endMinutes)}`)
-              .join("，")}`
+            `「${windowLabel}」候选${i + 1}（参与计算的人：${p.order.join("、")}）：${p.assignments
+              .map(
+                (a) =>
+                  `${a.name} ${formatMinutes(a.startMinutes)}-${formatMinutes(a.endMinutes)}` +
+                  (a.preferenceGapMinutes !== null
+                    ? `（偏离他偏好${a.preferenceGapMinutes}分钟）`
+                    : "")
+              )
+              .join("，")}` +
+              (i === 0
+                ? `（公平负担最小——单个人相对自己所需时长偏离最大的比例约${Math.round(p.worstPreferenceRatio * 100)}%，总共让大家多等约${p.totalPreferenceGapMinutes}分钟）` +
+                  (fairnessRationale ? `\n${fairnessRationale}` : "")
+                : worseBy > 0
+                  ? `（比候选1总共多让人多等约${worseBy}分钟，仅供比较）`
+                  : "（跟候选1总偏离相当，仅供比较）")
           );
         }
         /**
@@ -876,17 +1144,21 @@ export async function runColivingTurn(args: {
          * 拖得晚，未必是排列算法的锅，先回头确认每个人的约束是不是真的
          * 说了'不能更早'，而不是随口提了个时间"。
          */
-        const hardConstraintCount = people.filter((p) => p.earliestStart).length;
+        const hardConstraintCount = constraints.filter(
+          (constraint) =>
+            constraint.earliestStartMinutes > 0 ||
+            constraint.latestStartMinutes !== undefined
+        ).length;
         const noteParts: string[] = [];
         if (hardConstraintCount >= 2) {
           noteParts.push(
-            "**这次有两个以上的人带了硬约束（earliestStart）。** 排出来的结果如果" +
-              "把人拖到了比较晚的时段，往前拉窗口是救不了的——多个硬约束互相顶着，" +
-              "算法已经是在这些约束下能找到的最优解了。这时候先回头想一下：这几个" +
-              "硬约束是不是真的听到了'我最早只能几点''不能比这更早'这类明确的话，" +
-              "还是有人只是随口说了个习惯时间（那种该填 preferredStart，不是" +
-              "earliestStart）——填错会让算法在一道被人为收紧的题目上瞎耗，" +
-              "怎么排都排不出好结果。"
+            "**这次有两个以上的人带了硬约束（earliestStart/latestStart）。**" +
+              "排出来的结果如果把人拖到了比较晚的时段，往前拉窗口是救不了的——" +
+              "多个硬约束互相顶着，算法已经是在这些约束下能找到的最优解了。" +
+              "这时候先回头想一下：这几个硬约束是不是真的听到了'我最早只能几点'" +
+              "'不能比这更早''只能几点开始'这类明确的话，还是有人只是随口说了个" +
+              "习惯时间（那种该填 preferredStart，不是 earliestStart/latestStart）——" +
+              "填错会让算法在一道被人为收紧的题目上瞎耗，怎么排都排不出好结果。"
           );
         }
         return {
@@ -906,11 +1178,80 @@ export async function runColivingTurn(args: {
                   : "")
             ),
             latestEnd: formatMinutes(p.latestEndMinutes),
+            /**
+             * **公平性对比写死成数字，不留给模型自己心算。**
+             *
+             * `fairnessRatio` = 这个候选里，偏离最惨的那个人「偏离分钟数 /
+             * 自己需要的时长」——不是绝对分钟数。理由见 scheduling.ts 里
+             * `worstPreferenceRatio` 的注释：同样多等 60 分钟，对占用
+             * 半小时的人和占用两小时的人不是一回事，只报绝对分钟数会让
+             * 模型误以为"让短时长的人多等"是公平的（因为看起来数字一样）。
+             * 候选一按这个比值最小排出来，不代表总分钟数最省——
+             * `totalPreferenceGapMinutes` 单独给出来，两个数字都摆着，
+             * 模型自己判断要哪种公平。
+             */
             note:
               i === 0
-                ? "这是让最多人接近自己偏好的排法"
-                : "备选，满意度略低于第一个",
+                ? (plans.length > 1 && p.worstPreferenceRatio > 0
+                    ? `这是公平负担最小的排法：偏离最多的那个人，偏离时长约是他` +
+                      `自己所需时长的${Math.round(p.worstPreferenceRatio * 100)}%` +
+                      `（总共让大家多等约${p.totalPreferenceGapMinutes}分钟）`
+                    : "这是让最多人接近自己偏好的排法") +
+                  (fairnessRationale ? `\n${fairnessRationale}` : "")
+                : (() => {
+                    const worseBy = p.totalPreferenceGapMinutes - plans[0].totalPreferenceGapMinutes;
+                    const ratioPct = Math.round(p.worstPreferenceRatio * 100);
+                    return `备选：偏离最多的人约占自己所需时长的${ratioPct}%` +
+                      (worseBy > 0
+                        ? `，总共比候选一多让人多等约${worseBy}分钟`
+                        : "，总偏离跟候选一相当") +
+                      "——仅供比较；有新事实时更新约束并重新计算";
+                  })(),
           })),
+        };
+      },
+    }),
+
+    chooseSchedule: tool({
+      description:
+        "紧接 pickSchedule，选定候选1作为本轮唯一方案。之后 contactPerson" +
+        "必须带同一 windowLabel 和该人的 scheduleSlot，代码会核对。新事实" +
+        "出现时重新调用 pickSchedule，不改选旧候选。",
+      inputSchema: z.object({
+        windowLabel: z.string().describe("跟 pickSchedule 用的同一个窗口名"),
+        candidateNumber: z
+          .number()
+          .int()
+          .min(1)
+          .describe("选第几个候选，对应 pickSchedule 返回的 candidates[].rank"),
+      }),
+      execute: async ({ windowLabel, candidateNumber }) => {
+        const candidates = scheduleCandidatesByLabel.get(windowLabel);
+        if (!candidates) {
+          return { ok: false, reason: `没有叫「${windowLabel}」的 pickSchedule 结果，先调 pickSchedule` };
+        }
+        const picked = selectScheduleCandidate(candidates, candidateNumber);
+        if (!picked.ok) {
+          return picked;
+        }
+        const { plan } = picked.selection;
+        selectedSchedules.set(windowLabel, picked.selection);
+        scheduleResults.push(
+          `「${windowLabel}」已选定候选${candidateNumber}：${plan.assignments
+            .map(
+              (a) =>
+                `${a.name} ${formatMinutes(a.startMinutes)}-${formatMinutes(a.endMinutes)}` +
+                (a.preferenceGapMinutes !== null ? `（偏离他偏好${a.preferenceGapMinutes}分钟）` : "")
+            )
+            .join("，")}` +
+            "——这是这次唯一在用的方案，后面所有跟这个窗口有关的消息都要对齐这里的时段。"
+        );
+        return {
+          ok: true,
+          note:
+            "选定了。给参与者发 contactPerson 时带上 scheduleWindowLabel 和 " +
+            "scheduleSlot（他自己的开始/结束时间），代码会核对对不对，" +
+            "不用在每条消息里重复解释为什么选这个方案。",
         };
       },
     }),
@@ -1633,6 +1974,7 @@ export async function runColivingTurn(args: {
   }
   if (topicHitsConflict) {
     activeTools.pickSchedule = tools.pickSchedule;
+    activeTools.chooseSchedule = tools.chooseSchedule;
     activeTools.recordShare = tools.recordShare;
     activeTools.notePartyAffected = tools.notePartyAffected;
     activeTools.recordPosition = tools.recordPosition;
@@ -1647,6 +1989,7 @@ export async function runColivingTurn(args: {
    * 运行时状态每轮都变，留在断点之外，否则一变就整段落空。
    */
   const result = await generateText({
+    abortSignal: turnAbortSignal(),
     model: getLanguageModel(modelId),
     system: [
       {
@@ -1691,6 +2034,7 @@ export async function runColivingTurn(args: {
      */
     try {
       const forced = await generateText({
+        abortSignal: turnAbortSignal(),
         model: getLanguageModel(modelId),
         system: [
           {
@@ -1774,6 +2118,7 @@ export async function runColivingTurn(args: {
     if (names.length > 0) {
       try {
         const forcedContact = await generateText({
+          abortSignal: turnAbortSignal(),
           model: getLanguageModel(modelId),
           system: [
             {
@@ -1846,6 +2191,14 @@ export async function runColivingTurn(args: {
    * 一遍"一共住几位"，跟房东刚说的话完全对不上。
    */
   const liveRoster = await repo.rosterStatus(sender.householdId);
+  const livePositionFacts = [
+    ...(await repo.getStandalonePositions(sender.householdId)),
+    ...(
+      await Promise.all(
+        ctx.openCaseIds.map((caseId) => repo.getCasePositions(caseId))
+      )
+    ).flat(),
+  ];
   const rosterNote = liveRoster.complete
     ? "（总人数已确认）"
     : "（⚠️ 总人数还没确认过，问一句「一共住几个人」不算多余）";
@@ -1857,6 +2210,11 @@ export async function runColivingTurn(args: {
    */
   const renderBaseFacts = () =>
     `名册上的人：${ctx.members.map((m) => m.name).join("、")}${rosterNote}\n` +
+    (livePositionFacts.length
+      ? `已记录的住户原话：${livePositionFacts
+          .map((position) => `${position.personName}：${position.statement}`)
+          .join("；")}\n`
+      : "") +
     `本轮调用的工具：${toolsUsed.join("、") || "无"}` +
     (scheduleResults.length ? `\n${scheduleResults.join("\n")}` : "");
 
@@ -1901,6 +2259,12 @@ export async function runColivingTurn(args: {
   // 这里显式存一份非空引用给闭包用，不然每处 sender.xxx 都会报"可能为 null"
   const senderName = sender.name;
   async function critiqueAndMarkOutbound(msgs: OutboundMessage[]): Promise<void> {
+    const batchSummary = msgs
+      .map((message) => {
+        const name = outboundNames.get(message.personId) ?? "某位住户";
+        return `给${name}：${message.text}`;
+      })
+      .join("\n");
     const verdicts = await Promise.all(
       msgs.map((o) => {
         const targetName = outboundNames.get(o.personId) ?? "某位住户";
@@ -1931,12 +2295,19 @@ export async function runColivingTurn(args: {
           said: "",
           facts:
             `${renderBaseFacts()}\n这条是主动发的，起因是 ${senderName} 说：${args.text}` +
+            (batchSummary
+              ? `\n本批同时准备给其他人的消息如下；这些消息会分别审核，不能因为` +
+                `当前这一条只写收件人自己的时段，就断言其他人没被联系：\n${batchSummary}`
+              : "") +
             (o.isIntroduction
               ? "\n这个人是这一轮才刚加进系统的，这条是第一次联系、" +
                 "自我介绍性质，不是在回应任何投诉或纠纷"
               : "") +
             (o.sharedRule
-              ? `\n这是对共用者一样的规矩；模型声明的共用范围：${
+              ? `\n这是对共用者一样的规矩；模型声明的共用范围（仅供判断语气/` +
+                "角色，跟这条消息是不是对他一个人下指令有关；不代表本轮" +
+                "计算实际涉及哪些人，那份名单以上面 pickSchedule 候选方案" +
+                `里列出的人名为准）：${
                   o.sharedWith ?? "（没说清是哪些人 —— 这本身就是问题）"
                 }`
               : "") +
@@ -1970,6 +2341,80 @@ export async function runColivingTurn(args: {
   }
 
   await critiqueAndMarkOutbound(outbound);
+
+  // 排班回复从选定方案和真实出站状态生成，不让模型再把正确候选转述错。
+  // 理解需求与选方案仍由模型完成；这一步只负责可靠地交付已确定的事实。
+  // 做成函数是因为审稿重写阶段也可能才真正完成排班；那条路径同样必须
+  // 使用代码里的选定方案，不能重新让模型自由转述数字。
+  const buildSelectedScheduleReply = (): string | null => {
+    const selectedSchedule = [...selectedSchedules.entries()].at(-1);
+    if (!selectedSchedule) return null;
+    const [windowLabel, selection] = selectedSchedule;
+    let anonymousIndex = 0;
+    const publicNames = new Map<string, string>();
+    for (const assignment of selection.plan.assignments) {
+      if (assignment.name === sender.name) {
+        publicNames.set(assignment.name, "你");
+      } else if (isGeneratedResidentName(assignment.name)) {
+        publicNames.set(
+          assignment.name,
+          anonymousIndex++ === 0 ? "一位住户" : "另一位住户"
+        );
+      } else {
+        publicNames.set(assignment.name, assignment.name);
+      }
+    }
+    const assignments = selection.plan.assignments
+      .map(
+        (assignment) =>
+          `${publicNames.get(assignment.name) ?? "一位住户"} ${formatMinutes(assignment.startMinutes)}-${formatMinutes(assignment.endMinutes)}`
+      )
+      .join("，");
+    const participantNames = new Set(selection.plan.assignments.map((a) => a.name));
+    const acceptedOriginalNames = outbound
+      .filter((message) => !message.blocked)
+      .map((message) => outboundNames.get(message.personId) ?? "")
+      .filter((name) => name && name !== sender.name && participantNames.has(name));
+    const acceptedNames = acceptedOriginalNames.map(
+      (name) => publicNames.get(name) ?? "另一位住户"
+    );
+    return (
+      `我先按你们已确认的可用时间、偏好和使用时长，为${windowLabel}排出一版待确认方案：` +
+      `${assignments}。这不是定案。` +
+      (acceptedNames.length
+        ? `这轮我也在向${acceptedNames.join("、")}征求意见；收到回复后我继续协调并告诉你。`
+        : "这轮没有新增征询；这版仍不能说成大家已经同意。")
+    );
+  };
+  const buildContactProgressReply = (): string | null => {
+    const acceptedOriginalNames = [
+      ...new Set(
+        outbound
+          .filter((message) => !message.blocked)
+          .map((message) => outboundNames.get(message.personId) ?? "")
+          .filter((name) => name && name !== sender.name)
+      ),
+    ];
+    const acceptedNames = acceptedOriginalNames.map((name, index) =>
+      isGeneratedResidentName(name)
+        ? index === 0
+          ? "一位住户"
+          : "另一位住户"
+        : name
+    );
+    if (acceptedNames.length === 0) return null;
+    return (
+      `这轮我也在联系${acceptedNames.join("、")}。` +
+      `收到${acceptedNames.length === 1 ? "对方" : "他们"}回复后，` +
+      "我会根据实际情况继续协调。"
+    );
+  };
+  let scheduleReplyGenerated = false;
+  const initialScheduleReply = buildSelectedScheduleReply();
+  if (initialScheduleReply) {
+    scheduleReplyGenerated = true;
+    reply = initialScheduleReply;
+  }
 
   /**
    * 回复的审稿放在出站之后（不能并发）：**回复如果说"我去联系他了"，
@@ -2018,8 +2463,6 @@ export async function runColivingTurn(args: {
    * 就是被拦的那条"而放过真正的谎言（拦截通常发生在唯一一条出站上，
    * 精确匹配带来的收益很小，复杂度却要高一截）。
    */
-  const claimedContactSuccessPattern =
-    /(我|这|马上|现在)?(正|正在|已经|这就|刚刚?|刚才)(跟|和|给|去跟|去和|去给)?.{0,6}(说|商量|联系|问|通知|沟通|确认|谈|提|讲|劝)/;
   function checkFalseContactClaim(
     text: string
   ): { broke: "0"; why: string } | null {
@@ -2027,7 +2470,7 @@ export async function runColivingTurn(args: {
       (other) => other.personId === o.personId && !other.blocked
     ));
     const anyBlocked = unresolved.length > 0;
-    if (anyBlocked && claimedContactSuccessPattern.test(text)) {
+    if (anyBlocked && claimsContactCompletion(text)) {
       const blockedTargets = unresolved
         .map((o) => o.personId)
         .join("、");
@@ -2044,6 +2487,35 @@ export async function runColivingTurn(args: {
     return null;
   }
 
+  function checkIncompleteConflictTurn(
+    text: string
+  ): { broke: "0"; why: string } | null {
+    if (
+      !toolsUsed.includes("recordPosition") ||
+      selectedSchedules.size > 0 ||
+      outbound.some((message) => !message.blocked)
+    ) {
+      return null;
+    }
+    const asksSomething = /[？?]/.test(text);
+    const asksConflictDetail =
+      asksSomething &&
+      /(?:多久|多长|几点|时间|时段|冲突|撞|谁|愿意|同意|可以|能否|能不能|限制|偏好)/.test(
+        text
+      );
+    if (!hasDeferredCoordination(text) && asksConflictDetail) {
+      return null;
+    }
+    return {
+      broke: "0",
+      why:
+        "这是冲突协调轮次，而且刚记录了新的立场，但回复没有向当前说话人追问" +
+        "任何与冲突有关的缺失信息，本轮也既没选定排班、又没成功联系其他住户。" +
+        "信息齐全就现在排；缺其他人的必要信息就现在联系那个人。只确认收到、" +
+        "只问姓名或把协调推到以后，都不算推进。",
+    };
+  }
+
   /**
    * **代码级硬规则的统一入口。** 以后再发现新的"模型转述代码已知
    * 事实却转述错"的马甲（比如分摊金额），往这里加一个检查函数就够了，
@@ -2058,13 +2530,25 @@ export async function runColivingTurn(args: {
   function checkFactFidelity(
     text: string
   ): { broke: "0"; why: string } | null {
-    return checkFalseContactClaim(text);
+    return checkFalseContactClaim(text) ?? checkIncompleteConflictTurn(text);
+  }
+
+  // contactPerson 在这里只完成“通过审稿并进入本轮发送队列”；真正的渠道
+  // 投递与回复本人由路由并发执行。即使批判器放过“已经问了/刚联系过”，
+  // 也不能把尚未拿到渠道结果的动作写成完成态。
+  if (
+    outbound.some((message) => !message.blocked) &&
+    claimsContactCompletion(reply)
+  ) {
+    reply = buildContactProgressReply() ?? reply;
   }
 
   const factFidelityHit = checkFactFidelity(reply);
 
   const verdict = factFidelityHit
-    ? { pass: false as const, ...factFidelityHit }
+    ? { verified: true, pass: false as const, ...factFidelityHit }
+    : scheduleReplyGenerated
+      ? { verified: true, pass: true as const, broke: "", why: "" }
     : await critique({
         to: sender.name,
         role: senderRole,
@@ -2073,7 +2557,21 @@ export async function runColivingTurn(args: {
         draft: reply,
       });
 
-  if (!verdict.pass) {
+  /**
+   * **最终这句话有没有真的过审——不是"批判器调没调"。**
+   * 初稿过审就是 true；打回之后，这个值要跟着重写/最终修正的真实结果走，
+   * 不能因为"发了消息总比不发好"就悄悄伪装成过审。见 `ReplyReview` 定义。
+   */
+  let replyReview: ReplyReview = verdict.pass
+    ? { verified: verdict.verified, pass: true, broke: "", why: verdict.why }
+    : { verified: verdict.verified, pass: false, broke: verdict.broke, why: verdict.why };
+
+  const deterministicContactReply =
+    !verdict.pass ? buildContactProgressReply() : null;
+  if (deterministicContactReply) {
+    reply = deterministicContactReply;
+    replyReview = { verified: true, pass: true, broke: "", why: "" };
+  } else if (!verdict.pass) {
     console.log("[critic] 打回：", verdict.broke, verdict.why);
     try {
       /**
@@ -2111,7 +2609,13 @@ export async function runColivingTurn(args: {
        */
       // "0" 是代码判定的硬规则（分了资源却没算过），"7" 是批判器判的
       // 承诺没兑现——两者都需要重写时拿到完整工具集，不能只给 sendReply
-      const isBrokenPromise = verdict.broke.trim() === "7" || verdict.broke.trim() === "0";
+      const needsBlockedOutboundRecovery =
+        outbound.some((message) => message.blocked) &&
+        ["1", "2", "12"].includes(verdict.broke.trim());
+      const isBrokenPromise =
+        verdict.broke.trim() === "7" ||
+        verdict.broke.trim() === "0" ||
+        needsBlockedOutboundRecovery;
       /**
        * **根治，不再按"哪种具体动作"逐个开口子。**
        *
@@ -2130,20 +2634,20 @@ export async function runColivingTurn(args: {
        * `sendReply`），影响面没有扩大到无关的打回场景。
        */
       /**
-       * **`broke==="0"` 时额外无条件塞 `pickSchedule`，不能只 spread
-       * `activeTools`。** `pickSchedule` 进不进 `activeTools`，取决于
-       * 路由用本轮消息原文猜的话题（`topicHitsConflict`）——真实复现过：
-       * 硬规则已经判定"这轮需要排班却没调"，但路由没猜中冲突话题时，
-       * `activeTools` 里压根没有它，重写还是巧妇难为无米之炊。
-       * 硬规则命中本身就是比路由关键词匹配更可靠的信号。
+       * **第7条和代码规则0都无条件补齐排班工具，不能只 spread
+       * `activeTools`。** `pickSchedule` 进不进 `activeTools`，取决于路由
+       * 用本轮消息原文猜的话题（`topicHitsConflict`）——真实复现过最后
+       * 一句只是“我刚才不是说了吗”，路由没命中，但审稿已经确认它在
+       * 空口承诺稍后排。审稿命中本身比关键词路由更可靠。
        */
       const redoTools: Record<string, (typeof tools)[keyof typeof tools]> =
         isBrokenPromise
           ? {
               ...activeTools,
-              ...(verdict.broke.trim() === "0"
-                ? { pickSchedule: tools.pickSchedule }
-                : {}),
+              // 第7条也可能是“答应稍后排、但本轮没排”；不能再依赖本轮
+              // 原文是否被路由成 conflict，两个排班工具一律补齐。
+              pickSchedule: tools.pickSchedule,
+              chooseSchedule: tools.chooseSchedule,
               sendReply: tools.sendReply,
             }
           : { sendReply: tools.sendReply };
@@ -2152,6 +2656,7 @@ export async function runColivingTurn(args: {
       // 不重复审已经审过、已经落定的那些
       const outboundLenBeforeRedo = outbound.length;
       const redoResult = await generateText({
+        abortSignal: turnAbortSignal(),
         model: getLanguageModel(modelId),
         system: [
           {
@@ -2288,6 +2793,7 @@ export async function runColivingTurn(args: {
          * 不受路由影响，不需要额外补。
          */
         const retryResult = await generateText({
+          abortSignal: turnAbortSignal(),
           model: getLanguageModel(modelId),
           system: [
             {
@@ -2321,11 +2827,12 @@ export async function runColivingTurn(args: {
           tools: {
             ...activeTools,
             pickSchedule: tools.pickSchedule,
+            chooseSchedule: tools.chooseSchedule,
             sendReply: tools.sendReply,
           },
           toolChoice: "required",
-          // 可能要先调 pickSchedule 再 sendReply，给够 2 步的余量
-          stopWhen: [hasToolCall("sendReply"), stepCountIs(3)],
+          // 可能要先调 pickSchedule 再 chooseSchedule 再 sendReply，给够步数余量
+          stopWhen: [hasToolCall("sendReply"), stepCountIs(4)],
         });
         // 同一个盲区第四处——这条循环本身是这次泛化才新写的，写的时候
         // 就该顺手聚合，结果还是漏了，说明这个盲区已经不是"忘了"这么
@@ -2366,12 +2873,13 @@ export async function runColivingTurn(args: {
        * （信息不全时延后必须先问）。**这条路径以前完全没人复查**，
        * 重写永远被当成"改完就对"。
        *
-       * 只查一次，不循环重写——查出还是不合格，说明这条内容本身
-       * 有分歧（可能是批判器过严，也可能是模型确实拧不过来），
-       * 死循环重写只会越改越糟，倒不如老实发出去、把这次分歧记下来，
-       * 好过用户完全收不到回复。**这是有意的"有限复核"，不是查漏。**
+       * 主观分歧最多只再给一次**聚焦的最终修正机会**（只带 sendReply，
+       * 喂完整最新事实和明确的审稿理由），再复核一次收尾——比死循环重写
+       * 更克制，也比"打回一次就摆烂"更负责。这次复核的结论就是最终
+       * `replyReview`：还不合格，宁可保留这条可交付的消息（不让用户
+       * 收不到任何回复），但**评测和汇总必须看到红灯**，不能再假装通过。
        */
-      const newReplyFacts =
+      const renderNewReplyFacts = () =>
         renderBaseFacts() +
         (outbound.length
           ? `\n同一轮还联系了别人：${outbound
@@ -2385,25 +2893,153 @@ export async function runColivingTurn(args: {
         to: sender.name,
         role: senderRole,
         said: args.text,
-        facts: newReplyFacts,
+        facts: renderNewReplyFacts(),
         draft: reply,
       });
-      if (!redoVerdict.pass) {
-        // 不再重写第二次——记录下来，老实把这条发出去。
-        // 「有消息总好过没消息」的原则同样适用于这里。
+      const redoContactReply =
+        !redoVerdict.pass ? buildContactProgressReply() : null;
+      if (redoVerdict.pass) {
+        replyReview = {
+          verified: redoVerdict.verified,
+          pass: true,
+          broke: "",
+          why: redoVerdict.why,
+        };
+      } else if (redoContactReply) {
+        reply = redoContactReply;
+        replyReview = { verified: true, pass: true, broke: "", why: "" };
+      } else {
         console.log(
-          "[critic] 重写后复核仍不合格（只记录，不再重写）：",
+          "[critic] 重写后复核仍不合格，做最后一次聚焦修正：",
           redoVerdict.broke,
           redoVerdict.why
         );
+        try {
+          deliveredReply = null;
+          const finalNeedsAction =
+            redoVerdict.broke.trim() === "7" ||
+            redoVerdict.broke.trim() === "0" ||
+            (outbound.some((message) => message.blocked) &&
+              ["1", "2", "12"].includes(redoVerdict.broke.trim()));
+          const finalTools: Record<string, (typeof tools)[keyof typeof tools]> =
+            finalNeedsAction
+              ? {
+                  ...activeTools,
+                  pickSchedule: tools.pickSchedule,
+                  chooseSchedule: tools.chooseSchedule,
+                  sendReply: tools.sendReply,
+                }
+              : { sendReply: tools.sendReply };
+          const finalOutboundLen = outbound.length;
+          const finalFix = await generateText({
+            abortSignal: turnAbortSignal(),
+            model: getLanguageModel(modelId),
+            system: [
+              {
+                role: "system" as const,
+                content: doctrine,
+                providerOptions: {
+                  anthropic: { cacheControl: { type: "ephemeral" } },
+                },
+              },
+              { role: "system" as const, content: runtime },
+            ],
+            messages: [
+              ...history,
+              { role: "user" as const, content: args.text },
+              { role: "assistant" as const, content: reply },
+              {
+                role: "user" as const,
+                content:
+                  "【这不是住户说的，是审稿意见——这是最后一次修正机会】\n" +
+                  `第${redoVerdict.broke}条仍不合格：${redoVerdict.why}\n\n` +
+                  `【这一轮最新的完整事实】\n${renderNewReplyFacts()}\n\n` +
+                  (finalNeedsAction
+                    ? "这次不能只换措辞：先调必要的工具，把该排的方案排出来、该联系的人联系到；完成后再调 sendReply 交付正文。"
+                    : "只做一件事：调 sendReply，把改好后真正要发给对方的那句话交出来，") +
+                  "对着上面的理由和事实改，不要重复同一个问题。",
+              },
+            ],
+            tools: finalTools,
+            toolChoice: finalNeedsAction
+              ? "required"
+              : { type: "tool", toolName: "sendReply" },
+            ...(finalNeedsAction
+              ? { stopWhen: [hasToolCall("sendReply"), stepCountIs(4)] }
+              : {}),
+          });
+          for (const step of finalFix.steps) {
+            for (const call of step.toolCalls ?? []) {
+              toolsUsed.push(call.toolName);
+            }
+          }
+          const finalText = stripMarkdown((deliveredReply ?? "").trim());
+          if (finalText) {
+            reply = finalText;
+          }
+          const finalNewOutbound = outbound.slice(finalOutboundLen);
+          if (finalNewOutbound.length > 0) {
+            await critiqueAndMarkOutbound(finalNewOutbound);
+          }
+          const finalScheduleReply = buildSelectedScheduleReply();
+          if (finalScheduleReply) {
+            reply = finalScheduleReply;
+          }
+        } catch (finalError) {
+          console.log(
+            "[critic] 最后一次聚焦修正失败，沿用上一版重写稿：",
+            finalError instanceof Error ? finalError.message : String(finalError)
+          );
+        }
+        const finalVerdict = await critique({
+          to: sender.name,
+          role: senderRole,
+          said: args.text,
+          facts: renderNewReplyFacts(),
+          draft: reply,
+        });
+        const finalContactReply =
+          !finalVerdict.pass &&
+          selectedSchedules.size === 0 &&
+          buildContactProgressReply();
+        if (finalContactReply) {
+          reply = finalContactReply;
+          replyReview = { verified: true, pass: true, broke: "", why: "" };
+        } else {
+          replyReview = {
+            verified: finalVerdict.verified,
+            pass: finalVerdict.pass,
+            broke: finalVerdict.broke,
+            why: finalVerdict.why,
+          };
+        }
+        if (!replyReview.pass) {
+          console.log(
+            "[critic] 最终修正后仍不合格——保留可交付消息，但 replyReview 标红：",
+            finalVerdict.broke,
+            finalVerdict.why
+          );
+        }
       }
     } catch (error) {
-      // 改不动就用原来那条——有消息总好过没消息
+      // 改不动就用原来那条——有消息总好过没消息，但 replyReview 保持
+      // 上面设的失败态（初次打回的结论），不能假装重写成功了。
       console.log(
         "[critic] 重写失败，用原稿：",
         error instanceof Error ? error.message : String(error)
       );
     }
+  }
+
+  // 最后一次模型修正可能在已经调用 chooseSchedule 后超时。工具动作此时
+  // 已经生效、selectedSchedules 里也有真实方案，但异常会跳过 try 内的
+  // buildSelectedScheduleReply；若不在所有改写路径之后再收口一次，就会
+  // 把超时前的“以后再排”旧稿发出去。只要方案已经选定，最终交付一律以
+  // 代码生成的方案事实为准，模型是否顺利结束不能改变这个结果。
+  const settledScheduleReply = buildSelectedScheduleReply();
+  if (settledScheduleReply) {
+    reply = settledScheduleReply;
+    replyReview = { verified: true, pass: true, broke: "", why: "" };
   }
 
   // ── 落库：入站消息、回复本身也算一次 communication ──
@@ -2444,6 +3080,8 @@ export async function runColivingTurn(args: {
 
   return {
     reply,
+    replyReview,
+    scheduleFacts: [...scheduleResults],
     replyCommunicationId,
     // 审稿拦下的不交给调用方投递
     outbound: outbound.filter((o) => !o.blocked),

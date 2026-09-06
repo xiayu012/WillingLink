@@ -12,7 +12,7 @@
   ],
   "expect": {
     "minAcceptedOutbound": 2,
-    "mustUseTools": ["pickSchedule", "contactPerson"],
+    "mustUseTools": ["pickSchedule", "chooseSchedule", "contactPerson"],
     "replyMustNotMatch": ["[0-9]号住客"]
   }
 }

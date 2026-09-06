@@ -1,0 +1,19 @@
+{
+  "id": "fixed-start-2026-09-06",
+  "source": "合成回归：长时占用者有真实固定开始时刻，公平排序不得为了照顾短时使用者而突破硬约束；仍须选定同一候选并分别征询。",
+  "household": { "label": "评测-固定开始硬约束" },
+  "people": [
+    { "phone": "+15550009101", "name": "老王", "role": "tenant" },
+    { "phone": "+15550009102", "name": "小周", "role": "tenant" },
+    { "phone": "+15550009103", "name": "小陈", "role": "tenant" }
+  ],
+  "turns": [
+    { "from": "+15550009101", "text": "今晚三个人共用厨房，请你协调。我的线上烹饪课固定18点整开始、20点结束，必须连续跟课两小时，早一分钟晚一分钟都不行。小周18点后都可以，用半小时。小陈18点后也可以，19点最合适，用半小时。这些需求已经核对过。请给一个具体但尚未定案的安排，并分别问他们是否同意。" }
+  ],
+  "expect": {
+    "minAcceptedOutbound": 2,
+    "mustUseTools": ["pickSchedule", "chooseSchedule", "contactPerson"],
+    "replyMustMatch": ["18[:：]?00.{0,8}20[:：]?00"],
+    "replyMustNotMatch": ["[0-9]号住客"]
+  }
+}

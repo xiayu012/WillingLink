@@ -6,7 +6,16 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { config } from "dotenv";
 import { finalizeJudgment, judgeConversation, type JudgeTurn } from "../lib/chat/coliving/evals/judge";
 import { bestSchedulePlans } from "../lib/chat/coliving/scheduling";
-import { countAcceptedOutbound } from "../lib/chat/coliving/evals/schema";
+import {
+  countAcceptedOutbound,
+  evaluateReplyReview,
+  evaluateTurnReplyReviews,
+} from "../lib/chat/coliving/evals/schema";
+import {
+  claimsContactCompletion,
+  extractExplicitFixedStart,
+  hasDeferredCoordination,
+} from "../lib/chat/coliving/turn";
 
 async function main() {
   let count = 0;
@@ -27,6 +36,29 @@ async function main() {
     assert.equal(countAcceptedOutbound(bad[0].outbound), 0);
     assert.equal(countAcceptedOutbound([...bad[0].outbound, { blocked: false }]), 1);
   });
+  check("failed or unverified reply review cannot pass the eval gate", () => {
+    assert.deepEqual(evaluateReplyReview(undefined).length, 1);
+    assert.deepEqual(
+      evaluateReplyReview({ verified: false, pass: true, broke: "", why: "模型超时" }).length,
+      1
+    );
+    assert.deepEqual(
+      evaluateReplyReview({ verified: true, pass: false, broke: "2", why: "编造事实" }).length,
+      1
+    );
+    assert.deepEqual(
+      evaluateReplyReview({ verified: true, pass: true, broke: "", why: "" }),
+      []
+    );
+  });
+  check("an earlier red reply review cannot be hidden by a green last turn", () => {
+    const failures = evaluateTurnReplyReviews([
+      { verified: true, pass: false, broke: "7", why: "承诺未执行" },
+      { verified: true, pass: true, broke: "", why: "" },
+    ]);
+    assert.equal(failures.length, 1);
+    assert.match(failures[0], /第1轮/);
+  });
   check("substantive medium is not accepted", () => {
     assert.equal(finalizeJudgment([{ severity: "medium", turnIndex: 0, issue: "未完成协调", quote: bad[0].reply }], bad).pass, false);
   });
@@ -38,6 +70,40 @@ async function main() {
     const turns = [bad[0], { ...bad[0], reply: "没有发成功。", outbound: [{ ...bad[0].outbound[0], blocked: false }] }];
     const r = finalizeJudgment([{ severity: "high", turnIndex: 0, issue: "仅草稿问题", quote: bad[0].outbound[0].text }], turns);
     assert.equal(r.findings[0].severity, "low");
+  });
+  check("judge cannot call a delivered target blocked", () => {
+    const turns: JudgeTurn[] = [{
+      fromName: "小陈",
+      said: "请问老孙",
+      reply: "我已经向老孙发出消息。",
+      outbound: [{ toName: "老孙", text: "你需要用多久？", blocked: false }],
+    }];
+    const result = finalizeJudgment([{
+      severity: "high",
+      turnIndex: 0,
+      issue: "声称联系老孙，但发给老孙的消息被审稿拦下、没有真的发出去",
+      quote: turns[0].reply,
+    }], turns);
+    assert.equal(result.verified, true);
+    assert.equal(result.pass, true);
+    assert.deepEqual(result.findings, []);
+  });
+  check("judge cannot call a turn with accepted outbound no progress", () => {
+    const turns: JudgeTurn[] = [{
+      fromName: "小周",
+      said: "我随时都行，半小时就够",
+      reply: "我还在问另外两位，收齐后一起排。",
+      outbound: [{ toName: "房东", text: "你一般需要用多久？", blocked: false }],
+    }];
+    const result = finalizeJudgment([{
+      severity: "high",
+      turnIndex: 0,
+      issue: "只承诺以后再排，没有真正推进排方案或联系人，任务实质性落空",
+      quote: turns[0].reply,
+    }], turns);
+    assert.equal(result.verified, true);
+    assert.equal(result.pass, true);
+    assert.deepEqual(result.findings, []);
   });
   check("invented quote is unverified, never green", () => {
     const r = finalizeJudgment([{ severity: "high", turnIndex: 0, issue: "没有原文", quote: "不存在的原话" }], bad);
@@ -57,6 +123,45 @@ async function main() {
     assert.equal(finalizeJudgment([{ severity: "medium", turnIndex: 0, issue: "未同意就定案", quote: "记下了,你这边定七点。" }], turns).verified, true);
   });
   check("style-only finding does not block", () => assert.equal(finalizeJudgment([{ severity: "low", turnIndex: 0, issue: "文风", quote: bad[0].reply }], bad).pass, true));
+  check("deferred third-party action promise is detected narrowly", () => {
+    assert.equal(
+      hasDeferredCoordination(
+        "傍晚厨房怎么安排，我先把几位的时段问齐再定，定了第一时间发你。"
+      ),
+      true
+    );
+    assert.equal(
+      hasDeferredCoordination("我会去联系另外两位，收到结果再告诉你。"),
+      true
+    );
+    assert.equal(
+      hasDeferredCoordination("你时间灵活，后面排厨房时段好办。"),
+      true
+    );
+    assert.equal(
+      hasDeferredCoordination("我还在收其他人的时间，收齐排一版发你。"),
+      true
+    );
+    assert.equal(
+      hasDeferredCoordination("我先问你一句：你一般需要用多久？"),
+      false
+    );
+    assert.equal(
+      hasDeferredCoordination("我已向另外两位发出征询；收到回复后继续协调。"),
+      false
+    );
+  });
+  check("contact completion wording is detected before delivery", () => {
+    assert.equal(claimsContactCompletion("我已经向老孙发出消息。"), true);
+    assert.equal(claimsContactCompletion("好，我直接问他了。"), true);
+    assert.equal(claimsContactCompletion("我还在问另外两位，收齐后一起排。"), true);
+    assert.equal(claimsContactCompletion("这轮我也在联系老孙。"), false);
+  });
+  check("explicit fixed-start wording is recovered from recorded facts", () => {
+    assert.equal(extractExplicitFixedStart("我18点到家，只能18点开始做饭，要做两小时"), 1080);
+    assert.equal(extractExplicitFixedStart("我必须在 18:30 开始"), 1110);
+    assert.equal(extractExplicitFixedStart("七点最合适，但可以调整"), null);
+  });
 
   for (const label of ["厨房", "洗衣机"]) {
     check(`${label}: longer use can be last without violating arrival`, () => {
@@ -87,7 +192,19 @@ async function main() {
     assert(!src.includes("function checkScheduleHardRule("));
     assert(!src.includes("const pullBackMinutes"));
     assert(src.includes("contacted.delete(msg.personId)"));
-    assert(src.includes("bestSchedulePlans(windowStartMinutes, constraints, 3)"));
+    assert(src.includes("bestSchedulePlans(windowStartMinutes, constraints, 5)"));
+    assert(src.includes("const finalNeedsAction ="));
+    assert(src.includes("await critiqueAndMarkOutbound(finalNewOutbound)"));
+    assert(src.includes("const finalScheduleReply = buildSelectedScheduleReply()"));
+    assert(src.includes("const settledScheduleReply = buildSelectedScheduleReply()"));
+    assert(!src.includes("!topicHitsConflict ||\n      !toolsUsed.includes(\"recordPosition\")"));
+    assert(src.includes("const needsBlockedOutboundRecovery ="));
+    assert(src.includes("isGeneratedResidentName(target.name)"));
+    assert(src.includes("publicNames.get(assignment.name)"));
+    assert(src.includes("const deterministicContactReply ="));
+    assert(src.includes("const redoContactReply ="));
+    assert(src.includes("reply = buildContactProgressReply() ?? reply"));
+    assert(src.includes("!verdict.pass ? buildContactProgressReply() : null"));
   });
   const previous = process.env.COLIVING_JUDGE_OFF;
   process.env.COLIVING_JUDGE_OFF = "1";
