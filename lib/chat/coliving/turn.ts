@@ -66,11 +66,48 @@ export function claimsContactCompletion(text: string): boolean {
   return CLAIMED_CONTACT_COMPLETION_PATTERN.test(text);
 }
 
+/** case.kind 是开放文本；只有明确属于同住人或共享资源争用的未结事项才算。 */
+export function isOpenConflictCase(c: { kind: string; title: string }): boolean {
+  return (
+    /(?:conflict|contention|dispute|roommate|housemate|noise|clean(?:ing)?|trash|kitchen|bathroom|laundry|parking|guest)/i.test(
+      c.kind
+    ) ||
+    /(?:冲突|争用|争抢|室友|同住|厨房|灶台|卫生间|浴室|洗衣|停车|噪音|清洁|垃圾|访客)/.test(
+      c.title
+    )
+  );
+}
+
+export function isLowInformationFollowUp(text: string): boolean {
+  return /^(?:你好|您好|在吗|嗨|哈喽|hello|hi|嗯+|哦+|好(?:的)?|收到|知道了|谢谢)[!！。,.，?？\s]*$/i.test(
+    text.trim()
+  );
+}
+
+const CAPACITY_ESCAPE_PATTERN =
+  /(?:(?:添|加|买|自备|自己带|提供|准备).{0,10}(?:小电炉|电磁炉|便携(?:式)?(?:电)?炉|第二(?:个|台)?(?:灶|炉))|(?:小电炉|电磁炉|便携(?:式)?(?:电)?炉|第二(?:个|台)?(?:灶|炉)).{0,10}(?:办法|出路|解决|同时)|同时(?:开火|做饭)|两人.{0,8}(?:同时|一块儿).{0,8}(?:做饭|开火)|台面.{0,10}插座.{0,10}(?:两人|同时|开火)|插座.{0,10}(?:两人|同时|开火))/;
+
+/** 共享资源冲突还没经排班器证明无解时，不许把“加设备/并行使用”说成出路。 */
+export function isPrematureCapacityEscape(
+  text: string,
+  hasOpenConflict: boolean,
+  scheduleProvenInfeasible: boolean
+): boolean {
+  return hasOpenConflict && !scheduleProvenInfeasible && CAPACITY_ESCAPE_PATTERN.test(text);
+}
+
 function isGeneratedResidentName(name: string): boolean {
   return /^\d+号住客$/.test(name.trim());
 }
 
 export function extractExplicitFixedStart(statement: string): number | null {
+  // “没有要求必须18点开始”“不是固定在18点”是在明确否定固定开始。
+  // 先吃掉否定，否则下面只截到后半句“必须18点”，会把相反事实当硬约束。
+  if (
+    /(?:不|没|没有|并非|不是)[^，。；]{0,10}(?:只能|必须|固定)/.test(statement)
+  ) {
+    return null;
+  }
   const clause = statement.match(/(?:只能|必须|固定(?:在)?)[^，。；]{0,12}/)?.[0];
   if (!clause) return null;
   const hhmm = clause.match(/(\d{1,2})[:：]([0-5]\d)/);
@@ -198,6 +235,8 @@ export type OutboundMessage = {
    * 准备的，套在打招呼上会把中性内容当指控来审。
    */
   isIntroduction?: boolean;
+  /** 正文由已选候选和结构化时段生成，已通过代码一致性校验。 */
+  scheduleVerified?: boolean;
 };
 
 /**
@@ -347,13 +386,21 @@ export async function runColivingTurn(args: {
   const mentionsOther = ctx.members.some(
     (m) => m.personId !== sender.personId && args.text.includes(m.name)
   );
+  const hasOpenConflictCase = ctx.openCases.some(isOpenConflictCase);
+  const forcedModules = [
+    ...(mentionsOther ? ["conflict"] : []),
+    ...(hasOpenConflictCase ? ["conflict"] : []),
+  ];
 
   const { doctrine, runtime, loadedModuleIds, chars } = assembleSystemPrompt({
     brainId: "coliving",
     routeOn: args.text,
     runtimeContext: ctx.text,
-    forceModules: mentionsOther ? ["conflict"] : undefined,
+    // “你好”没有话题词；未结冲突本身是比本轮关键词更可靠的结构信号。
+    forceModules: forcedModules.length ? [...new Set(forcedModules)] : undefined,
   });
+  const conflictContextActive =
+    hasOpenConflictCase || loadedModuleIds.includes("conflict");
 
   // ── 本轮累积的状态 ──
   let decisionId: string | null = null;
@@ -394,6 +441,8 @@ export async function runColivingTurn(args: {
    * 这一步：选完之后所有消息只认这一个方案，不再各自去猜。
    */
   const selectedSchedules = new Map<string, ScheduleSelection>();
+  /** 只在本轮 pickSchedule 明确返回无候选时成立；口头说“排不开”不算证据。 */
+  let scheduleProvenInfeasible = false;
   /**
    * 这一轮里新加进来、这轮之前压根不存在的人。**批判器的四种角色
    * （报告的人/被说到的人/共用者通知的对象/受影响的其他人）全都假定
@@ -706,6 +755,7 @@ export async function runColivingTurn(args: {
         scheduleSlot,
       }) => {
         let message = stripMarkdown(raw);
+        let scheduleVerified = false;
         const target = await repo.findPersonByName(sender.householdId, name);
         if (!target) {
           return { ok: false, reason: `房子里没有叫「${name}」的人` };
@@ -760,6 +810,7 @@ export async function runColivingTurn(args: {
             `${salutation}关于${scheduleWindowLabel}，我先提出一个待确认的安排：` +
             `你用 ${scheduleSlot.start}-${scheduleSlot.end}。这不是定案；你愿意吗？` +
             "如果不合适直接告诉我，我会根据大家的回复继续协调。";
+          scheduleVerified = true;
         }
         if (target.personId === sender.personId) {
           return {
@@ -821,6 +872,7 @@ export async function runColivingTurn(args: {
           sharedRule: scope === "shared",
           sharedWith: sharedWith ?? null,
           isIntroduction: newlyAdded.has(target.personId),
+          scheduleVerified,
         });
         return { ok: true, sentTo: target.name };
       },
@@ -987,8 +1039,8 @@ export async function runColivingTurn(args: {
                 .regex(HH_MM_PATTERN)
                 .optional()
                 .describe(
-                  "最晚能开始的 HH:MM，仅用于真正钉死的时间。与 earliestStart" +
-                    "相同表示只能此刻开始。"
+                  "最晚能开始的 HH:MM，用于明确的最晚界限（例如明确拒绝20点后" +
+                    "才开始）；与 earliestStart 相同才表示只能此刻开始。"
                 ),
             })
           )
@@ -1025,7 +1077,12 @@ export async function runColivingTurn(args: {
 
         const constraints = people.map((p) => {
           const recordedFixedStart = storedPositions
-            .filter((position) => position.personName === p.name)
+            // commitment 是 AI 自己以前许过的话，不是住户的客观硬约束。
+            // 否则会形成“我说不动，所以它真的不能动”的闭环。
+            .filter(
+              (position) =>
+                position.personName === p.name && position.kind !== "commitment"
+            )
             .map((position) => extractExplicitFixedStart(position.statement))
             .find((value): value is number => value !== null);
           const explicitEarliest = p.earliestStart
@@ -1063,6 +1120,7 @@ export async function runColivingTurn(args: {
          */
         const plans = bestSchedulePlans(windowStartMinutes, constraints, 5);
         if (plans.length === 0) {
+          scheduleProvenInfeasible = true;
           const hasLatest = constraints.some(
             (constraint) => constraint.latestStartMinutes !== undefined
           );
@@ -1074,6 +1132,7 @@ export async function runColivingTurn(args: {
               : "没排出候选，检查一下 people 是不是填对了",
           };
         }
+        scheduleProvenInfeasible = false;
         // 重新排一次这个窗口，之前选定的方案就作废——不能让 chooseSchedule
         // 继续指向一个已经不存在的旧候选集合。
         scheduleCandidatesByLabel.set(windowLabel, plans);
@@ -2267,6 +2326,34 @@ export async function runColivingTurn(args: {
       .join("\n");
     const verdicts = await Promise.all(
       msgs.map((o) => {
+        // 这类正文不是模型自由发挥：时段先与 chooseSchedule 的唯一候选做了
+        // 结构化核对，再由上面的固定格式生成。语言批判器不应反过来把正确
+        // 数字误判成“锁死了另一个时段”。
+        if (o.scheduleVerified) {
+          return Promise.resolve({
+            verified: true,
+            pass: true as const,
+            broke: "",
+            why: "结构化排班时段与已选候选一致",
+          });
+        }
+        if (
+          isPrematureCapacityEscape(
+            o.text,
+            conflictContextActive,
+            scheduleProvenInfeasible
+          )
+        ) {
+          return Promise.resolve({
+            verified: true,
+            pass: false as const,
+            broke: "0",
+            why:
+              "这是未结的共享资源冲突，但本轮没有 pickSchedule 返回无候选的证据，" +
+              "不能先把加炉具、查插座或多人同时使用说成出路。先按一人独占排完" +
+              "所有顺序；只有结构化硬约束确实让排班无解，才考虑增容或并行。",
+          });
+        }
         const targetName = outboundNames.get(o.personId) ?? "某位住户";
         const withThisPerson = recentForCritique
           // **必须早于本轮开始**——本轮自己刚发的（含正在审的这条本身）
@@ -2487,11 +2574,38 @@ export async function runColivingTurn(args: {
     return null;
   }
 
+  function missingSelectedScheduleParticipants(): string[] {
+    const selected = [...selectedSchedules.values()].at(-1);
+    if (!selected) return [];
+    const contactedNames = new Set(
+      outbound
+        .filter((message) => !message.blocked)
+        .map((message) => outboundNames.get(message.personId) ?? "")
+    );
+    return selected.plan.assignments
+      .map((assignment) => assignment.name)
+      .filter((name) => name !== senderName && !contactedNames.has(name));
+  }
+
+  function checkUnconsultedSelectedSchedule(): { broke: "0"; why: string } | null {
+    const missing = missingSelectedScheduleParticipants();
+    return missing.length
+      ? {
+          broke: "0",
+          why:
+            `已经选定多人排班，但本轮没有实际向${missing.join("、")}征询。` +
+            "选出方案不是完成协调；现在就用 contactPerson 把各自时段发给" +
+            "尚未联系的参与者，不能只把整张表回给当前说话人。",
+        }
+      : null;
+  }
+
   function checkIncompleteConflictTurn(
     text: string
   ): { broke: "0"; why: string } | null {
     if (
-      !toolsUsed.includes("recordPosition") ||
+      (!toolsUsed.includes("recordPosition") &&
+        !(hasOpenConflictCase && isLowInformationFollowUp(args.text))) ||
       selectedSchedules.size > 0 ||
       outbound.some((message) => !message.blocked)
     ) {
@@ -2509,7 +2623,8 @@ export async function runColivingTurn(args: {
     return {
       broke: "0",
       why:
-        "这是冲突协调轮次，而且刚记录了新的立场，但回复没有向当前说话人追问" +
+        "这是冲突协调轮次（刚记录了新立场，或简短消息正在续接未结冲突），" +
+        "但回复没有向当前说话人追问" +
         "任何与冲突有关的缺失信息，本轮也既没选定排班、又没成功联系其他住户。" +
         "信息齐全就现在排；缺其他人的必要信息就现在联系那个人。只确认收到、" +
         "只问姓名或把协调推到以后，都不算推进。",
@@ -2530,6 +2645,23 @@ export async function runColivingTurn(args: {
   function checkFactFidelity(
     text: string
   ): { broke: "0"; why: string } | null {
+    const unconsultedSchedule = checkUnconsultedSelectedSchedule();
+    if (unconsultedSchedule) return unconsultedSchedule;
+    if (
+      isPrematureCapacityEscape(
+        text,
+        conflictContextActive,
+        scheduleProvenInfeasible
+      )
+    ) {
+      return {
+        broke: "0",
+        why:
+          "这是未结的共享资源冲突，但本轮没有 pickSchedule 返回无候选的证据。" +
+          "先按一人独占排完所有顺序并直接推进协调；不能把小电炉、插座或同时开火" +
+          "提前当成唯一出路，也不能把设备调查派回给收信人。",
+      };
+    }
     return checkFalseContactClaim(text) ?? checkIncompleteConflictTurn(text);
   }
 
@@ -2889,13 +3021,18 @@ export async function runColivingTurn(args: {
               )
               .join(" ／ ")}`
           : "\n这一轮没有联系任何其他人");
-      const redoVerdict = await critique({
-        to: sender.name,
-        role: senderRole,
-        said: args.text,
-        facts: renderNewReplyFacts(),
-        draft: reply,
-      });
+      // 重写稿必须重新过与首稿完全相同的代码硬闸；只交给语言批判器会让
+      // “首稿被确定性拦下、重写原样复读却变绿”成为可能。
+      const redoFactFidelityHit = checkFactFidelity(reply);
+      const redoVerdict = redoFactFidelityHit
+        ? { verified: true, pass: false as const, ...redoFactFidelityHit }
+        : await critique({
+            to: sender.name,
+            role: senderRole,
+            said: args.text,
+            facts: renderNewReplyFacts(),
+            draft: reply,
+          });
       const redoContactReply =
         !redoVerdict.pass ? buildContactProgressReply() : null;
       if (redoVerdict.pass) {
@@ -2991,13 +3128,16 @@ export async function runColivingTurn(args: {
             finalError instanceof Error ? finalError.message : String(finalError)
           );
         }
-        const finalVerdict = await critique({
-          to: sender.name,
-          role: senderRole,
-          said: args.text,
-          facts: renderNewReplyFacts(),
-          draft: reply,
-        });
+        const finalFactFidelityHit = checkFactFidelity(reply);
+        const finalVerdict = finalFactFidelityHit
+          ? { verified: true, pass: false as const, ...finalFactFidelityHit }
+          : await critique({
+              to: sender.name,
+              role: senderRole,
+              said: args.text,
+              facts: renderNewReplyFacts(),
+              draft: reply,
+            });
         const finalContactReply =
           !finalVerdict.pass &&
           selectedSchedules.size === 0 &&
@@ -3039,7 +3179,10 @@ export async function runColivingTurn(args: {
   const settledScheduleReply = buildSelectedScheduleReply();
   if (settledScheduleReply) {
     reply = settledScheduleReply;
-    replyReview = { verified: true, pass: true, broke: "", why: "" };
+    const unconsultedSchedule = checkUnconsultedSelectedSchedule();
+    replyReview = unconsultedSchedule
+      ? { verified: true, pass: false, ...unconsultedSchedule }
+      : { verified: true, pass: true, broke: "", why: "" };
   }
 
   // ── 落库：入站消息、回复本身也算一次 communication ──

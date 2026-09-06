@@ -214,6 +214,61 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
   const roleOf = (phone: string) =>
     members.find((m) => m.address === phone)?.role ?? "tenant";
 
+  for (const name of scenario.setup?.confirmedNames ?? []) {
+    const person = members.find((m) => m.name === name);
+    if (!person) {
+      throw new Error(`场景 ${scenario.id} 找不到要确认姓名的成员「${name}」`);
+    }
+    await repo.renamePerson({ personId: person.personId, name, confirmed: true });
+    person.nameConfirmed = true;
+  }
+
+  // 需要精确复现“某个结构化状态后的下一轮”时，直接预置测试状态，
+  // 不让额外一轮模型输出把前提改写掉；所有写入仍只发生在本次测试屋。
+  for (const openCase of scenario.setup?.openCases ?? []) {
+    const caseId = await repo.openCase({
+      householdId,
+      kind: openCase.kind,
+      title: openCase.title,
+      severity: openCase.severity ?? null,
+    });
+    for (const position of openCase.positions ?? []) {
+      const person = members.find((m) => m.name === position.person);
+      if (!person) {
+        throw new Error(
+          `场景 ${scenario.id} 预置表态找不到成员「${position.person}」`
+        );
+      }
+      await repo.recordCasePosition({
+        caseId,
+        householdId,
+        personId: person.personId,
+        kind: position.kind,
+        statement: position.statement,
+      });
+    }
+  }
+  for (const message of scenario.setup?.priorMessages ?? []) {
+    const person = members.find((m) => m.name === message.person);
+    if (!person) {
+      throw new Error(
+        `场景 ${scenario.id} 预置历史找不到成员「${message.person}」`
+      );
+    }
+    const conversationId = await repo.getOrCreateConversation({
+      personId: person.personId,
+      householdId,
+      channel: "sms",
+    });
+    await repo.appendMessage({
+      conversationId,
+      personId: person.personId,
+      direction: message.direction,
+      channel: "sms",
+      body: message.body,
+    });
+  }
+
   let last: Awaited<ReturnType<typeof turn.runColivingTurn>> | null = null;
   const transcript: TurnRecord[] = [];
   for (const t of scenario.turns) {

@@ -15,6 +15,9 @@ import {
   claimsContactCompletion,
   extractExplicitFixedStart,
   hasDeferredCoordination,
+  isLowInformationFollowUp,
+  isOpenConflictCase,
+  isPrematureCapacityEscape,
 } from "../lib/chat/coliving/turn";
 
 async function main() {
@@ -161,6 +164,31 @@ async function main() {
     assert.equal(extractExplicitFixedStart("我18点到家，只能18点开始做饭，要做两小时"), 1080);
     assert.equal(extractExplicitFixedStart("我必须在 18:30 开始"), 1110);
     assert.equal(extractExplicitFixedStart("七点最合适，但可以调整"), null);
+    assert.equal(
+      extractExplicitFixedStart("18点才到家，但没有要求必须18点整开始"),
+      null
+    );
+    assert.equal(extractExplicitFixedStart("不是固定在18点开始，可以往后排"), null);
+  });
+  check("open conflict survives a generic greeting without routing every case as conflict", () => {
+    assert.equal(
+      isOpenConflictCase({ kind: "kitchen_contention", title: "厨房晚饭时段冲突" }),
+      true
+    );
+    assert.equal(
+      isOpenConflictCase({ kind: "repair_request", title: "地下室热水器报修" }),
+      false
+    );
+    assert.equal(isLowInformationFollowUp("你好"), true);
+    assert.equal(isLowInformationFollowUp("你好，房租是多少"), false);
+  });
+  check("capacity escape is blocked until the scheduler proves infeasibility", () => {
+    const capacityEscape = "请先看台面插座够不够两人同时开火，我再提小电炉。";
+    assert.equal(isPrematureCapacityEscape(capacityEscape, true, false), true);
+    assert.equal(isPrematureCapacityEscape(capacityEscape, true, true), false);
+    assert.equal(isPrematureCapacityEscape(capacityEscape, false, false), false);
+    assert.equal(isPrematureCapacityEscape("我先把三个人的独占时段排出来。", true, false), false);
+    assert.equal(isPrematureCapacityEscape("房东说电磁炉不提供，我继续排时段。", true, false), false);
   });
 
   for (const label of ["厨房", "洗衣机"]) {
@@ -197,12 +225,19 @@ async function main() {
     assert(src.includes("await critiqueAndMarkOutbound(finalNewOutbound)"));
     assert(src.includes("const finalScheduleReply = buildSelectedScheduleReply()"));
     assert(src.includes("const settledScheduleReply = buildSelectedScheduleReply()"));
+    assert(src.includes('position.kind !== "commitment"'));
+    assert(src.includes("ctx.openCases.some(isOpenConflictCase)"));
     assert(!src.includes("!topicHitsConflict ||\n      !toolsUsed.includes(\"recordPosition\")"));
     assert(src.includes("const needsBlockedOutboundRecovery ="));
     assert(src.includes("isGeneratedResidentName(target.name)"));
     assert(src.includes("publicNames.get(assignment.name)"));
     assert(src.includes("const deterministicContactReply ="));
     assert(src.includes("const redoContactReply ="));
+    assert(src.includes("const redoFactFidelityHit = checkFactFidelity(reply)"));
+    assert(src.includes("const finalFactFidelityHit = checkFactFidelity(reply)"));
+    assert(src.includes("function checkUnconsultedSelectedSchedule()"));
+    assert(src.includes("const unconsultedSchedule = checkUnconsultedSelectedSchedule()"));
+    assert(src.includes("if (o.scheduleVerified)"));
     assert(src.includes("reply = buildContactProgressReply() ?? reply"));
     assert(src.includes("!verdict.pass ? buildContactProgressReply() : null"));
   });

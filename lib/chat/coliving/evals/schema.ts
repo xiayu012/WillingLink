@@ -112,6 +112,28 @@ export type EvalScenario = {
   snapshot?: string;
   household?: { label: string };
   people?: ScenarioPerson[];
+  /**
+   * 不经模型铺垫，直接预置待测的结构化状态。适合“未结事项后的下一轮”这类
+   * 回归：少一次模型调用，也避免第一轮输出波动改变第二轮前提。
+   */
+  setup?: {
+    confirmedNames?: string[];
+    priorMessages?: Array<{
+      person: string;
+      direction: "inbound" | "outbound";
+      body: string;
+    }>;
+    openCases?: Array<{
+      kind: string;
+      title: string;
+      severity?: string;
+      positions?: Array<{
+        person: string;
+        kind: "preference" | "rejection" | "commitment";
+        statement: string;
+      }>;
+    }>;
+  };
   turns: ScenarioTurn[];
   expect?: ScenarioExpectation;
 };
@@ -147,6 +169,10 @@ export function validateScenario(s: unknown, filename: string): EvalScenario {
         errors.push(`turns[${i}].from（${t.from}）不在 people 列表里`);
       }
     }
+  }
+  const setup = obj?.setup as EvalScenario["setup"] | undefined;
+  if (setup?.openCases && !Array.isArray(setup.openCases)) {
+    errors.push("setup.openCases 必须是数组");
   }
   if (errors.length > 0) {
     throw new Error(`场景文件 ${filename} 格式不对：${errors.join("；")}`);

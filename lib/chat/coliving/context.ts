@@ -2,16 +2,17 @@ import "server-only";
 
 import {
   getActiveRules,
+  getBlockedComms,
   getCaseParties,
   getCasePositions,
   getCaseShares,
   getMembers,
   getOpenCases,
-  getBlockedComms,
   getStandalonePositions,
-  rosterStatus,
   type Member,
+  type OpenCase,
   recentOutbound,
+  rosterStatus,
   type Sender,
 } from "./repo";
 
@@ -40,6 +41,8 @@ function describeMember(m: Member, isSelf: boolean): string {
 export type ColivingContext = {
   text: string;
   members: Member[];
+  /** 未结事项的结构化元数据，供路由判断后续轮仍属于哪个情境。 */
+  openCases: OpenCase[];
   openCaseIds: string[];
   /**
    * 生成器靠这个判断"该不该问总人数"，批判器也需要同一份数据——
@@ -435,6 +438,7 @@ export async function buildContext(
   return {
     text: lines.join("\n"),
     members,
+    openCases,
     openCaseIds: openCases.map((c) => c.id),
     roster,
   };

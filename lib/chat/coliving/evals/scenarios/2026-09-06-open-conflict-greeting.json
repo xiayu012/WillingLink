@@ -1,0 +1,39 @@
+{
+  "id": "open-conflict-greeting-2026-09-06",
+  "source": "脱敏生产回归：厨房排班未结时房东只发一句问候，系统不能丢失 conflict 路由，更不能沿着自己先前的错误承诺逃到小电炉和插座。",
+  "household": { "label": "评测-问候续接未结厨房排班" },
+  "people": [
+    { "phone": "+15550009201", "name": "老王", "role": "landlord" },
+    { "phone": "+15550009202", "name": "小周", "role": "tenant" },
+    { "phone": "+15550009203", "name": "小陈", "role": "tenant" }
+  ],
+  "setup": {
+    "confirmedNames": ["老王", "小周", "小陈"],
+    "priorMessages": [
+      { "person": "老王", "direction": "outbound", "body": "厨房排班还没完成，我会继续处理。" }
+    ],
+    "openCases": [
+      {
+        "kind": "kitchen_contention",
+        "title": "厨房晚饭时段冲突",
+        "severity": "P2",
+        "positions": [
+          { "person": "老王", "kind": "preference", "statement": "17点半开始最合适，用半小时" },
+          { "person": "小周", "kind": "rejection", "statement": "18点后均可，用半小时，但不接受20点或更晚才开始" },
+          { "person": "小陈", "kind": "preference", "statement": "18点才到家，需要连续使用两小时，但没有要求必须18点整开始" },
+          { "person": "小陈", "kind": "commitment", "statement": "AI曾承诺你的18点到20点固定不动" }
+        ]
+      }
+    ]
+  },
+  "turns": [
+    { "from": "+15550009201", "text": "你好" }
+  ],
+  "expect": {
+    "mustUseTools": ["pickSchedule", "chooseSchedule"],
+    "mustUseAnyOfTools": ["contactPerson", "proposeRule"],
+    "replyMustMatch": ["17[:：]?30|18[:：]?00"],
+    "replyMustNotMatch": ["小电炉|电磁炉|插座|同时开火|两人同时|唯一出路", "[0-9]号住客"],
+    "outboundMustNotMatch": ["小电炉|电磁炉|插座|同时开火|两人同时|唯一出路"]
+  }
+}
