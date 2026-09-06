@@ -1,7 +1,14 @@
 import "server-only";
 
 import postgres from "postgres";
-import { captureSnapshot, dropRestoredHousehold, restoreSnapshot } from "./evals/snapshot";
+import {
+  captureSnapshot,
+  dropRestoredHousehold,
+  restoreSnapshot,
+  toPortableSnapshot,
+  type Snapshot,
+} from "./evals/snapshot";
+import { colivingModelId, shadowCandidateModelId } from "./model";
 import { resolveSender } from "./repo";
 import { runColivingTurn } from "./turn";
 
@@ -57,15 +64,22 @@ import { runColivingTurn } from "./turn";
  *
  * ## 诚实交代一个当前的局限
  *
- * 单个部署里，"候选版本"和"生产版本"跑的是**同一份代码**。所以这一版
- * 影子跑真正稳定提供的价值是前两项，第三项要打折看：
+ * 默认情况下（不设 `COLIVING_SHADOW_MODEL`），"候选版本"和"生产版本"
+ * 跑的是**同一份代码、同一个模型**。这种情况下影子跑真正稳定提供的
+ * 价值只有前两项：
  *
  *   ①**把真实流量沉淀成可重放的快照**（解决"油箱空"）—— 完整成立
  *   ②**候选路径的端到端可用性验证**（恢复→跑→产出，全链路真跑一遍）
- *   ③ A/B 对比：同一份代码跑两次，差异里混着模型本身的随机性，
- *     不能直接当成"改动引起的回归"。要做真正的 A/B，得让候选侧跑
- *     不同的东西——预留了 `SHADOW_MODEL_ID` 这个口子（换模型跑影子），
- *     更彻底的做法是部署两份、或者把候选行为放在 feature flag 后面。
+ *   ③ A/B 对比：同一份代码同一个模型跑两次，差异里混着模型本身的
+ *     随机性，不能直接当成"改动引起的回归"。
+ *
+ * 设了 `COLIVING_SHADOW_MODEL`，候选版本会换成那个模型跑（`runColivingTurn`
+ * 的 `modelId` 参数），这时候③才算真的成立——但这仍然只是"换模型"的 A/B，
+ * 不是"换代码"的 A/B；要对比代码改动，还是得靠 `pnpm coliving-eval`
+ * 这类离线跑批。`shadow_run.production_model` / `shadow_model` 两列
+ * 记录了两侧实际用的模型，复核时能看出这次差异是不是模型造成的，
+ * 不用靠猜——**不设 `COLIVING_SHADOW_MODEL` 时这两列会相等**，那正是
+ * "同一份代码同一个模型跑两次"的诚实记录，不是缺陷。
  *
  * 这个局限**不影响 ① 的价值**，而 ① 正是用户当前最缺的那一块。
  */
@@ -76,6 +90,43 @@ export type ShadowOutcome = {
   shadowReply: string | null;
   error: string | null;
 };
+
+/**
+ * 把即将打日志/落库的错误文本脱敏成不含真实号码的版本。
+ *
+ * **为什么需要这一层**：`args.from` 是真实手机号，`restoreSnapshot` 在
+ * `rawSnapshot`（未脱敏，`toPortableSnapshot` 之前的那份）上抛错时也会把
+ * `person_contact.value` 原样拼进 `Error.message`（"号码 X 不在 phoneMap
+ * 里，拒绝原样恢复"）——这两处错误信息都会被下面 `runShadowTurn` 的
+ * catch 打 `console.log`、写进 `shadow_run.shadow_error`。不在这里挡一道，
+ * 真实号码就会经这条路径直接落进日志和数据库。
+ *
+ * 两层脱敏：
+ * 1. **精确抹掉这次调用已知的真实号码**——调用方传入的 `args.from`
+ *    和 `rawSnapshot.phoneMap` 的全部 key（那正是这次抓到的这栋房子里
+ *    每一个真实号码）。
+ * 2. **兜底**：不管精确列表有没有漏，只要文本里出现"像手机号"的数字串
+ *    （`+` 开头或纯数字，允许中间夹横线/空格，总长 7~18 位数字），一律
+ *    替换掉。这条兜底会连带遮住无害的槽位号（`+1555…`）——这是有意的
+ *    取舍：错误信息少一点细节，换绝不漏真实号码的保证。
+ *
+ * **不改变原始异常的控制流**：只处理文本内容，不吞异常、不改变
+ * 异常类型、不影响调用方 try/catch 的行为。
+ */
+export function redactShadowErrorMessage(
+  rawMessage: string,
+  knownRealNumbers: Array<string | null | undefined>
+): string {
+  let text = rawMessage;
+  for (const real of knownRealNumbers) {
+    if (!real) continue;
+    const escaped = real.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    text = text.replace(new RegExp(escaped, "g"), "[号码已脱敏]");
+  }
+  // 兜底：+开头或纯数字的长串，允许内部夹横线/空格，总长 7~18 位数字
+  text = text.replace(/\+?\d[\d\s-]{5,17}\d/g, "[号码已脱敏]");
+  return text;
+}
 
 function db(): postgres.Sql {
   const url = process.env.POSTGRES_URL;
@@ -108,7 +159,19 @@ export async function runShadowTurn(args: {
   productionTools: string[];
 }): Promise<ShadowOutcome | null> {
   let restoredHouseholdId: string | null = null;
+  /** 失败记录要尽量保留这些——即使失败发生在 capture 之后，最值得复现
+   *  的那条失败记录也不该因为写在 catch 里就把这些证据丢光。 */
+  let householdId: string | null = null;
+  let householdLabel: string | null = null;
+  let rawSnapshot: Snapshot | null = null;
+  /** 真人的号在快照里对应的槽位号（不是真实号码，落库/导出都用它） */
+  let inboundSlot: string | null = null;
   const sql = db();
+
+  const productionModelId = colivingModelId();
+  // 不设 COLIVING_SHADOW_MODEL 就跟生产用同一个模型——见文件头「诚实
+  // 交代一个当前的局限」，这不是缺陷，是如实记录"这次没有做模型层面的 A/B"
+  const candidateModelId = shadowCandidateModelId() ?? productionModelId;
 
   try {
     const sender = await resolveSender(args.channel, args.from);
@@ -120,6 +183,8 @@ export async function runShadowTurn(args: {
       // 测试屋自己发的消息不用再影子一遍，否则跑批会自我繁殖
       return null;
     }
+    householdId = sender.householdId;
+    householdLabel = sender.householdLabel;
 
     // ① 冻结「这条消息进来之前」的完整世界状态
     const snapshot = await captureSnapshot({
@@ -128,6 +193,7 @@ export async function runShadowTurn(args: {
       // 向量太占地方，而且相似判例检索对"这一步说了什么"影响很小
       dropEmbeddings: true,
     });
+    rawSnapshot = snapshot;
 
     // ② 恢复成一栋全新副本。号码在这一步被换成本次独有的测试号，
     //    所以副本里的人跟真人完全隔离，真人的短信永远打不到副本上
@@ -136,6 +202,7 @@ export async function runShadowTurn(args: {
 
     // 真人的号 → 快照里的槽位号 → 这次恢复出来的可用测试号
     const slot = snapshot.phoneMap[args.from];
+    inboundSlot = slot ?? null;
     const shadowFrom = slot ? restored.phoneMap[slot] : null;
     if (!shadowFrom) {
       throw new Error(
@@ -150,40 +217,70 @@ export async function runShadowTurn(args: {
       channel: args.channel,
       from: shadowFrom,
       text: args.text,
+      modelId: candidateModelId,
     });
 
     const [row] = await sql<{ id: string }[]>`
       insert into coliving.shadow_run
         (household_id, household_label, inbound_from, inbound_text, arrived_at,
-         production_reply, production_tools,
-         shadow_reply, shadow_tools, shadow_outbound, snapshot)
+         production_reply, production_tools, production_model,
+         shadow_reply, shadow_tools, shadow_outbound, shadow_model, snapshot)
       values
         (${sender.householdId}, ${sender.householdLabel},
-         ${args.from}, ${args.text}, ${args.arrivedAt},
-         ${args.productionReply}, ${args.productionTools},
+         ${inboundSlot}, ${args.text}, ${args.arrivedAt},
+         ${args.productionReply}, ${args.productionTools}, ${productionModelId},
          ${outcome.reply}, ${outcome.toolsUsed},
-         ${sql.json(outcome.outbound.map((o) => ({
+         ${sql.json(outcome.allOutbound.map((o) => ({
            toPersonId: o.personId,
            text: o.text,
            blocked: Boolean(o.blocked),
+           blockReason: o.blockReason ?? null,
          })))},
-         ${sql.json(snapshot as never)})
+         ${candidateModelId},
+         ${sql.json(toPortableSnapshot(snapshot) as never)})
       returning id`;
 
     return { shadowRunId: row.id, shadowReply: outcome.reply, error: null };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    // **打日志/落库之前必须先脱敏**——见 redactShadowErrorMessage 的注释：
+    // 这条 catch 兜住的两类典型错误（找不到测试号、restoreSnapshot 校验
+    // 号码）都会把真实手机号直接拼进 message。
+    const message = redactShadowErrorMessage(rawMessage, [
+      args.from,
+      ...(rawSnapshot ? Object.keys(rawSnapshot.phoneMap) : []),
+    ]);
     console.log("[shadow] 影子跑失败（不影响生产）：", message);
     // 失败也留痕：知道"这条消息影子没跑成"比完全没记录有用，
-    // 否则语料里会莫名其妙缺一段，事后查不出是没跑还是跑挂了
+    // 否则语料里会莫名其妙缺一段，事后查不出是没跑还是跑挂了。
+    // **如果失败发生在 capture 之后，尽量把已经拿到的 snapshot/household
+    // 证据一并存下来**——那正是最值得复现的一类失败（capture 成功、
+    // restore 或候选版本跑挂了），丢掉证据等于白抓了这次快照。
     try {
+      let portableSnapshot: Snapshot | null = null;
+      if (rawSnapshot) {
+        try {
+          portableSnapshot = toPortableSnapshot(rawSnapshot);
+        } catch (redactError) {
+          // 脱敏本身失败，宁可这条记录不带 snapshot，也不能把带真实
+          // 号码的快照存进库
+          console.log(
+            "[shadow] 失败记录的快照脱敏失败，这条记录不保留 snapshot：",
+            redactError instanceof Error ? redactError.message : String(redactError)
+          );
+        }
+      }
       const [row] = await sql<{ id: string }[]>`
         insert into coliving.shadow_run
-          (inbound_from, inbound_text, arrived_at,
-           production_reply, production_tools, shadow_error)
+          (household_id, household_label, inbound_from, inbound_text, arrived_at,
+           production_reply, production_tools, production_model, shadow_model,
+           shadow_error, snapshot)
         values
-          (${args.from}, ${args.text}, ${args.arrivedAt},
-           ${args.productionReply}, ${args.productionTools}, ${message})
+          (${householdId}, ${householdLabel},
+           ${inboundSlot}, ${args.text}, ${args.arrivedAt},
+           ${args.productionReply}, ${args.productionTools}, ${productionModelId},
+           ${candidateModelId}, ${message},
+           ${portableSnapshot ? sql.json(portableSnapshot as never) : null})
         returning id`;
       return { shadowRunId: row.id, shadowReply: null, error: message };
     } catch {

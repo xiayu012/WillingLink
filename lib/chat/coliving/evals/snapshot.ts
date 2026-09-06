@@ -28,6 +28,11 @@ import postgres from "postgres";
  *    会直接撞索引插不进去；更危险的是**万一插进去了，真实用户发来的
  *    短信会认到这个测试人格上**——那就是 guard.ts 记的那类事故的翻版。
  *
+ *    `captureSnapshot` 的直接返回值仍然带着真实号码（`restoreSnapshot`
+ *    要靠它把号码换成本次独有的测试号）。**任何要落库/落盘/进 git 的
+ *    场合，必须先过 `toPortableSnapshot`**——它才是真正"脱敏完成"的形态。
+ *
+
  * ## 为什么用 information_schema 动态发现列
  *
  * 这套 schema 是手写 SQL、15 个 migration 叠上来的（`repo.ts` 开头讲了
@@ -261,6 +266,56 @@ export async function captureSnapshot(args: {
   } finally {
     await sql.end();
   }
+}
+
+/**
+ * 把 `captureSnapshot` 产出的快照，转换成**可以安全落盘/进 git 的形式**。
+ *
+ * `captureSnapshot` 返回的快照本身仍然带着真实号码——`tables.person_contact`
+ * 的 `value` 字段是原始手机号，`phoneMap` 也是「真实号码 → 槽位号」。这是
+ * 有意的：`shadow.ts` 需要拿这份真实号码去核对"这条真实短信是哪个人发的"
+ * （`snapshot.phoneMap[args.from]`），过早脱敏会让这一步做不了。
+ *
+ * 但凡是要**持久化**（落库、写文件、导出进 git）的场合，必须先过这道函数：
+ * 把 `person_contact.value` 换成槽位号本身，`phoneMap` 收窄成「槽位号 →
+ * 自身」的恒等映射——转换后的结果里**不再包含任何真实号码**。
+ *
+ * `restoreSnapshot` 不需要为此单独改一份逻辑：它是靠 `phoneMap[row.value]`
+ * 找槽位号，恒等映射下 `row.value` 本身就是槽位号，同一段代码在"脱敏前"
+ * 和"脱敏后"的快照上行为一致。
+ *
+ * 这个函数是**幂等**的：对一份已经脱敏过的快照再调一次，`phoneMap[slot]`
+ * 命中的还是 `slot` 自己，不会报错也不会进一步丢失信息——所以调用方
+ * 不需要先判断"这份是不是已经脱敏过"，无脑调用即可。
+ */
+export function toPortableSnapshot(snap: Snapshot): Snapshot {
+  const tables: Snapshot["tables"] = {};
+  for (const [name, rows] of Object.entries(snap.tables)) {
+    if (name !== "person_contact") {
+      tables[name] = rows;
+      continue;
+    }
+    tables[name] = rows.map((row) => {
+      if (row.kind !== "sms") return row;
+      const value = String(row.value ?? "");
+      const slot = snap.phoneMap[value];
+      if (!slot) {
+        // 宁可整体报错，也不能把一个查不到槽位映射的号码原样放进
+        // 会持久化的快照——那多半意味着 capture 阶段本身漏了这个号码。
+        throw new Error(
+          `[snapshot] person_contact 里的号码不在 phoneMap 里，拒绝生成可持久化快照`
+        );
+      }
+      return { ...row, value: slot };
+    });
+  }
+
+  const identityPhoneMap: Record<string, string> = {};
+  for (const slot of Object.values(snap.phoneMap)) {
+    identityPhoneMap[slot] = slot;
+  }
+
+  return { ...snap, tables, phoneMap: identityPhoneMap };
 }
 
 /**

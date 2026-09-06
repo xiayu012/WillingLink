@@ -6,7 +6,10 @@
  *   pnpm coliving-eval -- --scenario kitchen-procrastination-2026-09-05
  *   pnpm coliving-eval -- --concurrency 8
  *   pnpm coliving-eval -- --limit 3
+ *   pnpm coliving-eval -- --judge-off        # 跳过语义验收，只跑结构性
+ *   pnpm coliving-eval -- --judge-advisory   # 语义验收照跑，但 high 不计入门禁
  *
+
  * 设计对照 docs/coliving-parallel-testing-plan.md 阶段一 + 阶段二：
  * - 每个场景一个独立测试屋，household_id 天然隔离，不需要
  *   `pnpm coliving:db --purge` 这个串行点，场景之间可以并发跑。
@@ -17,7 +20,8 @@
  *   JSON 提交进 `scenarios/`，以后每次跑批默认全量跑，自动重新验证
  *   过去踩过的所有坑。
  *
- * 退出码：有场景判失败 → 1，否则 0。
+ * 退出码：结构性断言失败，或语义验收（judge）报了 high → 1，否则 0。
+ * `--judge-advisory` 可以让 judge 只旁听、不参与退出码（默认参与，见下）。
  * 报告：终端打印 + 写一份 JSON 到 tests/coliving-eval/reports/（gitignored，
  * 目录不存在会自动建）。
  */
@@ -45,6 +49,12 @@ const LIMIT = Number(argValue("limit") ?? Number.POSITIVE_INFINITY);
  * 判定器本身正在被调试——它每个场景多一次模型调用，跑批会慢一点。
  */
 const JUDGE_OFF = process.argv.includes("--judge-off");
+/**
+ * 默认 judge 的 high 参与总门禁（结构性通过 ≠ 整体通过）。
+ * 想让它只旁听、不影响退出码，显式传这个 flag——**不能是默认行为**，
+ * 否则又会退回"judge 说了不算、报告却好像判过"的老样子。
+ */
+const JUDGE_ADVISORY = process.argv.includes("--judge-advisory");
 
 // ── 加载 + 校验语料 ──────────────────────────────────────────────────────
 const SCENARIOS_DIR = path.join(
@@ -283,11 +293,15 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
    * "AI 没直接点名，可是透露的信息足以让乙推断出是甲投诉的"。
    * 那类问题只有读懂人话才能发现，所以交给一次独立的模型判定。
    *
-   * **判定失败不覆盖结构性结论**：`pass` 仍然只由结构性断言决定，
-   * judge 的结果单独放在 `judge` 字段里。理由是这一层天然有误报
-   * （子代理自己也指出：它看不到 pickSchedule 的候选，"排得不近人情"
-   * 这类判断最容易误伤），让它直接把场景判红会让跑批变得不可信——
-   * 先让人看着它的意见，攒够信心再考虑要不要让它参与 gate。
+   * `pass` 这个字段本身**只反映结构性断言**，judge 的结果单独放在
+   * `judge` 字段里——这样报告页才能分别显示"结构性失败"和"语义失败"，
+   * 而不是混成一个不知道具体是哪层的红叉。
+   *
+   * **但总门禁（`main()` 算的退出码）默认把 `judge.pass`（只看 high）
+   * 也算进去**——一个场景语义验收报了 high，整批就不该显示"全部通过"。
+   * 这一层确实有误报（子代理自己指出过：它看不到 pickSchedule 的候选，
+   * "排得不近人情"这类判断最容易误伤，`real-kitchen-incident` 场景
+   * 复测时也见过），想让它只旁听、不影响退出码，传 `--judge-advisory`。
    */
   let judge: { pass: boolean; findings: JudgeFinding[] } | undefined;
   if (!JUDGE_OFF) {
@@ -347,17 +361,48 @@ async function main() {
   const results = await runWithConcurrency(scenarios, CONCURRENCY, runScenario);
   const totalMs = Date.now() - start;
 
-  let failCount = 0;
+  /**
+   * 三层结果分开算，报告和终端输出都要能区分开：
+   * - `structFail`：结构性断言失败（`r.pass === false`）。
+   * - `judgeHighFail`：语义验收报了至少一条 high。`JUDGE_ADVISORY` 时
+   *   这一层不影响总门禁，但依然打印出来，不能假装没发生。
+   * - `overallFail`：总门禁，决定这一行是 ✓ 还是 ✗、决定退出码。
+   */
+  let structFailCount = 0;
+  let judgeHighFailCount = 0;
+  let overallFailCount = 0;
   for (const r of results) {
-    console.log(`${r.pass ? "✓" : "✗"} [${r.id}] ${r.ms}ms`);
+    const judgeHighFail = Boolean(r.judge && !r.judge.pass);
+    const overallFail = !r.pass || (judgeHighFail && !JUDGE_ADVISORY);
+    if (!r.pass) structFailCount++;
+    if (judgeHighFail) judgeHighFailCount++;
+    if (overallFail) overallFailCount++;
+
+    const tag = overallFail ? "✗" : "✓";
+    const judgeNote = judgeHighFail
+      ? JUDGE_ADVISORY
+        ? "（语义验收有 high，advisory 模式不计入门禁）"
+        : "（语义验收有 high）"
+      : "";
+    console.log(`${tag} [${r.id}] ${r.ms}ms${judgeNote}`);
     if (!r.pass) {
-      failCount++;
-      for (const f of r.failures) console.log(`    - ${f}`);
+      for (const f of r.failures) console.log(`    - 结构性：${f}`);
+    }
+    if (judgeHighFail) {
+      for (const f of r.judge!.findings.filter((x) => x.severity === "high")) {
+        console.log(`    - 语义-high：${f.issue}（「${f.quote.slice(0, 60)}」）`);
+      }
+    }
+    if (overallFail) {
       console.log(`    最终回复：${r.lastReply}`);
     }
   }
   console.log(
-    `\n${results.length - failCount}/${results.length} 通过，总耗时 ${(totalMs / 1000).toFixed(1)}s`
+    `\n结构性 ${results.length - structFailCount}/${results.length} 通过；` +
+      `语义验收命中 high 的场景 ${judgeHighFailCount} 个` +
+      `${JUDGE_ADVISORY ? "（advisory，不计入门禁）" : ""}；` +
+      `总门禁 ${results.length - overallFailCount}/${results.length} 通过，` +
+      `总耗时 ${(totalMs / 1000).toFixed(1)}s`
   );
 
   const reportDir = path.join(process.cwd(), "tests/coliving-eval/reports");
@@ -369,7 +414,7 @@ async function main() {
   writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
   console.log(`报告已写入 ${reportPath}`);
 
-  process.exit(failCount > 0 ? 1 : 0);
+  process.exit(overallFailCount > 0 ? 1 : 0);
 }
 
 main().catch((e) => {

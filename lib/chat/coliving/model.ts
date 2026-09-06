@@ -23,3 +23,16 @@ export const COLIVING_DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 export function colivingModelId(): string {
   return process.env.COLIVING_MODEL?.trim() || COLIVING_DEFAULT_MODEL;
 }
+
+/**
+ * 影子跑（`lib/chat/coliving/shadow.ts`）候选版本要不要换一个模型跑，
+ * 从而做真正的 A/B。不设就返回 `null`，调用方应当退回跟生产同一个模型——
+ * 那种情况下影子跑提供的是"候选路径端到端可用性 + 语料沉淀"，**不提供
+ * 模型差异对比**，这一点由调用方如实记录，不要假装是 A/B。
+ *
+ * `runColivingTurn` 早就支持 `modelId` 参数覆盖（原本是给测试用的），
+ * 这里只是把它接到影子跑上。
+ */
+export function shadowCandidateModelId(): string | null {
+  return process.env.COLIVING_SHADOW_MODEL?.trim() || null;
+}
