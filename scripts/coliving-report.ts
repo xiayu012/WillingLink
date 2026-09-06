@@ -54,7 +54,7 @@ type ScenarioResult = {
   pass: boolean;
   failures: string[];
   turns: TurnRecord[];
-  judge?: { pass: boolean; findings: JudgeFinding[] };
+  judge: { pass: boolean; verified: boolean; findings: JudgeFinding[] };
   ms: number;
 };
 
@@ -152,20 +152,28 @@ function loadReport(file: string): ScenarioResult[] {
             }))
           : [],
       })),
-      judge: o.judge
-        ? {
-            pass: (o.judge as { pass?: boolean }).pass !== false,
-            findings: Array.isArray((o.judge as { findings?: unknown }).findings)
-              ? ((o.judge as { findings: JudgeFinding[] }).findings).map((f) => ({
-                  severity:
-                    f?.severity === "high" || f?.severity === "medium" ? f.severity : "low",
-                  turnIndex: Number.isInteger(f?.turnIndex) ? f.turnIndex : -1,
-                  issue: f?.issue ?? "",
-                  quote: f?.quote ?? "",
-                }))
-              : [],
-          }
-        : undefined,
+      // **缺 judge、或缺 verified，一律当"没验收过"，不能当通过**——
+      // 旧报告（这次改动之前跑出来的 JSON）里 judge 字段可能整个不存在，
+      // 或者存在但没有 verified；两种情况都不能被 `pass !== false` 这种
+      // 默认真的写法悄悄推定成"验收过、没问题"。
+      judge: {
+        pass:
+          o.judge && (o.judge as { verified?: boolean }).verified === true
+            ? (o.judge as { pass?: boolean }).pass === true
+            : false,
+        verified:
+          Boolean(o.judge) && (o.judge as { verified?: boolean }).verified === true,
+        findings:
+          o.judge && Array.isArray((o.judge as { findings?: unknown }).findings)
+            ? ((o.judge as { findings: JudgeFinding[] }).findings).map((f) => ({
+                severity:
+                  f?.severity === "high" || f?.severity === "medium" ? f.severity : "low",
+                turnIndex: Number.isInteger(f?.turnIndex) ? f.turnIndex : -1,
+                issue: f?.issue ?? "",
+                quote: f?.quote ?? "",
+              }))
+            : [],
+      },
       ms: typeof o.ms === "number" ? o.ms : 0,
     });
   }
@@ -291,9 +299,12 @@ function renderTurn(t: TurnRecord, index: number, findings: JudgeFinding[]): str
 
 // ── 渲染：一个场景 ───────────────────────────────────────────────────────
 function renderScenario(r: ScenarioResult): string {
-  const judgeFail = r.judge ? !r.judge.pass : false;
-  const ok = r.pass && !judgeFail;
-  const findings = r.judge?.findings ?? [];
+  // 没验收过（`--judge-off`、判定器挂了）跟"验收过、有 high"是两回事，
+  // 但对"这一行该不该显示成绿"来说结论一样：都不是"确认没问题"。
+  const judgeUnverified = !r.judge.verified;
+  const judgeFail = r.judge.verified && !r.judge.pass;
+  const ok = r.pass && !judgeFail && !judgeUnverified;
+  const findings = r.judge.findings;
   const highCount = findings.filter((f) => f.severity === "high").length;
 
   // findings 按轮次归位；turnIndex 越界的不能丢，收到末尾单独列
@@ -310,7 +321,7 @@ function renderScenario(r: ScenarioResult): string {
   }
 
   const badges = [
-    `<span class="badge ${ok ? "ok" : "bad"}">${ok ? "通过" : "有问题"}</span>`,
+    `<span class="badge ${ok ? "ok" : "bad"}">${ok ? "通过" : judgeUnverified ? "未验收" : "有问题"}</span>`,
     r.pass
       ? ""
       : `<span class="badge bad-soft">结构性失败 ${r.failures.length}</span>`,
@@ -362,11 +373,11 @@ function renderScenario(r: ScenarioResult): string {
 function renderPage(results: ScenarioResult[], reportPath: string): string {
   const total = results.length;
   const structFail = results.filter((r) => !r.pass).length;
-  const judgeFail = results.filter((r) => r.judge && !r.judge.pass).length;
+  const judgeFail = results.filter((r) => r.judge.verified && !r.judge.pass).length;
   const allOk = results.filter((r) => r.pass && !(r.judge && !r.judge.pass)).length;
   const allFindings = results.flatMap((r) => r.judge?.findings ?? []);
   const high = allFindings.filter((f) => f.severity === "high").length;
-  const judged = results.filter((r) => r.judge).length;
+  const judged = results.filter((r) => r.judge.verified).length;
 
   // 有问题的排前面（原顺序内保持稳定）——这是"先看有问题的"的另一半，
   // 光靠默认展开还不够，通过的场景排在前面照样要往下滚
@@ -378,7 +389,7 @@ function renderPage(results: ScenarioResult[], reportPath: string): string {
   const quickLinks = ordered.filter((r) => !(r.pass && !(r.judge && !r.judge.pass)));
   const quickLinksHtml =
     quickLinks.length > 0
-      ? `<div class="quick">有问题的场景：${quickLinks
+      ? `<div class="quick">待处理的场景：${quickLinks
           .map((r) => `<a href="#s-${slug(r.id)}">${escapeHtml(r.id)}</a>`)
           .join("")}</div>`
       : "";
@@ -622,7 +633,7 @@ h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: .02em; }
     <div class="stat"><div class="n">${total}</div><div class="l">场景总数</div></div>
     <div class="stat ok"><div class="n">${allOk}</div><div class="l">全部通过</div></div>
     <div class="stat bad"><div class="n">${structFail}</div><div class="l">结构性失败</div></div>
-    <div class="stat bad"><div class="n">${judgeFail}</div><div class="l">语义失败${judged < total ? `（${judged}/${total} 有验收）` : ""}</div></div>
+    <div class="stat bad"><div class="n">${judgeFail}</div><div class="l">语义失败${judged < total ? `；另有 ${total - judged} 个未验收` : ""}</div></div>
     <div class="stat warn"><div class="n">${high}</div><div class="l">严重问题条数</div></div>
   </div>
   ${quickLinksHtml}

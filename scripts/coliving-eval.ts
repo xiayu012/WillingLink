@@ -32,9 +32,9 @@ process.env.COLIVING_LOCAL_WRITE = "1";
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import type { JudgeFinding } from "../lib/chat/coliving/evals/judge";
+import type { JudgeResult } from "../lib/chat/coliving/evals/judge";
 import type { EvalScenario } from "../lib/chat/coliving/evals/schema";
-import { validateScenario } from "../lib/chat/coliving/evals/schema";
+import { countAcceptedOutbound, validateScenario } from "../lib/chat/coliving/evals/schema";
 
 // ── CLI args ─────────────────────────────────────────────────────────────
 function argValue(name: string): string | null {
@@ -120,8 +120,12 @@ type ScenarioResult = {
   failures: string[];
   /** 完整文字稿，给报告页和语义验收用 */
   turns: TurnRecord[];
-  /** 大模型语义验收（L2/L3）。`--judge-off` 或判定器挂了就没有这一项 */
-  judge?: { pass: boolean; findings: JudgeFinding[] };
+  /**
+   * 大模型语义验收（L2/L3）。**永远有值，不再是可选的**——`--judge-off`
+   * 或判定器挂了，`verified` 是 false，`pass` 恒为 false，调用方必须显式
+   * 处理"没验收"这个状态，不能因为字段不存在就悄悄当没发生过、算作通过。
+   */
+  judge: JudgeResult;
   lastReply: string;
   toolsUsed: string[];
   outboundTexts: string[];
@@ -230,6 +234,10 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
 
   const failures: string[] = [];
   const exp = scenario.expect ?? {};
+  const acceptedOutboundCount = countAcceptedOutbound(last.allOutbound);
+  if (exp.minAcceptedOutbound !== undefined && acceptedOutboundCount < exp.minAcceptedOutbound) {
+    failures.push(`应有至少 ${exp.minAcceptedOutbound} 条通过审稿的出站，实际 ${acceptedOutboundCount} 条；调用联系工具不等于联系成功`);
+  }
   const toolsUsed = last.toolsUsed;
   const outboundTexts = last.outbound.map((o) => o.text);
 
@@ -303,7 +311,10 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
    * "排得不近人情"这类判断最容易误伤，`real-kitchen-incident` 场景
    * 复测时也见过），想让它只旁听、不影响退出码，传 `--judge-advisory`。
    */
-  let judge: { pass: boolean; findings: JudgeFinding[] } | undefined;
+  // **`--judge-off` 或判定失败，都是"没验收"，不是"通过"**——直接标成
+  // `verified:false, pass:false`，不能让调用方因为拿不到 judge 结果就
+  // 默认当没发生过、把总结果算成绿。
+  let judge: JudgeResult = { pass: false, verified: false, findings: [] };
   if (!JUDGE_OFF) {
     try {
       const { judgeConversation } = await import(
@@ -325,9 +336,10 @@ async function runScenario(scenario: EvalScenario): Promise<ScenarioResult> {
         })),
       });
     } catch (error) {
-      // 判定器挂了不该让整个跑批失败——它是附加信息，不是门禁
+      // 判定器挂了不该让整个跑批直接崩溃退出——但这一场景的语义层
+      // 确确实实没验收过，`judge` 保持上面初始化的未验收态，不当通过。
       console.log(
-        `[judge] ${scenario.id} 判定失败（跳过）：`,
+        `[judge] ${scenario.id} 判定失败（标记未验收）：`,
         error instanceof Error ? error.message : String(error)
       );
     }
@@ -362,35 +374,47 @@ async function main() {
   const totalMs = Date.now() - start;
 
   /**
-   * 三层结果分开算，报告和终端输出都要能区分开：
+   * 四种情况分开算，报告和终端输出都要能区分开：
    * - `structFail`：结构性断言失败（`r.pass === false`）。
-   * - `judgeHighFail`：语义验收报了至少一条 high。`JUDGE_ADVISORY` 时
-   *   这一层不影响总门禁，但依然打印出来，不能假装没发生。
+   * - `judgeHighFail`：语义验收**真的判过**（`verified`）且报了至少一条 high。
+   * - `judgeUnverified`：`--judge-off` 或判定器挂了——**没验收过，
+   *   不是通过**，跟"判过、没问题"必须分开显示，否则一个真正没做语义
+   *   验收的场景会在汇总里显示成"通过"，这正是这次要堵的漏洞。
    * - `overallFail`：总门禁，决定这一行是 ✓ 还是 ✗、决定退出码。
+   *   `JUDGE_ADVISORY` 时 judgeHighFail/judgeUnverified 都只旁听，不影响
+   *   退出码，但依然打印出来，不能假装没发生。
    */
   let structFailCount = 0;
   let judgeHighFailCount = 0;
+  let judgeUnverifiedCount = 0;
   let overallFailCount = 0;
   for (const r of results) {
-    const judgeHighFail = Boolean(r.judge && !r.judge.pass);
-    const overallFail = !r.pass || (judgeHighFail && !JUDGE_ADVISORY);
+    const judgeHighFail = r.judge.verified && !r.judge.pass;
+    const judgeUnverified = !r.judge.verified;
+    const overallFail =
+      !r.pass || ((judgeHighFail || judgeUnverified) && !JUDGE_ADVISORY);
     if (!r.pass) structFailCount++;
     if (judgeHighFail) judgeHighFailCount++;
+    if (judgeUnverified) judgeUnverifiedCount++;
     if (overallFail) overallFailCount++;
 
     const tag = overallFail ? "✗" : "✓";
-    const judgeNote = judgeHighFail
+    const judgeNote = judgeUnverified
       ? JUDGE_ADVISORY
-        ? "（语义验收有 high，advisory 模式不计入门禁）"
-        : "（语义验收有 high）"
-      : "";
+        ? "（语义验收未验收，advisory 模式不计入门禁）"
+        : "（语义验收未验收）"
+      : judgeHighFail
+        ? JUDGE_ADVISORY
+          ? "（语义验收未通过，advisory 模式不计入门禁）"
+          : "（语义验收未通过）"
+        : "";
     console.log(`${tag} [${r.id}] ${r.ms}ms${judgeNote}`);
     if (!r.pass) {
       for (const f of r.failures) console.log(`    - 结构性：${f}`);
     }
     if (judgeHighFail) {
-      for (const f of r.judge!.findings.filter((x) => x.severity === "high")) {
-        console.log(`    - 语义-high：${f.issue}（「${f.quote.slice(0, 60)}」）`);
+      for (const f of r.judge.findings.filter((x) => x.severity !== "low")) {
+        console.log(`    - 语义-${f.severity}：${f.issue}（「${f.quote.slice(0, 60)}」）`);
       }
     }
     if (overallFail) {
@@ -399,7 +423,7 @@ async function main() {
   }
   console.log(
     `\n结构性 ${results.length - structFailCount}/${results.length} 通过；` +
-      `语义验收命中 high 的场景 ${judgeHighFailCount} 个` +
+      `语义验收未通过 ${judgeHighFailCount} 个、未验收 ${judgeUnverifiedCount} 个` +
       `${JUDGE_ADVISORY ? "（advisory，不计入门禁）" : ""}；` +
       `总门禁 ${results.length - overallFailCount}/${results.length} 通过，` +
       `总耗时 ${(totalMs / 1000).toFixed(1)}s`
@@ -409,7 +433,7 @@ async function main() {
   mkdirSync(reportDir, { recursive: true });
   const reportPath = path.join(
     reportDir,
-    `${new Date().toISOString().slice(0, 10)}.json`
+    `${new Date().toISOString().replace(/[:.]/g, "-")}.json`
   );
   writeFileSync(reportPath, JSON.stringify(results, null, 2), "utf8");
   console.log(`报告已写入 ${reportPath}`);

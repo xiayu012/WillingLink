@@ -814,77 +814,62 @@ export async function runColivingTurn(args: {
           return h * 60 + m;
         };
         /**
-         * **窗口起点不完全信模型给的，代码自动往前拉一段，只会让结果
-         * 更好、不会更差。**
+         * **窗口起点原样信模型给的，不再自动往前拉。**
          *
-         * 真实事故：三人厨房排班，模型把 `windowStart` 填成了跟硬约束者
-         * 的 `earliestStart` 一样的时刻（都是18:00）——这样一来18:00
-         * 之前压根没有窗口空间，两个只要半小时、没有硬约束的人只能被
-         * 挤到硬约束者后面，其中一人被推到20:00之后。**排列算法本身
-         * 没问题**（`findSchedulePlans` 会穷举全部排列找最优解），问题
-         * 是**喂给算法的窗口边界被模型算错了**——算法是在一道被人为
-         * 缩窄的题目上找到的"最优解"，题目本身就出错了。
-         *
-         * 这跟"组合优化交给代码算，不要靠模型心算"是同一条原则的新
-         * 变种：上次是排列顺序不能靠模型猜，这次是**问题的输入边界也
-         * 不能完全信模型给的**——窗口起点这种"要不要留出提前量"的判断，
-         * 同样是可以用代码兜底的空间计算，不该指望提示词反复提醒模型
-         * "窗口要留够"就能稳定做对。
-         *
-         * 修法：统计"没有硬约束、理论上随时能开始"的那些人一共需要
-         * 多久，代码自动把窗口起点往前拉这么多（封顶3小时，避免拉到
-         * 荒谬的凌晨时刻）——**这么做不会让任何人的结果变差**：算法
-         * 依然会穷举全部排列，如果提前这段窗口对最终结果没帮助，算法
-         * 自己会算出跟不提前时一样的答案；只有在提前真的能让灵活的人
-         * 挪到硬约束者前面、从而避免有人被推到窗口末尾之后时，算法才
-         * 会用上这段提前量。往前拉窗口是纯粹的"多给一个选项"，不是
-         * "强迫用这个选项"。
+         * 以前这里会替没有硬约束的人凭空多算出一段"更早的空间"，往前
+         * 拉窗口起点——这是在凭空假设"更早也能开始"，而这件事本身没有
+         * 事实依据（模型给的 `windowStart` 就是当前唯一已知的起点，
+         * 往前拉多少完全是猜的）。算法只应该在**给定的**窗口里找最优解，
+         * 不该替模型悄悄改题目的输入边界。
          */
         const windowStartMinutes = toMinutes(windowStart);
-        const flexiblePeopleDuration = people
-          .filter((p) => !p.earliestStart)
-          .reduce((sum, p) => sum + p.durationMinutes, 0);
-        const pullBackMinutes = Math.min(flexiblePeopleDuration, 180);
-        const effectiveWindowStartMinutes = windowStartMinutes - pullBackMinutes;
 
         const constraints = people.map((p) => ({
           name: p.name,
           durationMinutes: p.durationMinutes,
           earliestStartMinutes: p.earliestStart
-            ? Math.max(0, toMinutes(p.earliestStart) - effectiveWindowStartMinutes)
+            ? Math.max(0, toMinutes(p.earliestStart) - windowStartMinutes)
             : 0,
           preferredStartMinutes: p.preferredStart
-            ? toMinutes(p.preferredStart) - effectiveWindowStartMinutes
+            ? toMinutes(p.preferredStart) - windowStartMinutes
             : undefined,
         }));
-        const plans = bestSchedulePlans(effectiveWindowStartMinutes, constraints, 3);
+        const plans = bestSchedulePlans(windowStartMinutes, constraints, 3);
         if (plans.length === 0) {
           return { ok: false, reason: "没排出候选，检查一下 people 是不是填对了" };
         }
-        // 只记排第一的候选——那是工具建议的方案，供批判器核对草稿里
-        // 写的时段跟这个对不对得上（不代表模型必须用这个候选，模型
-        // 可能有正当理由选了别的候选，但那种情况下批判器读到的事实
-        // 和草稿本来就该讲清楚"为什么不用第一候选"，不构成误判）。
-        const top = plans[0];
-        scheduleResults.push(
-          `「${windowLabel}」算出的方案：${top.assignments
-            .map((a) => `${a.name} ${formatMinutes(a.startMinutes)}-${formatMinutes(a.endMinutes)}`)
-            .join("，")}`
-        );
+        /**
+         * **记下全部候选，不是只记第一名。**
+         *
+         * 本工具的 description 明确写了"返回的候选…选哪个、要不要用，
+         * 还是你自己判断"——`scheduleResults` 是喂给批判器（rubric 6.6）
+         * 的结构化事实，不是拿来做正则硬匹配的"唯一正确答案"：批判器
+         * 能理解语义，知道选候选二/三、或者做出有依据的公平让步都站得住，
+         * 只要草稿说清楚了为什么不用第一候选。
+         *
+         * 全部候选都是算法真实穷举出来的方案（不是模型编的），一并交出去
+         * 让批判器核对人和时段、以及整套方案本身站不站得住。
+         */
+        for (const p of plans) {
+          scheduleResults.push(
+            `「${windowLabel}」候选方案：${p.assignments
+              .map((a) => `${a.name} ${formatMinutes(a.startMinutes)}-${formatMinutes(a.endMinutes)}`)
+              .join("，")}`
+          );
+        }
         /**
          * **两个以上硬约束互相顶死，结果被拖得很晚时，提醒回头核实——
-         * 这类结果，往前拉窗口救不了，只有"这个约束是不是真的硬"这个
-         * 判断错了才会造成。**
+         * 这类结果只有"这个约束是不是真的硬"这个判断错了才会造成。**
          *
          * 真实事故：2号住客说的"我6:30，然后使用半个小时"是随口说的
          * 习惯，不是像3号住客"我最早必须18:00开始，因为下班18:00到家"
          * 那样明确的硬约束，但模型把两者同样填成了 `earliestStart`。
          * 两个硬约束一旦互相冲突（都要求"不能比这更早"，但物理上排不
-         * 下），算法不管往前拉多少窗口都没用——因为问题不在窗口边界，
-         * 在于**这个约束本来可能就不该算硬的**，这属于语言判断，不是
-         * 计算，代码不替模型拍板（这个项目一贯的边界：计算交给代码，
-         * 判断留给模型），**但可以把"猜错的代价"摆出来，让模型有机会
-         * 自己回头核实，而不是闷头把猜错的结果直接排出去**。
+         * 下），问题不在窗口边界，在于**这个约束本来可能就不该算硬的**，
+         * 这属于语言判断，不是计算，代码不替模型拍板（这个项目一贯的
+         * 边界：计算交给代码，判断留给模型），**但可以把"猜错的代价"
+         * 摆出来，让模型有机会自己回头核实，而不是闷头把猜错的结果
+         * 直接排出去**。
          *
          * 判法：硬约束的人数 ≥ 2 时，algorithmically 没有办法进一步优化
          * （多个硬约束天然会顶到较晚的时刻），提醒模型这类情况下"结果
@@ -893,13 +878,6 @@ export async function runColivingTurn(args: {
          */
         const hardConstraintCount = people.filter((p) => p.earliestStart).length;
         const noteParts: string[] = [];
-        if (pullBackMinutes > 0) {
-          noteParts.push(
-            `你填的窗口起点是 ${windowStart}，但为了给没有硬约束的人留出空间，` +
-              `实际算的时候把窗口往前拉到了 ${formatMinutes(effectiveWindowStartMinutes)}` +
-              "——下面候选里出现早于你填的起点的时段是正常的，按候选里的时间发消息即可。"
-          );
-        }
         if (hardConstraintCount >= 2) {
           noteParts.push(
             "**这次有两个以上的人带了硬约束（earliestStart）。** 排出来的结果如果" +
@@ -1880,12 +1858,7 @@ export async function runColivingTurn(args: {
   const renderBaseFacts = () =>
     `名册上的人：${ctx.members.map((m) => m.name).join("、")}${rosterNote}\n` +
     `本轮调用的工具：${toolsUsed.join("、") || "无"}` +
-    (scheduleResults.length
-      ? `\n${scheduleResults.join("\n")}\n草稿里写的时段必须跟这个对得上——` +
-        "不能把一个人连续的时段拆成两段中间留空当（做饭中途不能停下来），" +
-        "也不能写出跟这里的时间对不上的数字。"
-      : "");
-  const baseFacts = renderBaseFacts();
+    (scheduleResults.length ? `\n${scheduleResults.join("\n")}` : "");
 
   /**
    * **每一条出站消息都要审，不只是回复。**
@@ -1954,10 +1927,10 @@ export async function runColivingTurn(args: {
             ? "不确定"
             : o.sharedRule
               ? "共用者通知的对象"
-              : "被说到的人",
+              : "不确定",
           said: "",
           facts:
-            `${baseFacts}\n这条是主动发的，起因是 ${senderName} 说：${args.text}` +
+            `${renderBaseFacts()}\n这条是主动发的，起因是 ${senderName} 说：${args.text}` +
             (o.isIntroduction
               ? "\n这个人是这一轮才刚加进系统的，这条是第一次联系、" +
                 "自我介绍性质，不是在回应任何投诉或纠纷"
@@ -1986,6 +1959,8 @@ export async function runColivingTurn(args: {
           error: `审稿不合格 第${v.broke}条：${v.why}`,
         });
         msg.blocked = true;
+        // 被拦草稿没有投递，不能占住本轮重发资格。
+        contacted.delete(msg.personId);
         // 拦截理由也留在对象上：调用方（评测报告页）要把"为什么被拦"
         // 显示给人看——那是审稿系统真的在起作用的证据，只标一个 blocked
         // 布尔值等于把最有价值的部分丢了
@@ -2004,7 +1979,7 @@ export async function runColivingTurn(args: {
    * 让 rubric 第7条能查出这种"工具调过、消息没送到"的落差。
    */
   const replyFacts =
-    baseFacts +
+    renderBaseFacts() +
     (outbound.length
       ? `\n同一轮还联系了别人：${outbound
           .map(
@@ -2015,145 +1990,22 @@ export async function runColivingTurn(args: {
       : "\n这一轮没有联系任何其他人");
 
   /**
-   * **代码级硬规则，不靠批判器的语义判断，也不靠文本猜测。**
+   * **模型转述一个代码已经知道答案的事实，转述错了。**
    *
-   * 真实事故（2026-09-05，用户明确要求"没调 pickSchedule 就直接拒绝
-   * 交付"）：干净复现同一道约束题时，`pickSchedule` 的窗口拉伸修复
-   * 确实生效（灵活的人被正确排在硬约束者前面）；但用户展示的另一条
-   * 真实对话里，AI 完全没考虑"排在前面"这个选项，读起来像是**压根
-   * 没调用排班工具、直接在自由文本里口算**出了"只剩20点这档"——
-   * 同一道题，有时候真算、有时候瞎猜，说明"要不要调 pickSchedule"
-   * 这件事本身不稳定，靠提示词反复提醒不管用。
+   * "转述这一轮联系有没有真的发出去"——测试里出现频率很高：一轮又一轮，
+   * 模型说"我已经联系他了""正在跟他说""这就去问"，而 facts 明明白白
+   * 写着那条 `contactPerson` 消息被审稿拦下、根本没发出去。以前这类只
+   * 靠批判器（rubric 第7条）主观判断，"有限复核"同样只给一次重写机会，
+   * 重写完继续这么说也只能老实发出去。
    *
-   * 用什么当"是不是在分配共用资源"的信号：**不靠解析文本猜测**——
-   * "那位""另一位"这类委婉指代是准则要求的正确写法，文本关键词匹配
-   * 根本抓不住。改成看模型自己的工具调用：`recordShare` 的语义就是
-   * "分完之后调这个"（工具描述原话），**只要模型调用了 `recordShare`，
-   * 就说明它自己判断"这是一次分配决定"**——如果这个判断成立、却从没
-   * 调用过 `pickSchedule` 来算这次分配，那这次分配就是自己心算/瞎猜
-   * 的，不是算出来的。
-   *
-   * 命中就直接判定不合格，**不再额外跑一次批判器模型调用去二次确认**
-   * ——这条本身就是确定性的代码判断，问模型"这条合不合格"反而多此一举、
-   * 多花一次调用。
-   *
-   * **2026-09-05 补充**：光靠 `recordShare` 不够——真实复现过一种更隐蔽
-   * 的路径：模型压根没调用任何"分配类"工具，直接在回复正文里写死
-   * 两个时间点（"18点起""17:30到18:00"），把后一个说成是"另一个住户"
-   * 排在前面——读起来完全是自由文本口算，不经过任何结构化信号。
-   * 这种情况批判器事后能查出来（rubric 第2/6/7条），但只有一次重写
-   * 机会，查出来了也不一定改得对，"有限复核"设计下这条回复原样发出去
-   * 了。加一条纯文本结构信号兜底：回复正文里出现两处以上
-   * `HH:MM`/`HH点`这种时刻表达、且这一轮从没调用过 `pickSchedule`，
-   * 大概率是在编排班——直接判不合格，逼它老实调工具去算。
-   */
-  /**
-   * **2026-09-05 补：中文数字的钟点也要认。** 真实复现过：回复写
-   * "六点到八点"，这条正则原来只认阿拉伯数字（"6点"/"18:00"），
-   * 中文数字被漏检——不是走到了 `checkFactFidelity` 却判错，是**根本
-   * 没进这条判断**，掉回了原来那条"批判器主观判断+只给一次重写机会"
-   * 的老路径，可靠性又退回了今天最开始要解决的那个问题。**同一件事，
-   * 数字写法不同就能绕开检测，检测规则必须跟着输入的所有写法走全，
-   * 不能只顾着最常见的那种。**
-   */
-  const CN_DIGIT: Record<string, number> = {
-    零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5,
-    六: 6, 七: 7, 八: 8, 九: 9, 十: 10, 十一: 11, 十二: 12,
-  };
-  const cnHourPattern = "(?:十[一二]|[一二三四五六七八九十两])";
-  const timePattern = new RegExp(
-    `([01]?\\d|2[0-3])[:：][0-5]\\d|([01]?\\d|2[0-3])点(半)?|${cnHourPattern}点(半)?`,
-    "g"
-  );
-  /**
-   * 把 "18点"/"18点半"/"18:00"/"六点"/"六点半" 统一成 "HH:MM"，
-   * 方便跟 formatMinutes 的输出比对。
-   *
-   * **中文数字不做上午/下午换算**，直接按字面值当小时数——这是跟阿拉伯
-   * 数字保持一致的取舍：现有逻辑对"8点"也不判断是不是指晚上8点该写
-   * 20:00，两者都是字面值直传，不引入新的不一致。
-   */
-  const normalizeTime = (raw: string): string => {
-    const colonMatch = raw.match(/^([01]?\d|2[0-3])[:：]([0-5]\d)$/);
-    if (colonMatch) return `${colonMatch[1].padStart(2, "0")}:${colonMatch[2]}`;
-    const hourMatch = raw.match(/^([01]?\d|2[0-3])点(半)?$/);
-    if (hourMatch) return `${hourMatch[1].padStart(2, "0")}:${hourMatch[2] ? "30" : "00"}`;
-    const cnMatch = raw.match(new RegExp(`^(${cnHourPattern})点(半)?$`));
-    if (cnMatch) {
-      const hour = CN_DIGIT[cnMatch[1]];
-      return `${String(hour).padStart(2, "0")}:${cnMatch[2] ? "30" : "00"}`;
-    }
-    return raw;
-  };
-  /**
-   * 排班硬规则的判定逻辑抽成函数，**给定文本就能独立判定**——不依赖
-   * 闭包里某个特定时刻的快照。这样重写完之后可以原样再调一次，不用
-   * 把判定逻辑复制一份。
-   *
-   * **`computedTimes` 必须在函数内现算，不能在外层算一次存成 const**：
-   * 如果重写时模型真的调用了 `pickSchedule`（这正是我们想让它做的事），
-   * `scheduleResults` 会被追加新结果，但一次性快照的 `computedTimes`
-   * 不会跟着更新——判定会一直用重写前那份（可能是空的）旧集合，
-   * 永远判定不合格，白白烧掉重试次数。
-   *
-   * 三种不合格：
-   * 1. 调了 recordShare（分配了资源）但没调过 pickSchedule——心算/瞎猜的分配
-   * 2. 正文里两个以上时刻、没调过 pickSchedule——编排班
-   * 3. 调了 pickSchedule，但正文时刻跟算出来的对不上——编了新时段
-   */
-  function checkScheduleHardRule(
-    text: string
-  ): { broke: "0"; why: string } | null {
-    const computedTimes = new Set(
-      scheduleResults.flatMap((s) => (s.match(/([01]\d|2[0-3]):[0-5]\d/g) ?? []))
-    );
-    const mentions = (text.match(timePattern) ?? []).map(normalizeTime);
-    if (toolsUsed.includes("recordShare") && scheduleResults.length === 0) {
-      return {
-        broke: "0",
-        why:
-          "这一轮调用了 recordShare（分配了一份共用资源），但从没调用过" +
-          " pickSchedule 去算这次分配——这是自己心算/瞎猜出来的分配，" +
-          "不是排列组合算出来的。",
-      };
-    }
-    if (mentions.length >= 2 && scheduleResults.length === 0) {
-      return {
-        broke: "0",
-        why:
-          "回复正文里出现了两个以上具体时刻，像是在给多人排时间表，" +
-          "但这一轮从没调用过 pickSchedule——这些时间点是编出来的，" +
-          "不是算出来的，必须先调 pickSchedule 排出方案再回复。",
-      };
-    }
-    if (
-      scheduleResults.length > 0 &&
-      mentions.length > 0 &&
-      mentions.some((t) => !computedTimes.has(t))
-    ) {
-      return {
-        broke: "0",
-        why:
-          "回复里提到的时刻跟 pickSchedule 算出的方案对不上——" +
-          `工具算出的时刻是：${[...computedTimes].join("、")}，` +
-          "回复里必须原样用这些时刻，不能改写、不能编一个新的、" +
-          "也不能用「A或B之间」这种模糊表达来回避精确对齐，也不能同时" +
-          "提两个不同版本的时段让对方猜哪个是最终结果。",
-      };
-    }
-    return null;
-  }
-
-  /**
-   * **2026-09-05 泛化：这不是排班专属的病，是"模型转述一个代码已经
-   * 知道答案的事实"这整类动作的病，换个事实换个马甲会反复发作。**
-   *
-   * 排班场景堵的是"转述算出来的数字"；这里堵的是同一种病的另一个马甲：
-   * "转述这一轮联系有没有真的发出去"——今天测试里出现频率**比排班数字
-   * 对不上还高**：一轮又一轮，模型说"我已经联系他了""正在跟他说""这就
-   * 去问"，而 facts 明明白白写着那条 `contactPerson` 消息被审稿拦下、
-   * 根本没发出去。以前这类只靠批判器（rubric 第7条）主观判断，"有限
-   * 复核"同样只给一次重写机会，重写完继续这么说也只能老实发出去。
+   * （曾经这里还有一条排班时段的正则硬闸——比对回复里的时刻跟
+   * `pickSchedule` 算出的候选集合。撤掉了：正则认不出"引用住户刚说的
+   * 到家时间""在问对方偏好几点"这类正常提到时刻的句子，也堵不住"东拼
+   * 西凑几个候选里的数字"这种真编造，误伤比抓到的真问题还多。排出来
+   * 的全部候选已经作为结构化事实喂进了 `baseFacts`／`replyFacts`
+   * （见 `renderBaseFacts`），批判器带着这份事实去核对人和时段、以及
+   * 整套方案站不站得住——rubric 6.6 就是干这个的，交给能理解语义的
+   * 批判器，比一条只会数字符串比对的正则更适合。）
    *
    * 判定不需要语义理解——**这一轮有没有被拦下的出站消息**是代码已知的
    * 硬事实（`outbound[].blocked`），"回复里有没有用现在时/将来时声称
@@ -2171,10 +2023,12 @@ export async function runColivingTurn(args: {
   function checkFalseContactClaim(
     text: string
   ): { broke: "0"; why: string } | null {
-    const anyBlocked = outbound.some((o) => o.blocked);
+    const unresolved = outbound.filter((o) => o.blocked && !outbound.some(
+      (other) => other.personId === o.personId && !other.blocked
+    ));
+    const anyBlocked = unresolved.length > 0;
     if (anyBlocked && claimedContactSuccessPattern.test(text)) {
-      const blockedTargets = outbound
-        .filter((o) => o.blocked)
+      const blockedTargets = unresolved
         .map((o) => o.personId)
         .join("、");
       return {
@@ -2191,36 +2045,24 @@ export async function runColivingTurn(args: {
   }
 
   /**
-   * **代码级硬规则的统一入口。** 以后再发现第三种"模型转述代码已知
-   * 事实却转述错"的马甲（比如分摊金额），往这个数组里加一个检查函数
-   * 就够了，不需要重新搭一套"检测+重写"的脚手架——脚手架（下面的
-   * `verdict` 判定、`isBrokenPromise` 给完整工具集、追加重写循环）
-   * 是通用的，各个检查函数只负责回答"这条文本符合我要防的那种转述
-   * 失真吗"。
+   * **代码级硬规则的统一入口。** 以后再发现新的"模型转述代码已知
+   * 事实却转述错"的马甲（比如分摊金额），往这里加一个检查函数就够了，
+   * 不需要重新搭一套"检测+重写"的脚手架——脚手架（下面的 `verdict`
+   * 判定、`isBrokenPromise` 给完整工具集、追加重写循环）是通用的，
+   * 各个检查函数只负责回答"这条文本符合我要防的那种转述失真吗"。
+   *
+   * **只收纯代码就能验证、没有"批判器可能理解错"空间的事实**——排班
+   * 时段那条已经证明不适合放这里（语义判断，正则做不了），归还给
+   * 批判器；这里只留"这一轮有没有发生"这种是/否问题。
    */
   function checkFactFidelity(
     text: string
   ): { broke: "0"; why: string } | null {
-    return checkScheduleHardRule(text) ?? checkFalseContactClaim(text);
+    return checkFalseContactClaim(text);
   }
 
   const factFidelityHit = checkFactFidelity(reply);
 
-  /**
-   * **2026-09-05 再补充**：`pickSchedule` 确实被调用了，但交付的回复
-   * 时段跟工具算出的方案对不上——真实复现过：批判器（rubric 6.6）连续
-   * 三次正确打回同一个"时段编造/对不上"的问题，但"有限复核"只给一次
-   * 重写机会，重写完还是编了个新时段（甚至写成"16:30-17:00（或17:30到
-   * 18:00之间）"这种和稀泥的双重表达来绕开精确匹配），批判器查出来了
-   * 也没法再拦一次，回复原样发出去。
-   *
-   * 用同样的思路加代码级硬校验：把 `scheduleResults` 里 `formatMinutes`
-   * 吐出来的 `HH:MM` 全部收集成一个集合，回复里提到的每一个时刻
-   * （标准化后）都必须落在这个集合里——一个对不上就判不合格。
-   * 这比批判器的语义判断更严，但正确：`pickSchedule` 只会返回它真实
-   * 算出的时刻，回复里出现任何不在这个集合里的时刻，就一定是编的，
-   * 没有"批判器可能误判"的空间。
-   */
   const verdict = factFidelityHit
     ? { pass: false as const, ...factFidelityHit }
     : await critique({
@@ -2530,7 +2372,7 @@ export async function runColivingTurn(args: {
        * 好过用户完全收不到回复。**这是有意的"有限复核"，不是查漏。**
        */
       const newReplyFacts =
-        baseFacts +
+        renderBaseFacts() +
         (outbound.length
           ? `\n同一轮还联系了别人：${outbound
               .map(

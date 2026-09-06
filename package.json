@@ -32,6 +32,7 @@
     "coliving-report": "tsx scripts/coliving-report.ts",
     "brain:inspect": "tsx scripts/brain-inspect.ts",
     "scheduling:inspect": "tsx scripts/scheduling-inspect.ts",
+    "coliving:quality": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/coliving-quality-inspect.ts",
     "twilio:selftest": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/twilio-selftest.ts",
     "twilio:inspect": "tsx scripts/twilio-inspect.ts",
     "coliving:sim": "cross-env NODE_OPTIONS=--conditions=react-server tsx scripts/coliving-sim.ts",

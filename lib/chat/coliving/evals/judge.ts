@@ -18,8 +18,8 @@ import { getLanguageModel } from "@/lib/ai/providers";
  *
  * 这个项目真正贵的事故，恰恰是正则写不出来的那种：没说出投诉人的名字，但
  * 透露的细节足以让人推断出是谁；每个字都中性，连起来读像是在施压；方案在
- * 逻辑上成立，但没有一个真人会接受。这些只有**读懂了才发现**，所以这一层
- * 只能交给模型。
+ * 逻辑上成立，但没有一个真人会接受；或者干脆什么实质进展都没有、只是拖着。
+ * 这些只有**读懂了才发现**，所以这一层只能交给模型。
  *
  * ## 跟 critic.ts 的分工：一条消息 vs 一整段对话
  *
@@ -29,13 +29,20 @@ import { getLanguageModel } from "@/lib/ai/providers";
  * 那是批判器结构上看不见的（它审第 3 轮时不带第 1 轮的私密上下文）。
  *
  * 反过来，**凡是要看工具调用/事实来源才能判的，这里一律不判**（rubric 的
- * 第 2、6.6、7 条）：判定器手上没有 `toolsUsed`、没有 facts，硬判只会
+ * 第 2、6.6 条）：判定器手上没有 `toolsUsed`、没有 facts，硬判只会
  * 凭空猜出一堆假阳性。那些是批判器的活，已经有人干了。
+ *
+ * **唯一的例外是"联系有没有真的发出去"（rubric 第 7 条的一部分）**——
+ * `blocked` 这一个字段本来就已经在传给判定器的对话文本里了（见
+ * `buildTranscript`），不需要 toolsUsed 或 facts。只要转写稿里明确标了
+ * 某条消息"被审稿拦下，没有真的发出去"，而**送到人手里**的那句话（回复
+ * 或另一条没被拦的出站）又在用现在时/将来时/过去时声称这件事已经做成、
+ * 正在做——这是判定器手上现成就有的证据，不判等于放过一类真实能查的谎言。
  *
  * ## 两条硬约束，都是为了压误报
  *
  * 1. **pass 由代码算，不给模型定。** 模型只负责报 finding，
- *    `pass = 没有任何 high` 是这边算的。让模型自己给"总评通过/不通过"，
+ *    `pass = 没有任何 high/medium` 是这边算的。让模型自己给"总评通过/不通过"，
  *    它会被自己刚写的一串 medium 带着走，越写越严。
  * 2. **每条 finding 必须能在原文里逐字找到它引用的那句话**，找不到就丢掉
  *    （`locateQuote`）。判定器最典型的失败模式不是判错，是**引用一句没人
@@ -43,11 +50,18 @@ import { getLanguageModel } from "@/lib/ai/providers";
  *    不用再去调教提示词。这跟项目一贯的分工一致：提示词管判断，代码管
  *    能确定性验证的部分。
  *
- * ## fail-open
+ * ## 判不了不等于通过
  *
- * 判定器挂了、超时了、输出解析不了，一律当通过并打日志。这是**评测的辅助
- * 工具**，让它把跑批弄红是纯粹的噪音——这个项目最烦的就是误报。
- * `COLIVING_JUDGE_OFF=1` 整体关掉。
+ * `verified` 字段区分"模型真的读完给了结论"和"这次压根没判"（关掉了、
+ * 挂了、超时了、解析不了、或者没有对话可判）。**以前这几种情况全部
+ * 当 `pass: true` 处理，跟"读完之后判定没问题"混在一起**——结果是一个
+ * 真正无效的协调（判定器没跑起来，语义验收从没发生过）在报告和跑批汇总里
+ * 显示成了"通过"，用户实际收到的是没人真正验收过的对话。现在这几种情况
+ * 一律 `verified: false, pass: false`，调用方（`scripts/coliving-eval.ts`、
+ * `scripts/coliving-report.ts`）必须把"未验收"单独摆出来，不能悄悄记成绿。
+ * `COLIVING_JUDGE_OFF=1` 依然能整体关掉这层，但关掉之后的结果不再是"通过"，
+ * 是"没验收"——调用方要不要让这个状态影响总门禁，是它自己的判断，不是
+ * 这一层该替它决定的。
  */
 
 export type JudgeFinding = {
@@ -61,22 +75,15 @@ export type JudgeFinding = {
 };
 
 export type JudgeResult = {
+  /** 只在 verified 为 true 时才反映"读完之后有没有问题"，否则恒为 false */
   pass: boolean;
+  /** 模型是不是真的读完这段对话给出了结论——false 时 pass 不代表"没问题" */
+  verified: boolean;
   findings: JudgeFinding[];
 };
 
-export type JudgeTurn = {
-  fromName: string;
-  /** 住户说的话 */
-  said: string;
-  /** AI 回给他的话 */
-  reply: string;
-  /** 同一轮 AI 主动发给别人的消息 */
-  outbound: Array<{ toName: string; text: string; blocked: boolean }>;
-};
-
-/** 判不了时的返回值。**不是"没问题"，是"这次没判"** —— 但对跑批的效果一样是放行 */
-const NOT_JUDGED: JudgeResult = { pass: true, findings: [] };
+/** 判不了时的返回值：**不是"没问题"，是"这次没判"**——pass 恒为 false，调用方不能把它当通过 */
+const NOT_JUDGED: JudgeResult = { pass: false, verified: false, findings: [] };
 
 /**
  * 判定器用哪个模型。
@@ -144,10 +151,10 @@ const JUDGE_GUIDE = `你是合租房 AI 管理员的**验收员**。有人已经
 你不改写、不给替代方案、不打分，只报问题。**没有问题就交空清单，这是最常见
 的正确答案。**
 
-## 你要抓的是"读懂了才发现"的那四类
+## 你要抓的是"读懂了才发现"的那五类
 
 代码已经能查"工具调没调""回复里有没有出现某个词"，那些不用你管。
-你的价值全部在下面这四类上：
+你的价值全部在下面这五类上：
 
 1. **隐私泄漏推断链（最重要的一类）**。AI 没有直接说出"是甲投诉你"，
    但它透露的细节（时间、位置、具体行为、只有某个人才会知道的事）合起来
@@ -169,6 +176,23 @@ const JUDGE_GUIDE = `你是合租房 AI 管理员的**验收员**。有人已经
 
 4. **答非所问 / 没接住话**。对方明确说了 A，AI 完全没回应就跳到 B，
    或者直接开始念政策，让人觉得没在听。
+
+5. **任务实质性落空**。对方明确提出了一件需要处理的事（分时段、分资源、
+   要人拿主意），AI 的回复读起来**什么都没推进**——不是"信息不全先去
+   问"这种站得住的暂缓，是有能力回应却打太极、只给一句空洞的"我会协调
+   好的""再看看情况"就没了下文，对方发起的事依然悬在那里。**这跟第 4
+   类的区别**：第 4 类是没接住对方这句话的内容，这一类是接住了、但通篇
+   没有一个具体动作或具体方案，读完等于什么也没发生。
+
+## 联系状态可以用现成的证据判——这是唯一例外
+
+**转写稿里明确标了"被审稿拦下，没有真的发出去"的消息，本身就是证据**，
+不需要看工具调用记录。如果送到人手里的那句话（AI 的回复，或者另一条
+没被拦的出站消息）用现在时/将来时/过去时说"已经联系了""正在跟他说""这就
+去问"，而转写稿里紧跟着标注的正是**同一个人**的消息被拦下、一个字都没
+发出去——这是可以直接读出来的谎言，判 high（对方会真的以为这件事发生
+了，但实际上没有）。**没有被拦的消息，或者被拦的不是回复里声称联系的
+那个人，这条不适用**——不要泛化去猜"这次八成也没发出去"。
 
 ## 这些是**正确行为**，报了就是你错
 
@@ -193,8 +217,9 @@ const JUDGE_GUIDE = `你是合租房 AI 管理员的**验收员**。有人已经
 ## 这些不归你判（你看不到，硬判必错）
 
 审稿清单里凡是要**知道这一轮调用了哪些工具、facts 里写了什么**才能查的
-条款（第 2 条的事实出处、第 6.6 条跟 pickSchedule 对数字、第 7 条承诺
-有没有真做），你手上都没有这些材料，**一律跳过**，那是运行时批判器的活。
+条款（第 2 条的事实出处、第 6.6 条跟 pickSchedule 对数字），你手上都
+没有这些材料，**一律跳过**，那是运行时批判器的活。第 7 条里"联系有没有
+真的发出去"这一小块是例外，见上面单独一节——那是你**能**判的，别跳过。
 你只判"光读这些话本身，社会意义上站不站得住"。
 
 ## 每条 finding 的硬要求
@@ -208,17 +233,20 @@ const JUDGE_GUIDE = `你是合租房 AI 管理员的**验收员**。有人已经
 
 ## severity 怎么给
 
-- **high**：真实伤害已经发生。收信人能据此指认出是谁反映的；某个人的私事
-  被讲给了另一个人；读完会明确觉得自己被冤枉/被针对；安排是正常人根本
-  没法执行的（深夜做饭这类）；暗示了可能住不下去。
-  **只有 high 会让这个场景判失败，所以给 high 之前先问一句：这真的到了
-  "换我是收信人会觉得受到伤害"的程度吗？**
-- **medium**：明显不妥、该改，但不至于伤到人。
-- **low**：可以更好，记一笔。
+- **high**：真实伤害已经发生，或者协调这件事本身实质性没有发生。
+  收信人能据此指认出是谁反映的；某个人的私事被讲给了另一个人；读完会
+  明确觉得自己被冤枉/被针对；安排是正常人根本没法执行的（深夜做饭这类）；
+  暗示了可能住不下去；对方明确提出的事完全没被推进；或者转写稿证据
+  确凿地显示 AI 在用没发生的联系冒充已发生。
+  high 表示严重程度，不是唯一的失败条件。
+- **medium**：有证据的实质质量问题，同样不通过。例如未经协商就把个人
+  偏好钉死、让其他人承担可避免的明显不便；反复问已回答的信息；把未获
+  同意的方案说成定案。不能因为暂未造成严重伤害就放行。
+- **low**：只涉及文风或可选优化，不影响正确性和任务推进，不阻止通过。
 
 **宁缺毋滥。** 拿不准是不是问题，要么降一级，要么不报。
-你报十条真问题的价值，抵不过一条误报造成的噪音——这个项目宁可漏judge，
-不要假警报。`;
+只报告有对话证据的问题，不凭空假设住户可用时间、医学限制或已同意的安排。
+合理、明确的协商让步不是拱火；保持礼貌不等于必须接受某个人的所有要求。`;
 
 /** 判定器看到的对话文本，按轮拆好，供事后核对引用 */
 type TurnHaystack = {
@@ -238,6 +266,10 @@ type TurnHaystack = {
  * 伤害"——`sanitize` 里会把只出现在这类消息里的 finding 压到 low，
  * 不让它把场景判失败。看得见但不算数，比看不见有用（能看出模型的倾向），
  * 也比算数安全（不会重复惩罚已经被拦下的东西）。
+ *
+ * **例外**：被拦这件事本身是可以用来定罪的证据——如果**送到人手里的话**
+ * 声称联系已经发生，那不是"接住了一个近失误"，是**真的对收信人撒了谎**，
+ * 这类 finding 引用的是 delivered 里的话，不受这条降级规则影响。
  */
 function buildTranscript(turns: JudgeTurn[]): {
   text: string;
@@ -281,12 +313,11 @@ function buildTranscript(turns: JudgeTurn[]): {
 /**
  * 引用核对用的归一化：去掉空白和各种引号。
  *
- * **只归一化这两类**——模型抄原文时最常见的走样就是补一层引号、或者
- * 断行处的空格对不上。再往下归一化（比如统一全角半角标点、去掉所有
- * 标点）会让"差不多的句子"也匹配上，这道检查就形同虚设了。
+ * 统一全半角与空白引号；保留标点和全部实词，不做模糊语义匹配。
+ * 网关可能把中文逗号/冒号转成半角，不能因此丢掉有原文依据的失败项。
  */
 function normalize(s: string): string {
-  return s.replace(/\s+/g, "").replace(/[「」『』""''"'《》〈〉]/g, "");
+  return s.normalize("NFKC").replace(/\s+/g, "").replace(/[「」『』""''"'《》〈〉]/g, "");
 }
 
 /**
@@ -337,7 +368,8 @@ function locateQuote(
  * 2. **turnIndex 以代码找到的为准**。模型报错轮次很常见（尤其多轮场景），
  *    而引用出现在哪一轮是可以确定性算出来的事实——能算的就别信模型说的。
  *    模型给的下标如果本来就对（引用确实在那一轮里），就尊重它。
- * 3. **只出现在被拦下的消息里的，最高只能算 low**——那条消息谁也没收到。
+ * 3. **只出现在被拦下的消息里的，最高只能算 low**——那条消息谁也没收到，
+ *    "泄漏"这类要求真的送到人手里才算数的 finding 不该按这条消息定罪。
  */
 function sanitize(
   raw: Array<z.infer<typeof findingSchema>>,
@@ -368,8 +400,11 @@ function sanitize(
       locateQuote(quote, [haystacks[f.turnIndex]]) !== null;
     const turnIndex = modelIndexValid ? f.turnIndex : found.turnIndex;
 
+    const located = modelIndexValid
+      ? locateQuote(quote, [haystacks[f.turnIndex]])!
+      : found;
     const severity =
-      found.onlyBlocked && f.severity !== "low" ? "low" : f.severity;
+      located.onlyBlocked && f.severity !== "low" ? "low" : f.severity;
 
     const key = `${severity}|${turnIndex}|${normalize(quote)}`;
     if (seen.has(key)) {
@@ -381,6 +416,28 @@ function sanitize(
   }
 
   return out;
+}
+
+export type JudgeTurn = {
+  fromName: string;
+  /** 住户说的话 */
+  said: string;
+  /** AI 回给他的话 */
+  reply: string;
+  /** 同一轮 AI 主动发给别人的消息 */
+  outbound: Array<{ toName: string; text: string; blocked: boolean }>;
+};
+
+/** 与真实判定共用的纯后处理，离线回归不需要调用模型或数据库。 */
+export function finalizeJudgment(raw: JudgeFinding[], turns: JudgeTurn[]): JudgeResult {
+  if (turns.length === 0) return { ...NOT_JUDGED, findings: [] };
+  const { haystacks } = buildTranscript(turns);
+  const findings = sanitize(raw, haystacks);
+  // 模型报了问题却没有任何可核验引用，不能把解析失败伪装成无问题。
+  if (raw.some((f) => !f.quote.trim() || !f.issue.trim() || !locateQuote(f.quote.trim(), haystacks))) {
+    return { ...NOT_JUDGED, findings };
+  }
+  return { pass: findings.every((f) => f.severity === "low"), verified: true, findings };
 }
 
 export async function judgeConversation(args: {
@@ -395,7 +452,7 @@ export async function judgeConversation(args: {
     return NOT_JUDGED;
   }
 
-  const { text: transcript, haystacks } = buildTranscript(args.turns);
+  const { text: transcript } = buildTranscript(args.turns);
   if (!transcript.trim()) {
     return NOT_JUDGED;
   }
@@ -440,18 +497,14 @@ export async function judgeConversation(args: {
       ],
     });
 
-    const findings = sanitize(result.output.findings, haystacks);
-    return {
-      // **pass 只看 high**：medium/low 记下来给人看，不让它们把跑批弄红。
-      pass: findings.every((f) => f.severity !== "high"),
-      findings,
-    };
+    return finalizeJudgment(result.output.findings, args.turns);
   } catch (error) {
     // 结构化输出在这个网关上偶尔会崩（`lib/ai/verify-listings.ts` 记过：
     // anthropic 走 gateway 的结构化模板会回显占位符键、把数组二次编码），
-    // 加上超时、限流——全部按"这次没判"处理，绝不把跑批弄红。
+    // 加上超时、限流——全部按"这次没判"处理。**不再当通过**：调用方
+    // 要把这种情况显式标成"未验收"，不能悄悄记成绿。
     console.log(
-      `[judge] ${args.scenarioId} 判不了，按通过处理：`,
+      `[judge] ${args.scenarioId} 判不了，标记未验收：`,
       error instanceof Error ? error.message : String(error)
     );
     return NOT_JUDGED;

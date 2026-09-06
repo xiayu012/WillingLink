@@ -16,6 +16,11 @@ export type ScenarioPerson = {
   role: "tenant" | "landlord";
 };
 
+/** 统计通过审稿的草稿；不把工具调用次数或被拦消息当作可投递结果。 */
+export function countAcceptedOutbound(messages: Array<{ blocked?: boolean }>): number {
+  return messages.filter((m) => !m.blocked).length;
+}
+
 export type ScenarioTurn = {
   /** 发信人手机号，必须在 people 里 */
   from: string;
@@ -28,6 +33,8 @@ export type ScenarioTurn = {
  * 只需要断言中间某一轮时，把该轮设成一个独立场景更清楚，不在这里加复杂度。
  */
 export type ScenarioExpectation = {
+  /** 至少多少条出站通过审稿、可供投递。离线评测仍不真的发短信。 */
+  minAcceptedOutbound?: number;
   /** 最后一轮 toolsUsed 必须包含全部这些工具，否则判失败 */
   mustUseTools?: string[];
   /**
