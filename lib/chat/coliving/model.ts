@@ -6,19 +6,22 @@
  *   · 小红书私信    `lib/chat/xhs-dm.ts` 的 XHS_DM_MODEL
  *   · 合租房管理员  这里
  *
- * 默认 DeepSeek V4 Flash 是 2026-08-30 实测选出来的（见 AGENT_LOG）：
- * 同一条真实投诉，它 $0.004–0.011 一轮、sonnet-4.5 $0.127，**便宜约 18 倍**，
- * 而且三个安全探针（非法驱逐 / 自杀信号 / 住房公平陷阱）全过，
- * 「房东也是一票」这类新准则执行得比 sonnet 还到位。
- * 便宜的主因不只是单价——**它把多个工具并行调用，一轮只要 1–2 次往返**。
+ * 默认 `anthropic/claude-sonnet-4.5`（2026-09-07 切回）。此前 2026-08-30 起
+ * 默认 DeepSeek V4 Flash：同一条真实投诉实测 $0.004–0.011 一轮、sonnet-4.5
+ * $0.127，**便宜约 18 倍**，且三个安全探针（非法驱逐 / 自杀信号 / 住房公平
+ * 陷阱）全过（见 AGENT_LOG 2026-08-30）。但生产观察 + Codex 多次全量回归证明
+ * 它在**多轮冲突协调上不可靠**：跨轮忘偏好（老孙说 19:00 被排到 20:30）、
+ * 不调 pickSchedule 却编造具体时段，且单轮 38–60 秒，长场景慢到撞 gateway
+ * 超时（ECONNRESET / operation aborted due to timeout）。sonnet-4.5 更强更快
+ * （22–30 秒一轮），项目里批判器 / 终审已用它，接入零额外依赖；单价虽高，
+ * 但短信量低，绝对金额可忽略。
  *
- * 代价是慢：38–60 秒一轮（sonnet 22–30 秒）。短信是异步回的，不影响正确性。
- *
- * 要切回或试别的：设 `COLIVING_MODEL`。同在 gateway 上、值得一试的还有
- * `deepseek/deepseek-v4-pro`、`minimax/minimax-m3`、`zai/glm-5.3`。
+ * 要回退到便宜的旧默认：设 `COLIVING_MODEL=deepseek/deepseek-v4-flash`。
+ * 同在 gateway 上、值得一试的还有 `deepseek/deepseek-v4-pro`、
+ * `minimax/minimax-m3`、`zai/glm-5.3`。
  * **注意 `zai/glm-5.3-flash` 试过，不行**——它反问问题、一个工具都不调。
  */
-export const COLIVING_DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+export const COLIVING_DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
 
 export function colivingModelId(): string {
   return process.env.COLIVING_MODEL?.trim() || COLIVING_DEFAULT_MODEL;

@@ -5703,6 +5703,25 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · 合租房大脑默认模型切回 sonnet-4.5（Codex 监督、Claude 实现）
+
+**原因**：2026-08-30 起默认 DeepSeek V4 Flash（便宜约 18 倍、三个安全探针全过），
+但生产观察 + Codex 多次全量回归证实它在**多轮冲突协调上不可靠**：跨轮忘偏好
+（老孙说 19:00 被排到 20:30）、没调 pickSchedule 却编造具体时段，且单轮 38–60 秒，
+长场景慢到撞 gateway 超时。sonnet-4.5 更强更快（22–30 秒一轮），项目里批判器/
+终审早已用它，接入零额外依赖；单价虽高，但短信量低，绝对金额可忽略，老板已授权花钱。
+
+**改动**（`lib/chat/coliving/model.ts`）：`COLIVING_DEFAULT_MODEL` 改为
+`anthropic/claude-sonnet-4.5`；注释改写为「为何切回 + 如何回退」，并保留「别顺手
+统一其它链路模型」纪律。
+
+**验证**：`tsc --noEmit` 仅既有 speech-input.tsx 两条 TS2717，无新增；`git diff
+--check` 干净。默认模型改动只影响运行时选型。
+
+**回退**：设 `COLIVING_MODEL=deepseek/deepseek-v4-flash` 即回旧默认。
+
+---
+
 ## 2026-09-07 · 软偏好也确定性注入 pickSchedule（Codex 定位根因，Claude Sonnet 实现）
 
 **背景**：`pickSchedule.execute` 早就能从 `case_position` 历史表态确定性注入
