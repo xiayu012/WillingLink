@@ -432,8 +432,12 @@ export async function runColivingTurn(args: {
    * 本轮自己发出去的消息，执行工具时就已经写进库了，审稿时如果不排除
    * 本轮自己刚写的，`recentOutbound` 会把这条消息自己算成"最近的往来"，
    * 判成"重复发送"（跟自己比对，当然一模一样）。
+   *
+   * **取数据库时钟，不取 node 时钟。** 竞态门禁（hasNewInboundSince）要拿
+   * 它跟 `message.sent_at`（数据库 `now()` 生成）比大小，两个时钟不同源会
+   * 差约 2.1s——把前一轮刚说过话的人误判成「本轮刚发来新消息」。
    */
-  const turnStartedAt = new Date();
+  const turnStartedAt = await repo.dbNow();
   const sender = await repo.resolveSender(channel, args.from);
 
   /**

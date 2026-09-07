@@ -5703,6 +5703,30 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · 竞态闸时钟同源化：turnStartedAt 取数据库时钟（Codex 监督、Claude 实现）
+
+**根因**：`runColivingTurn` 里 `turnStartedAt = new Date()` 取的是 node 本机时钟，
+而 `coliving.message.sent_at` 由数据库 `now()` 生成（Neon 服务器时钟）。Codex 实测
+两边差约 2.1s（db 比 node 快约 2141ms）。`hasNewInboundSince` 用 `m.sent_at > since`
+判「目标人在本轮开始后有没有发新消息」，时钟不同源会把前一轮刚说过话的人误判成
+「本轮刚发来新消息」——`contactPerson` 和最终自动收口的竞态闸把可联系的人误跳过，
+是「选定排班后没联系到所有人」仍复现的隐藏原因之一。
+
+**改法（最小范围，两处）**：`repo.ts` 新增 `dbNow()`（`select now() as now` 单值）；
+`turn.ts` 里 `turnStartedAt = new Date()` → `await repo.dbNow()`。既有用法全部不动：
+`hasNewInboundSince` 的 since、`recentForCritique` 的 `sentAt < turnStartedAt`、
+`outcome.turnStartedAt` 返回给 route 的投递前门禁——它们本来就该跟 sent_at 同一把尺。
+
+**同类点排查**：没有其它「node 当前时刻当 since/门槛、与 db 时间戳做秒级比对」的
+竞态闸。未动：`recentlyAdded`/`outreach.ts` 的 `Date.now()` 比天级阈值、`context.ts`
+now 只用于显示「现在几点」、checkEnvironment 的 ±180 分钟窗口等。
+
+**验证**：`coliving:quality` 46/46 通过；`tsc --noEmit` 仅既有 speech-input.tsx 两条
+TS2717，无新增；`git diff --check` 干净。未跑模型级 eval（纯离线确定性改动，按成本
+纪律不值得）；未调用 Twilio、未写真人库。
+
+---
+
 ## 2026-09-07 · 测试成本纪律（老板纠偏：不能每轮烧全量模型评测）
 
 **触发**：老板指出 Vercel gateway 太贵，我在排查时反复跑全量 `coliving-eval`

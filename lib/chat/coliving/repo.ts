@@ -30,6 +30,23 @@ function db(): postgres.Sql {
   return client;
 }
 
+/**
+ * 数据库的当前时刻（Neon 服务器时钟）。
+ *
+ * **不要拿 node 的 `new Date()` 冒充「现在」。** `coliving.message.sent_at`
+ * 这类时间戳全是数据库 `now()` 生成的，本机时钟与服务器时钟会漂移
+ * （实测差约 2.1s）。拿 node 时钟当门槛去比 db 时间戳，秒级竞态判断
+ * （hasNewInboundSince 的 since、recentForCritique 的截止线）会把前一轮
+ * 刚说过话的人误判成「本轮刚发来新消息」。凡是要跟 sent_at 同一把尺，
+ * 就从这里取「当下」。
+ */
+export async function dbNow(): Promise<Date> {
+  const rows = await db()<{ now: Date }[]>`
+    select now() as now
+  `;
+  return rows[0].now;
+}
+
 export type Role = "tenant" | "landlord" | "coordinator" | "other";
 
 export type Member = {
