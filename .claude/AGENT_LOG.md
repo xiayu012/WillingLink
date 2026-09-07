@@ -5703,6 +5703,28 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · 简单肯定回排班征询在模型跑之前短路（Codex 定位，Claude Sonnet 实现）
+
+**根因**：`simpleScheduleAffirmation` 一直放在模型跑完、审稿重写之后才覆盖成短确认，
+住户回「愿意」时模型仍会白跑一轮（几十秒 + 一次带工具往返），
+`affirmation-short-reply` 场景因此报「不该调用 pickSchedule/chooseSchedule 却调用了」。
+
+**改法**：`runColivingTurn` 在 `pendingCommunication` 之后、`buildContext`/主生成之前
+新增短路闸——`isSimpleAffirmation(args.text) && isScheduleSlotInquiry(answering)` 命中
+即直接返回短确认，并把入站落库、`linkResponse`、`recordDecision("reply_only")` +
+`queueCommunication` + `appendMessage` outbound 做齐；`usage` 全 0、`outbound=[]`、
+`replyReview` pass。不调模型、不排班、不联系人。模型跑完后的收口保留为幂等防线。
+
+**验证**：`coliving:quality` 51 项通过（+1 短路闸接线断言）；`tsc --noEmit` 仅既有
+speech-input.tsx 两条 TS2717，无新增；`git diff --check` 干净。未跑模型级（按成本纪律，
+离线闸覆盖结构性回归）。
+
+**残余风险**：短路闸复用 `pendingCommunication` 的取数，若某次征询从未落成含
+「你用 HH:MM-HH:MM」模板的 communication，「愿意」不会短路（与旧行为一致，至多多跑
+一轮模型，不会误跳过）；`usage` 全 0 是语义正确（确实没调模型），成本统计口径要注意。
+
+---
+
 ## 2026-09-07 · 合租房大脑默认模型切回 sonnet-4.5（Codex 监督、Claude 实现）
 
 **原因**：2026-08-30 起默认 DeepSeek V4 Flash（便宜约 18 倍、三个安全探针全过），

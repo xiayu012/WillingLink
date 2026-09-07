@@ -729,6 +729,91 @@ export async function runColivingTurn(args: {
    */
   const answering = await repo.pendingCommunication(sender.personId);
 
+  const modelId = args.modelId ?? colivingModelId();
+
+  /**
+   * 短路闸：住户以「愿意/行/可以」这类简单肯定，回复一条排班时段征询。
+   *
+   * 这种情况一开始就能确定回什么，不必跑模型。过去是等模型跑完、审稿
+   * 重写之后才覆盖成短确认，于是住户回「愿意」时模型仍会白跑一轮、多花
+   * 几十秒和一次带工具的模型往返（affirmation-short-reply 场景因此报
+   * 「不该调用排班工具但调用了」）。这里在 buildContext 与主生成之前
+   * 直接短路：生成短确认正文、做齐簿记、立刻返回。不调模型、不排班、
+   * 不联系其他人。
+   */
+  if (isSimpleAffirmation(args.text) && isScheduleSlotInquiry(answering)) {
+    const slot = answering ? extractSlotFromInquiry(answering.body) : null;
+    const shortReply = slot
+      ? `好，${slot} 就定给你了。`
+      : `好，时段定了，按这个来。`;
+
+    // 落库与正常回合一致：先把住户这句话作为入站消息写下，再 linkResponse
+    // 把它关联回它正在回答的那条征询——这也是「谁确认过哪段」持久事实的
+    // 来源（repo.listScheduleInquiryConfirmations 靠 response_message_id）。
+    const inboundId = await repo.appendMessage({
+      conversationId,
+      personId: sender.personId,
+      direction: "inbound",
+      channel,
+      body: args.text,
+    });
+    if (inboundId) {
+      await repo.linkResponse({ personId: sender.personId, messageId: inboundId });
+    }
+
+    // 回复本身也算一次 communication：兜底记一条 reply_only 决策（与正常
+    // ensureDecision("reply_only") 同语义），再把短确认作为回复落库。
+    const shortDecisionId = await repo.recordDecision({
+      householdId: sender.householdId,
+      kind: "reply_only",
+      intent: "简单肯定回复排班征询，代码短路落锤，未调用模型",
+      modelId,
+      doctrineModules: [],
+      contextChars: 0,
+      contextSnapshot: null,
+    });
+    const shortReplyCommunicationId = await repo.queueCommunication({
+      householdId: sender.householdId,
+      decisionId: shortDecisionId,
+      caseId: null,
+      toPersonId: sender.personId,
+      channel,
+      purpose: "回复本人",
+      body: shortReply,
+    });
+    await repo.appendMessage({
+      conversationId,
+      personId: sender.personId,
+      direction: "outbound",
+      channel,
+      body: shortReply,
+      communicationId: shortReplyCommunicationId,
+    });
+
+    return {
+      reply: shortReply,
+      replyReview: { verified: true, pass: true, broke: "", why: "" },
+      scheduleFacts: [],
+      replyCommunicationId: shortReplyCommunicationId,
+      outbound: [],
+      allOutbound: [],
+      decisionId: shortDecisionId,
+      modules: [],
+      promptChars: 0,
+      toolsUsed: [],
+      unknownSender: false,
+      usage: {
+        steps: 0,
+        inputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+      },
+      turnStartedAt,
+    };
+  }
+
   // 「刚进来」= 这条会话线上还没有过任何来往。比记一个标志位可靠：
   // 不管他是自己发来的第一条，还是回复我们主动发的第一条，都算。
   const ctx = await buildContext(sender, channel, {
@@ -763,8 +848,6 @@ export async function runColivingTurn(args: {
     (confirmedScheduleSlots.get(personId) ?? []).some(
       (c) => c.start === slot.start && c.end === slot.end
     );
-
-  const modelId = args.modelId ?? colivingModelId();
 
   /**
    * 关键词永远会有漏网的（真实投诉说的是"做饭""挨饿""不公平"，

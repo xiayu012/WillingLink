@@ -386,9 +386,21 @@ async function main() {
     assert(src.includes("selfStatedSlotsByWindow"));
     // 自报时段立即 return skipped:true，不发任何消息（不用通知语气，也不用征询语气）
     assert(src.includes("preConsented: true") && src.includes("skipped: true"), "self-stated slot must return preConsented+skipped");
-    // 预同意分支不能调用 queueCommunication
-    assert(!src.slice(0, src.indexOf("preConsented: true")).split("if (isSelfStated)").pop()?.includes("queueCommunication"),
-      "preConsented branch must not reach queueCommunication");
+    // 预同意分支不能调用 queueCommunication——限定在 enqueueScheduleContact 内断言：
+    // 两个 preConsented return（自报精确时段 / 持久已确认同一 slot）都必须先于
+    // 该函数的发送 queueCommunication（不能只靠全文件前缀——短路分支也含
+    // queueCommunication，但那是对住户本人的回复落库，与预同意跳过无关）。
+    const enqueueStartIdx = src.indexOf("async function enqueueScheduleContact(");
+    const preConsentedIdx = src.indexOf("preConsented: true", enqueueStartIdx);
+    const enqueueSendQueueIdx = src.indexOf(
+      "const communicationId = await repo.queueCommunication(",
+      enqueueStartIdx
+    );
+    assert(enqueueStartIdx > 0, "enqueueScheduleContact 必须存在");
+    assert(preConsentedIdx > enqueueStartIdx, "preConsented return 必须在 enqueueScheduleContact 内");
+    assert(enqueueSendQueueIdx > 0, "enqueueScheduleContact 的发送 queueCommunication 必须存在");
+    assert(preConsentedIdx < enqueueSendQueueIdx,
+      `preConsented return（@${preConsentedIdx}）必须先于发送 queueCommunication（@${enqueueSendQueueIdx}）`);
     // 非自报时段仍走征询
     assert(src.includes("你愿意吗"), "non-self-stated slot still asks for confirmation");
   });
@@ -459,13 +471,20 @@ async function main() {
   check("preconsent branch returns before queueCommunication in contactPerson source", () => {
     // 结构断言：确保 preConsentedForSchedule.add 和 return {preConsented:true, skipped:true}
     // 出现在 queueCommunication 之前，防止预同意分支悄悄走漏到发送流程。
+    // 限定在 enqueueScheduleContact 内比较——文件前面还有短路分支的
+    // repo.queueCommunication（那是对住户本人的回复落库，与预同意跳过无关）。
     const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
-    const preconsentIdx = turnSrc.indexOf("preConsentedForSchedule.add(target.personId)");
-    // Find the preConsented return block — look for "preConsented: true," which is unique to this branch
-    const returnPreconsentedIdx = turnSrc.indexOf("preConsented: true,");
-    const queueIdx = turnSrc.indexOf("queueCommunication({");
-    assert(preconsentIdx > 0, "preConsentedForSchedule.add 必须存在");
-    assert(returnPreconsentedIdx > 0, "preConsented:true return 必须存在");
+    const enqueueStartIdx = turnSrc.indexOf("async function enqueueScheduleContact(");
+    const preconsentIdx = turnSrc.indexOf(
+      "preConsentedForSchedule.add(target.personId)",
+      enqueueStartIdx
+    );
+    // Find the preConsented return block within enqueueScheduleContact
+    const returnPreconsentedIdx = turnSrc.indexOf("preConsented: true,", enqueueStartIdx);
+    const queueIdx = turnSrc.indexOf("queueCommunication({", enqueueStartIdx);
+    assert(enqueueStartIdx > 0, "enqueueScheduleContact 必须存在");
+    assert(preconsentIdx > enqueueStartIdx, "preConsentedForSchedule.add 必须存在（enqueueScheduleContact 内）");
+    assert(returnPreconsentedIdx > enqueueStartIdx, "preConsented:true return 必须存在（enqueueScheduleContact 内）");
     // 预同意的 return 必须在 queueCommunication 之前（在源码里 index 更小）
     assert(
       returnPreconsentedIdx < queueIdx,
@@ -499,13 +518,40 @@ async function main() {
     // Fix 2: 短回复确认文本必须在最终收口（入库之前）最后覆盖，防止审稿/重写路径把它改长。
     const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
     assert(turnSrc.includes("simpleScheduleConfirmationText"), "必须存在 simpleScheduleConfirmationText 变量");
-    // 使用唯一注释定位最终 override 块，以及唯一字符串定位回复 queueCommunication
+    // 使用唯一注释定位最终 override 块，以及最后一条回复 queueCommunication（文件前面
+    // 还有短路分支的"回复本人"——那条路径提前 return，与这里的顺序无关，用 lastIndexOf
+    // 锚定收尾那一条）。
     const finalOverrideIdx = turnSrc.indexOf("最终落锤：简单肯定覆盖");
-    const replyQueueIdx = turnSrc.indexOf('"回复本人"');
+    const replyQueueIdx = turnSrc.lastIndexOf('"回复本人"');
     assert(finalOverrideIdx > 0, "最终落锤注释必须存在");
     assert(replyQueueIdx > 0, "回复本人 queueCommunication 必须存在");
     assert(finalOverrideIdx < replyQueueIdx,
       `最终落锤（@${finalOverrideIdx}）必须早于 queueCommunication 回复本人（@${replyQueueIdx}）`);
+  });
+  check("short-circuit affirmation sits before buildContext/generateText and never schedules", () => {
+    // 源码级断言：住户以简单肯定回复排班征询时，runColivingTurn 在拿到
+    // answering 之后、buildContext 与主生成之前就短路返回；短路分支内不得
+    // 出现排班工具调用（否则"愿意"仍会白跑一轮模型 + pickSchedule/chooseSchedule）。
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const marker = "短路闸：住户以「愿意/行/可以」这类简单肯定，回复一条排班时段征询";
+    const markerIdx = turnSrc.indexOf(marker);
+    const buildCtxIdx = turnSrc.indexOf("const ctx = await buildContext(sender");
+    const mainGenIdx = turnSrc.indexOf("const result = await generateText({");
+    assert(markerIdx > 0, "短路闸注释必须存在");
+    assert(buildCtxIdx > markerIdx,
+      `短路闸（@${markerIdx}）必须先于 buildContext（@${buildCtxIdx}）`);
+    assert(mainGenIdx > markerIdx,
+      `短路闸（@${markerIdx}）必须先于主生成 generateText（@${mainGenIdx}）`);
+    const branch = turnSrc.slice(markerIdx, buildCtxIdx);
+    assert(branch.includes("return {"), "短路分支必须直接返回，不能落到模型路径");
+    assert(branch.includes("queueCommunication({"), "短路分支仍要把回复作为 communication 落库");
+    assert(branch.includes("linkResponse({"), "短路分支必须把入站关联回正在回答的征询");
+    for (const forbidden of ["pickSchedule", "chooseSchedule", "contactPerson("]) {
+      assert(
+        !branch.includes(forbidden),
+        `短路分支内不应出现 ${forbidden}（@${branch.indexOf(forbidden)}）`
+      );
+    }
   });
   check("pendingCommunication orders expects_reply=true first to prevent notification shadowing", () => {
     // Fix 3: 新的通知（expects_reply=false）不能遮住真正的时段征询（expects_reply=true）。
