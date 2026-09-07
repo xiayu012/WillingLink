@@ -56,3 +56,6 @@ tests/search-eval/reports/
 tests/coliving-eval/reports/
 scripts/_tmp-*
 scripts/tmp-*
+
+# 老板对 Claude Code 说过的话（含私人信息，仅本地保留，不入库）
+.claude/OWNER_TO_CLAUDE.md
