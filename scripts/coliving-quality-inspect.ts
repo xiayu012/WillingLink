@@ -590,6 +590,30 @@ async function main() {
     assert(repoSrc.includes("left join coliving.communication"), "getRecentTurns must join communication table");
     assert(repoSrc.includes("c.status != 'skipped'"), "getRecentTurns must exclude skipped outbound");
   });
+  check("history windows are trimmed: getRecentTurns=8, recentOutbound=6 outbound-only, getStandalonePositions=10", () => {
+    const repoSrc = readFileSync("lib/chat/coliving/repo.ts", "utf8");
+    // 锁死三个“会话流水”默认窗口，防止将来有人把历史又调肥；结构事实类上下文不算在内。
+    const fnToNextExport = (name: string) => {
+      const start = repoSrc.indexOf(`export async function ${name}(`);
+      assert(start >= 0, `${name} 必须存在`);
+      const next = repoSrc.indexOf("export async function", start + 1);
+      return repoSrc.slice(start, next > start ? next : start + 4000);
+    };
+    const recentTurnsSrc = fnToNextExport("getRecentTurns");
+    assert(recentTurnsSrc.includes("limit = 8"), "getRecentTurns 默认 limit 必须收窄为 8");
+    assert(recentTurnsSrc.includes("limit ${limit}"), "getRecentTurns 必须用参数 limit，不能写死覆盖显式传入值");
+    const standaloneSrc = fnToNextExport("getStandalonePositions");
+    assert(standaloneSrc.includes("limit = 10"), "getStandalonePositions 默认 limit 必须收窄为 10");
+    assert(standaloneSrc.includes("limit ${limit}"), "getStandalonePositions 必须用参数 limit");
+    const outboundSrc = fnToNextExport("recentOutbound");
+    assert(outboundSrc.includes("limit = 6"), "recentOutbound 默认 limit 必须收窄为 6");
+    assert(outboundSrc.includes("m.direction = 'outbound'"), "recentOutbound 必须只返回 outbound");
+    assert(outboundSrc.includes("limit ${limit}"), "recentOutbound 必须用参数 limit，显式传 24（批判器）才不被默认值覆盖");
+    // 调用方显式传 limit 时不得被默认值顶掉：批判器的 24 条窗口是唯一显式传参处。
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    assert(turnSrc.includes("repo.recentOutbound(sender.householdId, 24)"),
+      "批判器必须继续用显式 24 条窗口（不能回退成默认 6 而丢审稿事实）");
+  });
   check("stale-skipped contactPerson outbound does not count as contacted in judge trace", () => {
     // 旧回合跳过的消息不能出现在 outbound 里；judge 不会看到"已联系"
     const turns: JudgeTurn[] = [{

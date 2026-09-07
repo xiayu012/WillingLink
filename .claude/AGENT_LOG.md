@@ -5703,6 +5703,22 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · 收窄历史窗口：只留“够用”的会话流水（Codex 派单、Claude 实现）
+
+老板要“不把所有历史聊天都塞进去”。只收窄“会话流水”层，不动结构化事实账本：
+- `getRecentTurns` 默认 limit 12→8；`getStandalonePositions` 20→10；
+  `recentOutbound` 12→6 且加 `m.direction='outbound'`（它本意是“你最近对别人说过
+  什么”，之前却一直混着 inbound；inbound 归各会话线 history，不再重复堆）。
+- 显式传 limit 的调用方尊重传入值（批判器 `recentOutbound(householdId,24)` 未动）。
+
+**验证**：`coliving:quality` 56 项通过；`tsc --noEmit` 仅既有两条 TS2717；`git diff
+--check` 干净。
+
+**遗留（有意接受）**：整屋窗口不再展示别人会话线的入站，未结构化的随口事实跨轮更
+快淡出（结构化账本承担）；会话线程超 8 条旧消息出窗；未归案表态超 10 条取最近 10。
+
+---
+
 ## 2026-09-07 · 合租房批判器省钱改造（四项一起，Codex 派单）
 
 老板拍板省钱优先：能程序做的绝不叫 LLM。烧钱根因是大脑已是便宜

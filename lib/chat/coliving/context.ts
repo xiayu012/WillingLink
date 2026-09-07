@@ -416,10 +416,10 @@ export async function buildContext(
     lines.push(
       "**看清楚再开口。** 已经问过的别再问一遍，已经答过你的别当没答。"
     );
+    // recentOutbound 只返回出站消息——入站由各自会话线的 history 管。
     for (const r of recent) {
       const t = r.sentAt.toISOString().slice(11, 16);
-      const who = r.direction === "inbound" ? `${r.to} 说` : `你对 ${r.to} 说`;
-      lines.push(`- ${t} ${who}：${r.body.replace(/\n/g, " ").slice(0, 60)}`);
+      lines.push(`- ${t} 你对 ${r.to} 说：${r.body.replace(/\n/g, " ").slice(0, 60)}`);
     }
     lines.push("");
   }

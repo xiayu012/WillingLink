@@ -356,7 +356,7 @@ export async function hasNewInboundSince(
 /** 最近几轮对话，按时间正序返回，喂给模型当 history */
 export async function getRecentTurns(
   conversationId: string,
-  limit = 12
+  limit = 8
 ): Promise<Array<{ role: "user" | "assistant"; content: string }>> {
   const rows = await db()<
     { direction: "inbound" | "outbound"; body: string }[]
@@ -522,7 +522,7 @@ export async function getCasePositions(caseId: string): Promise<CasePosition[]> 
  */
 export async function getStandalonePositions(
   householdId: string,
-  limit = 20
+  limit = 10
 ): Promise<CasePosition[]> {
   return await db()<CasePosition[]>`
     select cp.id, cp.person_id as "personId", p.display_name as "personName",
@@ -1773,10 +1773,13 @@ export async function rosterStatus(householdId: string): Promise<{
  * 没有这个，AI 只看得见跟当前这个人的往来，**根本不知道自己刚给别人
  * 发过什么**。真实后果：房东每说一句就触发一轮，每轮都去问 2号
  * 「你几点做饭」，一连问了四次，其中两次是在人家已经答过之后。
+ *
+ * **只返回 outbound。** 各会话线自己的入站由 `getRecentTurns` 管，别在这里
+ * 再堆一遍；这里是「你最近对别人说过什么」，防止重复发问。
  */
 export async function recentOutbound(
   householdId: string,
-  limit = 12
+  limit = 6
 ): Promise<
   Array<{ to: string; body: string; sentAt: Date; direction: string }>
 > {
@@ -1786,6 +1789,7 @@ export async function recentOutbound(
     join coliving.conversation c on c.id = m.conversation_id
     join coliving.person p on p.id = m.person_id
     where c.household_id = ${householdId}
+      and m.direction = 'outbound'
     order by m.sent_at desc
     limit ${limit}
   ` as never;
