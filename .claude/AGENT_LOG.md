@@ -5703,6 +5703,26 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · lib/coordination 协商状态机（实验模块，Codex 设计、Claude 实现）
+
+老板方向：多人语言协作不该把“状态+协调”放进 LLM，应回到确定性状态机 + 薄意图层；
+低耦合、可整体删除。落地为自包含模块 `lib/coordination/`（README 设计 +
+types/machine/intent/machine.test），**不 import 任何业务代码**，只依赖本目录 +
+node assert。
+
+核心：事件溯源（不落状态，`reduce(events)→State` 派生）；`step(events,intent,ctx)`
+纯函数产出新事件 + 出站动作；不变量（一人一段不重叠、已确认段不被静默改、同一事
+不重复 propose、settle 必须全员确认）由 `checkInvariants` 强制；`allocateSlots`
+确定性分配；`parseIntent` 是确定性 stub、文件头标明是 LLM 挂载点。
+
+**验证**：`tsx lib/coordination/machine.test.ts` 14/14 通过；`tsc --noEmit` 仅既有
+speech-input.tsx 两条 TS2717；`git diff --check` 干净。纯实验、未接入运行时。
+
+**下一步**：验证这套状态机能否覆盖真实排班分支；若可行，再决定是否把现有
+pickSchedule/contactPerson/确认逻辑逐步迁入（渐进替换，不是推倒重来）。
+
+---
+
 ## 2026-09-07 · 常驻准则瘦身（二）：constitution/core/craft/conflict 压到约一半
 
 老板判断 deepseek 任务过载、要压缩准则。四份合计 **25478 → 14130（-44.5%）**：
