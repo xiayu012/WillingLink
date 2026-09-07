@@ -27,8 +27,11 @@ import {
  */
 const MAX_STEPS = 6;
 const HH_MM_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+// deepseek-v4-flash 多步一轮实测 131–240 秒，120 秒会被自己打断（gateway 报
+// operation aborted due to timeout）。路由 maxDuration 是 300 秒，这里给 240 秒
+// 留出余量；仍可用 COLIVING_TURN_MODEL_TIMEOUT_MS 覆盖。
 const TURN_MODEL_TIMEOUT_MS = Number(
-  process.env.COLIVING_TURN_MODEL_TIMEOUT_MS ?? 120_000
+  process.env.COLIVING_TURN_MODEL_TIMEOUT_MS ?? 240_000
 );
 
 function turnAbortSignal(): AbortSignal {

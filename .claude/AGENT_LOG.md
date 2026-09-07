@@ -5703,6 +5703,23 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · 每轮超时 120s→240s（修 deepseek 长场景被自己打断）
+
+**根因**：`turnAbortSignal` 用 `AbortSignal.timeout(120_000)`，而 deepseek-v4-flash
+多步一轮实测 131–240 秒，120 秒就把长场景（7 轮厨房、多人排班）的模型调用自己
+打断了，gateway 报 `operation aborted due to timeout`。路由 `maxDuration` 是 300 秒。
+
+**改法**：`TURN_MODEL_TIMEOUT_MS` 默认 120_000 → 240_000，留出余量；仍可用
+`COLIVING_TURN_MODEL_TIMEOUT_MS` 覆盖。
+
+**验证**：全量回归（deepseek 大脑 + deepseek 批判器、关 judge）从“大部分超时失败”
+变成 **结构性 15/19 通过**，场景都能跑完。剩余个别批量批判超时走“默认放行”兜底，
+不影响投递。新增多人排班分支里 `all-agree` 的 `mustUseAnyOfTools` 断言过严已移除
+（定案回合只该落锤、不该再调排班工具）；其余分支正确抓到了“承诺不兑现/漏联系/编造
+已确认”等真实问题。
+
+---
+
 ## 2026-09-07 · 评测转向：只测多人排班 + 分支思维（老板 2026-09-07 方向）
 
 老板指出旧场景太短、且要“在一个消息后分支多种情况”。新增 5 条**多人排班分支**

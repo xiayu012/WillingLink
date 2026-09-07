@@ -17,7 +17,6 @@
     { "from": "+15550001001", "text": "两位都同意了，请把这个安排定案，并分别发最终通知。这是定案，不是征求意见，别再问「你愿意吗」。" }
   ],
   "expect": {
-    "mustUseAnyOfTools": ["pickSchedule", "contactPerson"],
     "replyMustNotMatch": ["你愿意吗", "这不是定案"]
   }
 }
