@@ -5668,3 +5668,35 @@ formatMinutes(endMinutes) 与 selfStatedSlotsByWindow 比对，同样豁免 gate
   该人可能仍被再次征询——但此时正文已按 act 分支，不会再出现「你愿意吗」。
 - `isSimpleAffirmation` 只认单词语义肯定（愿意/行/可以…），「可以，没问题」这类
   复合短句不命中，属保守的漏记（可能多问一次），不是误跳过。
+
+---
+
+## 2026-09-07 · 回退 scheduleContactTextForAct 的 act 分支（Codex 全量回归证明它是回归）
+
+**背景（Codex Sonnet-4.5 全量回归实测结论）**：上一版给排班联系正文加
+`scheduleContactTextForAct` 的 act 分支——inform/remind 出「定在 X-Y，就这样定了，
+有变动随时说」。回归证明这个分支是错的：
+
+- 模型的 `act` 字段不可靠，经常在**还在提议征询**时就填 inform，于是把「就这样
+  定了」发给还没确认的人。
+- 审稿清单第 11 条明确：共同生活的规则是**提议不是通知**，不该用「就这样定了」。
+- 真正修掉「老孙确认后又收到你愿意吗」的是 `hasDurableConfirmedSlot` 跳过已确认者，
+  不是 act 分支。
+
+**改动（Claude Sonnet 实现，Codex 验收，未提交时点如下）**：
+1. `scheduleContactTextForAct` 删掉 inform/remind →「就这样定了」分支，**任何 act
+   都返回同一份征询正文**。保留函数签名与 `act` 形参仅为兼容调用方与测试。
+2. **保留**原始修复不动：`listScheduleInquiryConfirmations`、
+   `hasDurableConfirmedSlot`、contactPerson 里「已确认同一 slot 就 preConsented+
+   skipped」的跳过逻辑、`missingSelectedScheduleParticipants()` 把已确认者视为已处理。
+3. 离线检查改写：任何 act 都返回征询正文、绝不含「就这样定了」；源码级断言
+   「定案正文分支必须整体不存在」。
+
+**验证**：`coliving:quality` 45 项通过；`tsc --noEmit` 仅既有 speech-input.tsx 两条
+TS2717，无新增；`git diff --check` 干净。
+
+**如实记下的权衡**：act 分支撤掉后，「某次征询未被记为 durable confirmation 的人
+可能被再次征询」的旧风险回来了——与其把「就这样定了」发给还没确认的人，宁可多问
+一次可能已确认的人；已确认者的防护靠 `hasDurableConfirmedSlot`，不再靠正文语气。
+若将来发现模型在征询时频繁填 act=inform 导致确认落不了库，正确修法是放宽 durable
+查询的 act 白名单，而不是回到正文按 act 分支。

@@ -160,15 +160,16 @@ export function scheduleSlotMatchesSelfStatement(
 }
 
 /**
- * 根据 contactPerson 的 act 生成排班联系正文。抽成纯函数只为可测试性——
- * 真实事故（生产日志，2026-09-06）：03:58:45 的定案/通知回合 act=inform、
- * expects_reply=false，正文却仍是「你愿意吗/这不是定案」，把已确认过
- * 17:30-18:00 的老孙又问了一遍。
+ * 生成排班联系正文。抽成纯函数只为可测试性。
  *
- * - inform/remind：**定案通知**，不含任何征询字眼。
- * - propose/confirm/ask（及未单列的其他 act）：沿用「待确认安排」征询正文。
+ * 排班联系正文**一律**用征询措辞，**不按 act 分支**。上一版按 act 分
+ * inform/remind →「就这样定了」（Codex Sonnet-4.5 全量回归实测结论）：
+ * 模型的 act 字段不可靠，常在还在提议征询时就填 inform，把「就这样定了」
+ * 发给还没确认的人。审稿清单第 11 条也明确共同生活规则是提议不是通知。
+ * 「已确认同一 slot 的人不再重复联系」由调用方的 hasDurableConfirmedSlot
+ * 跳过逻辑负责，不靠正文语气——act 不是可靠的定案信号。
  *
- * 代码只负责按 act 分支生成正文、不负责措辞之外的判断；选哪个 act 仍是模型的活。
+ * 函数保留 act 形参仅为兼容调用方/测试签名，任何 act 都必须返回征询正文。
  */
 export function scheduleContactTextForAct(args: {
   act: string;
@@ -176,17 +177,6 @@ export function scheduleContactTextForAct(args: {
   windowLabel: string;
   scheduleSlot: { start: string; end: string };
 }): string {
-  if (args.act === "inform" || args.act === "remind") {
-    // windowLabel 常以「时段」结尾（模型填的窗口名，如「傍晚厨房灶台时段」），
-    // 这里只在需要时补「时段」，避免拼出「时段时段定在」。
-    const label = args.windowLabel.endsWith("时段")
-      ? args.windowLabel
-      : `${args.windowLabel}时段`;
-    return (
-      `${args.salutation}${label}定在 ${args.scheduleSlot.start}-${args.scheduleSlot.end}，` +
-      "就这样定了，有变动随时说。"
-    );
-  }
   return (
     `${args.salutation}关于${args.windowLabel}，我先提出一个待确认的安排：` +
     `你用 ${args.scheduleSlot.start}-${args.scheduleSlot.end}。这不是定案；你愿意吗？` +
@@ -1024,7 +1014,8 @@ export async function runColivingTurn(args: {
               reason: `${name} 之前已确认过 ${scheduleSlot.start}-${scheduleSlot.end} 这个时段，定案/通知不再重复发送`,
             };
           }
-          // 正文按 act 分支：inform/remind 出定案通知，其余出「待确认安排」征询。
+          // 正文一律征询（不按 act）：定案/通知的区分由上方持久确认跳过负责，
+          // act 字段不可靠，不能让它把「就这样定了」发给还没确认的人。
           message = scheduleContactTextForAct({
             act,
             salutation,

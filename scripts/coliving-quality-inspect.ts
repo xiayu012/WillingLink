@@ -462,27 +462,25 @@ async function main() {
     assert.equal(r.pass, true);
     assert.deepEqual(r.findings, []);
   });
-  check("scheduleContactTextForAct: inform/remind are final notices, propose stays an inquiry", () => {
+  check("scheduleContactTextForAct: every act returns the inquiry text, never a final notice", () => {
+    // act 分支已回退（Codex Sonnet-4.5 全量回归结论）：act 字段不可靠，
+    // 常还在征询时就填 inform。任何 act 都必须返回「待确认安排」征询正文。
     const salutation = "老孙，";
     const slot = { start: "17:30", end: "18:00" };
-    const inform = scheduleContactTextForAct({ act: "inform", salutation, windowLabel: "傍晚厨房灶台时段", scheduleSlot: slot });
-    assert(inform.includes("17:30-18:00") && inform.includes("定在"));
-    for (const banned of ["你愿意吗", "这不是定案", "我会根据大家的回复继续协调"]) {
-      assert(!inform.includes(banned), `inform 正文不应含「${banned}」：${inform}`);
-    }
-    const remind = scheduleContactTextForAct({ act: "remind", salutation, windowLabel: "傍晚厨房", scheduleSlot: slot });
-    assert(remind.includes("17:30-18:00") && remind.includes("定在"));
-    assert(!remind.includes("你愿意吗"));
-    for (const act of ["propose", "confirm", "ask"] as const) {
-      const inquiry = scheduleContactTextForAct({ act, salutation, windowLabel: "傍晚厨房灶台时段", scheduleSlot: slot });
-      assert(inquiry.includes("你愿意吗") && inquiry.includes("这不是定案"), `${act} 应沿用征询正文`);
+    for (const act of ["inform", "remind", "propose", "confirm", "ask"] as const) {
+      const text = scheduleContactTextForAct({ act, salutation, windowLabel: "傍晚厨房灶台时段", scheduleSlot: slot });
+      assert(text.includes("你愿意吗") && text.includes("这不是定案"),
+        `${act} 也应返回征询正文，不得出定案通知：${text}`);
+      assert(text.includes("17:30-18:00"), `${act} 正文应带时段`);
+      assert(!text.includes("就这样定了"), `${act} 正文不得含「就这样定了」：${text}`);
     }
   });
-  check("contactPerson builds schedule text via scheduleContactTextForAct (no inline duplicate)", () => {
+  check("contactPerson builds schedule text via scheduleContactTextForAct (no inline duplicate, no act branch)", () => {
     const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
     assert(src.includes("scheduleContactTextForAct("), "contactPerson 必须调用 scheduleContactTextForAct");
-    const actBranchIdx = src.indexOf("if (args.act === \"inform\" || args.act === \"remind\")");
-    assert(actBranchIdx > 0, "scheduleContactTextForAct 必须包含 inform/remind 分支");
+    // 定案正文分支必须整体不存在（连「就这样定了，有变动随时说。」这句也不能复辟）
+    assert(!src.includes("就这样定了，有变动随时说。"),
+      "scheduleContactTextForAct 不得再含 inform/remind 定案正文分支");
     const contactCallIdx = src.indexOf("message = scheduleContactTextForAct(");
     assert(contactCallIdx > 0, "contactPerson 的 message 赋值必须来自 scheduleContactTextForAct");
     // 内联征询模板只能在纯函数里以 args.scheduleSlot 出现一次；contactPerson 直接拼
