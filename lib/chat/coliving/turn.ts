@@ -237,6 +237,241 @@ export function extractExplicitFixedStart(statement: string): number | null {
   return hour * 60 + minute;
 }
 
+/**
+ * 从一条 position statement 里抽取**软偏好的开始时间**（分钟，0-1439）。
+ *
+ * 与 `extractExplicitFixedStart` 的分工：硬约束（只能/必须/固定）归那个
+ * 函数处理，把 earliest/latest 钉死；这里只认「最合适/习惯/方便/直接报个
+ * 时刻」这类**可让步**的偏好时间，供 `pickSchedule` 在模型本轮漏填
+ * `preferredStart` 时兜底（软偏好，不碰 hard 约束）。
+ *
+ * 保守边界（宁可漏注，不可错注）：
+ * - 整句在说硬约束（`extractExplicitFixedStart` 能抽出时间）→ 直接 null。
+ *   那个时间已经作为 hard 注入，同一句话不能标注两遍。
+ * - 时间出现在否定/假设/过去式语境（不是X点、X点不行、不接受X点、如果X点、
+ *   昨天X点）→ 剔除；全被剔除就 null。
+ * - 同一句里多个**不同**的时间候选都存活（"七点或八点都可以"、"X点到Y点"）
+ *   → 拿不准哪个是偏好，null。
+ * - 12→24 推断只做保守这一种：窗口本身在 PM 区间（windowStartMinutes >=
+ *   12:00）而说的是 1-11 点这种 12 小时制表达，按晚上抬 12 小时；明确写了
+ *   上午/下午标记按标记走；其余拿不准不抬。宁可不注入，也不许把 7 点注成
+ *   19 点（或反过来）。
+ */
+export function extractPreferredStart(
+  statement: string,
+  windowStartMinutes: number
+): number | null {
+  // 硬约束句子整体不参与软偏好抽取（见上注释第一条）。
+  if (extractExplicitFixedStart(statement) !== null) return null;
+
+  const hits = scanTimeHits(statement);
+  if (hits.length === 0) return null;
+
+  const survivors: number[] = [];
+  const seen = new Set<number>();
+  for (const hit of hits) {
+    if (timeHitInExcludedContext(statement, hit)) continue;
+    const minutes = softTimeToMinutes(statement, hit, windowStartMinutes);
+    if (minutes === null) continue;
+    if (!seen.has(minutes)) {
+      seen.add(minutes);
+      survivors.push(minutes);
+    }
+  }
+  return survivors.length === 1 ? survivors[0] : null;
+}
+
+const CN_DIGIT: Record<string, number> = {
+  零: 0,
+  〇: 0,
+  一: 1,
+  二: 2,
+  两: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+};
+
+/** 中文数字（0-99，含「十」「X十Y」），解不出或越界返回 null。 */
+function parseCnNumber(text: string): number | null {
+  if (!text) return null;
+  const chars = [...text];
+  if (!chars.includes("十")) {
+    if (chars.length !== 1) return null;
+    const d = CN_DIGIT[chars[0]];
+    return d === undefined ? null : d;
+  }
+  if (chars.length === 1 && chars[0] === "十") {
+    // 单独的「十」＝10（「七点十分」的分钟）。
+    return 10;
+  }
+  if (chars.length === 2 && chars[0] === "十") {
+    // 十X（十、十一、十九）
+    const ones = CN_DIGIT[chars[1]];
+    return ones === undefined || ones === 0 ? null : 10 + ones;
+  }
+  if (chars.length === 2 && chars[1] === "十") {
+    // X十（二十、九十）
+    const tens = CN_DIGIT[chars[0]];
+    return tens === undefined || tens === 0 ? null : tens * 10;
+  }
+  if (chars.length === 3 && chars[1] === "十") {
+    // X十Y（二十一、二十三）
+    const tens = CN_DIGIT[chars[0]];
+    const ones = CN_DIGIT[chars[2]];
+    if (tens === undefined || ones === undefined || tens === 0) return null;
+    return tens * 10 + ones;
+  }
+  return null;
+}
+
+type TimeHit = {
+  /** 时间 token 的起始下标（statement 内） */
+  index: number;
+  /** 时间 token 原文长度（含分钟部分），用于取后面的语境窗口 */
+  rawLen: number;
+  /** 12 小时制/24 小时制都先解出的字面小时（0-23 内） */
+  hour: number;
+  minute: number;
+};
+
+/**
+ * 扫出 statement 里所有「时刻」候选：阿拉伯 `18:30`/`18点30`/`6点半`，
+ * 中文 `七点`/`六点半`/`七点十分`（零点到二十三，含「点/时」「半」「分」）。
+ * 只解字面值，不做 12→24 推断（那是 `softTimeToMinutes` 的事）。
+ */
+function scanTimeHits(statement: string): TimeHit[] {
+  const hits: TimeHit[] = [];
+  const push = (index: number, rawLen: number, hour: number, minute: number) => {
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return;
+    hits.push({ index, rawLen, hour, minute });
+  };
+
+  // 阿拉伯数字 HH:MM / H:MM（含全角冒号）。
+  for (const m of statement.matchAll(/(\d{1,2})\s*[:：]\s*([0-5]\d)/g)) {
+    push(m.index!, m[0].length, Number(m[1]), Number(m[2]));
+  }
+
+  // 阿拉伯数字 + 点/时：18点 / 18点30 / 18点半 / 6点半。
+  for (const m of statement.matchAll(
+    /(\d{1,2})\s*[点时]\s*(半|([0-5]?\d)\s*分?)?/g
+  )) {
+    const minute = m[2] === "半" ? 30 : m[3] !== undefined ? Number(m[3]) : 0;
+    push(m.index!, m[0].length, Number(m[1]), minute);
+  }
+
+  // 中文数字 + 点/时：七点 / 六点半 / 七点十分 / 二十三点 / 零点。
+  const cnDot = new RegExp(
+    `([零〇一二两三四五六七八九十]{1,3})\\s*[点时]\\s*(半|([0-5]?\\d)\\s*分?|([零〇一二两三四五六七八九十]{1,3})\\s*分?)?`,
+    "g"
+  );
+  for (const m of statement.matchAll(cnDot)) {
+    const hour = parseCnNumber(m[1]);
+    if (hour === null) continue;
+    let minute = 0;
+    if (m[2] === "半") minute = 30;
+    else if (m[3] !== undefined) minute = Number(m[3]);
+    else if (m[4] !== undefined) {
+      const cnMinute = parseCnNumber(m[4]);
+      if (cnMinute === null) continue;
+      minute = cnMinute;
+    }
+    push(m.index!, m[0].length, hour, minute);
+  }
+
+  return hits.sort((a, b) => a.index - b.index);
+}
+
+/** 从句内取时间 token 前后的紧邻语境：遇到标点就停，窗口最多 8 字。 */
+function clauseContext(
+  statement: string,
+  hit: TimeHit
+): { before: string; after: string } {
+  const punctuation = /[，。；、,!?！？…]/;
+  let beforeStart = Math.max(0, hit.index - 8);
+  for (let i = hit.index - 1; i >= beforeStart; i--) {
+    if (punctuation.test(statement[i])) {
+      beforeStart = i + 1;
+      break;
+    }
+  }
+  const afterMax = Math.min(statement.length, hit.index + hit.rawLen + 8);
+  let afterEnd = afterMax;
+  for (let i = hit.index + hit.rawLen; i < afterMax; i++) {
+    if (punctuation.test(statement[i])) {
+      afterEnd = i;
+      break;
+    }
+  }
+  return {
+    before: statement.slice(beforeStart, hit.index),
+    after: statement.slice(hit.index + hit.rawLen, afterEnd),
+  };
+}
+
+/**
+ * 这个时间候选是不是出现在「明显不是在说本次偏好」的语境里：
+ * 否定（不是X点/不接受X点/X点不行）、假设（如果X点）、过去式（昨天X点）。
+ * 命中的一律剔除，绝不注入成偏好。
+ */
+function timeHitInExcludedContext(statement: string, hit: TimeHit): boolean {
+  const { before, after } = clauseContext(statement, hit);
+  if (
+    /(?:不|没|别|勿|莫|甭|拒绝|不要|不想)/.test(before) ||
+    /(?:不行|不可以|不合适|不方便|不好|不妥|没空|算了|改天|太晚|太早|不要|不必|不用)/.test(after)
+  ) {
+    return true;
+  }
+  // 紧跟着"小时"的是时长不是时刻（"四点五个小时"＝4.5 小时，不是 4:05）。
+  if (/^(?:小时|个钟头|个小时)/.test(after)) {
+    return true;
+  }
+  if (
+    /(?:如果|假如|要是|假设|万一|曾经|以前|昨天|前天|上周|上次|当时|原本|本来|打算|预计)/.test(before)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** 时间 token 前面是不是带了明确的时段词（上午/下午/晚上/中午……）。 */
+function periodMarker(statement: string, index: number): "am" | "pm" | "noon" | null {
+  const pre = statement.slice(Math.max(0, index - 3), index);
+  if (/(?:晚上|晚间|傍晚|夜里|深夜|下午|午后)/.test(pre)) return "pm";
+  if (/(?:早上|上午|凌晨|清晨|早晨)/.test(pre)) return "am";
+  if (/(?:中午|正午)/.test(pre)) return "noon";
+  return null;
+}
+
+/** 把字面小时按语境转成分钟（0-1439）。拿不准的返回 null。 */
+function softTimeToMinutes(
+  statement: string,
+  hit: TimeHit,
+  windowStartMinutes: number
+): number | null {
+  const marker = periodMarker(statement, hit.index);
+  let hour = hit.hour;
+  if (marker === "pm") {
+    // 晚上/下午七点 → 19:00。十二点（夜里十二点＝零点）这种跨天歧义
+    // 在排班窗口里基本不会出现，按字面 12 处理。
+    if (hour < 12) hour += 12;
+  } else if (marker === "noon") {
+    hour = 12;
+  } else if (marker === "am") {
+    // 早上七点 → 7:00（即使窗口在晚上也不抬）。
+  } else if (windowStartMinutes >= 12 * 60 && hour >= 1 && hour <= 11) {
+    // 没写时段词：只有窗口本身在 PM 区间、而说的是 1-11 点这种 12 小时制
+    // 时刻，才敢按晚上抬 12 小时。零点/12 点及明确 24 小时表达都不动。
+    hour += 12;
+  }
+  if (hour < 0 || hour > 23) return null;
+  return hour * 60 + hit.minute;
+}
+
 export type TurnUsage = {
   steps: number;
   inputTokens: number;
@@ -1478,14 +1713,23 @@ export async function runColivingTurn(args: {
         ];
 
         const constraints = people.map((p) => {
-          const recordedFixedStart = storedPositions
+          const personPositions = storedPositions.filter(
+            (position) =>
+              position.personName === p.name && position.kind !== "commitment"
+          );
+          const recordedFixedStart = personPositions
             // commitment 是 AI 自己以前许过的话，不是住户的客观硬约束。
             // 否则会形成“我说不动，所以它真的不能动”的闭环。
-            .filter(
-              (position) =>
-                position.personName === p.name && position.kind !== "commitment"
-            )
             .map((position) => extractExplicitFixedStart(position.statement))
+            .find((value): value is number => value !== null);
+          // 软偏好同等待遇：住户历史表态里说过「七点最合适」「6:30 用半小时」
+          // 这类非强制时间，模型本轮忘了填 preferredStart 时，从记录里确定性
+          // 抽出来兜底。与 hard 约束不同，这只填 soft 的 preferredStartMinutes，
+          // 不碰 earliest/latest。抽取极其保守，拿不准就 null（见函数注释）。
+          const recordedPreferredStart = personPositions
+            .map((position) =>
+              extractPreferredStart(position.statement, windowStartMinutes)
+            )
             .find((value): value is number => value !== null);
           const explicitEarliest = p.earliestStart
             ? toMinutes(p.earliestStart)
@@ -1509,9 +1753,12 @@ export async function runColivingTurn(args: {
                 : explicitLatest !== undefined
                   ? explicitLatest - windowStartMinutes
                   : undefined,
-            preferredStartMinutes: p.preferredStart
-              ? toMinutes(p.preferredStart) - windowStartMinutes
-              : undefined,
+            preferredStartMinutes:
+              p.preferredStart
+                ? toMinutes(p.preferredStart) - windowStartMinutes
+                : recordedPreferredStart !== undefined
+                  ? recordedPreferredStart - windowStartMinutes
+                  : undefined,
           };
         });
         /**

@@ -5703,6 +5703,31 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · 软偏好也确定性注入 pickSchedule（Codex 定位根因，Claude Sonnet 实现）
+
+**背景**：`pickSchedule.execute` 早就能从 `case_position` 历史表态确定性注入
+**硬约束**（`extractExplicitFixedStart` 抽「只能/必须/固定 X 点」，钉死
+earliest/latest）。但**软偏好没有同等待遇**——`preferredStartMinutes` 只来自模型
+本轮填的 `p.preferredStart`。住户说过「七点用厨房最合适」「6:30 用半小时」这类
+非强制时间，跨轮模型忘了填，排班就丢掉偏好——这是 real-kitchen / forgotten-preference
+反复「忘偏好、编时段」的根因之一。
+
+**改动**：新增纯函数 `extractPreferredStart(statement, windowStartMinutes)`，支持
+阿拉伯 `18:30`/`18点30`/`6点半` 与中文 `七点`/`六点半`/`七点十分`；12→24 只做保守
+推断（窗口在 PM 且说 1-11 点才抬 12 小时，明确上午/下午/晚上按标记走）；硬约束句、
+否定/假设/过去式、多候选、时长句一律 null（宁漏不错）。`pickSchedule` 里只在模型
+漏填 `p.preferredStart` 时用它兜底 `preferredStartMinutes`，不碰 hard 约束。
+
+**验证**：`coliving:quality` 50 项通过（+3 组行为断言：正常恢复 / 绝不误注 / 接线）；
+`tsc --noEmit` 仅既有 speech-input.tsx 两条 TS2717；`git diff --check` 干净。未跑
+模型级（确定性纯函数，免费闸足够）。
+
+**残余风险（保守代价，方向是漏注不是错注）**：硬约束+软偏好同句时软偏好被短路；
+区间/备选句不注入；`case_position` 不按窗口域隔离，早饭说的「七点」落到晚饭会被
+PM 推断抬成 19:00（fixedStart 抽取本就有的跨窗口局限）；兜底只在模型漏填时生效。
+
+---
+
 ## 2026-09-07 · 调度正确性打回（6.5/6.6/6.7）进入完整工具集重写（Codex 监督、Claude 实现）
 
 **根因**：`runColivingTurn` 的打回重写里，`isBrokenPromise` 只把 broke 为

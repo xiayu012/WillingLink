@@ -14,6 +14,7 @@ import {
 import {
   claimsContactCompletion,
   extractExplicitFixedStart,
+  extractPreferredStart,
   extractSlotFromInquiry,
   hasDeferredCoordination,
   isLowInformationFollowUp,
@@ -175,6 +176,54 @@ async function main() {
       null
     );
     assert.equal(extractExplicitFixedStart("不是固定在18点开始，可以往后排"), null);
+  });
+  check("soft preferred-start wording is recovered from recorded facts", () => {
+    // 阿拉伯数字：冒号 / 点+分 / 点 / 点半。
+    assert.equal(extractPreferredStart("18:30开始最合适", 17 * 60), 18 * 60 + 30);
+    assert.equal(extractPreferredStart("18点30最合适", 17 * 60), 18 * 60 + 30);
+    assert.equal(extractPreferredStart("18点开始最合适", 17 * 60), 18 * 60);
+    // 12→24 保守推断：窗口本身在 PM 区间，6:30/6点半/七点 这类按晚上抬。
+    assert.equal(extractPreferredStart("6:30，然后使用半个小时", 18 * 60), 18 * 60 + 30);
+    assert.equal(extractPreferredStart("我6点半用半小时", 18 * 60), 18 * 60 + 30);
+    assert.equal(extractPreferredStart("七点用厨房最合适", 18 * 60), 19 * 60);
+    // 中文数字：半 / 分。
+    assert.equal(extractPreferredStart("六点半开始就行", 18 * 60), 18 * 60 + 30);
+    assert.equal(extractPreferredStart("七点十分最合适", 18 * 60), 19 * 60 + 10);
+    assert.equal(extractPreferredStart("十七点半最合适，用半小时", 18 * 60), 17 * 60 + 30);
+    // 明确时段词覆盖推断：晚上七点→19点；早上七点即使窗口在晚上也不抬。
+    assert.equal(extractPreferredStart("晚上七点开始最合适", 18 * 60), 19 * 60);
+    assert.equal(extractPreferredStart("早上七点最合适", 18 * 60), 7 * 60);
+    // 窗口在上午 → 按字面。
+    assert.equal(extractPreferredStart("七点用厨房最合适", 6 * 60), 7 * 60);
+  });
+  check("soft preferred-start wording is never mis-annotated", () => {
+    // 硬约束句子归 extractExplicitFixedStart，软抽取直接放弃，避免同一句话标两遍。
+    assert.equal(extractPreferredStart("我只能18点开始，要做两小时", 18 * 60), null);
+    assert.equal(extractPreferredStart("我最早必须18:30开始", 18 * 60), null);
+    // 否定/拒绝/假设/过去式不是本次偏好。
+    assert.equal(extractPreferredStart("不接受20点以后才开始", 18 * 60), null);
+    assert.equal(extractPreferredStart("不是固定在18点开始", 18 * 60), null);
+    assert.equal(extractPreferredStart("我七点不行，别排七点", 18 * 60), null);
+    assert.equal(extractPreferredStart("如果七点开始就好了", 18 * 60), null);
+    assert.equal(extractPreferredStart("昨天七点用了一次厨房", 18 * 60), null);
+    // 多个不同候选 / 完全没有时刻 → 拿不准，null。
+    assert.equal(extractPreferredStart("七点或八点都可以", 18 * 60), null);
+    assert.equal(extractPreferredStart("我随时都行", 18 * 60), null);
+    // 跟"小时"连写的是时长不是时刻。
+    assert.equal(extractPreferredStart("需要四点五小时", 18 * 60), null);
+  });
+  check("pickSchedule fallback prefers recorded soft start when model omits preferredStart", () => {
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    assert(src.includes("extractPreferredStart(position.statement, windowStartMinutes)"),
+      "pickSchedule 必须从历史表态抽软偏好");
+    // 兜底只发生在模型没填 preferredStart 时，且只填软偏好、不碰 hard 约束。
+    const idx = src.indexOf("preferredStartMinutes:");
+    assert(idx > 0, "constraints 里必须存在 preferredStartMinutes");
+    const block = src.slice(idx, src.indexOf("};", idx));
+    assert(block.includes("p.preferredStart"), "模型填了 preferredStart 时优先用它");
+    assert(block.includes("recordedPreferredStart"), "没填时回落到历史软偏好");
+    assert(block.includes("recordedPreferredStart - windowStartMinutes"),
+      "回落值必须是相对窗口起点的分钟数");
   });
   check("open conflict survives a generic greeting without routing every case as conflict", () => {
     assert.equal(
