@@ -3231,19 +3231,32 @@ export async function runColivingTurn(args: {
        * 时态骗过检查。这本身就是"死代码杜绝新人必须联系到"那次改动
        * （c328ae8）之后仍然留着的同一类缺口，这次一并补上。
        *
-       * 只在打回原因确实是第7条时才多给 `contactPerson`——其余11条
-       * （角色错位、编造事实、语气问题等）都是纯措辞问题，重写只需要
-       * 换种说法，不需要、也不该借机去联系别人（避免打回原因跟第7条
-       * 无关时也顺手多发消息，扩大这段代码的影响面）。
+       * 后来把"哪些打回给完整工具集"从"只有第7条"推广成下面这个分类器
+       * （7 / 0 / 6.5·6.6·6.7 / 被拦出站 1·2·12）——因为这些打回都意味着
+       * "这一轮少了某个具体动作"，只给 `sendReply` 只能换措辞救不回来。
+       * 其余打回（角色错位、编造事实、语气问题等）仍是纯措辞问题，重写只
+       * 有 `sendReply`，不需要、也不该借机去联系别人或重排方案（避免影响面
+       * 扩大到无关的打回场景）。
        */
-      // "0" 是代码判定的硬规则（分了资源却没算过），"7" 是批判器判的
-      // 承诺没兑现——两者都需要重写时拿到完整工具集，不能只给 sendReply
+      // 需要"完整工具集重写"的打回：打回原因本身意味着"这一轮少了某个具体
+      // 动作"，只给 sendReply 只能换措辞、救不回来。
+      //  - "0"：代码判定的硬规则（分了资源却没算过 / 联系被拦却说成已联系）；
+      //  - "7"：批判器判承诺没兑现——两者本来就需要重写时拿到完整工具集。
+      //  - 6.5/6.6/6.7：调度正确性——时段偏离常理、跟 pickSchedule 真算的
+      //    对不上、没排完独占就逃到设备。修法是重新真算
+      //    pickSchedule→chooseSchedule，不是换措辞；不给完整工具集，模型只能
+      //    把编造的时段再交一遍（real-kitchen"老孙说 19:00 却被排到 20:30"
+      //    反复出现，就是这类打回当时只给 sendReply 造成的）。
+      //  - 出站被拦且 broke 1/2/12：要在重写里把被拦下的联系重发出去。
+      const needsScheduleRecompute =
+        ["6.5", "6.6", "6.7"].includes(verdict.broke.trim());
       const needsBlockedOutboundRecovery =
         outbound.some((message) => message.blocked) &&
         ["1", "2", "12"].includes(verdict.broke.trim());
       const isBrokenPromise =
         verdict.broke.trim() === "7" ||
         verdict.broke.trim() === "0" ||
+        needsScheduleRecompute ||
         needsBlockedOutboundRecovery;
       /**
        * **根治，不再按"哪种具体动作"逐个开口子。**
@@ -3256,25 +3269,26 @@ export async function runColivingTurn(args: {
        * 每次都要我回来手动加一行。**这不是缺一行代码，是这条路径的
        * 设计本身在按"动作种类"枚举，而动作种类是枚举不完的。**
        *
-       * 改法：第7条命中时，直接给重写**跟主生成一样的完整工具集**，
-       * 不再判断"是哪种动作"——模型自己知道该调哪个工具去把承诺兑现，
-       * 不需要代码替它猜。多给的这些工具在其余12条打回原因下依然不会
-       * 被打开（`isBrokenPromise` 为 false 时 `redoTools` 还是只有
+       * 改法：这些打回命中时，直接给重写**跟主生成一样的完整工具集**，
+       * 不再判断"是哪种动作"——模型自己知道该调哪个工具去把承诺兑现或把
+       * 排班重算，不需要代码替它猜。多给的这些工具在其余打回原因下依然
+       * 不会被打开（`isBrokenPromise` 为 false 时 `redoTools` 还是只有
        * `sendReply`），影响面没有扩大到无关的打回场景。
        */
       /**
-       * **第7条和代码规则0都无条件补齐排班工具，不能只 spread
-       * `activeTools`。** `pickSchedule` 进不进 `activeTools`，取决于路由
-       * 用本轮消息原文猜的话题（`topicHitsConflict`）——真实复现过最后
-       * 一句只是“我刚才不是说了吗”，路由没命中，但审稿已经确认它在
-       * 空口承诺稍后排。审稿命中本身比关键词路由更可靠。
+       * **第7条、代码规则0和 6.5/6.6/6.7 调度正确性打回都无条件补齐排班
+       * 工具，不能只 spread `activeTools`。** `pickSchedule` 进不进
+       * `activeTools`，取决于路由用本轮消息原文猜的话题（`topicHitsConflict`）
+       * ——真实复现过最后一句只是“我刚才不是说了吗”，路由没命中，但审稿
+       * 已经确认它在空口承诺稍后排。审稿命中本身比关键词路由更可靠。
        */
       const redoTools: Record<string, (typeof tools)[keyof typeof tools]> =
         isBrokenPromise
           ? {
               ...activeTools,
-              // 第7条也可能是“答应稍后排、但本轮没排”；不能再依赖本轮
-              // 原文是否被路由成 conflict，两个排班工具一律补齐。
+              // 第7条可能是“答应稍后排、但本轮没排”，6.5/6.6/6.7 则是
+              // 时段没真算/算错——都不能再依赖本轮原文是否被路由成
+              // conflict，两个排班工具一律补齐。
               pickSchedule: tools.pickSchedule,
               chooseSchedule: tools.chooseSchedule,
               sendReply: tools.sendReply,
@@ -3309,22 +3323,31 @@ export async function runColivingTurn(args: {
                 ? "你刚才那条不合格（代码判定，不是准则第几条）：\n"
                 : `你刚才那条第${verdict.broke}条不合格：\n`) +
               `${verdict.why}\n\n【这一轮的事实，重写要跟这个对得上】\n${replyFacts}\n\n` +
-              (isBrokenPromise
-                ? "你承诺了一件事，但这轮实际没有做到——**现在真的去做**：" +
-                  "该联系人、该排方案、该记什么，你手上有跟正常这一轮" +
-                  "一样的全部工具，自己判断该调哪个，做完再调 `sendReply` " +
-                  "交付，回复里就可以如实说已经做了。\n\n" +
-                  "**只有两种情况允许不调工具、直接改措辞**：" +
-                  "①确实做不了（联系不上、对方不在名册里）；" +
-                  "②这一步所需的信息本来就不全，且**你已经在更早的轮次" +
-                  "或本轮别的步骤里问过了**，现在只是等对方回——" +
-                  "这种情况可以说「等他们回」，但不能是「这轮才第一次" +
-                  "意识到该问、却决定不问、只说回头再问」这种拖延。\n\n" +
-                  "**不属于上面两种情况、只是嫌麻烦不想现在做，一律不" +
-                  "合格**——「这事我记下了，回头去问」「打算联系他」这类" +
-                  "说法只有在真符合①②时才能用，不是随便换个时态就能用的" +
-                  "免检词。用了这类说法，回复里必须同时体现②的条件成立" +
-                  "（比如提一句「之前问过」「还没等到回音」），不能空说。\n\n"
+              (needsScheduleRecompute
+                ? "这次打回的是调度正确性：你给的时段偏离常理、跟 `pickSchedule` 真算的" +
+                  "对不上、或没真算就拍了时段。事实里已经有「已选定候选N」那一行，" +
+                  "就照已选定那一行把时段抄对；还没有选定方案，" +
+                  "就**现在真的调 `pickSchedule` 重新算一版，再调 `chooseSchedule` 选定" +
+                  "（默认候选一），最后照着选定的结果写时段**——不能只换措辞，也不准在正文" +
+                  "里心算时段、或把上一版编的时段换个说法再交一遍。还缺谁的可用时间没问清，" +
+                  "就先调 `contactPerson` 去问、问齐了再排；确实还不齐且这轮已经问过、只是" +
+                  "在等回复，才可以说还在等。\n\n"
+                : isBrokenPromise
+                  ? "你承诺了一件事，但这轮实际没有做到——**现在真的去做**：" +
+                    "该联系人、该排方案、该记什么，你手上有跟正常这一轮" +
+                    "一样的全部工具，自己判断该调哪个，做完再调 `sendReply` " +
+                    "交付，回复里就可以如实说已经做了。\n\n" +
+                    "**只有两种情况允许不调工具、直接改措辞**：" +
+                    "①确实做不了（联系不上、对方不在名册里）；" +
+                    "②这一步所需的信息本来就不全，且**你已经在更早的轮次" +
+                    "或本轮别的步骤里问过了**，现在只是等对方回——" +
+                    "这种情况可以说「等他们回」，但不能是「这轮才第一次" +
+                    "意识到该问、却决定不问、只说回头再问」这种拖延。\n\n" +
+                    "**不属于上面两种情况、只是嫌麻烦不想现在做，一律不" +
+                    "合格**——「这事我记下了，回头去问」「打算联系他」这类" +
+                    "说法只有在真符合①②时才能用，不是随便换个时态就能用的" +
+                    "免检词。用了这类说法，回复里必须同时体现②的条件成立" +
+                    "（比如提一句「之前问过」「还没等到回音」），不能空说。\n\n"
                 : "") +
               "重写一条，调 sendReply 把要发给对方的那句话交出来。" +
               "上面事实里标了「被审稿拦下，没有发出去」的联系，" +
@@ -3339,10 +3362,11 @@ export async function runColivingTurn(args: {
         ],
         tools: redoTools,
         toolChoice: "required",
-        // 第7条这条路径现在拿到的是完整工具集，可能需要比"只有
-        // contactPerson"时更多步（比如先 recordPosition 再 pickSchedule
-        // 再 sendReply），预算从 3 步放宽到 4 步，仍然远低于主生成的
-        // MAX_STEPS=6——这是补救性的单次重写，不该比正常一轮更奢侈。
+        // 完整工具集这条路径可能需要比"只有 sendReply"时更多步（比如先
+        // recordPosition 再 pickSchedule 再 sendReply；调度正确性打回则要
+        // pickSchedule→chooseSchedule→sendReply），预算从 3 步放宽到 4 步，
+        // 仍然远低于主生成的 MAX_STEPS=6——这是补救性的单次重写，
+        // 不该比正常一轮更奢侈。
         stopWhen: [hasToolCall("sendReply"), stepCountIs(4)],
       });
       /**
@@ -3550,9 +3574,12 @@ export async function runColivingTurn(args: {
         );
         try {
           deliveredReply = null;
+          // 与首轮 isBrokenPromise 同一份分类：6.5/6.6/6.7 调度正确性打回在
+          // 最后一次聚焦修正里同样要给完整工具集，不能只剩 sendReply。
           const finalNeedsAction =
             redoVerdict.broke.trim() === "7" ||
             redoVerdict.broke.trim() === "0" ||
+            ["6.5", "6.6", "6.7"].includes(redoVerdict.broke.trim()) ||
             (outbound.some((message) => message.blocked) &&
               ["1", "2", "12"].includes(redoVerdict.broke.trim()));
           const finalTools: Record<string, (typeof tools)[keyof typeof tools]> =

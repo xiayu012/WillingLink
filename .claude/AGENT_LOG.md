@@ -5703,6 +5703,30 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · 调度正确性打回（6.5/6.6/6.7）进入完整工具集重写（Codex 监督、Claude 实现）
+
+**根因**：`runColivingTurn` 的打回重写里，`isBrokenPromise` 只把 broke 为
+`"7"`/`"0"`/「出站被拦且 1/2/12」算作“需要完整工具集重写”。而批判器抓“编造时段 /
+时段对不上 pickSchedule / 没排完独占就逃到设备”时命中的是 **6.5/6.6/6.7**——这类
+打回的修法是重新真算 `pickSchedule→chooseSchedule`，不是换措辞。命中时只给
+`sendReply`，模型只能把编造的时段原样再交一遍，正是 real-kitchen“老孙说 19:00
+却被排到 20:30”反复出现的成因。
+
+**改法**：新增 `needsScheduleRecompute = ["6.5","6.6","6.7"].includes(broke)`，
+并入 `isBrokenPromise`，与 `"0"`/`"7"` 同一待遇；最后一次聚焦修正的
+`finalNeedsAction` 也补同一份三个 id。重写提示词对这类打回给出专段：事实里已有
+「已选定候选N」就照抄对；没有就真调 pickSchedule 重算 → chooseSchedule 选定 →
+照结果写时段，不能只换措辞、不能心算。
+
+**验证**：`coliving:quality` 47 项通过（+1 接线检查）；`tsc --noEmit` 仅既有
+speech-input.tsx 两条 TS2717，无新增；`git diff --check` 干净。
+
+**遗留**：结构性修复，不代表具体场景已达标；stepCountIs(4) 的补救预算对
+pick→choose→sendReply 够用，但若还要补 contactPerson 问人可能顶到上限。待定向
+复测确认 6.5/6.6/6.7 实跑是否真走对。
+
+---
+
 ## 2026-09-07 · 验证：自动补发 + 时钟同源 已根治“漏联系”结构失败
 
 **结论（定向复测确认）**：`real-kitchen-incident-2026-09-04` 用 sonnet-4.5 +

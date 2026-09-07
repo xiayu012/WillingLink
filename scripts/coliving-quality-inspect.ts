@@ -247,6 +247,49 @@ async function main() {
     assert(src.includes("reply = buildContactProgressReply() ?? reply"));
     assert(src.includes("!verdict.pass ? buildContactProgressReply() : null"));
   });
+  check("6.5/6.6/6.7 schedule brkes enter the full-toolset rewrite", () => {
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    // 1) needsScheduleRecompute 具名布尔必须由三个调度正确性 rule id 构成。
+    //    这类打回的修法是重新真算 pickSchedule→chooseSchedule，不是换措辞；
+    //    只给 sendReply 会让模型把编造的时段原样再交一遍。
+    const schedIdx = src.indexOf("const needsScheduleRecompute =");
+    assert(schedIdx > 0, "必须存在 needsScheduleRecompute 布尔");
+    const schedDecl = src.slice(schedIdx, src.indexOf(";", schedIdx));
+    for (const id of ["6.5", "6.6", "6.7"]) {
+      assert(schedDecl.includes(`"${id}"`), `needsScheduleRecompute 必须由 ${id} 构成`);
+    }
+    // 2) 首轮打回重写：isBrokenPromise 必须并入 needsScheduleRecompute，否则
+    //    6.5/6.6/6.7 命中时 redoTools 还是只有 sendReply。
+    const promiseIdx = src.indexOf("const isBrokenPromise =");
+    assert(promiseIdx > 0, "isBrokenPromise 必须存在");
+    const promiseDecl = src.slice(promiseIdx, src.indexOf(";", promiseIdx));
+    assert(promiseDecl.includes("needsScheduleRecompute"),
+      "isBrokenPromise 必须并入 needsScheduleRecompute");
+    // 3) 最后一次聚焦修正：finalNeedsAction 也要把三个 id 算进完整工具集条件，
+    //    否则重写后仍被 6.5/6.6/6.7 打回时只剩 sendReply、照样救不回来。
+    const finalIdx = src.indexOf("const finalNeedsAction =");
+    assert(finalIdx > 0, "finalNeedsAction 必须存在");
+    const finalDecl = src.slice(finalIdx, src.indexOf(";", finalIdx));
+    for (const id of ["6.5", "6.6", "6.7"]) {
+      assert(finalDecl.includes(`"${id}"`), `finalNeedsAction 必须把 ${id} 算作需要完整工具集`);
+    }
+    // 4) 完整工具集重写里真的带排班工具，模型才可能在重写时真算一遍。
+    for (const toolConst of ["const redoTools", "const finalTools"]) {
+      const toolsIdx = src.indexOf(toolConst);
+      assert(toolsIdx > 0, `${toolConst} 必须存在`);
+      const toolsBlock = src.slice(toolsIdx, src.indexOf("};", toolsIdx));
+      assert(toolsBlock.includes("pickSchedule: tools.pickSchedule"), `${toolConst} 必须含 pickSchedule`);
+      assert(toolsBlock.includes("chooseSchedule: tools.chooseSchedule"), `${toolConst} 必须含 chooseSchedule`);
+    }
+    // 5) 调度正确性打回的重写提示词必须指示"真的调 pickSchedule 重算"，
+    //    而不是只让模型换个说法。
+    const redoPromptIdx = src.indexOf("这次打回的是调度正确性：");
+    assert(redoPromptIdx > 0, "重写提示必须带调度正确性专段");
+    assert(
+      src.includes("现在真的调 `pickSchedule`") && src.includes("重新算一版"),
+      "调度正确性打回的重写提示必须指示真的调 pickSchedule 重算"
+    );
+  });
   check("contactPerson skips duplicate open messages across turns", () => {
     const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
     const repo = readFileSync("lib/chat/coliving/repo.ts", "utf8");
