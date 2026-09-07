@@ -5703,6 +5703,30 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · 合租房批判器省钱改造（四项一起，Codex 派单）
+
+老板拍板省钱优先：能程序做的绝不叫 LLM。烧钱根因是大脑已是便宜
+`deepseek/deepseek-v4-flash`，但批判器默认还是 sonnet-4.5，且每轮回复 + 每条
+出站 + 每次重写各跑一次 sonnet。本次四项一起改：
+
+1. **批判器降级 + 程序化升级兜底**（`critic.ts`）：默认模型降到
+   `deepseek/deepseek-v4-flash`（约 18 倍差价）。新增 `hasSafetySensitiveTopic`
+   ——正则关键词放代码里、不靠 LLM，命中非法驱逐/自杀自伤/歧视/性骚扰/住房公平
+   陷阱任一即升级到 sonnet-4.5 复核。`COLIVING_CRITIC_MODEL` 覆盖保留（逃生舱）。
+2. **出站审稿合并批量**（`turn.ts` + `critic.ts` 的 `critiqueBatch`）：N 条出站从
+   N 次模型往返改为一次审整批，按数组下标对齐逐条 verdict；解析失败仍默认放行。
+3. **扩大确定性闸**：新增 `deterministicallySafeReply`——短确认或纯告知（白名单、
+   无新排班/新联系/新规则）直接 pass，不调语言批判器。
+4. **缓存核对**：coliving 链路各 generateText 稳定前缀均已带 cacheControl ephemeral。
+
+**验证**：`coliving:quality` 55 项通过（+4 断言）；`tsc --noEmit` 仅既有两条
+TS2717，无新增；`git diff --check` 干净。未跑模型级。
+
+**省钱量级**：批判器模型价差约 18 倍（仅敏感轮付 sonnet）；批量省 (N−1) 次往返；
+空转确认轮整次跳过 critique。典型多联系人轮模型成本约降一个量级（以真实账单为准）。
+
+---
+
 ## 2026-09-07 · 简单肯定回排班征询在模型跑之前短路（Codex 定位，Claude Sonnet 实现）
 
 **根因**：`simpleScheduleAffirmation` 一直放在模型跑完、审稿重写之后才覆盖成短确认，

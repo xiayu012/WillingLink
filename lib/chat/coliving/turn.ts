@@ -5,7 +5,8 @@ import { z } from "zod";
 import { assembleSystemPrompt } from "@/lib/ai/brains";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
-import { critique } from "./critic";
+import { critique, critiqueBatch } from "./critic";
+import type { Verdict } from "./critic";
 import { assertCanWrite } from "./guard";
 import { colivingModelId } from "./model";
 import { embedOne } from "./embedding";
@@ -112,6 +113,46 @@ export function isSimpleAffirmation(text: string): boolean {
     text.trim()
   );
 }
+
+/**
+ * 纯确认/知会的短句白名单。代码能确定"这句只是收个话头"，没有下指令、
+ * 没有点名、没有承诺动作、没有宣称已经做了什么——这类低风险回复不值得再
+ * 花一次模型调用过语言批判器（措辞风险低）。
+ *
+ * 判定方式：整句切成小段后，每一段都得是白名单里的确认词。任何额外的内容
+ * （"我回头联系他"、"你最好先……"）都不在白名单里，仍然走批判器。
+ * **宁可保守：判不准就不是纯确认，照常过审。**
+ */
+const NOTICE_ACK_WORDS = new Set([
+  "好", "好的", "好嘞", "行", "行的", "行吧", "嗯", "嗯嗯", "嗯好", "哦", "哦哦",
+  "哦好", "啊", "对", "对的", "没错", "是的", "没问题", "可以", "可以的", "OK",
+  "ok", "Ok", "收到", "知道了", "明白", "明白了", "了解", "了解了", "谢谢",
+  "谢谢了", "多谢", "感谢", "谢谢告知", "谢谢提醒", "谢谢通知", "谢谢说明",
+  "谢谢你的告知", "知道了谢谢", "好的收到", "辛苦", "辛苦啦", "了解啦",
+]);
+
+export function isPureNoticeReply(text: string): boolean {
+  const t = text.trim();
+  if (!t || t.length > 40) {
+    return false;
+  }
+  const segments = t.split(/[，,。!！?？~～、;；\s]+/).filter((s) => s.length > 0);
+  return segments.length > 0 && segments.every((s) => NOTICE_ACK_WORDS.has(s));
+}
+
+/**
+ * 这轮只要动过排班/联系人/规则任何一个，回复就"不是安静的纯确认回合"——
+ * 判"能不能确定性跳过批判器"时当作仍有实质内容，照常过审。
+ */
+const TURN_ACTION_TOOLS = new Set([
+  "pickSchedule",
+  "chooseSchedule",
+  "contactPerson",
+  "addResident",
+  "proposeRule",
+  "recordShare",
+  "scheduleReminder",
+]);
 
 /**
  * 这条消息是不是在回答系统发给他的一条排班时段征询。
@@ -3099,49 +3140,66 @@ export async function runColivingTurn(args: {
         return `给${name}：${message.text}`;
       })
       .join("\n");
-    const verdicts = await Promise.all(
-      msgs.map((o) => {
-        // 这类正文不是模型自由发挥：时段先与 chooseSchedule 的唯一候选做了
-        // 结构化核对，再由上面的固定格式生成。语言批判器不应反过来把正确
-        // 数字误判成“锁死了另一个时段”。
-        if (o.scheduleVerified) {
-          return Promise.resolve({
-            verified: true,
-            pass: true as const,
-            broke: "",
-            why: "结构化排班时段与已选候选一致",
-          });
-        }
-        if (
-          isPrematureCapacityEscape(
-            o.text,
-            conflictContextActive,
-            scheduleProvenInfeasible
-          )
-        ) {
-          return Promise.resolve({
-            verified: true,
-            pass: false as const,
-            broke: "0",
-            why:
-              "这是未结的共享资源冲突，但本轮没有 pickSchedule 返回无候选的证据，" +
-              "不能先把加炉具、查插座或多人同时使用说成出路。先按一人独占排完" +
-              "所有顺序；只有结构化硬约束确实让排班无解，才考虑增容或并行。",
-          });
-        }
-        const targetName = outboundNames.get(o.personId) ?? "某位住户";
-        const withThisPerson = recentForCritique
-          // **必须早于本轮开始**——本轮自己刚发的（含正在审的这条本身）
-          // 都已经写进库了，不排除的话批判器会拿这条消息跟它自己比对。
-          .filter((r) => r.to === targetName && r.sentAt < turnStartedAt)
-          .slice(0, 6)
-          .map(
-            (r) =>
-              `${r.direction === "inbound" ? "他说" : "你对他说"}：${r.body
-                .replace(/\n/g, " ")
-                .slice(0, 60)}`
-          );
-        return critique({
+    /**
+     * **批量审稿：一整批出站合并成一次 `critiqueBatch` 调用，不再 N 条 N 次。**
+     *
+     * 之前对每条消息各调一次 `critique`（N 条 = N 次模型往返，各自重发一份
+     * rubric）。合并后整批共享一次 rubric system 缓存写入，成本与延迟都从
+     * N 次降到 1 次（单条仍走 `critique` 单条路径，行为与原来一致）。
+     *
+     * 确定性路径不进模型：
+     *  - `scheduleVerified`：正文由已选候选 + 固定模板生成，结构化核对过，
+     *    语言批判器不应反过来把正确数字误判成"锁死了另一个时段" → 直接放行；
+     *  - 过早的增容逃逸（未结共享资源冲突但排班器没证明无解）→ 直接打回。
+     */
+    const verdicts: Verdict[] = new Array(msgs.length);
+    const needsCritique: Array<{
+      msgIndex: number;
+      input: Parameters<typeof critique>[0];
+    }> = [];
+    for (const [i, o] of msgs.entries()) {
+      if (o.scheduleVerified) {
+        verdicts[i] = {
+          verified: true,
+          pass: true,
+          broke: "",
+          why: "结构化排班时段与已选候选一致",
+        };
+        continue;
+      }
+      if (
+        isPrematureCapacityEscape(
+          o.text,
+          conflictContextActive,
+          scheduleProvenInfeasible
+        )
+      ) {
+        verdicts[i] = {
+          verified: true,
+          pass: false,
+          broke: "0",
+          why:
+            "这是未结的共享资源冲突，但本轮没有 pickSchedule 返回无候选的证据，" +
+            "不能先把加炉具、查插座或多人同时使用说成出路。先按一人独占排完" +
+            "所有顺序；只有结构化硬约束确实让排班无解，才考虑增容或并行。",
+        };
+        continue;
+      }
+      const targetName = outboundNames.get(o.personId) ?? "某位住户";
+      const withThisPerson = recentForCritique
+        // **必须早于本轮开始**——本轮自己刚发的（含正在审的这条本身）
+        // 都已经写进库了，不排除的话批判器会拿这条消息跟它自己比对。
+        .filter((r) => r.to === targetName && r.sentAt < turnStartedAt)
+        .slice(0, 6)
+        .map(
+          (r) =>
+            `${r.direction === "inbound" ? "他说" : "你对他说"}：${r.body
+              .replace(/\n/g, " ")
+              .slice(0, 60)}`
+        );
+      needsCritique.push({
+        msgIndex: i,
+        input: {
           to: targetName,
           /**
            * 共用者规矩、针对个人的事、中性打招呼，三种判法完全不同。
@@ -3177,9 +3235,17 @@ export async function runColivingTurn(args: {
               ? `\n最近跟他之间的往来（新到旧）：\n${withThisPerson.join("\n")}`
               : "\n最近没有跟他之间的往来记录"),
           draft: o.text,
-        });
-      })
-    );
+        },
+      });
+    }
+    if (needsCritique.length > 0) {
+      const batchVerdicts = await critiqueBatch(
+        needsCritique.map((n) => n.input)
+      );
+      for (const [k, n] of needsCritique.entries()) {
+        verdicts[n.msgIndex] = batchVerdicts[k];
+      }
+    }
     // 出站那些不重写（重写要重跑整轮），但**不合格就不发**，并留痕。
     // 宁可少发一条，也不发一条会让人觉得被冤枉的。
     for (const [i, v] of verdicts.entries()) {
@@ -3504,9 +3570,25 @@ export async function runColivingTurn(args: {
 
   const factFidelityHit = checkFactFidelity(reply);
 
+  /**
+   * **确定性低风险闸：这类回复不需要过语言批判器。**
+   *
+   * 只有**代码能证明低风险**的才跳过，判不准一律照常走 `critique`：
+   *  1. `simpleScheduleAffirmation` 的短确认——正文由上面代码生成，已确定性正确；
+   *  2. 纯确认/纯知会的短句（`isPureNoticeReply`），**且本轮没有新排班、新联系人、
+   *     新规则**（没选定方案 / 没成功发出去的联系 / 没动排班联系人规则工具）。
+   *     空转回合里一句"好的，收到"没有任何可被批判的内容；有实质动作就仍过审。
+   */
+  const deterministicallySafeReply =
+    (simpleScheduleAffirmation && reply === simpleScheduleConfirmationText) ||
+    (isPureNoticeReply(reply) &&
+      selectedSchedules.size === 0 &&
+      !outbound.some((message) => !message.blocked) &&
+      !toolsUsed.some((toolName) => TURN_ACTION_TOOLS.has(toolName)));
+
   const verdict = factFidelityHit
     ? { verified: true, pass: false as const, ...factFidelityHit }
-    : scheduleReplyGenerated
+    : scheduleReplyGenerated || deterministicallySafeReply
       ? { verified: true, pass: true as const, broke: "", why: "" }
     : await critique({
         to: sender.name,

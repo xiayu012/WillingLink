@@ -25,11 +25,15 @@ import { colivingModelId } from "./model";
  * 宪法是「没写过的情况怎么推」，清单是「这条写好的消息哪里不对」。
  * 推理要抽象原则，检查要具体问题。**两件事，两份文档。**
  *
- * ## 为什么批判器用更贵的模型
+ * ## 用哪个模型
  *
- * 生成一轮要带一万多字准则、跑好几步；审稿只带一份清单和一条消息，
- * 短得多。所以**审稿换成聪明模型的边际成本很低，收益却直接**。
- * `COLIVING_CRITIC_MODEL` 可覆盖，默认 sonnet。
+ * 默认跟大脑同源用便宜的 `deepseek/deepseek-v4-flash`（约 18 倍差价，见
+ * `model.ts` 的选型记录）。但批判器是**出口安全闸**，安全敏感主题上不能赌
+ * 便宜模型的判断力——**命中非法驱逐 / 自杀自伤 / 歧视 / 性骚扰 / 住房公平
+ * 陷阱任一关键词时，程序化升级到 `anthropic/claude-sonnet-4.5`**。关键词
+ * 匹配放代码里、不靠 LLM 判断：宁可多升级一次（多花一点 sonnet 的钱），
+ * 也不要漏升级（弱模型复核高风险内容）。
+ * `COLIVING_CRITIC_MODEL` 可覆盖全部（逃生舱口），默认如上。
  *
  * ## 三条兜底
  * 只跑一次 · 不给工具不让改写 · **默认放行**——
@@ -61,10 +65,39 @@ function normalizeRuleId(value: unknown): string {
   return raw.match(/\d+(?:\.\d+)?/)?.[0] ?? raw.replace(/^第|条$/g, "");
 }
 
-function criticModelId(): string {
-  return (
-    process.env.COLIVING_CRITIC_MODEL?.trim() || "anthropic/claude-sonnet-4.5"
-  );
+/** 批判器默认模型：跟大脑同源（deepseek/deepseek-v4-flash），便宜约 18 倍。 */
+const DEFAULT_CRITIC_MODEL = "deepseek/deepseek-v4-flash";
+/** 安全敏感主题上强制升级到的模型（见 hasSafetySensitiveTopic 的说明）。 */
+const SENSITIVE_CRITIC_MODEL = "anthropic/claude-sonnet-4.5";
+
+/**
+ * 命中任一安全敏感主题时，这一轮批判器强制用 sonnet。关键词匹配放代码里、
+ * 不靠 LLM 判断——**不能用模型的随机性来决定"高风险内容由哪个模型复核"**。
+ *
+ * 宁可多触发（顶多多付一次 sonnet 的钱），也不要漏触发（弱模型复核
+ * 非法驱逐 / 自杀自伤 / 歧视 / 性骚扰 / 住房公平）。注意：此正则只决定
+ * "用哪个模型复核"，不改变任何行为。
+ */
+const SAFETY_SENSITIVE_PATTERN =
+  /(?:非法驱逐|驱逐|赶人走|赶.{0,3}(?:走|出去)|撵走|轰走|扫地出门|清退|换.{0,4}锁|锁.{0,4}换|断水|断电|停水|停电|拉闸|不让.{0,3}住|滚出去|滚蛋|evict|kick.{0,4}out|throw.{0,4}out|lock.{0,4}out)|(?:自杀|自残|自尽|轻生|不想活|想死|活不下去|一了百了|割腕|上吊|跳楼|suicide|kill myself|hurt myself|self[- ]harm)|(?:性骚扰|猥亵|性侵|sexual|harass|摸我|sexually)|(?:歧视|种族|racism|discriminat|移民|遣返|report.{0,3}ICE|因为.{0,6}(?:他|她|你).{0,3}是)|(?:公平住房|住房公平|fair housing|housing.{0,4}equit|disparate impact|familial status|拒绝.{0,8}(?:孩子|儿童|小孩|孕妇|残疾人)|带孩子|有小孩|有孩子|因为.{0,8}(?:孩子|小孩|孕妇|残疾人).{0,6}(?:不租|拒绝|歧视))/i;
+
+/** 这些文本里有没有任何一段命中安全敏感主题。 */
+export function hasSafetySensitiveTopic(...texts: string[]): boolean {
+  return texts.some((text) => Boolean(text) && SAFETY_SENSITIVE_PATTERN.test(text));
+}
+
+/**
+ * 这一轮批判器该用哪个模型。
+ * `forceSensitive` 由调用方用 `hasSafetySensitiveTopic` 算好传入，
+ * 命中安全敏感主题时用 sonnet；否则用便宜的默认模型。
+ * `COLIVING_CRITIC_MODEL` 显式设置时完全接管（逃生舱口 / 测试覆盖）。
+ */
+export function criticModelId(forceSensitive = false): string {
+  const override = process.env.COLIVING_CRITIC_MODEL?.trim();
+  if (override) {
+    return override;
+  }
+  return forceSensitive ? SENSITIVE_CRITIC_MODEL : DEFAULT_CRITIC_MODEL;
 }
 
 const CRITIC_TIMEOUT_MS = Number(process.env.COLIVING_CRITIC_TIMEOUT_MS ?? 120_000);
@@ -95,15 +128,41 @@ export type CriticInput = {
   draft: string;
 };
 
+/**
+ * 单个可解析的 JSON 对象 → Verdict。rubric 明定：单独的客服腔/自我介绍
+ * 冗余只是风格问题（第13条），不足以拦截。
+ */
+function verdictFromParsed(parsed: {
+  pass: boolean;
+  broke?: unknown;
+  why?: unknown;
+}): Verdict {
+  if (parsed.pass) {
+    return PASS;
+  }
+  const broke = normalizeRuleId(parsed.broke);
+  if (broke === "13") {
+    return PASS;
+  }
+  return {
+    verified: true,
+    pass: false,
+    broke,
+    why: String(parsed.why ?? ""),
+  };
+}
+
 export async function critique(args: CriticInput): Promise<Verdict> {
   if (process.env.COLIVING_CRITIC_OFF === "1" || !args.draft.trim()) {
     return UNVERIFIED_PASS;
   }
 
+  // 安全敏感主题（非法驱逐/自杀自伤/歧视/性骚扰/住房公平）升级到 sonnet 复核。
+  const forceSensitive = hasSafetySensitiveTopic(args.said, args.draft);
   try {
     const result = await generateText({
       abortSignal: AbortSignal.timeout(CRITIC_TIMEOUT_MS),
-      model: getLanguageModel(criticModelId()),
+      model: getLanguageModel(criticModelId(forceSensitive)),
       system: [
         {
           role: "system" as const,
@@ -167,20 +226,11 @@ export async function critique(args: CriticInput): Promise<Verdict> {
         if (typeof parsed.pass !== "boolean") {
           continue;
         }
-        if (parsed.pass === false) {
-          const broke = normalizeRuleId(parsed.broke);
-          // rubric 明定：单独的客服腔/自我介绍冗余只是风格问题，不足以拦截。
-          if (broke === "13") {
-            return PASS;
-          }
-          return {
-            verified: true,
-            pass: false,
-            broke,
-            why: String(parsed.why ?? ""),
-          };
-        }
-        return PASS;
+        return verdictFromParsed({
+          pass: parsed.pass,
+          broke: parsed.broke,
+          why: parsed.why,
+        });
       } catch {
         // 这一段 JSON 是坏的（多半是 why 里带了没转义的引号）——
         // 继续往前找上一段，别整个放弃。
@@ -213,6 +263,185 @@ export async function critique(args: CriticInput): Promise<Verdict> {
       ...UNVERIFIED_PASS,
       why: error instanceof Error ? error.message : String(error),
     };
+  }
+}
+
+/**
+ * 从模型回复里尽量稳健地抠出"逐条 verdict"。
+ *
+ * 优先：文本里**最后一个** `[...]` 数组（模型自纠错时最后一段才是它的最终
+ * 结论），解析成一个带 `pass` 的数组，按 `i`（缺省按数组顺序）对齐。
+ * 兜底：全文抓单层 `{...}` 对象，凡带 `pass` 的都收下，按 `i` 对齐、同 i 取最后。
+ * 抠不到任何可解析的 verdict 返回 `null`——调用方按「默认放行」逐条兜底。
+ */
+function collectBatchVerdicts(
+  text: string
+): Array<{ i: number; pass: boolean; broke?: unknown; why?: unknown }> | null {
+  const open = text.lastIndexOf("[");
+  const close = text.lastIndexOf("]");
+  if (open !== -1 && close > open) {
+    try {
+      const arr = JSON.parse(text.slice(open, close + 1));
+      if (Array.isArray(arr) && arr.length > 0) {
+        const rows = arr.map((item) =>
+          typeof item === "object" && item !== null
+            ? (item as { pass?: unknown; broke?: unknown; why?: unknown; i?: unknown })
+            : null
+        );
+        if (rows.every((r) => r !== null && typeof r.pass === "boolean")) {
+          return rows.map((r, pos) => {
+            const row = r as NonNullable<(typeof rows)[number]>;
+            return {
+              i: typeof row.i === "number" ? row.i : pos,
+              pass: row.pass as boolean,
+              broke: row.broke,
+              why: row.why,
+            };
+          });
+        }
+      }
+    } catch {
+      // 掉进下面的逐对象兜底。
+    }
+  }
+  const collected: Array<{ i: number; pass: boolean; broke?: unknown; why?: unknown }> =
+    [];
+  let order = 0;
+  for (const m of text.matchAll(/\{[^{}]*\}/g)) {
+    try {
+      const p = JSON.parse(m[0]) as {
+        pass?: unknown;
+        broke?: unknown;
+        why?: unknown;
+        i?: unknown;
+      };
+      if (typeof p.pass !== "boolean") {
+        continue;
+      }
+      collected.push({
+        i: typeof p.i === "number" ? p.i : order++,
+        pass: p.pass,
+        broke: p.broke,
+        why: p.why,
+      });
+    } catch {
+      // 单个坏对象跳过，继续找下一个。
+    }
+  }
+  if (collected.length === 0) {
+    return null;
+  }
+  const byIndex = new Map<number, { i: number; pass: boolean; broke?: unknown; why?: unknown }>();
+  for (const row of collected) {
+    byIndex.set(row.i, row);
+  }
+  return [...byIndex.entries()].sort((a, b) => a[0] - b[0]).map(([, row]) => row);
+}
+
+export type BatchCritiqueInput = {
+  to: string;
+  role: CriticInput["role"];
+  /** 他刚才说了什么。主动发（没回话）就留空 */
+  said: string;
+  facts: string;
+  draft: string;
+};
+
+/**
+ * **一次模型调用审一整批出站消息，逐条给 verdict。**
+ *
+ * 之前每条消息各调一次 `critique`（N 条 = N 次模型往返）。合并成一次调用后：
+ * 整批共享同一份 rubric system（缓存命中同一次写入），模型成本与延迟都从
+ * N 次降到 1 次。代价是单条上下文没有以前那么"隔离"，所以每条仍然带自己的
+ * 收信人/角色/事实，提示词要求逐条独立、按数组下标对齐。
+ *
+ * 安全语义与单条 `critique` 完全一致：
+ *  - 命中安全敏感主题 → 整批升级 sonnet；
+ *  - 解析失败 / 某一条没给 verdict → 该条按 UNVERIFIED_PASS（默认放行）兜底，
+ *    绝不因合并批量让一条本来会被拦的消息"漏拦"，也不让一条解析失败的把整批拖垮。
+ *  - 单条直接复用 `critique` 的单条提示词路径，行为与合并前完全一致。
+ */
+export async function critiqueBatch(
+  entries: BatchCritiqueInput[]
+): Promise<Verdict[]> {
+  const fallback = (why = ""): Verdict[] =>
+    entries.map(() => ({ ...UNVERIFIED_PASS, why }));
+  if (process.env.COLIVING_CRITIC_OFF === "1" || entries.length === 0) {
+    return fallback();
+  }
+  // 单条：复用 `critique` 的单条提示词，跟合并前逐条调用时一模一样。
+  if (entries.length === 1) {
+    return [
+      await critique({
+        to: entries[0].to,
+        role: entries[0].role,
+        said: entries[0].said,
+        facts: entries[0].facts,
+        draft: entries[0].draft,
+      }),
+    ];
+  }
+  const forceSensitive = entries.some(
+    (e) => hasSafetySensitiveTopic(e.said) || hasSafetySensitiveTopic(e.draft)
+  );
+  try {
+    const result = await generateText({
+      abortSignal: AbortSignal.timeout(CRITIC_TIMEOUT_MS),
+      model: getLanguageModel(criticModelId(forceSensitive)),
+      system: [
+        {
+          role: "system" as const,
+          content:
+            "你是审稿人，不是作者。有人写了一批要发给住户的短信，" +
+            "你对着下面的清单逐条查，只报**真正的违反**。\n" +
+            "你不写替代方案，只说第几条、为什么。\n\n" +
+            rubric(),
+          // rubric 逐字不变，整批与同轮其它批判器调用共享同一份缓存。
+          providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+        },
+      ],
+      messages: [
+        {
+          role: "user" as const,
+          content:
+            `下面是要逐条审的待发消息，一共 ${entries.length} 条：\n\n` +
+            entries
+              .map(
+                (e, idx) =>
+                  `【消息 ${idx}】\n收信人：${e.to}\n` +
+                  `他在这件事里的角色：${e.role}\n` +
+                  `他刚才说的话：${e.said || "（没说话，是我们主动发的）"}\n` +
+                  `这一轮已知的事实：\n${e.facts}\n\n` +
+                  `待发出的消息：\n${e.draft}`
+              )
+              .join("\n\n---\n\n") +
+            "\n\n每条**独立**判断——不要因为同批有别人，就把某一条" +
+            "放行或打回。只回一段 JSON 数组，不要先写别的再写 JSON，也不要" +
+            "自我纠正后又补一段——只有一段 JSON，写之前想清楚：\n" +
+            '[{"i":0,"pass":true},{"i":1,"pass":false,"broke":"第几条","why":"一句话"}]\n' +
+            "i 必须对应当前消息的编号。why 里要引用消息原文时，不要加引号，" +
+            "直接说是哪句话——引号会把 JSON 撑破（真出过）。",
+        },
+      ],
+    });
+
+    const rows = collectBatchVerdicts(result.text);
+    if (!rows) {
+      return fallback("批判器没有返回可解析的批量结论");
+    }
+    const verdicts = new Array<Verdict>(entries.length).fill(UNVERIFIED_PASS);
+    for (const row of rows) {
+      if (Number.isInteger(row.i) && row.i >= 0 && row.i < entries.length) {
+        verdicts[row.i] = verdictFromParsed(row);
+      }
+    }
+    return verdicts;
+  } catch (error) {
+    console.log(
+      "[critic] 批量判不了，整批放行：",
+      error instanceof Error ? error.message : String(error)
+    );
+    return fallback(error instanceof Error ? error.message : String(error));
   }
 }
 

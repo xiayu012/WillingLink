@@ -20,12 +20,17 @@ import {
   isLowInformationFollowUp,
   isOpenConflictCase,
   isPrematureCapacityEscape,
+  isPureNoticeReply,
   isScheduleSlotInquiry,
   isSimpleAffirmation,
   scheduleContactTextForAct,
   scheduleInquiryConfirmation,
   scheduleSlotMatchesSelfStatement,
 } from "../lib/chat/coliving/turn";
+import {
+  criticModelId,
+  hasSafetySensitiveTopic,
+} from "../lib/chat/coliving/critic";
 
 async function main() {
   let count = 0;
@@ -682,6 +687,76 @@ async function main() {
     assert.equal(scheduleInquiryConfirmation({ inquiryBody: "你用 17:30-18:00，愿意吗？", responseBody: "愿意，但为什么我最后用？" }), null);
     assert.equal(scheduleInquiryConfirmation({ inquiryBody: "今天吃什么？", responseBody: "愿意" }), null);
     assert.equal(scheduleInquiryConfirmation({ inquiryBody: "你用 17:30-18:00，愿意吗？", responseBody: "不行" }), null);
+  });
+
+  // ── 批判器省钱改造（2026-09-07）：默认降级 deepseek + 安全主题升级 sonnet ───
+  check("critic default model is cheap deepseek; safety-sensitive topics escalate to sonnet", () => {
+    const prev = process.env.COLIVING_CRITIC_MODEL;
+    delete process.env.COLIVING_CRITIC_MODEL;
+    try {
+      assert.equal(criticModelId(), "deepseek/deepseek-v4-flash", "默认必须降级成跟大脑同源的便宜模型");
+      assert.equal(criticModelId(false), "deepseek/deepseek-v4-flash");
+      assert.equal(criticModelId(true), "anthropic/claude-sonnet-4.5", "安全敏感主题必须程序化升级到 sonnet");
+    } finally {
+      if (prev === undefined) delete process.env.COLIVING_CRITIC_MODEL;
+      else process.env.COLIVING_CRITIC_MODEL = prev;
+    }
+    const criticSrc = readFileSync("lib/chat/coliving/critic.ts", "utf8");
+    assert(criticSrc.includes("hasSafetySensitiveTopic(args.said, args.draft)"),
+      "critique 必须用入站正文 + 待发消息判安全敏感主题");
+    assert(criticSrc.includes("criticModelId(forceSensitive)"),
+      "critique 必须把敏感判定结果喂给模型选型");
+    assert(criticSrc.includes('DEFAULT_CRITIC_MODEL = "deepseek/deepseek-v4-flash"'), "默认降级常量必须在");
+    assert(criticSrc.includes('SENSITIVE_CRITIC_MODEL = "anthropic/claude-sonnet-4.5"'), "升级常量必须在");
+    assert(criticSrc.includes('process.env.COLIVING_CRITIC_MODEL?.trim()'), "必须保留 COLIVING_CRITIC_MODEL 覆盖");
+  });
+  check("safety-sensitive keyword matcher hits real probes, not benign chit-chat", () => {
+    // 非法驱逐 / 自杀自伤 / 歧视 / 性骚扰 / 住房公平
+    assert.equal(hasSafetySensitiveTopic("房东要把我赶出去，说我不交钱就别住了"), true);
+    assert.equal(hasSafetySensitiveTopic("再这样我真不想活了，活着没意思"), true);
+    assert.equal(hasSafetySensitiveTopic("他那样说我，我觉得就是歧视"), true);
+    assert.equal(hasSafetySensitiveTopic("他半夜摸我，算性骚扰吗"), true);
+    assert.equal(hasSafetySensitiveTopic("房东说因为我有孩子就不租给我"), true);
+    assert.equal(hasSafetySensitiveTopic("好的，晚上一起吃饭吧"), false);
+    assert.equal(hasSafetySensitiveTopic("收到，我记下了"), false);
+  });
+
+  // ── 出站审稿合并成单次批量调用 ────────────────────────────────────────────
+  check("outbound review is a single batch critique call, never N per-message calls", () => {
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const criticSrc = readFileSync("lib/chat/coliving/critic.ts", "utf8");
+    assert(criticSrc.includes("export async function critiqueBatch("), "critic.ts 必须导出 critiqueBatch");
+    const fnStart = turnSrc.indexOf("async function critiqueAndMarkOutbound(");
+    const fnEnd = turnSrc.indexOf("await critiqueAndMarkOutbound(outbound);");
+    assert(fnStart > 0, "critiqueAndMarkOutbound 必须存在");
+    assert(fnEnd > fnStart, "必须能定位 critiqueAndMarkOutbound 的结束");
+    const fnBody = turnSrc.slice(fnStart, fnEnd);
+    assert(fnBody.includes("critiqueBatch("), "critiqueAndMarkOutbound 必须走单次批量 critiqueBatch");
+    assert(fnBody.includes("needsCritique"), "必须先收集需要模型审的消息，而不是逐条直接调");
+    assert(!fnBody.includes("critique({"), "critiqueAndMarkOutbound 内不得再逐条调 critique");
+    assert(!fnBody.includes("Promise.all("), "不得再并发逐条调 critique");
+    // 批量安全语义不丢：scheduleVerified 直接放行、过早增容逃逸确定性打回 仍在代码里
+    assert(fnBody.includes("o.scheduleVerified"), "scheduleVerified 直接放行路径必须保留");
+    assert(fnBody.includes("isPrematureCapacityEscape"), "过早增容逃逸确定性打回路径必须保留");
+  });
+
+  // ── 确定性低风险闸：短确认 / 纯告知跳过批判器 ────────────────────────────
+  check("deterministic safe-reply gate covers short confirmation and pure notices", () => {
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    assert(turnSrc.includes("deterministicallySafeReply"), "回复判定必须存在确定性低风险闸");
+    assert(turnSrc.includes("simpleScheduleAffirmation && reply === simpleScheduleConfirmationText"),
+      "短确认命中必须直接 pass（不再走 critique）");
+    assert(turnSrc.includes("isPureNoticeReply(reply)"), "纯告知命中必须走确定性跳过判定");
+    assert(turnSrc.includes("TURN_ACTION_TOOLS"), "跳过判定必须核对本轮有没有新动作（排班/联系人/规则）");
+    // 行为：白名单内的纯确认/知会才算数，含动作/承诺/点名的不算
+    assert.equal(isPureNoticeReply("好的，收到。"), true);
+    assert.equal(isPureNoticeReply("好的。"), true);
+    assert.equal(isPureNoticeReply("知道了，谢谢。"), true);
+    assert.equal(isPureNoticeReply("明白，辛苦啦"), true);
+    assert.equal(isPureNoticeReply("好的，我这就去联系小周。"), false);
+    assert.equal(isPureNoticeReply("收到，回头再安排。"), false);
+    assert.equal(isPureNoticeReply("好的，你最好别这样。"), false);
+    assert.equal(isPureNoticeReply(""), false);
   });
 
   const previous = process.env.COLIVING_JUDGE_OFF;
