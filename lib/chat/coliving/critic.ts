@@ -158,7 +158,12 @@ export async function critique(args: CriticInput): Promise<Verdict> {
   }
 
   // 安全敏感主题（非法驱逐/自杀自伤/歧视/性骚扰/住房公平）升级到 sonnet 复核。
-  const forceSensitive = hasSafetySensitiveTopic(args.said, args.draft);
+  // facts 也扫一遍：出站审稿里"命中敏感是来自入站 args.text"的消息，收信人
+  // said 为空、draft 又不带关键词，敏感上下文只落在 facts 里（"起因是…"那行），
+  // 不扫 facts 会把这类整轮敏感的复核漏降级回便宜模型。
+  const forceSensitive =
+    hasSafetySensitiveTopic(args.said, args.draft) ||
+    hasSafetySensitiveTopic(args.facts);
   try {
     const result = await generateText({
       abortSignal: AbortSignal.timeout(CRITIC_TIMEOUT_MS),
@@ -382,7 +387,9 @@ export async function critiqueBatch(
     ];
   }
   const forceSensitive = entries.some(
-    (e) => hasSafetySensitiveTopic(e.said) || hasSafetySensitiveTopic(e.draft)
+    (e) =>
+      hasSafetySensitiveTopic(e.said, e.draft) ||
+      hasSafetySensitiveTopic(e.facts)
   );
   try {
     const result = await generateText({

@@ -844,6 +844,67 @@ async function main() {
     assert.equal(isPureNoticeReply(""), false);
   });
 
+  // ── 取消"提示词大脑验收"：非敏感直接 pass，只对安全敏感主题调批判器 ────
+  check("non-sensitive main reply does not call critique; safety-sensitive still does", () => {
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const gateIdx = src.indexOf("const safetySensitiveReply = hasSafetySensitiveTopic(reply, args.text);");
+    assert(gateIdx > 0, "主回复判定必须先算 safetySensitiveReply（hasSafetySensitiveTopic 同时覆盖 reply 与入站 args.text）");
+    const block = src.slice(gateIdx, src.indexOf("let replyReview: ReplyReview", gateIdx));
+    // 安全敏感 → 仍调 critique（升级 sonnet）；三元收尾的非敏感分支直接 pass，不调 LLM。
+    const passObj = "{ verified: true, pass: true as const, broke: \"\", why: \"\" }";
+    assert(block.includes("await critique({"), "安全敏感命中时主回复仍调 critique");
+    assert(block.lastIndexOf(passObj) > block.indexOf("await critique({"),
+      "非敏感收尾分支必须直接 pass，不再调 LLM 批判器");
+  });
+  check("non-sensitive outbound never enters needsCritique", () => {
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const fnStart = turnSrc.indexOf("async function critiqueAndMarkOutbound(");
+    const fnEnd = turnSrc.indexOf("await critiqueAndMarkOutbound(outbound);");
+    assert(fnStart > 0 && fnEnd > fnStart, "critiqueAndMarkOutbound 必须可定位");
+    const fnBody = turnSrc.slice(fnStart, fnEnd);
+    const gateIdx = fnBody.indexOf("if (!hasSafetySensitiveTopic(o.text, args.text)) {");
+    const pushIdx = fnBody.indexOf("needsCritique.push({");
+    assert(gateIdx > 0, "收集需要模型审的消息前必须有安全敏感闸");
+    assert(gateIdx < pushIdx, "安全敏感闸必须早于 needsCritique.push");
+    const gated = fnBody.slice(gateIdx, pushIdx);
+    assert(gated.includes("verdicts[i] = { verified: true, pass: true"),
+      "非敏感出站必须直接放行（verdicts[i] = pass），而不是 push 进 needsCritique");
+    // 确定性闸不丢：scheduleVerified 直通、过早增容逃逸确定性打回、批量调用仍在
+    assert(fnBody.includes("o.scheduleVerified"), "scheduleVerified 直接放行路径必须保留");
+    assert(fnBody.includes("isPrematureCapacityEscape"), "过早增容逃逸确定性打回路径必须保留");
+    assert(fnBody.includes("critiqueBatch("), "敏感消息仍走单次批量 critiqueBatch");
+  });
+  check("whole-turn safety upgrade intact: reply/redo/final/outbound all sonnet-gated", () => {
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const criticSrc = readFileSync("lib/chat/coliving/critic.ts", "utf8");
+    // 1) 回复链三处 critique 调用都在（主/重写/最终修正），数量没因改动被删
+    const critiqueCount = turnSrc.split("await critique({").length - 1;
+    assert.equal(critiqueCount, 3, `回复链必须有且只有 3 处 critique 调用，实际 ${critiqueCount}`);
+    // 2) 主回复/重写/最终修正三段，每段 critique 之前都有 hasSafetySensitiveTopic(reply, args.text) 守卫
+    const segments: Array<[string, string]> = [
+      ["const safetySensitiveReply = hasSafetySensitiveTopic(reply, args.text);", "const redoFactFidelityHit = checkFactFidelity(reply);"],
+      ["const redoFactFidelityHit = checkFactFidelity(reply);", "const finalFactFidelityHit = checkFactFidelity(reply);"],
+      ["const finalFactFidelityHit = checkFactFidelity(reply);", "最终落锤：简单肯定覆盖"],
+    ];
+    for (const [startAnchor, endAnchor] of segments) {
+      const start = turnSrc.indexOf(startAnchor);
+      const end = turnSrc.indexOf(endAnchor, start + 1);
+      assert(start > 0 && end > start, `审稿段落必须可定位：${startAnchor.slice(0, 40)}…`);
+      const seg = turnSrc.slice(start, end);
+      assert(seg.includes("await critique({"), "段落内必须保留 critique 调用（安全敏感升级路径）");
+      assert(seg.includes("hasSafetySensitiveTopic(reply, args.text)"), "段落内必须有安全敏感守卫");
+    }
+    // 3) 出站入口的守卫覆盖正文与入站（hasSafetySensitiveTopic 同时覆盖入站与出站/reply）
+    const outboundStart = turnSrc.indexOf("async function critiqueAndMarkOutbound(");
+    const outboundEnd = turnSrc.indexOf("await critiqueAndMarkOutbound(outbound);");
+    assert(outboundStart > 0 && outboundEnd > outboundStart, "出站审稿函数必须可定位");
+    const outboundSeg = turnSrc.slice(outboundStart, outboundEnd);
+    assert(outboundSeg.includes("hasSafetySensitiveTopic(o.text, args.text)"), "出站守卫必须覆盖 o.text（正文）");
+    // 4) 升级在 critic 内部：安全敏感命中 → forceSensitive → criticModelId(true)=sonnet
+    assert(criticSrc.includes("criticModelId(forceSensitive)"), "critic 内仍按 forceSensitive 升级模型");
+    assert(criticSrc.includes('SENSITIVE_CRITIC_MODEL = "anthropic/claude-sonnet-4.5"'), "升级常量必须在");
+  });
+
   const previous = process.env.COLIVING_JUDGE_OFF;
   process.env.COLIVING_JUDGE_OFF = "1";
   const off = await judgeConversation({ scenarioId: "off", source: "offline", roster: [], turns: bad });

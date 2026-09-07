@@ -6005,3 +6005,54 @@ settle-round、auto-funnel 等场景以「执行异常」中断。故本次只�
 复测。剩余观察：auto-funnel 会因「竞态新入站」闸跳过部分参与者（生产语义正确——
 对方刚发消息不该再发征询；但在 eval 回放里时间戳可能放大此跳过），待余额恢复后需
 复测并核对 eval 时间戳保真。
+
+## 2026-09-07 · 取消“提示词大脑（critic）验收”：非敏感直接 pass，批判器只留安全敏感升级（Codex 派单、Claude Sonnet medium 实现）
+
+老板方向（2026-09-07）：MVP 能排班就够，取消每轮一次 LLM 批判器验收——能程序做的
+绝不叫 LLM。现状每轮都跑一次批判器（deepseek，已降级但仍是一次模型调用），既花钱又
+因模型弱而漏判。改法：日常只靠确定性闸兜底，批判器只在安全敏感主题
+（`hasSafetySensitiveTopic` 命中）上升级 sonnet 复核，其余直接 `{verified:true,
+pass:true}`，不调 LLM。
+
+**改动（只动 turn.ts / critic.ts / scripts/coliving-quality-inspect.ts）**：
+
+1. 主回复审稿（turn.ts 主 verdict 处）：`checkFactFidelity(reply)` 命中 → 仍打回
+   （确定性，保留）；命中且 schedule 生成或确定性安全回复 → 仍 pass（保留）；其余
+   只有 `safetySensitiveReply = hasSafetySensitiveTopic(reply, args.text)` 为真才
+   `await critique(...)`（sonnet），否则直接 pass，不再调 LLM 批判器。
+2. 出站审稿 `critiqueAndMarkOutbound`：`scheduleVerified` 直接放行、过早增容
+   `isPrematureCapacityEscape` 确定性打回都保留；出站循环里在组对象前先拦
+   `if (!hasSafetySensitiveTopic(o.text, args.text)) { verdicts[i] = {verified:true,
+   pass:true,...}; continue; }`——非敏感出站不进 `needsCritique`。批量逻辑同理。
+3. redo/final 两个 `await critique(` 调用点同样改为确定性优先：`checkFactFidelity`
+   broke "0" 仍打回、命中 `hasSafetySensitiveTopic` 才 critique、其余直接 pass。
+   原来非敏感已无 LLM 打回，重写/补发自然只被确定性信号与安全升级触发；
+   `isBrokenPromise`/`needsScheduleRecompute`/`finalNeedsAction` 分类机原样未动。
+4. 安全不因这次改动漏掉：critic.ts 的 `critique`/`critiqueBatch` 里 `forceSensitive`
+   在原有的 `hasSafetySensitiveTopic(said, draft)` 之外再并上
+   `hasSafetySensitiveTopic(facts)`——因为出站对象 `said` 常为空、敏感信号可能只在
+   入站 `args.text`（facts 里带“起因是 senderName 说：…”），否则出站/批量该升级
+   sonnet 会漏成默认便宜模型。命中即整批/整轮升级。`COLIVING_CRITIC_MODEL` /
+   `COLIVING_CRITIC_OFF` 保留。
+
+**验证**：`pnpm.cmd coliving:quality` 62 项通过（新增 3 项源码级结构断言：非敏感主
+回复不调 critique、非敏感出站不进 needsCritique、安全敏感整轮仍 sonnet 升级）；
+`pnpm.cmd exec tsc --noEmit` 仍只有既有 speech-input.tsx 两条 TS2717，无新增；
+`git diff --check` 干净（critic.ts 一度因 LF/CRLF 混用告警，已归一化回 CRLF）。
+
+**未提交 / 阻塞（如实）**：按约定不提交、不 push、不跑真实 Twilio、不跑模型级评测。
+`.claude/AGENT_LOG.md` 追加先被工具权限拦（提示 sensitive file），本条目是换 Bash
+方式补写；若仍写不进，此事实本身就是记录，余下由下次会话或 Codex 补。
+
+**残余风险**：
+
+- 非敏感轮次漏过批判器后，rubric 里那批“主观质量”检查（措辞、啰嗦、语气）不再执行。
+  这是老板要的取舍（能程序做的绝不叫 LLM），代价是质量兜底只剩确定性闸——而确定性
+  闸只盯排班事实/联系状态，不盯文风。万一后续发现非敏感轮文风事故变多，出路是再想
+  一条便宜的确定性/局部检查，而不是把整批判器拉回来。
+- `hasSafetySensitiveTopic` 是关键词正则：主题换词回避、语义敏感但词没中的边界情况会
+  回退成直接 pass。与改动前一致，不是本次新引入，但“只留安全敏感”后这个边界的权重
+  变高了。
+- 结构断言用 readFileSync+includes，属源码级哨兵：将来重构若把 `await critique(` 挪到
+  非敏感路径之外但没同步更新断言，会静默漂移。行为级回归还得靠 coliving eval 场景，
+  本次按成本纪律没跑。

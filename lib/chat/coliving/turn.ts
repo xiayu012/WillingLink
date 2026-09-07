@@ -5,7 +5,7 @@ import { z } from "zod";
 import { assembleSystemPrompt } from "@/lib/ai/brains";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { buildContext } from "./context";
-import { critique, critiqueBatch } from "./critic";
+import { critique, critiqueBatch, hasSafetySensitiveTopic } from "./critic";
 import type { Verdict } from "./critic";
 import { assertCanWrite } from "./guard";
 import { colivingModelId } from "./model";
@@ -3095,10 +3095,14 @@ export async function runColivingTurn(args: {
      * rubric）。合并后整批共享一次 rubric system 缓存写入，成本与延迟都从
      * N 次降到 1 次（单条仍走 `critique` 单条路径，行为与原来一致）。
      *
+     * **老板定的闸：非敏感出站不进批判器，只有安全敏感主题才走模型复核。**
      * 确定性路径不进模型：
      *  - `scheduleVerified`：正文由已选候选 + 固定模板生成，结构化核对过，
      *    语言批判器不应反过来把正确数字误判成"锁死了另一个时段" → 直接放行；
-     *  - 过早的增容逃逸（未结共享资源冲突但排班器没证明无解）→ 直接打回。
+     *  - 过早的增容逃逸（未结共享资源冲突但排班器没证明无解）→ 直接打回；
+     *  - 其余非敏感消息（`hasSafetySensitiveTopic(o.text, args.text)` 未命中）
+     *    → 直接 pass，不再调 LLM 批判器；
+     *  - 只有命中安全敏感主题的消息进 `needsCritique`，整批升级 sonnet 复核。
      */
     const verdicts: Verdict[] = new Array(msgs.length);
     const needsCritique: Array<{
@@ -3131,6 +3135,13 @@ export async function runColivingTurn(args: {
             "不能先把加炉具、查插座或多人同时使用说成出路。先按一人独占排完" +
             "所有顺序；只有结构化硬约束确实让排班无解，才考虑增容或并行。",
         };
+        continue;
+      }
+      // **非敏感出站不进批判器。** 日常只靠上面的确定性检查（scheduleVerified /
+      // 过早增容逃逸）；其余只有命中安全敏感主题（覆盖入站说的和这条正文，
+      // `hasSafetySensitiveTopic` 判）才值得升级 sonnet 复核，否则直接 pass。
+      if (!hasSafetySensitiveTopic(o.text, args.text)) {
+        verdicts[i] = { verified: true, pass: true, broke: "", why: "" };
         continue;
       }
       const targetName = outboundNames.get(o.personId) ?? "某位住户";
@@ -3521,11 +3532,13 @@ export async function runColivingTurn(args: {
   /**
    * **确定性低风险闸：这类回复不需要过语言批判器。**
    *
-   * 只有**代码能证明低风险**的才跳过，判不准一律照常走 `critique`：
+   * 老板拍板取消"提示词大脑验收"后，批判器只对安全敏感主题开放，非敏感回复
+   * 本来就一律直接 pass——这道闸的直通结论已被上面的兜底覆盖，保留它是为了
+   * 让"这类回复确定性安全"这个判断显式可读、也守住已有的结构断言：
    *  1. `simpleScheduleAffirmation` 的短确认——正文由上面代码生成，已确定性正确；
    *  2. 纯确认/纯知会的短句（`isPureNoticeReply`），**且本轮没有新排班、新联系人、
    *     新规则**（没选定方案 / 没成功发出去的联系 / 没动排班联系人规则工具）。
-   *     空转回合里一句"好的，收到"没有任何可被批判的内容；有实质动作就仍过审。
+   *     空转回合里一句"好的，收到"没有任何可被批判的内容。
    */
   const deterministicallySafeReply =
     (simpleScheduleAffirmation && reply === simpleScheduleConfirmationText) ||
@@ -3534,17 +3547,24 @@ export async function runColivingTurn(args: {
       !outbound.some((message) => !message.blocked) &&
       !toolsUsed.some((toolName) => TURN_ACTION_TOOLS.has(toolName)));
 
+  // 老板定的闸：日常审稿只靠代码。`checkFactFidelity` 命中 → 打回重写（确定性，
+  // 保留）；未命中且不是排班生成的回复，只有命中安全敏感主题（非法驱逐/自杀
+  // 自伤/歧视/性骚扰/住房公平，由 hasSafetySensitiveTopic 判，**入站与回复正文
+  // 都覆盖**）才升级 sonnet 批判器复核；其余一律直接 pass，不再调 LLM 批判器。
+  const safetySensitiveReply = hasSafetySensitiveTopic(reply, args.text);
   const verdict = factFidelityHit
     ? { verified: true, pass: false as const, ...factFidelityHit }
     : scheduleReplyGenerated || deterministicallySafeReply
       ? { verified: true, pass: true as const, broke: "", why: "" }
-    : await critique({
-        to: sender.name,
-        role: senderRole,
-        said: args.text,
-        facts: replyFacts,
-        draft: reply,
-      });
+    : safetySensitiveReply
+      ? await critique({
+          to: sender.name,
+          role: senderRole,
+          said: args.text,
+          facts: replyFacts,
+          draft: reply,
+        })
+      : { verified: true, pass: true as const, broke: "", why: "" };
 
   /**
    * **最终这句话有没有真的过审——不是"批判器调没调"。**
@@ -3905,15 +3925,18 @@ export async function runColivingTurn(args: {
       // 重写稿必须重新过与首稿完全相同的代码硬闸；只交给语言批判器会让
       // “首稿被确定性拦下、重写原样复读却变绿”成为可能。
       const redoFactFidelityHit = checkFactFidelity(reply);
+      // 重写稿同样只对安全敏感主题升级 sonnet 复核；其余直接 pass，不调 LLM。
       const redoVerdict = redoFactFidelityHit
         ? { verified: true, pass: false as const, ...redoFactFidelityHit }
-        : await critique({
-            to: sender.name,
-            role: senderRole,
-            said: args.text,
-            facts: renderNewReplyFacts(),
-            draft: reply,
-          });
+        : hasSafetySensitiveTopic(reply, args.text)
+          ? await critique({
+              to: sender.name,
+              role: senderRole,
+              said: args.text,
+              facts: renderNewReplyFacts(),
+              draft: reply,
+            })
+          : { verified: true, pass: true as const, broke: "", why: "" };
       const redoContactReply =
         !redoVerdict.pass ? buildContactProgressReply() : null;
       if (redoVerdict.pass) {
@@ -4013,15 +4036,18 @@ export async function runColivingTurn(args: {
           );
         }
         const finalFactFidelityHit = checkFactFidelity(reply);
+        // 最后一次修正稿同样只对安全敏感主题升级 sonnet 复核；其余直接 pass。
         const finalVerdict = finalFactFidelityHit
           ? { verified: true, pass: false as const, ...finalFactFidelityHit }
-          : await critique({
-              to: sender.name,
-              role: senderRole,
-              said: args.text,
-              facts: renderNewReplyFacts(),
-              draft: reply,
-            });
+          : hasSafetySensitiveTopic(reply, args.text)
+            ? await critique({
+                to: sender.name,
+                role: senderRole,
+                said: args.text,
+                facts: renderNewReplyFacts(),
+                draft: reply,
+              })
+            : { verified: true, pass: true as const, broke: "", why: "" };
         const finalContactReply =
           !finalVerdict.pass &&
           selectedSchedules.size === 0 &&
