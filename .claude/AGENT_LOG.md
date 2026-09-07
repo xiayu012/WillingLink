@@ -6076,3 +6076,39 @@ pass:true}`，不调 LLM。
 - 结构断言用 readFileSync+includes，属源码级哨兵：将来重构若把 `await critique(` 挪到
   非敏感路径之外但没同步更新断言，会静默漂移。行为级回归还得靠 coliving eval 场景，
   本次按成本纪律没跑。
+
+---
+
+## 2026-09-07 · lib/coordination 接 LLM 意图解析 + 端到端验证 5 条真实排班分支
+
+CODEX_TASK：给自包含协商状态机接「薄 LLM 意图解析」，用 5 条多人排班分支做端到端
+验证。不提交、不 push、不跑 Twilio、不连数据库。
+
+**新增**：
+- `lib/coordination/llm.ts` —— `llmParseIntent(message): Promise<Intent>` 胶水层。
+  import `@/lib/ai/providers` + `generateText`（deepseek/deepseek-v4-flash），prompt
+  把 7 种 Intent 讲清楚、要求只输出 JSON。核心（types/machine/intent stub）仍零耦合。
+  解析失败/非 JSON/模型异常一律退化成 `{type:"other"}`，不抛错。start/duration 必须
+  是整数分钟，时长缺省 30。
+- `lib/coordination/e2e.test.ts` —— 5 条分支 ×（golden 确定性跑 + LLM 真实解析跑）。
+  golden 证明「解析对了机器就能到终态、不破不变量」；LLM 跑如实记录逐步解析判读
+  （exact/equiv/wrong），不重试、不硬凑。
+
+**LLM 解析实测（deepseek-v4-flash，35 条消息）**：34 exact + 1 equiv + 0 wrong。
+唯一 equiv：小李“我8点才有空，用半小时”被判成 `add_constraint(1200,30)` 而非
+`report_availability`——机器等价（都是更新可用时间），且“才”字本就偏约束语气，
+不算错。关键歧义全部分对：confirm vs report（“可以” vs “我X点有空”）、
+“不行+新时间”给 counter_propose 而非 reject、无时长时默认 30、晚上语境 6点=1080。
+
+**验证**：machine.test.ts 14/14 绿；e2e.test.ts 10/10 通过（5 golden + 5 llm）；
+`tsc --noEmit` 仅既有 speech-input.tsx 两条 TS2717；`git diff --check` 干净。
+
+**残余风险**：
+- LLM 解析有随机性：本次 35 条全过，不等于每条永远过。confirm/report 一旦分错，
+  分支会卡在 gathering/proposed，e2e 会如实 FAIL——这正是脚本存在的原因，别为了
+  绿而重试或放宽断言。
+- 时间默认晚上语境是 prompt 约定，不在代码里；出现“6点”无早晚修饰时依赖模型按
+  厨房排班语境推 1080。机器对 360 也会因窗口下界夹回 1080，语义无害但判读会标数字错。
+- 场景 5「第四人中途硬约束」受机器限制：参与者在排第一版前必须全员报过，所以第四
+  人不是“后加入”，而是全程在场、在确认中途抛出更硬的约束触发重排。机器不支持
+  「新参与者中途加入现有方案」（会 noop 丢弃），属已知边界，未改（实验模块不动核心）。
