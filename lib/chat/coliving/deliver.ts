@@ -13,11 +13,11 @@ export { markCommunication } from "./repo";
 export async function sendSmsOrSkip(
   to: string,
   text: string
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; externalMessageId?: string | null }> {
   try {
     const result = await sendSms(to, text);
     return result.ok
-      ? { ok: true }
+      ? { ok: true, externalMessageId: result.sids.join(",") || null }
       : { ok: false, error: result.error ?? "unknown" };
   } catch (error) {
     return {

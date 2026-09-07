@@ -44,6 +44,7 @@ export async function GET(request: Request) {
         await markCommunication({
           communicationId: m.communicationId,
           status: outcome.ok ? "sent" : "failed",
+          externalMessageId: outcome.ok ? outcome.externalMessageId : null,
           error: outcome.ok ? null : outcome.error,
         });
         if (outcome.ok) {

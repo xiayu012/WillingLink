@@ -241,6 +241,25 @@ async function main() {
     assert(src.includes("reply = buildContactProgressReply() ?? reply"));
     assert(src.includes("!verdict.pass ? buildContactProgressReply() : null"));
   });
+  check("contactPerson skips duplicate open messages across turns", () => {
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const repo = readFileSync("lib/chat/coliving/repo.ts", "utf8");
+    assert(repo.includes("export async function findRecentOpenCommunication"));
+    assert(repo.includes("status in ('queued', 'sent')"));
+    assert(repo.includes("responded_at is null"));
+    assert(src.includes("const recentlyCovered = new Map"));
+    assert(src.includes("await repo.findRecentOpenCommunication"));
+    assert(src.includes("这次不重复发送"));
+    assert(src.includes("for (const covered of recentlyCovered.values())"));
+  });
+  check("sent communications retain provider message ids", () => {
+    const twilioRoute = readFileSync("app/api/twilio/messages/route.ts", "utf8");
+    const cronRoute = readFileSync("app/api/cron/coliving/route.ts", "utf8");
+    const deliver = readFileSync("lib/chat/coliving/deliver.ts", "utf8");
+    assert(twilioRoute.includes("externalMessageId: sent.ok ? sent.sids.join"));
+    assert(deliver.includes("externalMessageId: result.sids.join"));
+    assert(cronRoute.includes("externalMessageId: outcome.ok ? outcome.externalMessageId : null"));
+  });
   const previous = process.env.COLIVING_JUDGE_OFF;
   process.env.COLIVING_JUDGE_OFF = "1";
   const off = await judgeConversation({ scenarioId: "off", source: "offline", roster: [], turns: bad });

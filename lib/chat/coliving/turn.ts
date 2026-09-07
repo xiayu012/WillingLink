@@ -410,6 +410,8 @@ export async function runColivingTurn(args: {
   const outbound: OutboundMessage[] = [];
   const toolsUsed: string[] = [];
   const contacted = new Set<string>();
+  /** 跨轮已问过且还没回的人：算作已征询，但不能再发一遍同文短信。 */
+  const recentlyCovered = new Map<string, { name: string; communicationId: string }>();
   /**
    * 每次调用 `pickSchedule` 真正算出来的排第一候选，原样记下来。
    *
@@ -826,6 +828,26 @@ export async function runColivingTurn(args: {
         }
         if (contacted.has(target.personId)) {
           return { ok: false, reason: `本轮已经给 ${target.name} 发过了` };
+        }
+        const duplicate = await repo.findRecentOpenCommunication({
+          toPersonId: target.personId,
+          channel,
+          body: message,
+        });
+        if (duplicate) {
+          recentlyCovered.set(target.personId, {
+            name: target.name,
+            communicationId: duplicate.id,
+          });
+          return {
+            ok: true,
+            skipped: true,
+            reason:
+              `近24小时已经给 ${target.name} 发过同一条，且对方还没回复；` +
+              "这次不重复发送。",
+            communicationId: duplicate.id,
+            sentTo: target.name,
+          };
         }
         contacted.add(target.personId);
 
@@ -2465,11 +2487,21 @@ export async function runColivingTurn(args: {
     const acceptedNames = acceptedOriginalNames.map(
       (name) => publicNames.get(name) ?? "另一位住户"
     );
+    const alreadyAskedNames = [...recentlyCovered.values()]
+      .map((covered) => covered.name)
+      .filter((name) => name !== sender.name && participantNames.has(name))
+      .map((name) => publicNames.get(name) ?? "另一位住户");
     return (
       `我先按你们已确认的可用时间、偏好和使用时长，为${windowLabel}排出一版待确认方案：` +
       `${assignments}。这不是定案。` +
       (acceptedNames.length
-        ? `这轮我也在向${acceptedNames.join("、")}征求意见；收到回复后我继续协调并告诉你。`
+        ? `这轮我也在向${acceptedNames.join("、")}征求意见；` +
+          (alreadyAskedNames.length
+            ? `${alreadyAskedNames.join("、")}前面已问过，正在等回复；`
+            : "") +
+          "收到回复后我继续协调并告诉你。"
+        : alreadyAskedNames.length
+          ? `${alreadyAskedNames.join("、")}前面已问过，正在等回复；这版仍不能说成大家已经同意。`
         : "这轮没有新增征询；这版仍不能说成大家已经同意。")
     );
   };
@@ -2582,6 +2614,9 @@ export async function runColivingTurn(args: {
         .filter((message) => !message.blocked)
         .map((message) => outboundNames.get(message.personId) ?? "")
     );
+    for (const covered of recentlyCovered.values()) {
+      contactedNames.add(covered.name);
+    }
     return selected.plan.assignments
       .map((assignment) => assignment.name)
       .filter((name) => name !== senderName && !contactedNames.has(name));

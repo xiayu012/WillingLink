@@ -112,6 +112,7 @@ export async function POST(request: Request) {
           await markCommunication({
             communicationId,
             status: sent.ok ? "sent" : "failed",
+            externalMessageId: sent.ok ? sent.sids.join(",") || null : null,
             error: sent.ok ? null : (sent.error ?? "unknown"),
           });
         }

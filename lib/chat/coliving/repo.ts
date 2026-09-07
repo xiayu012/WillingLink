@@ -759,6 +759,29 @@ export async function queueCommunication(args: {
   return rows[0].id;
 }
 
+export async function findRecentOpenCommunication(args: {
+  toPersonId: string;
+  channel: string;
+  body: string;
+  withinHours?: number;
+}): Promise<{ id: string; status: string; sentAt: Date | null; createdAt: Date } | null> {
+  const rows = await db()<
+    { id: string; status: string; sentAt: Date | null; createdAt: Date }[]
+  >`
+    select id, status, sent_at as "sentAt", created_at as "createdAt"
+    from coliving.communication
+    where to_person_id = ${args.toPersonId}
+      and channel = ${args.channel}
+      and body = ${args.body}
+      and status in ('queued', 'sent')
+      and responded_at is null
+      and coalesce(sent_at, created_at) > now() - (${args.withinHours ?? 24} || ' hours')::interval
+    order by coalesce(sent_at, created_at) desc
+    limit 1
+  `;
+  return rows[0] ?? null;
+}
+
 export type BlockedComm = {
   toName: string;
   purpose: string | null;
