@@ -64,7 +64,7 @@ export function hasDeferredCoordination(text: string): boolean {
  * 保留原样，不算这里要拦的"误导性在途声称"。
  */
 const CLAIMED_CONTACT_COMPLETION_PATTERN =
-  /(?:(?:我|这边|马上|现在)?(?:正|正在|已经|这就|刚刚?|刚才|还在)(?:跟|和|给|去跟|去和|去给)?.{0,6}(?:发|说|商量|联系|问|通知|沟通|确认|谈|提|讲|劝)|(?:我|这边)[^。！？!?\n]{0,12}(?:问|联系|找|跟[^。！？!?\n]{0,6}(?:说|确认|核实|商量))[^。！？!?\n]{0,6}了)/;
+  /(?:(?:我|这边|马上|现在)?(?:正|正在|已经|这就|刚刚?|刚才|还在)(?:跟|和|给|去跟|去和|去给)?.{0,6}(?:发|说|商量|联系|问|通知|沟通|确认|谈|提|讲|劝|催|提醒|追)|(?:我|这边)[^。！？!?\n]{0,12}(?:问|联系|找|催|追|跟[^。！？!?\n]{0,6}(?:说|确认|核实|商量))[^。！？!?\n]{0,6}了)/;
 
 export function claimsContactCompletion(text: string): boolean {
   return CLAIMED_CONTACT_COMPLETION_PATTERN.test(text);
