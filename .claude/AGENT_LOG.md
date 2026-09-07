@@ -5700,3 +5700,37 @@ TS2717，无新增；`git diff --check` 干净。
 一次可能已确认的人；已确认者的防护靠 `hasDurableConfirmedSlot`，不再靠正文语气。
 若将来发现模型在征询时频繁填 act=inform 导致确认落不了库，正确修法是放宽 durable
 查询的 act 白名单，而不是回到正文按 act 分支。
+
+---
+
+## 2026-09-07 · 选定排班后由代码确定性自动联系所有参与者（Codex 监督，Claude Sonnet medium 实现）
+
+**根因（Codex 多次全量回归实测）**：模型在单轮里既要 pickSchedule → chooseSchedule →
+逐个 contactPerson → sendReply，经常漏掉一个或几个参与者；`checkUnconsultedSelectedSchedule`
+打回后重写仍漏。结论：「逐个联系到位」不能靠模型自觉——选定方案后改由**代码确定性
+补发**，不再依赖模型记得调用 contactPerson。
+
+**改动（`lib/chat/coliving/turn.ts`）**：
+1. 抽取唯一入队函数 `enqueueScheduleContact(name, windowLabel, slot)`：把 contactPerson
+   排班分支原有整套逻辑收进来——找目标人 → 自报精确时段跳过 → 已确认同一 slot 跳过
+   → 无地址跳过 → 本轮已联系跳过 → 24h 同文未回跳过 → 竞态新入站跳过 → 固定征询模板
+   （`scheduleContactTextForAct({act:"propose"})`）→ queueCommunication（act 一律
+   propose、expectsReply=true）→ appendMessage → 入 outbound（scheduleVerified:true）
+   → contacted.add。
+2. contactPerson 排班分支改为委托 `return enqueueScheduleContact(...)`，不复制第二份。
+3. 最终收口自动补发：所有审稿/重写之后、settled reply 之前，对
+   `missingSelectedScheduleParticipants()` 的每个名字按 assignment 调 enqueue；用
+   `!simpleScheduleAffirmation` 守护。这样 buildSelectedScheduleReply 看到真实出站，
+   回复如实说「在向谁征求意见」；补发也到不了的人（无地址/竞态）才保持红灯。
+
+**验证**：`coliving:quality` 46 项通过（新增 1 项「auto-funnel deterministically
+enqueues every still-missing participant」）；`tsc --noEmit` 仅既有 speech-input.tsx 两条
+TS2717，无新增；`git diff --check` 干净。新增脱敏场景
+`auto-funnel-missed-contact-2026-09-07`（三人未自报精确时段，`minAcceptedOutbound:3`）。
+
+**未完成 / 阻塞（如实）**：端到端模型级复测跑到一半时 **Vercel AI Gateway 余额耗尽**
+（GatewayInternalServerError: A positive credit balance is required…），real-kitchen、
+settle-round、auto-funnel 等场景以「执行异常」中断。故本次只离线验证，未实跑模型级
+复测。剩余观察：auto-funnel 会因「竞态新入站」闸跳过部分参与者（生产语义正确——
+对方刚发消息不该再发征询；但在 eval 回放里时间戳可能放大此跳过），待余额恢复后需
+复测并核对 eval 时间戳保真。

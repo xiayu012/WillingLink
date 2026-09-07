@@ -640,6 +640,184 @@ export async function runColivingTurn(args: {
   /** 模型显式交付的正文。调了 sendReply 就以它为准，不再猜哪段自由文本是正文。 */
   let deliveredReply: string | null = null;
 
+  /**
+   * **排班征询的唯一入队函数（contactPerson 排班分支与最终自动收口共用）。**
+   *
+   * 选定多人排班后，"逐个向每个参与者征询到位"这件必须可靠发生的事，由代码
+   * 确定性完成，不再寄托模型记得调用 contactPerson——Codex 全量回归（多模型
+   * 多轮）证明：模型在单轮里既要 pickSchedule → chooseSchedule → 逐个
+   * contactPerson → sendReply，经常漏掉一个或几个参与者；checkUnconsulted
+   * 打回后重写仍漏。把"找到目标人 → 预同意/已确认同一 slot/无地址/本轮已联系/
+   * 24h 同文未回/竞态新入站这些跳过 → 生成征询正文 → 落库入队、写进对方会话线、
+   * 收进本轮出站并标 scheduleVerified"整套逻辑收进这一个函数，两个调用方不各写
+   * 一份，杜绝逻辑漂移。
+   *
+   * 函数只负责"可靠入队"这一件事，不替大脑决定要不要发、怎么措辞：正文一律
+   * `scheduleContactTextForAct` 的征询模板（act 固定 propose、expectsReply=true
+   * ——排班征询永远在等对方回音，模型填的 act 不可靠，不能让它落成 inform）。
+   */
+  async function enqueueScheduleContact(
+    name: string,
+    windowLabel: string,
+    slot: { start: string; end: string }
+  ): Promise<
+    | { ok: true; sentTo: string; skipped: false }
+    | {
+        ok: true;
+        skipped: true;
+        preConsented?: boolean;
+        reason: string;
+        communicationId?: string;
+        sentTo?: string;
+      }
+    | { ok: false; reason: string; stale?: boolean }
+  > {
+    // enqueueScheduleContact 是提升函数声明，runColivingTurn 入口 `if (!sender)
+    // return` 的收窄不会带进函数体，TS 于是把 sender 当可空。但唯一能走到这里
+    // 的两条路（contactPerson 排班分支、最终自动收口）都在入口早退之后，sender
+    // 必非空——这里防御性断言一次，同时满足类型收窄，不引入运行时分支。
+    if (!sender) {
+      return { ok: false, reason: "内部状态错误：没有说话人" };
+    }
+    const target = await repo.findPersonByName(sender.householdId, name);
+    if (!target) {
+      return { ok: false, reason: `房子里没有叫「${name}」的人` };
+    }
+    const selfStatedEntry = selfStatedSlotsByWindow.get(windowLabel)?.get(name);
+    // slot 参数在 contactPerson 语境里就叫 scheduleSlot，别名保持一致方便对照。
+    const scheduleSlot = slot;
+    if (scheduleSlotMatchesSelfStatement(selfStatedEntry, scheduleSlot)) {
+      // 预先同意：不创建 communication、不 appendMessage、不进 outbound、不进 contacted。
+      // 门禁通过 preConsentedForSchedule 把这个人视为已授权，不再要求额外联系。
+      preConsentedForSchedule.add(target.personId);
+      return {
+        ok: true,
+        preConsented: true,
+        skipped: true,
+        reason: `${name} 在对话里已明确说出这个精确时段，原话视作许可，不再发征询`,
+      };
+    }
+    if (hasDurableConfirmedSlot(target.personId, scheduleSlot)) {
+      preConsentedForSchedule.add(target.personId);
+      return {
+        ok: true,
+        preConsented: true,
+        skipped: true,
+        reason: `${name} 之前已确认过 ${scheduleSlot.start}-${scheduleSlot.end} 这个时段，定案/通知不再重复发送`,
+      };
+    }
+    if (target.personId === sender.personId) {
+      return {
+        ok: false,
+        reason: "这是当前跟你说话的人，直接回复就行，不用另外发",
+      };
+    }
+    if (!target.address) {
+      return {
+        ok: false,
+        reason: `${target.name} 在这个渠道没有登记地址，联系不上`,
+      };
+    }
+    if (contacted.has(target.personId)) {
+      return { ok: false, reason: `本轮已经给 ${target.name} 发过了` };
+    }
+    // 正文由固定模板生成，避免模型把一次建议写成"定案"，或在自然语言里重新心算错时间。
+    const message = scheduleContactTextForAct({
+      act: "propose",
+      salutation: isGeneratedResidentName(target.name) ? "" : `${target.name}，`,
+      windowLabel,
+      scheduleSlot,
+    });
+    const purpose = `为「${windowLabel}」排班征询${target.name}`;
+    const duplicate = await repo.findRecentOpenCommunication({
+      toPersonId: target.personId,
+      channel,
+      body: message,
+    });
+    if (duplicate) {
+      recentlyCovered.set(target.personId, {
+        name: target.name,
+        communicationId: duplicate.id,
+      });
+      return {
+        ok: true,
+        skipped: true,
+        reason:
+          `近24小时已经给 ${target.name} 发过同一条，且对方还没回复；` +
+          "这次不重复发送。",
+        communicationId: duplicate.id,
+        sentTo: target.name,
+      };
+    }
+    /**
+     * **竞态门禁：上下文已过期就跳过，不冒充已联系。** 真实事故见 contactPerson
+     * 历史注释（01:51 发征询、01:53 对方已回愿意，并发旧回合又发一遍）。工具
+     * 执行时重新查目标人自 turnStartedAt 之后有无新入站；有就跳过。
+     */
+    const targetHasNewInbound = await repo.hasNewInboundSince(
+      target.personId,
+      channel,
+      turnStartedAt
+    );
+    if (targetHasNewInbound) {
+      return {
+        ok: false,
+        stale: true,
+        reason:
+          `${target.name} 在本轮开始后已经发来新消息，上下文已过期；` +
+          "这条征询跳过，不会发出，也不计入已联系——下一轮拿到最新上下文再处理。",
+      };
+    }
+    contacted.add(target.personId);
+    const did = await ensureDecision("contact_one", purpose);
+    // 模型常先说「只回复本人」，转头又来联系别人。判断记录要跟实际行为对得上。
+    await repo.upgradeDecisionKind(
+      did,
+      contacted.size > 1 ? "contact_group" : "contact_one"
+    );
+    const communicationId = await repo.queueCommunication({
+      householdId: sender.householdId,
+      decisionId: did,
+      caseId: activeCaseId,
+      toPersonId: target.personId,
+      channel,
+      purpose,
+      body: message,
+      // 排班征询永远是 propose、永远等回音：act 字段不可靠，不能让它把
+      // "在等对方确认"记成 inform 而不再盯回音（见 scheduleContactTextForAct）。
+      act: "propose",
+      expectsReply: true,
+    });
+    // 也要写进对方自己的会话线。否则下次他发消息过来，
+    // 我们看不到自己曾经对他说过什么——他却记得。
+    const theirConversation = await repo.getOrCreateConversation({
+      personId: target.personId,
+      householdId: sender.householdId,
+      channel,
+    });
+    await repo.appendMessage({
+      conversationId: theirConversation,
+      personId: target.personId,
+      direction: "outbound",
+      channel,
+      body: message,
+      communicationId,
+    });
+    outbound.push({
+      to: target.address,
+      personId: target.personId,
+      text: message,
+      communicationId,
+      sharedRule: false,
+      sharedWith: null,
+      isIntroduction: newlyAdded.has(target.personId),
+      // 结构化排班正文：审稿按 scheduleVerified 直接放行（见
+      // critiqueAndMarkOutbound），不再交给语言批判器反向误判数字。
+      scheduleVerified: true,
+    });
+    return { ok: true, sentTo: target.name, skipped: false };
+  }
+
   const tools = {
     /**
      * **最后一步调这个，把要发给对方的短信正文交出来。**
@@ -964,65 +1142,13 @@ export async function runColivingTurn(args: {
           if (!consistency.ok) {
             return { ok: false, reason: `${consistency.reason}。改成一致的时段再发，不能私自改动已选方案。` };
           }
-          // 排班数字已经由代码核对，正文也从同一结构化参数生成，避免模型
-          // 把一次建议写成”固定/天天”，或在自然语言里重新心算错时间。
-          const salutation = isGeneratedResidentName(target.name)
-            ? ""
-            : `${target.name}，`;
-          /**
-           * **自报精确时段且已选方案时段完全一致：视为预先同意，不再发任何消息。**
-           *
-           * 真实事故：住户说”我七点半开始用五分钟”，系统先正确把这个时段
-           * 排进方案，随即又发”你愿意吗”——对方的原话就是许可，不需要再问。
-           * 被调整过（算法因约束把他挪晚了）或只给宽泛范围的人仍走正常征询。
-           *
-           * 判据：pickSchedule 时模型填 saidExactSlot=true，代码存下 start+end；
-           * 这里做分钟精确比对——只有选定方案里他的 start/end 与原话完全一致
-           * 才触发，被算法移位的人不命中。
-           */
-          const selfStatedEntry = selfStatedSlotsByWindow.get(scheduleWindowLabel)?.get(name);
-          const isSelfStated = scheduleSlotMatchesSelfStatement(selfStatedEntry, scheduleSlot);
-          if (isSelfStated) {
-            // 预先同意：不创建 communication、不 appendMessage、不进 outbound、不进 contacted。
-            // 门禁通过 preConsentedForSchedule 把这个人视为已授权，不再要求额外联系。
-            preConsentedForSchedule.add(target.personId);
-            return {
-              ok: true,
-              preConsented: true,
-              skipped: true,
-              reason: `${name} 在对话里已明确说出这个精确时段，原话视作许可，不再发征询`,
-            };
-          }
-          /**
-           * **定案/通知回合不再联系「已确认该时段」的人。**
-           *
-           * 真实事故（生产日志，2026-09-06）：老孙对 17:30-18:00 回「愿意」、
-           * 系统已回「好，就定给你了」之后，03:58:45 的定案收尾回合又给他发
-           * 了一条正文仍是「你愿意吗/这不是定案」的短信。系统没有持久记录
-           * 他已经确认过，于是又去问了一遍已经点头的人。
-           *
-           * 判据只认「他确认过的那个精确 slot」：scheduleSlot 已与已选方案做过
-           * 结构化核对（字符串相等），命中即代表同一个时段他早已同意，任何 act
-           * 都不用再发。被算法挪过时段的人不命中，仍走正常征询/通知。
-           */
-          if (hasDurableConfirmedSlot(target.personId, scheduleSlot)) {
-            preConsentedForSchedule.add(target.personId);
-            return {
-              ok: true,
-              preConsented: true,
-              skipped: true,
-              reason: `${name} 之前已确认过 ${scheduleSlot.start}-${scheduleSlot.end} 这个时段，定案/通知不再重复发送`,
-            };
-          }
-          // 正文一律征询（不按 act）：定案/通知的区分由上方持久确认跳过负责，
-          // act 字段不可靠，不能让它把「就这样定了」发给还没确认的人。
-          message = scheduleContactTextForAct({
-            act,
-            salutation,
-            windowLabel: scheduleWindowLabel,
-            scheduleSlot,
-          });
-          scheduleVerified = true;
+          // 排班分支交给 enqueueScheduleContact——与最终自动收口共用同一个
+          // 入队函数，不在这里复制一份发送逻辑：找目标人、自报精确时段/已确认
+          // 同一 slot 的预同意跳过、无地址/重复/竞态闸，以及 queueCommunication
+          // + appendMessage + 入 outbound（scheduleVerified:true）全收在里面；
+          // 正文由 scheduleContactTextForAct 固定生成（act 一律 propose、永远
+          // expectsReply=true），不在这里按模型 act 分支。
+          return enqueueScheduleContact(name, scheduleWindowLabel, scheduleSlot);
         }
         if (target.personId === sender.personId) {
           return {
@@ -3534,6 +3660,43 @@ export async function runColivingTurn(args: {
       console.log(
         "[critic] 重写失败，用原稿：",
         error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+
+  // ── 选定方案后的确定性收口：漏掉的参与者由代码补发，不再靠模型记得 ────
+  // 审稿/重写全部走完，仍可能有人漏掉——模型单轮里既要 pickSchedule →
+  // chooseSchedule → 逐个 contactPerson → sendReply，常常漏掉一个或几个
+  // 参与者，打回后重写也仍漏（Codex 全量回归实测）。这里在收口回复之前，
+  // 对 missingSelectedScheduleParticipants() 返回的每个名字，按其在该方案里
+  // 的 assignment 调 enqueueScheduleContact（与 contactPerson 排班分支共用
+  // 同一入队函数）。这样 buildSelectedScheduleReply() 看到的是真实出站，
+  // 回复能如实说"在向谁征求意见"；只有补发也到不了的人（无地址/竞态/名册外）
+  // 才在下方保持红灯并如实标注，不谎称已联系。
+  // 简单肯定回合不触发收口（跟 settledScheduleReply 的 !simpleScheduleAffirmation
+  // 守护一致）：那种回合不会新选方案，即使有也不该由代码替它联系人。
+  const selectedEntry = [...selectedSchedules.entries()].at(-1);
+  if (!simpleScheduleAffirmation && selectedEntry) {
+    const [selectedWindowLabel, selection] = selectedEntry;
+    const slotByParticipant = new Map<string, { start: string; end: string }>();
+    for (const assignment of selection.plan.assignments) {
+      slotByParticipant.set(assignment.name, {
+        start: formatMinutes(assignment.startMinutes),
+        end: formatMinutes(assignment.endMinutes),
+      });
+    }
+    for (const name of missingSelectedScheduleParticipants()) {
+      const assignmentSlot = slotByParticipant.get(name);
+      if (!assignmentSlot) continue;
+      const funnelResult = await enqueueScheduleContact(
+        name,
+        selectedWindowLabel,
+        assignmentSlot
+      );
+      console.log(
+        funnelResult.ok && !funnelResult.skipped
+          ? `[schedule-funnel] 自动补发征询给 ${name}（${selectedWindowLabel} ${assignmentSlot.start}-${assignmentSlot.end}）`
+          : `[schedule-funnel] ${name} 无需补发：${funnelResult.reason}`
       );
     }
   }

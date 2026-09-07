@@ -488,6 +488,38 @@ async function main() {
     assert(src.indexOf("你用 ${scheduleSlot.start}-${scheduleSlot.end}。这不是定案") === -1,
       "contactPerson 不应再内联征询模板");
   });
+  check("selected-schedule auto-funnel deterministically enqueues every still-missing participant", () => {
+    // 治本（Codex 全量回归实测）：选定多人排班后"逐个向漏掉的人征询到位"由代码
+    // 确定性完成，不再靠模型记得逐个 contactPerson——模型单轮里既要 pickSchedule
+    // → chooseSchedule → 逐个 contactPerson → sendReply 经常漏人，打回重写仍漏。
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    // 1) 只有一个入队函数定义；contactPerson 排班分支与最终收口都委托它，不复制两份。
+    const enqueueDefs = src.match(/async function enqueueScheduleContact\(/g) ?? [];
+    assert.equal(enqueueDefs.length, 1, "enqueueScheduleContact 只能定义一次（不允许复制两份发送逻辑）");
+    assert(src.includes("return enqueueScheduleContact(name, scheduleWindowLabel, scheduleSlot);"),
+      "contactPerson 排班分支必须委托 enqueueScheduleContact");
+    assert(src.includes("const message = scheduleContactTextForAct({"),
+      "征询正文必须由固定模板 scheduleContactTextForAct 生成（不按模型 act 分支）");
+    // 2) 最终收口循环真实存在：遍历 missingSelectedScheduleParticipants() 返回值，
+    //    逐个按其在选定方案里的 assignment 调 enqueueScheduleContact。
+    const settledIdx = src.indexOf("const settledScheduleReply = buildSelectedScheduleReply()");
+    const loopStart = src.indexOf("for (const name of missingSelectedScheduleParticipants())");
+    assert(loopStart > 0, "必须存在遍历 missingSelectedScheduleParticipants 的确定性循环");
+    assert(loopStart < settledIdx,
+      `补发循环（@${loopStart}）必须早于 settled reply（@${settledIdx}），回复才能看到真实出站`);
+    const funnelBlock = src.slice(loopStart, settledIdx);
+    assert(funnelBlock.includes("await enqueueScheduleContact("),
+      "循环必须逐个调 enqueueScheduleContact");
+    assert(funnelBlock.includes("selectedWindowLabel"),
+      "循环必须把选中方案的 window label 传给入队函数");
+    assert(funnelBlock.includes("assignmentSlot"),
+      "循环必须按参与者在选定方案里的 assignment slot 调入队函数");
+    assert(funnelBlock.includes("if (!assignmentSlot) continue"),
+      "名册里没有该名字 assignment 的参与者必须安全跳过");
+    // 3) 收口循环不得自己复制发送逻辑——共用 enqueueScheduleContact 才会走全部门禁。
+    assert(!funnelBlock.includes("queueCommunication({"), "收口循环不得再直接 queueCommunication");
+    assert(!funnelBlock.includes("outbound.push({"), "收口循环不得再直接入 outbound");
+  });
   check("durable confirmation: repo exposes responded schedule inquiries, turn skips confirmed slots", () => {
     const repo = readFileSync("lib/chat/coliving/repo.ts", "utf8");
     const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");

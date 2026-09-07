@@ -1,0 +1,22 @@
+{
+  "id": "auto-funnel-missed-contact-2026-09-07",
+  "source": "合成回归（2026-09-07）：选定多人排班后，「逐一向每位参与者征询到位」改由代码确定性补发，不再靠模型记得逐个 contactPerson。Codex 全量回归（多模型多轮）实测：模型在单轮里既要 pickSchedule → chooseSchedule → 逐个 contactPerson → sendReply，经常漏掉一个或几个参与者，checkUnconsulted 打回后重写仍漏。此场景是三人（除说话人小林外还有三位住户要用傍晚灶台）的最小复现：即使模型选完方案却漏调 contactPerson 或漏掉某一位，最终出站仍必须向每一位漏掉的人发出正文为「你愿意吗/这不是定案」的征询（见 turn.ts 选定方案后的确定性收口循环）。",
+  "household": { "label": "评测-选定方案后代码确定性补发征询" },
+  "people": [
+    { "phone": "+15550009401", "name": "小林", "role": "landlord" },
+    { "phone": "+15550009402", "name": "老王", "role": "tenant" },
+    { "phone": "+15550009403", "name": "小孙", "role": "tenant" },
+    { "phone": "+15550009404", "name": "小吴", "role": "tenant" }
+  ],
+  "turns": [
+    {
+      "from": "+15550009401",
+      "text": "傍晚厨房灶台除我以外三个人的可用时间都核对过了，需求如下：老王18点后都可以，用半小时；小孙18点后都可以，18:30最合适，用40分钟；小吴19点后才到家，用半小时。我小林晚上不用厨房。请用工具排一个公平的时段方案，选定一个候选，并分别向老王、小孙、小吴发出征询，请他们确认自己分到的具体时段——这是征求意见，先不要直接定死。"
+    }
+  ],
+  "expect": {
+    "mustUseTools": ["pickSchedule", "chooseSchedule"],
+    "minAcceptedOutbound": 3,
+    "outboundMustNotMatch": ["[0-9]号住客"]
+  }
+}
