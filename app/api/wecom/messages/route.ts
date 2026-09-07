@@ -1,6 +1,6 @@
 import { after } from "next/server";
 import { adaptersEnabled, handleInboundMessage } from "@/lib/chat/adapter";
-import { markCommunication } from "@/lib/chat/coliving/repo";
+import { hasNewInboundSince, markCommunication } from "@/lib/chat/coliving/repo";
 import { runColivingTurn } from "@/lib/chat/coliving/turn";
 import {
   decryptWecom,
@@ -196,11 +196,32 @@ export async function POST(request: Request) {
 
       // 给本人的回复 + 主动发给房子里其他人的（杠杆二，得也有 wecom 地址才收得到），
       // 互不依赖，并发发出去，跟 twilio 那条路由同样的提速逻辑。
+      // 出站消息发送前做最后一次竞态检查（与 Twilio 路由保持语义一致）。
       await Promise.all([
         outcome.reply
           ? deliver(fromUser, outcome.reply, outcome.replyCommunicationId)
           : Promise.resolve(),
-        ...outcome.outbound.map((m) => deliver(m.to, m.text, m.communicationId)),
+        ...outcome.outbound.map((m) => {
+          async function deliverWithGate() {
+            if (m.personId && outcome.turnStartedAt) {
+              const hasNew = await hasNewInboundSince(m.personId, "wecom", outcome.turnStartedAt);
+              if (hasNew) {
+                if (m.communicationId) {
+                  await markCommunication({
+                    communicationId: m.communicationId,
+                    status: "skipped",
+                    externalMessageId: null,
+                    error: "上下文过期：目标人在本轮开始后有新入站，此条征询已作废",
+                  });
+                }
+                console.log("[wecom] 跳过过期出站消息，目标已有新入站，communicationId：", m.communicationId ?? m.personId);
+                return;
+              }
+            }
+            return deliver(m.to, m.text, m.communicationId);
+          }
+          return deliverWithGate();
+        }),
       ]);
 
       console.log(

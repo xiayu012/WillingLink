@@ -14,10 +14,14 @@ import {
 import {
   claimsContactCompletion,
   extractExplicitFixedStart,
+  extractSlotFromInquiry,
   hasDeferredCoordination,
   isLowInformationFollowUp,
   isOpenConflictCase,
   isPrematureCapacityEscape,
+  isScheduleSlotInquiry,
+  isSimpleAffirmation,
+  scheduleSlotMatchesSelfStatement,
 } from "../lib/chat/coliving/turn";
 
 async function main() {
@@ -259,6 +263,202 @@ async function main() {
     assert(twilioRoute.includes("externalMessageId: sent.ok ? sent.sids.join"));
     assert(deliver.includes("externalMessageId: result.sids.join"));
     assert(cronRoute.includes("externalMessageId: outcome.ok ? outcome.externalMessageId : null"));
+  });
+
+  // ── 并发竞态门禁 ────────────────────────────────────────────────────────────
+  check("stale-context gate: repo has hasNewInboundSince, turn.ts calls it before send", () => {
+    const repo = readFileSync("lib/chat/coliving/repo.ts", "utf8");
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    // repo 必须有这个函数
+    assert(repo.includes("export async function hasNewInboundSince"));
+    assert(repo.includes("m.direction = 'inbound'"));
+    assert(repo.includes("m.sent_at > ${since}"));
+    // turn.ts 必须在 contacted.add 之前调用它
+    assert(src.includes("await repo.hasNewInboundSince("));
+    assert(src.includes("turnStartedAt"));
+    assert(src.includes("stale: true"));
+    // 跳过的消息不能加进 outbound（stale gate 里没有 outbound.push）
+    const staleBlock = src.slice(
+      src.indexOf("const targetHasNewInbound"),
+      src.indexOf("contacted.add(target.personId)")
+    );
+    assert(!staleBlock.includes("outbound.push"), "stale-skipped message must not enter outbound");
+  });
+
+  // ── 自报精确时段不再征询 ────────────────────────────────────────────────────
+  check("saidExactSlot schema exists in pickSchedule people and selfStatedSlotsByWindow is tracked", () => {
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    assert(src.includes("saidExactSlot"));
+    assert(src.includes("selfStatedSlotsByWindow"));
+    // 自报时段立即 return skipped:true，不发任何消息（不用通知语气，也不用征询语气）
+    assert(src.includes("preConsented: true") && src.includes("skipped: true"), "self-stated slot must return preConsented+skipped");
+    // 预同意分支不能调用 queueCommunication
+    assert(!src.slice(0, src.indexOf("preConsented: true")).split("if (isSelfStated)").pop()?.includes("queueCommunication"),
+      "preConsented branch must not reach queueCommunication");
+    // 非自报时段仍走征询
+    assert(src.includes("你愿意吗"), "non-self-stated slot still asks for confirmation");
+  });
+  check("isSimpleAffirmation detects yes-words only, not compound messages", () => {
+    assert.equal(isSimpleAffirmation("愿意"), true);
+    assert.equal(isSimpleAffirmation("行"), true);
+    assert.equal(isSimpleAffirmation("好的"), true);
+    assert.equal(isSimpleAffirmation("可以"), true);
+    assert.equal(isSimpleAffirmation("没问题"), true);
+    assert.equal(isSimpleAffirmation("确认"), true);
+    assert.equal(isSimpleAffirmation("OK"), true);
+    // 含追问的不算纯肯定
+    assert.equal(isSimpleAffirmation("愿意，但为什么我最后用？"), false);
+    assert.equal(isSimpleAffirmation("可以，你什么时候确认？"), false);
+    assert.equal(isSimpleAffirmation("你好"), false);
+    assert.equal(isSimpleAffirmation("我有问题"), false);
+  });
+  check("isScheduleSlotInquiry recognises slot inquiry by act and body template", () => {
+    const slotInquiry = {
+      act: "propose" as const,
+      body: "小五，关于早晨厨房时段，我先提出一个待确认的安排：你用 07:15-07:25。这不是定案；你愿意吗？如果不合适直接告诉我，我会根据大家的回复继续协调。",
+    };
+    assert.equal(isScheduleSlotInquiry(slotInquiry), true);
+    assert.equal(extractSlotFromInquiry(slotInquiry.body), "07:15-07:25");
+    // inform 类型（房东联系）不算征询
+    assert.equal(isScheduleSlotInquiry({ act: "inform", body: slotInquiry.body }), false);
+    // 没有 act 不算
+    assert.equal(isScheduleSlotInquiry({ act: null, body: slotInquiry.body }), false);
+    // 普通消息不算
+    assert.equal(isScheduleSlotInquiry({ act: "propose", body: "你这边有没有时间？" }), false);
+    assert.equal(isScheduleSlotInquiry(null), false);
+  });
+  check("isScheduleSlotInquiry recognises act=ask (production act value)", () => {
+    // 生产日志实测：contactPerson 发出的征询落库为 act='ask'，不是 propose/confirm。
+    // 初版只检查 propose/confirm 导致生产场景全部漏识别；这里回归覆盖 ask。
+    const askInquiry = { act: "ask" as const, body: "你用 07:15-07:25，愿意吗？" };
+    assert.equal(isScheduleSlotInquiry(askInquiry), true);
+    assert.equal(extractSlotFromInquiry(askInquiry.body), "07:15-07:25");
+    // 非排班内容不触发（act 对，body 错）
+    assert.equal(isScheduleSlotInquiry({ act: "ask", body: "今天吃什么？" }), false);
+  });
+  check("scheduleSlotMatchesSelfStatement: exact match is preconsented, any mismatch is not", () => {
+    // 自报时段与选定时段完全相等 → 视为预先同意，不再发征询。
+    assert.equal(
+      scheduleSlotMatchesSelfStatement({ start: "07:15", end: "07:25" }, { start: "07:15", end: "07:25" }),
+      true,
+      "完全相同应返回 true"
+    );
+    // start 不同（算法把开始时间挪晚了）→ 不命中
+    assert.equal(
+      scheduleSlotMatchesSelfStatement({ start: "07:30", end: "07:40" }, { start: "07:15", end: "07:40" }),
+      false,
+      "start 不同应返回 false"
+    );
+    // end 不同（时长被改了）→ 不命中
+    assert.equal(
+      scheduleSlotMatchesSelfStatement({ start: "07:15", end: "07:25" }, { start: "07:15", end: "07:35" }),
+      false,
+      "end 不同应返回 false"
+    );
+    // 没有自报记录（undefined）→ 不命中
+    assert.equal(
+      scheduleSlotMatchesSelfStatement(undefined, { start: "07:15", end: "07:25" }),
+      false,
+      "没有自报记录应返回 false"
+    );
+  });
+  check("preconsent branch returns before queueCommunication in contactPerson source", () => {
+    // 结构断言：确保 preConsentedForSchedule.add 和 return {preConsented:true, skipped:true}
+    // 出现在 queueCommunication 之前，防止预同意分支悄悄走漏到发送流程。
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const preconsentIdx = turnSrc.indexOf("preConsentedForSchedule.add(target.personId)");
+    // Find the preConsented return block — look for "preConsented: true," which is unique to this branch
+    const returnPreconsentedIdx = turnSrc.indexOf("preConsented: true,");
+    const queueIdx = turnSrc.indexOf("queueCommunication({");
+    assert(preconsentIdx > 0, "preConsentedForSchedule.add 必须存在");
+    assert(returnPreconsentedIdx > 0, "preConsented:true return 必须存在");
+    // 预同意的 return 必须在 queueCommunication 之前（在源码里 index 更小）
+    assert(
+      returnPreconsentedIdx < queueIdx,
+      `预同意 return（@${returnPreconsentedIdx}）必须早于 queueCommunication（@${queueIdx}）`
+    );
+  });
+  check("simpleScheduleAffirmation guards all buildSelectedScheduleReply overrides", () => {
+    // 结构断言：确认三处 buildSelectedScheduleReply 覆盖都加了 !simpleScheduleAffirmation 守护。
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const scheduleReplyCalls = [...turnSrc.matchAll(/buildSelectedScheduleReply\(\)/g)];
+    // 至少 3 处调用（initial / final / settled）
+    assert(scheduleReplyCalls.length >= 3, `期望至少 3 处 buildSelectedScheduleReply() 调用，实际 ${scheduleReplyCalls.length}`);
+    // 每个调用点后紧跟的 if 条件都应含 simpleScheduleAffirmation
+    const overridePattern = /buildSelectedScheduleReply\(\)[\s\S]{0,120}simpleScheduleAffirmation/g;
+    const guarded = [...turnSrc.matchAll(overridePattern)];
+    assert(
+      guarded.length >= 3,
+      `期望至少 3 处 override 被 simpleScheduleAffirmation 守护，实际 ${guarded.length}`
+    );
+  });
+  check("productionContactPerson calls scheduleSlotMatchesSelfStatement (not inline logic)", () => {
+    // Fix 1: 生产 contactPerson 必须调用纯函数，不能复制一份内联判断。
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    assert(turnSrc.includes("scheduleSlotMatchesSelfStatement(selfStatedEntry, scheduleSlot)"),
+      "contactPerson 必须调用 scheduleSlotMatchesSelfStatement 而不是内联三条件");
+    // 内联旧写法不应出现（selfStated.start === scheduleSlot.start 直接比较）
+    assert(!turnSrc.includes("selfStatedEntry.start === scheduleSlot.start"),
+      "不应出现内联 start 比较，应改为调用 scheduleSlotMatchesSelfStatement");
+  });
+  check("simpleScheduleConfirmationText is applied last before appendMessage/queueCommunication", () => {
+    // Fix 2: 短回复确认文本必须在最终收口（入库之前）最后覆盖，防止审稿/重写路径把它改长。
+    const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    assert(turnSrc.includes("simpleScheduleConfirmationText"), "必须存在 simpleScheduleConfirmationText 变量");
+    // 使用唯一注释定位最终 override 块，以及唯一字符串定位回复 queueCommunication
+    const finalOverrideIdx = turnSrc.indexOf("最终落锤：简单肯定覆盖");
+    const replyQueueIdx = turnSrc.indexOf('"回复本人"');
+    assert(finalOverrideIdx > 0, "最终落锤注释必须存在");
+    assert(replyQueueIdx > 0, "回复本人 queueCommunication 必须存在");
+    assert(finalOverrideIdx < replyQueueIdx,
+      `最终落锤（@${finalOverrideIdx}）必须早于 queueCommunication 回复本人（@${replyQueueIdx}）`);
+  });
+  check("pendingCommunication orders expects_reply=true first to prevent notification shadowing", () => {
+    // Fix 3: 新的通知（expects_reply=false）不能遮住真正的时段征询（expects_reply=true）。
+    const repoSrc = readFileSync("lib/chat/coliving/repo.ts", "utf8");
+    assert(repoSrc.includes("(expects_reply = true) desc, sent_at desc limit 1"),
+      "pendingCommunication 必须优先 expects_reply=true 再按时间排序");
+  });
+  check("wecom route applies same pre-send race gate as twilio route", () => {
+    // Fix 4: WeCom 投递路径必须与 Twilio 语义一致，有 hasNewInboundSince 竞态门禁。
+    const wecomSrc = readFileSync("app/api/wecom/messages/route.ts", "utf8");
+    assert(wecomSrc.includes("hasNewInboundSince"), "wecom route 必须 import hasNewInboundSince");
+    assert(wecomSrc.includes("deliverWithGate"), "wecom route 必须有 deliverWithGate");
+    assert(wecomSrc.includes("outcome.turnStartedAt"), "wecom route 必须使用 turnStartedAt");
+    assert(wecomSrc.includes('status: "skipped"'), "wecom route 必须 mark skipped");
+    // 日志不得打印地址（m.to），只允许 communicationId/personId
+    assert(!wecomSrc.includes("已有新入站：\", m.to"), "wecom route 日志不能打印 m.to 地址");
+  });
+  check("route.ts applies pre-send race gate for outbound messages", () => {
+    const routeSrc = readFileSync("app/api/twilio/messages/route.ts", "utf8");
+    // 必须 import hasNewInboundSince
+    assert(routeSrc.includes("hasNewInboundSince"), "route.ts must import hasNewInboundSince");
+    // 必须有竞态门禁逻辑
+    assert(routeSrc.includes("deliverWithGate"), "route.ts must have deliverWithGate");
+    assert(routeSrc.includes("outcome.turnStartedAt"), "route.ts must use turnStartedAt");
+    assert(routeSrc.includes('status: "skipped"'), "route.ts must mark stale outbound as skipped");
+    assert(routeSrc.includes("上下文过期"), "route.ts must log the skipped reason");
+  });
+  check("getRecentTurns excludes skipped outbound from context", () => {
+    const repoSrc = readFileSync("lib/chat/coliving/repo.ts", "utf8");
+    // 查询必须 left join communication 并过滤 skipped
+    assert(repoSrc.includes("left join coliving.communication"), "getRecentTurns must join communication table");
+    assert(repoSrc.includes("c.status != 'skipped'"), "getRecentTurns must exclude skipped outbound");
+  });
+  check("stale-skipped contactPerson outbound does not count as contacted in judge trace", () => {
+    // 旧回合跳过的消息不能出现在 outbound 里；judge 不会看到"已联系"
+    const turns: JudgeTurn[] = [{
+      fromName: "小五",
+      said: "愿意",
+      reply: "好，你的 07:15-07:25 已经定下来了。",
+      outbound: [],  // 竞态门禁触发，这轮没有出站消息
+    }];
+    // judge 不应该把 outbound 为空本身当成问题：
+    // 没有 findings → verified=true, pass=true（"没发现问题"是一个正当的合格结论）
+    const r = finalizeJudgment([], turns);
+    assert.equal(r.verified, true);
+    assert.equal(r.pass, true);
+    assert.deepEqual(r.findings, []);
   });
   const previous = process.env.COLIVING_JUDGE_OFF;
   process.env.COLIVING_JUDGE_OFF = "1";

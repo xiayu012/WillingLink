@@ -5575,3 +5575,54 @@ Sonnet、medium。第一次长时间无输出后为节省额度主动中断；�
 - `git diff --check` 通过。`tsc --noEmit` 仍只有既有
   `components/ai-elements/speech-input.tsx:55-56` 两条声明冲突；本次无新增。
 - 未调用 Twilio，所有写入均为 `is_test=true` 隔离测试屋；真人数据仅只读复盘。
+
+---
+
+## 2026-09-06 · 根治排班短信过期并发与啰嗦（Codex 二轮审查，Claude Sonnet 实现）
+
+**根因（生产日志）**：01:51:27 发出征询 → 01:53:46 住户回"愿意" → 01:53:54 并发旧回合仍调 contactPerson → 01:53:59 又发"你愿意吗"。此外，住户自报精确时段后系统仍发征询；"愿意"答复收到整张排班表。
+
+**实现（两轮，Codex 独立验收）**：
+1. 竞态门禁（工具执行时）：contactPerson.execute() 调 repo.hasNewInboundSince；有新入站返回 {ok:false,stale:true}，不进 outbound。
+2. 竞态门禁（投递前）：TurnOutcome 新增 turnStartedAt:Date；route.ts deliverWithGate() 在 sendSms 前再查；有新入站则 markCommunication({status:'skipped'}) 并跳过。
+3. 排除 skipped 出站：getRecentTurns SQL LEFT JOIN communication 过滤 status='skipped'，不污染历史上下文。
+4. 自报精确时段预同意：selfStatedSlotsByWindow 改存 {start,end}；contactPerson 做 HH:MM 完全一致比对，一致则 preConsentedForSchedule.add 并返回 skipped:true，不发任何消息。
+5. 预同意门禁豁免：missingSelectedScheduleParticipants() 把 preConsentedForSchedule 成员加进 contactedNames。
+6. 落锤短回复：stripMarkdown 之后加代码覆盖；isSimpleAffirmation && isScheduleSlotInquiry 同时成立时替换为短确认句。
+7. isScheduleSlotInquiry 接受 act='ask'（生产实际值）。
+8. 行为级测试：quality-inspect 26→35 项全通过；tsc 仅 speech-input.tsx 既有两条 TS2717，无新增。
+
+**坑**：Edit 工具插入代码混入 U+201C/U+201D 中文弯引号，tsc 报 Unexpected "；重写整块改为纯 ASCII。
+
+**遗留风险**：两层门禁间仍有毫秒级窗口，无分布式锁无法完全消除，已是可接受范围。
+
+---
+
+## 2026-09-06 Codex 第三轮审查返工
+1. scheduleSlotMatchesSelfStatement：生产 contactPerson 改为调用纯函数，消除内联逻辑漂移。
+2. simpleScheduleConfirmationText：保存短回复文本，在所有审稿/重写/settled 之后、appendMessage 之前最终覆盖，同时设 replyReview 为通过。
+3. pendingCommunication 改为 (expects_reply=true) desc, sent_at desc，防止通知遮住真正等回复的征询。
+4. WeCom 路由补 hasNewInboundSince 竞态门禁，与 Twilio 语义对齐，日志不打手机号。
+41 offline checks pass, tsc clean, git diff --check clean.
+---
+
+## 2026-09-06 Codex 最终验收：新增 eval 场景并实跑
+
+新增两个脱敏 coliving eval 场景（实际调用生产默认模型）：
+
+**preconsent-exact-slot-2026-09-06**
+- 三人早晨厨房，小五自报精确时段（07:30-07:35），老王给宽泛范围。
+- 结构性断言：mustUseTools=[pickSchedule,chooseSchedule,contactPerson]；minAcceptedOutbound:1；outboundMustNotMatch:[^小五[，,]]
+- 实跑结论：结构性 1/1 通过，outboundMustNotMatch 未触发（小五未收到任何征询消息）。
+  语义验收：judge 尝试 flag "小五未被明确征询" 但 citation 找不到原文，自动丢弃——被丢弃的 finding 不计入门禁，judge 整体标为 unverified。这是 judge citation 机制的已知局限，不是功能回归。
+
+**affirmation-short-reply-2026-09-06**
+- Turn1 coordinator 设置厨房时段，Turn2 被征询的老王回"愿意"。
+- 断言：replyMustMatch:[^好[，。]]；replyMustNotMatch:[还在问|小五|整个]；mustNotUseTools:[pickSchedule,chooseSchedule]
+- 实跑结论：结构性 1/1 通过；语义验收通过；总门禁 1/1 通过。短落锤路径确认有效。
+
+同步修正：missingSelectedScheduleParticipants() 新增对 selfStatedSlotsByWindow 的直接检查——当模型
+合理地跳过调用 contactPerson（因为 coordinator 说了不用问），通过 formatMinutes(startMinutes)/
+formatMinutes(endMinutes) 与 selfStatedSlotsByWindow 比对，同样豁免 gate，不再触发"未征询"。
+
+41 offline quality checks pass. tsc clean.

@@ -57,7 +57,7 @@ export async function buildContext(
   channel = "sms",
   opts: {
     justJoined?: boolean;
-    answering?: { purpose: string | null; body: string; sentAt: Date } | null;
+    answering?: { purpose: string | null; body: string; sentAt: Date; act?: string | null } | null;
   } = {}
 ): Promise<ColivingContext> {
   const [

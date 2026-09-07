@@ -295,19 +295,45 @@ export async function appendMessage(args: {
 export async function pendingCommunication(
   personId: string,
   withinHours = 72
-): Promise<{ purpose: string | null; body: string; sentAt: Date } | null> {
+): Promise<{ purpose: string | null; body: string; sentAt: Date; act: string | null } | null> {
   const rows = await db()<
-    { purpose: string | null; body: string; sentAt: Date }[]
+    { purpose: string | null; body: string; sentAt: Date; act: string | null }[]
   >`
-    select purpose, body, sent_at as "sentAt"
+    select purpose, body, sent_at as "sentAt", act
     from coliving.communication
     where to_person_id = ${personId}
       and status = 'sent'
       and responded_at is null
       and sent_at > now() - (${withinHours} || ' hours')::interval
-    order by sent_at desc limit 1
+    order by (expects_reply = true) desc, sent_at desc limit 1
   `;
   return rows[0] ?? null;
+}
+
+/**
+ * 竞态门禁：检查某人在指定时刻之后是否发来了新的入站消息。
+ *
+ * 用途：`contactPerson` 执行时，如果目标住户在本轮上下文构建之后已经
+ * 发来新消息，说明上下文已经过期——继续按旧上下文发出的征询会形成
+ * 并发重复，甚至在对方已经表态后再发一遍"你愿意吗"。发现有新消息就跳过，
+ * 等下一轮拿到最新上下文再处理。
+ */
+export async function hasNewInboundSince(
+  personId: string,
+  channel: string,
+  since: Date
+): Promise<boolean> {
+  const rows = await db()<{ exists: boolean }[]>`
+    select exists(
+      select 1 from coliving.message m
+      join coliving.conversation c on c.id = m.conversation_id
+      where c.person_id = ${personId}
+        and c.channel = ${channel}
+        and m.direction = 'inbound'
+        and m.sent_at > ${since}
+    ) as exists
+  `;
+  return rows[0]?.exists ?? false;
 }
 
 /** 最近几轮对话，按时间正序返回，喂给模型当 history */
@@ -319,10 +345,14 @@ export async function getRecentTurns(
     { direction: "inbound" | "outbound"; body: string }[]
   >`
     select direction, body from (
-      select direction, body, sent_at
-      from coliving.message
-      where conversation_id = ${conversationId}
-      order by sent_at desc
+      select m.direction, m.body, m.sent_at
+      from coliving.message m
+      left join coliving.communication c on c.id = m.communication_id
+      where m.conversation_id = ${conversationId}
+        -- 跳过被竞态门禁标记为过期的出站消息，避免模型把已作废的征询
+        -- 当作"已成功联系"的事实带入下一轮上下文。
+        and (m.direction = 'inbound' or c.id is null or c.status != 'skipped')
+      order by m.sent_at desc
       limit ${limit}
     ) t order by sent_at asc
   `;

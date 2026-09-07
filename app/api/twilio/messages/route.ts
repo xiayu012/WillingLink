@@ -5,7 +5,7 @@ import {
   jsonWithCors,
   toErrorResponse,
 } from "@/lib/chat/adapter";
-import { markCommunication } from "@/lib/chat/coliving/repo";
+import { markCommunication, hasNewInboundSince } from "@/lib/chat/coliving/repo";
 import { runShadowTurn, shadowEnabled } from "@/lib/chat/coliving/shadow";
 import { runColivingTurn } from "@/lib/chat/coliving/turn";
 import { emptyTwiml, sendSms, verifyTwilioSignature } from "@/lib/chat/twilio";
@@ -129,9 +129,29 @@ export async function POST(request: Request) {
         outcome.reply
           ? deliver(from, outcome.reply, outcome.replyCommunicationId)
           : Promise.resolve(),
-        ...outcome.outbound.map((msg) =>
-          deliver(msg.to, msg.text, msg.communicationId)
-        ),
+        ...outcome.outbound.map((msg) => {
+          // 竞态门禁：如果目标人在本轮开始后发来了新消息，上下文已过期，
+          // 跳过此条出站消息而非发出。避免在对方已表态后再发一遍"你愿意吗"。
+          async function deliverWithGate() {
+            if (msg.personId && outcome.turnStartedAt) {
+              const hasNew = await hasNewInboundSince(msg.personId, "sms", outcome.turnStartedAt);
+              if (hasNew) {
+                if (msg.communicationId) {
+                  await markCommunication({
+                    communicationId: msg.communicationId,
+                    status: "skipped",
+                    externalMessageId: null,
+                    error: "上下文过期：目标人在本轮开始后有新入站，此条征询已作废",
+                  });
+                }
+                console.log("[twilio] 跳过过期出站消息，目标已有新入站，communicationId：", msg.communicationId ?? msg.personId);
+                return;
+              }
+            }
+            return deliver(msg.to, msg.text, msg.communicationId);
+          }
+          return deliverWithGate();
+        }),
       ]);
 
       console.log(

@@ -100,6 +100,65 @@ function isGeneratedResidentName(name: string): boolean {
   return /^\d+号住客$/.test(name.trim());
 }
 
+/**
+ * 住户回复"愿意/行/没问题"这类简短肯定——只落锤，不需要复述全案。
+ *
+ * 要求：整条消息就是表示同意，不含新的诉求或质疑。用于检测"这条消息
+ * 等价于「我同意」"，避免误伤"我同意，但你能解释一下为什么我最后用？"
+ * 这类含追问的回复（那类仍该走完整的模型处理流程）。
+ */
+export function isSimpleAffirmation(text: string): boolean {
+  return /^(?:愿意|行|好的?|可以|没问题|同意|确认|OK|ok|好啊|妥|妥了|行的?|没有问题|可以的?)[!！。.，,\s]*$/i.test(
+    text.trim()
+  );
+}
+
+/**
+ * 这条消息是不是在回答系统发给他的一条排班时段征询。
+ * 判据：pending communication 的 act 是 ask/propose/confirm（生产实测 act=ask），
+ * 且 body 包含系统生成的排班征询模板特征（"你用 HH:MM-HH:MM"）。
+ *
+ * 真实生产日志：`contactPerson` 发出的时段征询 act 字段落库为 `ask`（不是 propose/confirm）。
+ * 初版只检查 propose/confirm，导致生产场景全部漏识别。
+ */
+export function isScheduleSlotInquiry(answering: {
+  act?: string | null;
+  body: string;
+} | null): boolean {
+  if (!answering) return false;
+  const act = answering.act;
+  if (act !== "ask" && act !== "propose" && act !== "confirm") return false;
+  return /你用\s*\d{2}:\d{2}-\d{2}:\d{2}/.test(answering.body);
+}
+
+/**
+ * 从征询消息体里提取时段字符串（如 "07:30-07:35"）。
+ */
+export function extractSlotFromInquiry(body: string): string | null {
+  const m = body.match(/你用\s*(\d{2}:\d{2}-\d{2}:\d{2})/);
+  return m?.[1] ?? null;
+}
+
+/**
+ * 纯函数：判断选定方案时段与住户自报精确时段是否完全吻合。
+ *
+ * selfStated 来自 selfStatedSlotsByWindow（pickSchedule 时由 saidExactSlot=true 存入）；
+ * selectedSlot 来自 contactPerson 调用时传入的 scheduleSlot。
+ * 只有 start 和 end 同时相等才视为预先同意；任一不符说明算法已挪位，仍需征询。
+ *
+ * 提取为纯函数仅为可测试性——实际比对逻辑与 contactPerson 内部的 isSelfStated 完全一致。
+ */
+export function scheduleSlotMatchesSelfStatement(
+  selfStated: { start: string; end: string } | undefined,
+  selectedSlot: { start: string; end: string }
+): boolean {
+  return (
+    selfStated !== undefined &&
+    selfStated.start === selectedSlot.start &&
+    selfStated.end === selectedSlot.end
+  );
+}
+
 export function extractExplicitFixedStart(statement: string): number | null {
   // “没有要求必须18点开始”“不是固定在18点”是在明确否定固定开始。
   // 先吃掉否定，否则下面只截到后半句“必须18点”，会把相反事实当硬约束。
@@ -289,6 +348,12 @@ export type TurnOutcome = {
    * 实测：缓存读比普通输入便宜 9.7 倍，缓存写贵 25%。
    */
   usage: TurnUsage;
+  /**
+   * 本轮开始的时刻。路由层用它做竞态门禁：
+   * 如果出站消息的目标人在这个时刻之后有新的入站，说明上下文已过期，
+   * 对应的消息应跳过而非发出。
+   */
+  turnStartedAt: Date;
 };
 
 /**
@@ -353,6 +418,7 @@ export async function runColivingTurn(args: {
         outputTokens: 0,
         costUsd: 0,
       },
+      turnStartedAt,
     };
   }
 
@@ -443,7 +509,19 @@ export async function runColivingTurn(args: {
    * 这一步：选完之后所有消息只认这一个方案，不再各自去猜。
    */
   const selectedSchedules = new Map<string, ScheduleSelection>();
-  /** 只在本轮 pickSchedule 明确返回无候选时成立；口头说“排不开”不算证据。 */
+  /**
+   * 按窗口名 → 人名，存自报精确时段的 start/end（HH:MM）。
+   * 只有 selectedSchedule 里该人的 start/end 与这里完全相等，才视为预先同意。
+   * 算法因约束挪位后时段不同，不命中，仍走正常征询。
+   */
+  const selfStatedSlotsByWindow = new Map<string, Map<string, { start: string; end: string }>>();
+  /**
+   * 本轮已确认为”预先同意”的人（自报时段与选定完全一致）。
+   * `checkUnconsultedSelectedSchedule` 用它把这些人视为已征询，
+   * 不强迫模型再发一遍消息。对发起人的汇报不得谎称”已联系”这些人。
+   */
+  const preConsentedForSchedule = new Set<string>();
+  /** 只在本轮 pickSchedule 明确返回无候选时成立；口头说”排不开”不算证据。 */
   let scheduleProvenInfeasible = false;
   /**
    * 这一轮里新加进来、这轮之前压根不存在的人。**批判器的四种角色
@@ -804,10 +882,34 @@ export async function runColivingTurn(args: {
             return { ok: false, reason: `${consistency.reason}。改成一致的时段再发，不能私自改动已选方案。` };
           }
           // 排班数字已经由代码核对，正文也从同一结构化参数生成，避免模型
-          // 把一次建议写成“固定/天天”，或在自然语言里重新心算错时间。
+          // 把一次建议写成”固定/天天”，或在自然语言里重新心算错时间。
           const salutation = isGeneratedResidentName(target.name)
             ? ""
             : `${target.name}，`;
+          /**
+           * **自报精确时段且已选方案时段完全一致：视为预先同意，不再发任何消息。**
+           *
+           * 真实事故：住户说”我七点半开始用五分钟”，系统先正确把这个时段
+           * 排进方案，随即又发”你愿意吗”——对方的原话就是许可，不需要再问。
+           * 被调整过（算法因约束把他挪晚了）或只给宽泛范围的人仍走正常征询。
+           *
+           * 判据：pickSchedule 时模型填 saidExactSlot=true，代码存下 start+end；
+           * 这里做分钟精确比对——只有选定方案里他的 start/end 与原话完全一致
+           * 才触发，被算法移位的人不命中。
+           */
+          const selfStatedEntry = selfStatedSlotsByWindow.get(scheduleWindowLabel)?.get(name);
+          const isSelfStated = scheduleSlotMatchesSelfStatement(selfStatedEntry, scheduleSlot);
+          if (isSelfStated) {
+            // 预先同意：不创建 communication、不 appendMessage、不进 outbound、不进 contacted。
+            // 门禁通过 preConsentedForSchedule 把这个人视为已授权，不再要求额外联系。
+            preConsentedForSchedule.add(target.personId);
+            return {
+              ok: true,
+              preConsented: true,
+              skipped: true,
+              reason: `${name} 在对话里已明确说出这个精确时段，原话视作许可，不再发征询`,
+            };
+          }
           message =
             `${salutation}关于${scheduleWindowLabel}，我先提出一个待确认的安排：` +
             `你用 ${scheduleSlot.start}-${scheduleSlot.end}。这不是定案；你愿意吗？` +
@@ -847,6 +949,36 @@ export async function runColivingTurn(args: {
               "这次不重复发送。",
             communicationId: duplicate.id,
             sentTo: target.name,
+          };
+        }
+        /**
+         * **竞态门禁：上下文已过期就跳过，不冒充已联系。**
+         *
+         * 真实事故（生产日志，2026-09-06）：01:51:27 发出征询，01:53:46 对方
+         * 已回复"愿意"，系统随即正确落锤——但另一个较早开始的并发回合上下文
+         * 在 01:53:54 才执行 contactPerson，01:53:59 又发出同一个"你愿意吗"。
+         * 旧回合的 decision 在 01:53:51 落库，rationale 还称对方"尚未表态"，
+         * 说明模型思考期间库里已有新入站，但 contactPerson 按旧上下文继续执行。
+         *
+         * 修法：工具执行时重新查目标人自 turnStartedAt 之后有无新入站；有就跳过。
+         * 不标 ok:false（那样模型会以为失败，可能换措辞重试）；也不加进 outbound
+         * （不能让后续检查把"已跳过"当成"已联系"）——直接返回 ok:false 并说清
+         * 原因，让模型知道这条不需要重发、状态没有改变。
+         *
+         * 设计通用：不针对厨房或排班，任何 contactPerson 在目标有新消息时都跳过。
+         */
+        const targetHasNewInbound = await repo.hasNewInboundSince(
+          target.personId,
+          channel,
+          turnStartedAt
+        );
+        if (targetHasNewInbound) {
+          return {
+            ok: false,
+            stale: true,
+            reason:
+              `${target.name} 在本轮开始后已经发来新消息，上下文已过期；` +
+              "这条征询跳过，不会发出，也不计入已联系——下一轮拿到最新上下文再处理。",
           };
         }
         contacted.add(target.personId);
@@ -1064,6 +1196,16 @@ export async function runColivingTurn(args: {
                   "最晚能开始的 HH:MM，用于明确的最晚界限（例如明确拒绝20点后" +
                     "才开始）；与 earliestStart 相同才表示只能此刻开始。"
                 ),
+              saidExactSlot: z
+                .boolean()
+                .optional()
+                .describe(
+                  "true=这个人在对话里明确说出了精确的开始时间和使用时长（如" +
+                    "「我七点半用五分钟」），且此处填入的 earliestStart/latestStart" +
+                    " 和 durationMinutes 与原话完全一致。填 true 后，若选定方案里" +
+                    "他的时段与原话一致，就不再发征询，把原话视作许可。" +
+                    "只给宽泛时间范围（「我下午都行」）或被系统调整过的，不填或填 false。"
+                ),
             })
           )
           .min(2)
@@ -1140,6 +1282,23 @@ export async function runColivingTurn(args: {
          * （candidates 只是给它核对用，不是选择题选项），但要能覆盖到
          * 真正的最优解，5 个比 3 个更稳，穷举本身几毫秒级，不心疼这点算力。
          */
+        // 记下哪些人自报了精确时段及具体 start/end，供后续 contactPerson 做精确比对。
+        // 只有选定方案里该人的 start/end 与此处完全一致，才视为预先同意并跳过征询。
+        const selfStatedMap = new Map<string, { start: string; end: string }>();
+        for (const p of people) {
+          if (p.saidExactSlot && p.earliestStart && p.latestStart === p.earliestStart) {
+            // 这里存的是模型填的原始 start，end 由 start+duration 推算。
+            // 格式化为 HH:MM 与 contactPerson 里的 scheduleSlot.start/end 比对。
+            const startMin = toMinutes(p.earliestStart);
+            const endMin = startMin + p.durationMinutes;
+            const fmt = (m: number) => formatMinutes(m);
+            selfStatedMap.set(p.name, { start: fmt(startMin), end: fmt(endMin) });
+          }
+        }
+        if (selfStatedMap.size > 0) {
+          selfStatedSlotsByWindow.set(windowLabel, selfStatedMap);
+        }
+
         const plans = bestSchedulePlans(windowStartMinutes, constraints, 5);
         if (plans.length === 0) {
           scheduleProvenInfeasible = true;
@@ -2168,6 +2327,32 @@ export async function runColivingTurn(args: {
   let reply = stripMarkdown(raw.trim());
 
   /**
+   * **落锤短回复：简单肯定 + 排班征询 → 代码直接覆盖，不让模型复述全屋方案。**
+   *
+   * 真实事故（生产日志，2026-09-06）：住户回"愿意"，系统给完整排班表 +
+   * "还在问别人"——doctrine 已有条款但模型这条没有执行。这里用代码钉死：
+   * 只要检测到用户在回答一个排班征询且是简单肯定，就用短确认代替模型输出。
+   *
+   * simpleScheduleAffirmation 状态让后续的 buildSelectedScheduleReply() 跳过覆盖——
+   * 三处调用（initialScheduleReply / finalScheduleReply / settledScheduleReply）
+   * 都检查这个标志，防止整张排班表重新覆盖这里设好的短回复。
+   */
+  let simpleScheduleAffirmation = false;
+  let simpleScheduleConfirmationText = "";
+  const answeringCtx = answering ?? null;
+  if (
+    isSimpleAffirmation(args.text) &&
+    isScheduleSlotInquiry(answeringCtx)
+  ) {
+    const slot = answeringCtx ? extractSlotFromInquiry(answeringCtx.body) : null;
+    simpleScheduleConfirmationText = slot
+      ? `好，${slot} 就定给你了。`
+      : `好，时段定了，按这个来。`;
+    reply = simpleScheduleConfirmationText;
+    simpleScheduleAffirmation = true;
+  }
+
+  /**
    * **代码强制，不再是提示词劝说**：这一轮新加进来的人，
    * 只要还没被联系过，这里就再补一步，强制调 contactPerson。
    *
@@ -2530,7 +2715,7 @@ export async function runColivingTurn(args: {
   };
   let scheduleReplyGenerated = false;
   const initialScheduleReply = buildSelectedScheduleReply();
-  if (initialScheduleReply) {
+  if (initialScheduleReply && !simpleScheduleAffirmation) {
     scheduleReplyGenerated = true;
     reply = initialScheduleReply;
   }
@@ -2616,6 +2801,31 @@ export async function runColivingTurn(args: {
     );
     for (const covered of recentlyCovered.values()) {
       contactedNames.add(covered.name);
+    }
+    // Pre-consented via contactPerson call returning {preConsented:true}.
+    for (const personId of preConsentedForSchedule) {
+      const name = outboundNames.get(personId);
+      if (name) contactedNames.add(name);
+    }
+    // Pre-consented directly via selfStatedSlotsByWindow: if a participant's selected
+    // assignment exactly matches what they self-stated, they authorized their slot via
+    // their own words — the model may legitimately skip calling contactPerson for them,
+    // but the gate must still treat them as handled (not "missing").
+    const selectedWindowLabel = [...selectedSchedules.entries()].at(-1)?.[0];
+    if (selectedWindowLabel) {
+      const slotMap = selfStatedSlotsByWindow.get(selectedWindowLabel);
+      if (slotMap) {
+        for (const assignment of selected.plan.assignments) {
+          const selfStated = slotMap.get(assignment.name);
+          const assignmentSlot = {
+            start: formatMinutes(assignment.startMinutes),
+            end: formatMinutes(assignment.endMinutes),
+          };
+          if (scheduleSlotMatchesSelfStatement(selfStated, assignmentSlot)) {
+            contactedNames.add(assignment.name);
+          }
+        }
+      }
     }
     return selected.plan.assignments
       .map((assignment) => assignment.name)
@@ -3154,7 +3364,7 @@ export async function runColivingTurn(args: {
             await critiqueAndMarkOutbound(finalNewOutbound);
           }
           const finalScheduleReply = buildSelectedScheduleReply();
-          if (finalScheduleReply) {
+          if (finalScheduleReply && !simpleScheduleAffirmation) {
             reply = finalScheduleReply;
           }
         } catch (finalError) {
@@ -3212,12 +3422,20 @@ export async function runColivingTurn(args: {
   // 把超时前的“以后再排”旧稿发出去。只要方案已经选定，最终交付一律以
   // 代码生成的方案事实为准，模型是否顺利结束不能改变这个结果。
   const settledScheduleReply = buildSelectedScheduleReply();
-  if (settledScheduleReply) {
+  if (settledScheduleReply && !simpleScheduleAffirmation) {
     reply = settledScheduleReply;
     const unconsultedSchedule = checkUnconsultedSelectedSchedule();
     replyReview = unconsultedSchedule
       ? { verified: true, pass: false, ...unconsultedSchedule }
       : { verified: true, pass: true, broke: "", why: "" };
+  }
+
+  // **最终落锤：简单肯定覆盖，所有审稿/重写路径之后、入库之前最后执行一次。**
+  // 批判/重写路径可能把短句替换成整张方案——在这里用确定性文本收口，
+  // 保证入库和投递的是经过代码控制的短句，而非模型重写结果。
+  if (simpleScheduleAffirmation && simpleScheduleConfirmationText) {
+    reply = simpleScheduleConfirmationText;
+    replyReview = { verified: true, pass: true, broke: "", why: "" };
   }
 
   // ── 落库：入站消息、回复本身也算一次 communication ──
@@ -3278,5 +3496,6 @@ export async function runColivingTurn(args: {
     toolsUsed,
     unknownSender: false,
     usage: sumUsage(result.steps),
+    turnStartedAt,
   };
 }
