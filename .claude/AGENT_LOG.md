@@ -5703,6 +5703,28 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · 测试成本纪律（老板纠偏：不能每轮烧全量模型评测）
+
+**触发**：老板指出 Vercel gateway 太贵，我在排查时反复跑全量 `coliving-eval`
+（含语义 judge、甚至把被测大脑临时切成 sonnet），把 gateway 余额烧光了。这是
+工作方式错误，不是技术障碍——项目里早有 `docs/coliving-parallel-testing-plan.md`
+写了正确分层：**代码能判的绝不用模型判、按需跑不是每次改动都跑**。
+
+**定下的纪律（写入 `AGENTS.md`，长期有效）**：
+1. 每次改动默认只跑免费闸：`coliving:quality`（46 项离线确定性检查，不调 LLM）
+   + `tsc --noEmit` + `git diff --check`。
+2. 模型级 `coliving-eval` 只在必要时跑，且尽量省：`--scenario <id>` 只跑受影响
+   场景；`--judge-off` 跳过最贵的语义 judge；被测大脑保持生产默认
+   `deepseek-v4-flash`，不为“更聪明”切 sonnet。
+3. 全量（含 judge）只用于发布前或老板明确要求，跑完记录结果，不重复跑同一批。
+4. 语料只增不减，但“用例数”与“每次要跑的规模”解耦：结构层先拦、语义层按需抽样。
+
+**教训**：`coliving:quality` 的 base 路径是纯函数断言（finalizeJudgment + 字符串
+断言），不产生模型调用；真正烧钱的是 `coliving-eval` 的 judge（sonnet-4.5）和把
+被测大脑切到 sonnet。以后验收默认停在免费闸，模型级评测只做增量、定向、判分分层。
+
+---
+
 ## 2026-09-07 · 选定排班后由代码确定性自动联系所有参与者（Codex 监督，Claude Sonnet medium 实现）
 
 **根因（Codex 多次全量回归实测）**：模型在单轮里既要 pickSchedule → chooseSchedule →
