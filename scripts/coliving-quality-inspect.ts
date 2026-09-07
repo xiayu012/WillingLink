@@ -32,6 +32,35 @@ import {
   hasSafetySensitiveTopic,
 } from "../lib/chat/coliving/critic";
 
+const TOOL_DECL_NAMES = [
+  "sendReply", "decide", "logEvent", "contactPerson", "proposeRule",
+  "recordStance", "notePartyAffected", "pickSchedule", "chooseSchedule",
+  "recordShare", "scheduleReminder", "recordPosition", "addResident",
+  "confirmRoster", "renamePerson", "remember", "closeCase", "noteObservation",
+  "recall", "lookupHistory", "findSimilarCases", "checkEnvironment",
+];
+
+/** 统计每个工具"声明区"（xxx: tool({ … execute: async 前）里字符串字面量的总字符。
+ *  含 schema 的 .describe()/description 及 enum 常量值；不含 execute 实现。
+ *  作为"工具描述膨胀会直接烧每步 token"的源码级护栏。 */
+function toolDeclarationLiteralChars(src: string, toolNames: string[]): number {
+  let total = 0;
+  for (const name of toolNames) {
+    const startRe = new RegExp(`\\n\\s{4}${name}: tool\\({`);
+    const startIdx = src.search(startRe);
+    if (startIdx < 0) continue;
+    const execIdx = src.indexOf("execute: async", startIdx);
+    const block = src.slice(startIdx, execIdx);
+    const re = /"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(block)) !== null) {
+      const raw = (m[1] ?? m[2] ?? "").replace(/\\(["'\\])/g, "$1");
+      total += raw.replace(/\$\{[^}]*\}/g, "").length;
+    }
+  }
+  return total;
+}
+
 async function main() {
   let count = 0;
   const check = (name: string, fn: () => void) => { fn(); count++; console.log(`PASS ${name}`); };
@@ -613,6 +642,38 @@ async function main() {
     const turnSrc = readFileSync("lib/chat/coliving/turn.ts", "utf8");
     assert(turnSrc.includes("repo.recentOutbound(sender.householdId, 24)"),
       "批判器必须继续用显式 24 条窗口（不能回退成默认 6 而丢审稿事实）");
+  });
+  check("查询类工具不再无条件进入 activeTools；只有环境/历史信号才暴露", () => {
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const start = src.indexOf("const activeTools");
+    const firstCond = src.indexOf("if (ctx.openCaseIds.length > 0)", start);
+    assert(start > 0 && firstCond > start, "activeTools 初始集必须可定位");
+    const init = src.slice(start, firstCond);
+    for (const t of ["noteObservation", "recall", "lookupHistory", "findSimilarCases", "checkEnvironment"]) {
+      assert(!init.includes(`tools.${t}`), `${t} 不得无条件进入 activeTools 初始集`);
+    }
+    for (const t of ["decide", "sendReply", "logEvent", "contactPerson", "remember", "addResident"]) {
+      assert(init.includes(`tools.${t}`), `${t} 必须保留在常驻初始集`);
+    }
+    // 按需暴露的信号必须真实存在并驱动 activeTools 的条件赋值
+    assert(src.includes("const environmentSignal ="), "环境信号判定必须存在");
+    assert(src.includes("const historySignal ="), "历史/反复信号判定必须存在");
+    assert(src.includes("activeTools.noteObservation = tools.noteObservation;"), "环境信号命中才暴露 noteObservation");
+    assert(src.includes("activeTools.checkEnvironment = tools.checkEnvironment;"), "环境信号命中才暴露 checkEnvironment");
+    assert(src.includes("activeTools.recall = tools.recall;"), "历史信号命中才暴露 recall");
+    assert(src.includes("activeTools.lookupHistory = tools.lookupHistory;"), "历史信号命中才暴露 lookupHistory");
+    assert(src.includes("activeTools.findSimilarCases = tools.findSimilarCases;"), "历史信号命中才暴露 findSimilarCases");
+  });
+  check("工具描述声明区字面量被压缩且不回弹", () => {
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    const literals = toolDeclarationLiteralChars(src, TOOL_DECL_NAMES);
+    // 瘦身前 ~7294；压缩后 ~5500。上限取 6000，锁住"又写长了"的回弹，又不卡死合理微调。
+    assert(literals < 6000, `工具声明区字面量 ${literals} 超过护栏 6000，疑似描述又膨胀`);
+  });
+  check("运行时上下文不再预先宣传默认未暴露的查询工具", () => {
+    const ctx = readFileSync("lib/chat/coliving/context.ts", "utf8");
+    assert(!ctx.includes("你还能查什么"), "查询工具默认不暴露后，上下文不应再宣传它们");
+    assert(ctx.includes("你可以主动联系这屋里的其他人"), "主动联系人的硬事实要保留");
   });
   check("stale-skipped contactPerson outbound does not count as contacted in judge trace", () => {
     // 旧回合跳过的消息不能出现在 outbound 里；judge 不会看到"已联系"

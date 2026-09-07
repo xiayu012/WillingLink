@@ -1196,9 +1196,8 @@ export async function runColivingTurn(args: {
      */
     sendReply: tool({
       description:
-        "把要回给当前这个人的短信正文交出来。**这是本轮最后一步**，" +
-        "调完就结束。只放真正要发出去的话，不要放你的思考过程、" +
-        "不要放给别人的那条（那个用 contactPerson）。",
+        "本轮最后一步：把要回给当前这个人的短信正文交出来，调完就结束。" +
+        "只放真正要发的话，不放思考过程或给别人的那条（那个用 contactPerson）。",
       inputSchema: z.object({
         text: z
           .string()
@@ -1244,11 +1243,9 @@ export async function runColivingTurn(args: {
 
     decide: tool({
       description:
-        "**每一轮都要调这个。** 说清楚你这次的治理判断：要不要介入、找谁、" +
-        "想达成什么、为什么。这是判断本身，跟你实际说出口的话分开记录。\n" +
-        "**可以和 logEvent 在同一次里一起调**，不必等它返回——" +
-        "但如果是同一件未了结的事，caseId 两边都要各自填，" +
-        "别指望一边设好了另一边就能用（两个工具经常并发跑，谁先谁后不确定）。",
+        "每轮必调：记下你这次的治理判断（要不要介入、找谁、想达成什么、为什么）。" +
+        "判断与说出口的话分开记录。可与 logEvent 同一轮并发调，" +
+        "同一件事的 caseId 两个工具各自填，不共享状态。",
       inputSchema: z.object({
         kind: z
           .enum([
@@ -1272,9 +1269,8 @@ export async function runColivingTurn(args: {
           .string()
           .optional()
           .describe(
-            "如果是某件未了结事情的后续，填它的 id。**这轮如果同时调了 " +
-              "logEvent，那边也要单独填同一个 id**——两个工具经常同一轮" +
-              "并发调用，谁先跑完不确定，指望这边先设好共享状态给那边用会漏。"
+            "某件未了结事情的后续就填它的 id。同时调了 logEvent 也在那边" +
+              "单独填同一个 id——两个工具并发，谁先跑完不确定，不共享状态。"
           ),
       }),
       execute: async ({ kind, intent, rationale, caseId }) => {
@@ -1310,12 +1306,9 @@ export async function runColivingTurn(args: {
 
     logEvent: tool({
       description:
-        "记录发生了一件事。**判断为无需处理时也要记**，把理由写进 detail——" +
-        "不作为同样必须可被复核。需要持续跟进的事，同时把 openCase 设为 true。\n" +
-        "**是某件「还没了结的事」的后续，就填 caseId，不要只填 openCase。** " +
-        "别指望同一轮里调 decide 时填的 caseId 会自动传到这边——" +
-        "两个工具经常并发跑，谁先谁后不确定，各自填各自的（真实发生过：" +
-        "同一件事因为这个开出了两条一模一样标题的 case）。",
+        "记录发生的一件事；判断为无需处理时也要记，理由写进 detail（不作为" +
+        "同样要被复核）。需持续跟进就 openCase=true；是某件未了结事的后续" +
+        "就填 caseId——与 decide 并发、状态不共享，两边各自填。",
       inputSchema: z.object({
         kind: z
           .string()
@@ -1339,13 +1332,12 @@ export async function runColivingTurn(args: {
           .string()
           .optional()
           .describe(
-            "如果这是「还没了结的事」列表里某一条的后续，填它的 id——" +
-              "跟 decide 用同一个，这边要单独填一遍。"
+            "「还没了结的事」里某条的后续就填它的 id——与 decide 同 id，这边单独填。"
           ),
         openCase: z
           .boolean()
           .optional()
-          .describe("是全新的事、需要持续跟进，才设为 true；有 caseId 就不要设"),
+          .describe("全新且需持续跟进才 true；有 caseId 就不要设"),
         caseTitle: z.string().optional().describe("openCase 时给它起个短标题"),
       }),
       execute: async (a) => {
@@ -1394,10 +1386,9 @@ export async function runColivingTurn(args: {
      */
     contactPerson: tool({
       description:
-        "主动给这栋房子里的另一个人发消息（不是回复当前这个人）。" +
-        "**这是你按流程做的判断，不是征求当前这位的同意。**\n" +
-        "铁律：不得透露是谁反映的，除非那个人明确说了可以。" +
-        "对被投诉的一方，先按中立提醒的力度说，不要一上来就指控。",
+        "主动给这栋房子里的另一个人发消息（非回复当前这位）。这是你按流程做的" +
+        "判断，不是征求当前这位同意。**不得透露是谁反映的**，除非那人明确说可以；" +
+        "对被投诉一方先按中立提醒说，不要上来就指控。",
       inputSchema: z.object({
         name: z.string().describe("要联系的人的名字，必须是房子里现有的人"),
         purpose: z
@@ -1406,8 +1397,8 @@ export async function runColivingTurn(args: {
         scope: z
           .enum(["personal", "shared"])
           .describe(
-            "personal=针对他个人的事；shared=一条规矩，对同样的人都一样。" +
-              "说规矩就填 shared，不然对方会读成在说他一个人。"
+            "personal=针对他个人的事；shared=对同样的人都一样的规矩。" +
+              "说规矩就填 shared，否则对方读成针对他一个人。"
           ),
         sharedWith: z
           .string()
@@ -1421,21 +1412,17 @@ export async function runColivingTurn(args: {
         act: z
           .enum(["ask", "inform", "propose", "confirm", "remind", "escalate"])
           .describe(
-            "**这条是在干什么**（决定系统要不要盯着他回音）：\n" +
-              "ask=在问他一个问题，等他答 · inform=告知，他不用回 · " +
-              "propose=提方案征求意见 · confirm=请他确认（事关钱/时间/" +
-              "权利时用）· remind=之前说过的再提一次 · escalate=转给房东。\n" +
-              "**填错的代价**：该等的填成 inform，系统不会盯着，这件事" +
-              "就会悄无声息地烂在那里——这两天反复出的「说了跟进却没" +
-              "下文」正是这么来的。"
+            "这条在干什么（系统据此决定是否盯着他回音）：ask=问问题等他答 · " +
+              "inform=告知不用回 · propose=提方案征求意见 · " +
+              "confirm=请他确认（事关钱/时间/权利）· remind=催上次说的 · " +
+              "escalate=转房东。该等的填成 inform 会让事情无人跟进。"
           ),
         scheduleWindowLabel: z
           .string()
           .optional()
           .describe(
-            "这条消息在告诉他排班时段时填——跟 `chooseSchedule` 用的同一个" +
-              "窗口名。填了这个，`scheduleSlot` 也必须填，代码会核对是不是" +
-              "跟已选方案里他的时段完全一致，不一致会拒绝执行、这条不会发出去。"
+            "排班消息里填：与 `chooseSchedule` 同一个窗口名。填了就必须也填 " +
+              "`scheduleSlot`；代码核对与已选方案该人时段完全一致，不一致拒绝执行。"
           ),
         scheduleSlot: z
           .object({
@@ -1634,11 +1621,9 @@ export async function runColivingTurn(args: {
 
     proposeRule: tool({
       description:
-        "把共同生活的安排记成这栋房子的一条规则（时段、分工、访客约定等）。\n" +
-        "**这类规则不是你定的，也不是房东定的，是住在这里的人一起定的。**\n" +
-        "你给的是默认方案——先按它执行，省得大家从零协商；" +
-        "然后你要逐个私下问过每个住在这里的人（contactPerson），" +
-        "把谁同意、谁有异议用 recordStance 记下来。全问过一轮，这条规则才算真正成立。",
+        "把共同生活的安排记成规则（时段/分工/访客等）。规则不是你和房东单方" +
+        "定的，是住在这里的人一起定的。你给默认方案并先照执行，然后逐个私信" +
+        "住在这里的人（contactPerson），用 recordStance 记谁同意/谁异议；全问过才算成立。",
       inputSchema: z.object({
         kind: z
           .string()
@@ -1679,11 +1664,9 @@ export async function runColivingTurn(args: {
 
     recordStance: tool({
       description:
-        "记下某个人对一条共同规则的态度。**只在对方真的表过态时才记**——" +
-        "没回复不等于同意，那属于「问过了但还没答」，用 asked。\n" +
-        "**之前同意过的人现在说这条不合适、对他不公平——那就是在表异议**，" +
-        "立刻记 objected，**不用等你问完细节、想好新方案再记**。" +
-        "先记态度，重新设计规则是另一件事，两者不互相等待。",
+        "记某人对一条共同规则的态度。**只在对方真表过态时记**——没回复不等于同意，" +
+        "那是「问过还没答」，用 asked。之前同意过的人现在说这条不合适/不公平，" +
+        "就是在表异议，立刻记 objected，不用等你问完细节、想好新方案再记。",
       inputSchema: z.object({
         name: z.string(),
         stance: z
@@ -1727,12 +1710,9 @@ export async function runColivingTurn(args: {
 
     notePartyAffected: tool({
       description:
-        "标记某个人被这件事影响到，即使他还没开口表过态。" +
-        "**涉及多个人的事，只要看得出会影响到谁，就顺手标一下**——" +
-        "不止是已经说话的人，还没抢开口的、方案会改到他作息的人也算。\n" +
-        "这跟 recordPosition 不是一回事：那个记的是「说过什么」，" +
-        "这个记的是「跟这件事有没有利害关系」，即使他什么都没说。" +
-        "结案时会拿这份名单核对是不是每个人都通知到了结果。",
+        "标记某个人被这件事影响到，即使他还没开口表过态——被牵扯到、方案会改到" +
+        "他作息的人也算。与 recordPosition 不同：那个记「说过什么」，这个记" +
+        "「利害关系」。结案时按这份名单核对是否人人知情。",
       inputSchema: z.object({
         caseId: z.string().describe("上下文里那一栏给的 id"),
         name: z.string().describe("被影响到的人"),
@@ -1758,10 +1738,9 @@ export async function runColivingTurn(args: {
 
     pickSchedule: tool({
       description:
-        "为多人连续使用同一资源计算排班；不要自行心算。硬约束绝不突破，" +
-        "软偏好用于比较公平负担（偏离分钟数/本人使用时长）。候选1是初始" +
-        "提议的唯一选择，候选2-5仅供比较。算完立刻调用 chooseSchedule；" +
-        "若有人补充限制或不同意，更新 people 后重新计算。",
+        "为多人连续使用同一资源计算排班——不要心算，数字全由代码算。硬约束" +
+        "不突破，软偏好只用于比公平负担。算完立刻调 chooseSchedule 选候选1；" +
+        "有人补充限制/不同意就更新 people 重算。",
       inputSchema: z.object({
         windowLabel: z.string().describe("这段窗口叫什么，比如「傍晚厨房时段」"),
         windowStart: z
@@ -1778,33 +1757,29 @@ export async function runColivingTurn(args: {
                 .regex(HH_MM_PATTERN)
                 .optional()
                 .describe(
-                  "最早能开始的 HH:MM。仅用于明确的可用下界（如尚未到家/" +
-                    "明确说不能更早）；一般习惯填 preferredStart。"
+                  "最早能开始的 HH:MM。仅用于明确下界（尚未到家/明确说不能更早）；" +
+                    "一般习惯填 preferredStart。"
                 ),
               preferredStart: z
                 .string()
                 .regex(HH_MM_PATTERN)
                 .optional()
-                .describe(
-                  "最合适或平时习惯的 HH:MM；这是可让步的软偏好。"
-                ),
+                .describe("最合适或平时习惯的 HH:MM；可让步的软偏好。"),
               latestStart: z
                 .string()
                 .regex(HH_MM_PATTERN)
                 .optional()
                 .describe(
-                  "最晚能开始的 HH:MM，用于明确的最晚界限（例如明确拒绝20点后" +
-                    "才开始）；与 earliestStart 相同才表示只能此刻开始。"
+                  "最晚能开始的 HH:MM（明确拒绝更晚才开始才填）；" +
+                    "与 earliestStart 相同=只能此刻开始。"
                 ),
               saidExactSlot: z
                 .boolean()
                 .optional()
                 .describe(
-                  "true=这个人在对话里明确说出了精确的开始时间和使用时长（如" +
-                    "「我七点半用五分钟」），且此处填入的 earliestStart/latestStart" +
-                    " 和 durationMinutes 与原话完全一致。填 true 后，若选定方案里" +
-                    "他的时段与原话一致，就不再发征询，把原话视作许可。" +
-                    "只给宽泛时间范围（「我下午都行」）或被系统调整过的，不填或填 false。"
+                  "true=本人明确说出精确开始与时长，且此处 earliestStart/latestStart/" +
+                    "durationMinutes 与原话完全一致。选定方案里他的时段与原话一致时" +
+                    "免发征询，视原话为许可；只给宽泛范围或被调整过的不填。"
                 ),
             })
           )
@@ -2066,9 +2041,9 @@ export async function runColivingTurn(args: {
 
     chooseSchedule: tool({
       description:
-        "紧接 pickSchedule，选定候选1作为本轮唯一方案。之后 contactPerson" +
-        "必须带同一 windowLabel 和该人的 scheduleSlot，代码会核对。新事实" +
-        "出现时重新调用 pickSchedule，不改选旧候选。",
+        "紧接 pickSchedule 选定候选1为本轮唯一方案。之后 contactPerson 联系" +
+        "该窗口里的人必须带同一 windowLabel 和其 scheduleSlot，代码核对一致才发；" +
+        "有新事实就重新 pickSchedule，不改选旧候选。",
       inputSchema: z.object({
         windowLabel: z.string().describe("跟 pickSchedule 用的同一个窗口名"),
         candidateNumber: z
@@ -2110,9 +2085,8 @@ export async function runColivingTurn(args: {
 
     recordShare: tool({
       description:
-        "把算好的份额存下来（三道闸第一条：几个人分/每人多少/差多少）。" +
-        "**同一件事下次再被提起时，先查这里有没有存过，不要重新心算一遍**——" +
-        "重新算容易跟上次说的对不上。分完之后调这个，一种资源、每个人一条。",
+        "把算好的份额存下来。同一件事再被提起时先查这里存过没，别重新心算" +
+        "（重算容易跟上次对不上）。一种资源、每个人一条。",
       inputSchema: z.object({
         caseId: z.string().describe("上下文里那一栏给的 id"),
         resource: z.string().describe("分的是什么，比如「周一到周五晚间灶台时段」"),
@@ -2147,12 +2121,9 @@ export async function runColivingTurn(args: {
 
     scheduleReminder: tool({
       description:
-        "给未来某个时间点安排一件「到时候要主动开口」的事——比如轮换制度" +
-        "规定的「下次该换人了」「下个月同一天该重新问一遍偏好」。" +
-        "**这是你唯一能让自己在没人说话的情况下、未来某一刻主动联系人的办法**，" +
-        "不调这个，事情就只能靠住户自己想起来问你，而三道闸第二条明确要求" +
-        "「轮换周期不得短于一个月，且每次都由你主动提醒」——不主动提醒就是没" +
-        "过这道闸。到点后由后台任务扫描触发，不需要你自己盯着时间。",
+        "给未来某刻安排一件「到时要主动开口」的事（轮换/到点重问偏好）。" +
+        "这是你唯一能让自己在没人说话时、未来主动联系人的办法；" +
+        "到点由后台触发，不用你自己盯。",
       inputSchema: z.object({
         description: z.string().describe("到时候要做的事，一句话，写清楚背景"),
         dueAt: z.string().describe("到期时间，ISO 8601 格式或「YYYY-MM-DD」"),
@@ -2188,26 +2159,17 @@ export async function runColivingTurn(args: {
 
     recordPosition: tool({
       description:
-        "记下某个人对一件未结的事表过的态（想要什么/拒绝了什么），" +
-        "或者你自己对某个人许下的承诺（比如「优先排给你」）。" +
-        "**涉及多方、可能有冲突的事，说了就记，不要指望自己在后面几轮里还记得**。\n" +
-        "**这件事现在有没有正式立案都能用**——真实事故：房东随口说" +
-        "「七点用厨房最合适」时还没有任何冲突浮现、没有开案，那句偏好" +
-        "没被记下来，几轮之后真的要排班时，模型对着房东说「你的时间还" +
-        "没确认」，其实房东早说过了。**任何人随口提到的时段偏好、态度，" +
-        "只要以后可能用得上，当场就记，不用等这件事升级成一个正式的" +
-        "「未结的事」才记**——不确定要不要立案就不填 caseId，留空即可。\n" +
-        "上下文「还没了结的事」里每件事下面缩进列出的、以及「还没归到" +
-        "具体事情上的表态」里列出的，都是已经记过的——开新方案前先看" +
-        "那里，别漏看、别自相矛盾。",
+        "记某人对未结事表过的态（想要/拒绝）或你许过的承诺。涉及多方、可能冲突的" +
+        "话说了就记，别指望之后几轮还记得。**立不立案都能用**——随口提到的时段偏好/" +
+        "态度，只要以后可能用得上当场就记，不用等升级成案子；没立案就不填 caseId。" +
+        "上下文列出的表态都是已记过的，开新方案前先看，别漏、别自相矛盾。",
       inputSchema: z.object({
         caseId: z
           .string()
           .optional()
           .describe(
-            "这条表态属于上下文里哪件「未结的事」，填它的 id。" +
-              "这件事还没立案、只是随口提到的偏好，就不填——" +
-              "不确定的时候，不填比编一个 id 安全。"
+            "这条表态属于哪件「未结的事」就填它的 id；还没立案、只是随口提到就不填——" +
+              "不确定时，不填比编一个 id 安全。"
           ),
         name: z.string().describe("说这句话的人，或者你许诺的对象"),
         kind: z
@@ -2239,13 +2201,10 @@ export async function runColivingTurn(args: {
 
     addResident: tool({
       description:
-        "把一个手机号加进这栋房子。**拿到号码就加，不要等**——" +
-        "房东（或别人）在对话里报出室友号码时用这个。" +
-        "加完他就能收到消息了。名字不知道就别填，占位符不影响任何事。\n" +
-        "**加完这一个人，这一轮就要用 contactPerson 主动跟他打个招呼**" +
-        "（工具结果会给你他的名字）——他还不认识你，别等他先开口、" +
-        "也别拖到下一轮。一次报了好几个号码，就一个一个都打招呼，" +
-        "不要因为要打的招呼多就漏掉。",
+        "把一个手机号加进这栋房子。拿到号码就加，不要等——房东（或别人）在对话里" +
+        "报出室友号码时用；名字不知道就不填，占位符不影响。**加完这一轮就要用 " +
+        "contactPerson 主动跟他打招呼**（结果会给你名字）——他还不认识你，别等他" +
+        "先开口，也别拖到下一轮；报了好几个就逐个都打，别漏。",
       inputSchema: z.object({
         phone: z.string().describe("手机号，原样填，系统会自己规范化"),
         name: z.string().optional().describe("对方说了名字才填，没说就留空"),
@@ -2290,10 +2249,8 @@ export async function runColivingTurn(args: {
 
     confirmRoster: tool({
       description:
-        "有人告诉你这屋一共住几个人时，立刻调这个记下那个数字。" +
-        "记下来之后你就不会再问第二遍。" +
-        "只管把数字说对，齐没齐由系统自己比，不用你算——" +
-        "你不用管名册上现在有几个、也不用判断够不够。",
+        "有人告诉你这屋一共住几人时，立刻记下那个数字，记完就不会再问第二遍。" +
+        "只管数字对，齐不齐由系统自己比，不用你算。",
       inputSchema: z.object({
         total: z.number().describe("对方说的总人数，就这一个数字"),
       }),
@@ -2317,10 +2274,8 @@ export async function runColivingTurn(args: {
 
     renamePerson: tool({
       description:
-        "改掉某个人的显示名。**在对话里自然听出真名时才用**——" +
-        "比如他自己说「我是小王」，或别人提到他的名字。" +
-        "**不必一上来就问名字**，但要称呼他、或者不问就得说出系统编号时，" +
-        "问一句「怎么称呼你」是自然的。问到了就用这个工具记下来。",
+        "改某个人的显示名。自然听出真名才用（本人说「我是小王」或别人提到）；" +
+        "要称呼他却不知名字时，问一句「怎么称呼你」是自然的，问到了就记。",
       inputSchema: z.object({
         currentName: z.string().describe("现在系统里叫什么（占位名或旧名）"),
         newName: z.string().describe("听出来的真名或他希望被怎么称呼"),
@@ -2345,15 +2300,10 @@ export async function runColivingTurn(args: {
 
     remember: tool({
       description:
-        "记下关于某个人的长期事实。**顺手记，不声张。**\n" +
-        "不用等他专门告诉你——**说话里带出来的就记**：" +
-        "他说「她今天没回来」，你就知道那位是女性；说「我下班晚」，" +
-        "就知道他作息偏晚；说「我这两天嗓子不行」，就知道他在生病。\n" +
-        "**记完不要跟他说你记了**，也不要复述给别人听。" +
-        "这些是给你以后判断用的，不是拿来展示的。\n" +
-        "**只记事实，不记评判**：「他上夜班」是事实，「他挺懒的」不是——" +
-        "后者会让你以后带着偏见处理他的事。\n" +
-        "不记这一次的经过（那个用 logEvent），只记以后还用得上的。",
+        "记关于某个人的长期事实——说话里带出来的就顺手记、不声张。" +
+        "记完不要告诉他你记了，也别复述给别人。**只记事实不记评判**" +
+        "（「他上夜班」是事实，「他挺懒的」不是，那会带来偏见）。" +
+        "不记经过（那个用 logEvent），只记以后还用得上的。",
       inputSchema: z.object({
         name: z.string().describe("这条记忆是关于谁的"),
         kind: z
@@ -2366,36 +2316,29 @@ export async function runColivingTurn(args: {
         basis: z
           .enum(["stated", "observed", "inferred", "third_party"])
           .describe(
-            "**这条是怎么来的，必须诚实**：stated=当事人自己说的 · " +
-              "observed=你从系统记录里看到的 · inferred=**你推出来的** · " +
-              "third_party=**别人说他的，他自己还没确认过**。\n" +
-              "「我上夜班」是 stated；「所以他白天睡觉」是 inferred；\n" +
-              "**A 跟你说「B 半夜老在厨房打电话」，给 B 记的这条是 " +
-              "third_party，不是 stated**——B 从头到尾没说过话。\n" +
-              "把推断或别人的指控标成 stated，几个月后没人记得那只是" +
-              "单方说法，你会把它当确认过的事实读回去，再基于它推新的" +
-              "——**记忆会被自己污染，而且回不去了**。"
+            "这条怎么来的，必须诚实：stated=本人说的 · observed=从系统记录看到 · " +
+              "inferred=你推出来的 · third_party=别人说他、他本人没确认过。\n" +
+              "A 跟你说「B 半夜在厨房打电话」，给 B 记的是 third_party，不是 stated。" +
+              "把推断或别人指控标成 stated，几个月后你会当确认过的事实读回去——" +
+              "记忆会被自己污染，回不去了。"
           ),
         subjectKey: z
           .string()
           .describe(
             "主题键。**同一个人同一个主题只留一条当前有效**，新的自动取代旧的。\n" +
-              "先从这几个里挑，挑不到再自己起：\n" +
-              "`work_schedule`（上什么班、几点上下班——**作息和班次算同一个主题**，" +
-              "别一次写 work 一次写 sleep_schedule，那样旧的取代不掉）· " +
-              "`cooking_time` · `health` · `diet` · `guests` · " +
-              "`noise_sensitivity` · `language` · `identity` · `room`\n" +
-              "**关键是同一件事以后一直用同一个键。** 他 3 月说11点睡、" +
-              "8 月说凌晨3点回——那是取代，不是并列。"
+              "优先从这些挑：`work_schedule`（上什么班/几点上下班——作息和班次是同一主题，" +
+              "别一次写 work 一次写 sleep_schedule）· `cooking_time` · `health` · " +
+              "`diet` · `guests` · `noise_sensitivity` · `language` · `identity` · `room`\n" +
+              "关键：同一件事一直用同一个键。3 月说 11 点睡、8 月说凌晨 3 点回——" +
+              "那是取代，不是并列。"
           ),
         untilWhen: z
           .string()
           .optional()
           .describe(
-            "这条事实什么时候失效，ISO 日期。**只要话里带了时间范围就必须填**：\n" +
-              "「**这周**上夜班」→ 填本周日 · 「**这两天**感冒」→ 填两天后 · " +
-              "「**周四**我姐来住」→ 填周五\n" +
-              "不填 = 永久有效。把临时的存成永久，几个月后你还会以为他在上夜班。"
+            "这条事实何时失效（ISO 日期）。**话里带时间范围就必须填**：" +
+              "这周→本周日、这两天→两天后、周四→周五。不填=永久有效；" +
+              "把临时的存成永久，几个月后你就搞错了。"
           ),
       }),
       execute: async ({ name, kind, content, basis, subjectKey, untilWhen }) => {
@@ -2429,11 +2372,8 @@ export async function runColivingTurn(args: {
 
     closeCase: tool({
       description:
-        "一件事了结了就用这个收尾。**上下文里「还没了结的事」那一栏里的东西，" +
-        "只要看得出已经过去了，就该收掉**——住户说好了、不再提了、" +
-        "或者你安排完之后没再出问题。" +
-        "不收的话那件事会一直挂着，你以后每轮都被它干扰，" +
-        "而且**「后来怎么样了」这个问题永远没有答案**。",
+        "一件事了结了就收尾——「还没了结的事」里看得出已经过去的就该收掉" +
+        "（住户说好、不再提、安排后没再出问题）。不收它会一直挂着干扰每一轮。",
       inputSchema: z.object({
         caseId: z.string().describe("上下文里那一栏给的 id"),
         kind: z
@@ -2447,9 +2387,9 @@ export async function runColivingTurn(args: {
             "withdrawn",
           ])
           .describe(
-            "resolved=彻底解决 · improved=好转但没根治 · recurred=又犯了 · " +
-              "worsened=更糟了 · no_response=没人理这事 · " +
-              "escalated=转给房东了 · withdrawn=提的人自己撤了"
+            "resolved=彻底解决 · improved=好转未根治 · recurred=又犯 · " +
+              "worsened=更糟 · no_response=没人理 · escalated=转房东 · " +
+              "withdrawn=提出者自己撤"
           ),
         note: z.string().describe("一句话说清后来怎么样了"),
         sentiment: z
@@ -2469,18 +2409,15 @@ export async function runColivingTurn(args: {
           )
           .optional()
           .describe(
-            "**这件事下面如果记过表态（想要什么/拒绝了什么/你许过什么承诺），" +
-              "resolved 时必须把每一条都过一遍填在这里，一条都不能漏。** " +
-              "没记过表态的事不用填这个。"
+            "resolved 时把这件事记过的每条表态都过一遍填进来，一条不能漏；" +
+              "没记过表态不用填。"
           ),
         notifiedParties: z
           .array(z.string())
           .optional()
           .describe(
-            "本轮已经用 contactPerson 通知过结果的人名。" +
-              "**结果通知不是通过本轮 contactPerson 发的、而是之前对话里已经" +
-              "说清楚了，才需要在这里手动列**——本轮真的调用 contactPerson 的会" +
-              "自动核对，不用重复填。"
+            "结果不是本轮 contactPerson 发的、而是之前对话已说清时，才在这里手动列人名" +
+              "（本轮真调 contactPerson 的会自动核对，不用重复填）。"
           ),
       }),
       execute: async ({
@@ -2592,12 +2529,9 @@ export async function runColivingTurn(args: {
 
     noteObservation: tool({
       description:
-        "记一条**关于这个地方**的环境观察：气味、噪音、施工、天气、外面的动静。" +
-        "住户说「外面今天特别臭」「楼下在施工」——这既是他报告的一件事" +
-        "（那个用 logEvent），**也是关于这栋房子所在位置的一条事实**。" +
-        "分开记的好处：几年后住户全换了，这个地方的环境史还在；" +
-        "而且以后有人抱怨噪音时，你能查到当时外面是不是真有动静，" +
-        "**不至于把外面的事算到室友头上**。",
+        "记一条关于这栋房子所在位置的环境观察：气味/噪音/施工/天气/外面动静。" +
+        "住户报的那件事用 logEvent，这里记的是「地点+时间」的环境事实——" +
+        "以后抱怨噪音时能查到外面当时是否有动静，不至于把外面的事算到室友头上。",
       inputSchema: z.object({
         kind: z
           .string()
@@ -2623,11 +2557,8 @@ export async function runColivingTurn(args: {
 
     recall: tool({
       description:
-        "按意思翻以前记下的东西。**说法不一样但说的是一件事时用这个**——" +
-        "「半夜切菜声音大」「凌晨厨房一直有人」「宵夜把我吵醒」" +
-        "字面完全不同，但都是同一类问题，SQL 查不出来。\n" +
-        "上下文里默认只给你当前住户的档案，更早的、别人的、" +
-        "已经过期的都要靠这个翻。",
+        "按意思翻以前记下的记忆。说法不同但指同一件事（如半夜厨房声响）时用——" +
+        "SQL 查不出同义表达。更早的、别人的、已过期的都靠它翻。",
       inputSchema: z.object({
         query: z.string().describe("用一句话说你想找什么"),
       }),
@@ -2733,8 +2664,8 @@ export async function runColivingTurn(args: {
 
     checkEnvironment: tool({
       description:
-        "查投诉时间点附近，房子周边有没有外部的噪音/气味/施工来源。" +
-        "**不是所有抱怨都该归咎于室友**——先看看是不是外面的事。",
+        "查投诉时间点附近，房子周边有无外部噪音/气味/施工来源。" +
+        "不是所有抱怨都该归咎于室友——先看是不是外面的事。",
       inputSchema: z.object({
         kind: z
           .string()
@@ -2771,32 +2702,42 @@ export async function runColivingTurn(args: {
    * `assembleSystemPrompt` 早就在做"不相关的准则不塞进上下文"，工具
    * 列表现在补上同一层过滤。
    *
-   * 分三组：
+   * 分两组：
    *
-   *   **① 核心链路（5个，永远常驻）**：`decide` `sendReply` `logEvent`
-   *   `contactPerson` `remember`——几乎每一轮都会用到，缺一个就断链路。
+   *   **① 核心链路（6个，永远常驻）**：`decide` `sendReply` `logEvent`
+   *   `contactPerson` `remember` `addResident`——几乎每一轮都会用到，
+   *   缺一个就断链路。`addResident` 单独跟核心链路绑在一起不放进情境组，
+   *   是吸取 c328ae8 的教训：房东随时可能突然报个号码，不一定伴着
+   *   "入住"这类字眼，漏摆的代价（联系不上新住户）远比多摆一个工具的
+   *   注意力成本高，宁可常驻也不赌路由。
    *
-   *   **② 查询类（5个，永远常驻）**：`noteObservation` `recall`
-   *   `lookupHistory` `findSimilarCases` `checkEnvironment`——本来就是
-   *   低频、模型主动判断"要不要查"的工具，常驻不算浪费注意力（它们
-   *   之间功能区分度高，不容易互相选错）。
-   *
-   *   **③ 情境组（11个，按结构信号或话题信号决定要不要摆出来）**：
+   *   **② 情境组（11个，按结构信号或话题信号决定要不要摆出来）**：
    *   优先用**结构信号**（比纯话题关键词更准，不会因为这一轮没提到
    *   相关字眼就漏摆）——`closeCase` 只要 `openCaseIds` 非空就摆
    *   （不看话题：钱类、安全类结案都不会被"这轮聊的是不是冲突"卡住）；
-   *   `addResident`/`confirmRoster` 只要名册没收全就摆（不看话题：
-   *   房东随时可能突然报个号码，不一定伴着"入住"这类字眼）；
-   *   `renamePerson` 只要有人还顶着占位名就摆。其余用话题信号
-   *   （`loadedModuleIds` 是不是命中了 `tenancy`/`conflict`）兜底。
+   *   `confirmRoster` 只要名册没收全就摆；`renamePerson` 只要有人还
+   *   顶着占位名就摆。其余用话题信号（`loadedModuleIds` 是不是命中了
+   *   `tenancy`/`conflict`）兜底。
+   *
+   *   **③ 查询/观察类（5个，按需暴露，默认不摆）**：`noteObservation`
+   *   `checkEnvironment` 只在出现外部环境/气味/噪音/天气等信号时给；
+   *   `recall` `lookupHistory` `findSimilarCases` 只在已开着案子或本轮
+   *   明显是"反复/历史"类信号时给。它们本来就是低频、模型主动判断
+   *   "要不要查"的工具，不该占常驻位（本轮瘦身目标）。信号用下面代码
+   *   能确定的保守词表，**宁可少给**——模型需要时会少，但不会错给。
    */
   const hasUnconfirmedName = ctx.members.some((m) => !m.nameConfirmed);
   const topicHitsTenancy = loadedModuleIds.includes("tenancy");
   const topicHitsConflict = loadedModuleIds.includes("conflict");
-  // addResident 不放进"话题命中才摆"的情境组——它是真实事故的教训
-  // （c328ae8）：房东随时可能突然报个号码，不一定伴着"入住"这类字眼，
-  // 漏摆这一个工具的后果（联系不上新住户）比多摆一个工具的注意力
-  // 成本高得多，所以跟核心链路一样常驻。
+  const environmentSignal =
+    /外面|楼下|隔壁|邻居|街上|马路|街道|施工|装修|工地|天气|下雨|下雪|刮风|很臭|臭味|气味|烟味|油烟|噪音|噪声|吵|太响/i.test(
+      args.text
+    );
+  const historySignal =
+    ctx.openCaseIds.length > 0 ||
+    /上次|以前|过去|历史|又|再次|老是|总是|经常|每次都|again|repeat|recur/i.test(
+      args.text
+    );
   const activeTools: Record<string, (typeof tools)[keyof typeof tools]> = {
     decide: tools.decide,
     sendReply: tools.sendReply,
@@ -2804,11 +2745,6 @@ export async function runColivingTurn(args: {
     contactPerson: tools.contactPerson,
     remember: tools.remember,
     addResident: tools.addResident,
-    noteObservation: tools.noteObservation,
-    recall: tools.recall,
-    lookupHistory: tools.lookupHistory,
-    findSimilarCases: tools.findSimilarCases,
-    checkEnvironment: tools.checkEnvironment,
   };
   if (ctx.openCaseIds.length > 0) {
     activeTools.closeCase = tools.closeCase;
@@ -2830,6 +2766,15 @@ export async function runColivingTurn(args: {
     activeTools.recordShare = tools.recordShare;
     activeTools.notePartyAffected = tools.notePartyAffected;
     activeTools.recordPosition = tools.recordPosition;
+  }
+  if (environmentSignal) {
+    activeTools.noteObservation = tools.noteObservation;
+    activeTools.checkEnvironment = tools.checkEnvironment;
+  }
+  if (historySignal) {
+    activeTools.recall = tools.recall;
+    activeTools.lookupHistory = tools.lookupHistory;
+    activeTools.findSimilarCases = tools.findSimilarCases;
   }
 
   /**

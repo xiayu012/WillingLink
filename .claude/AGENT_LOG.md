@@ -5703,6 +5703,22 @@ TS2717，无新增；`git diff --check` 干净。
 
 ---
 
+## 2026-09-07 · AI 工程瘦身（一）：工具面按需暴露 + 描述压缩 + 上下文精简
+
+老板判断 deepseek 被塞太多工具/内容、任务过载，是工程问题不是模型问题。第一步：
+
+1. **查询/观察工具按需暴露**：`noteObservation`/`checkEnvironment` 仅环境信号命中
+   才给；`recall`/`lookupHistory`/`findSimilarCases` 仅 open case 或“反复/历史”词
+   命中才给。常驻工具 11 → 6（decide/sendReply/logEvent/contactPerson/remember/
+   addResident）。删掉 context 里“你还能查什么”整段。
+2. **工具描述压缩**：22 个 tool 声明区字面量 7294 → 5526（-24.2%），关键约束保留。
+3. **运行时上下文精简**：整文件字面量 3147 → 2440（-22.5%），结构化事实全保留。
+
+**验证**：`coliving:quality` 59 项通过（+3 护栏断言）；`tsc` 仅既有两条 TS2717；
+`git diff --check` 干净。未跑模型级（离线瘦身、不碰准则）。
+
+---
+
 ## 2026-09-07 · 每轮超时 120s→240s（修 deepseek 长场景被自己打断）
 
 **根因**：`turnAbortSignal` 用 `AbortSignal.timeout(120_000)`，而 deepseek-v4-flash
