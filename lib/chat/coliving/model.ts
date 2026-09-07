@@ -6,22 +6,19 @@
  *   · 小红书私信    `lib/chat/xhs-dm.ts` 的 XHS_DM_MODEL
  *   · 合租房管理员  这里
  *
- * 默认 `anthropic/claude-sonnet-4.5`（2026-09-07 切回）。此前 2026-08-30 起
- * 默认 DeepSeek V4 Flash：同一条真实投诉实测 $0.004–0.011 一轮、sonnet-4.5
- * $0.127，**便宜约 18 倍**，且三个安全探针（非法驱逐 / 自杀信号 / 住房公平
- * 陷阱）全过（见 AGENT_LOG 2026-08-30）。但生产观察 + Codex 多次全量回归证明
- * 它在**多轮冲突协调上不可靠**：跨轮忘偏好（老孙说 19:00 被排到 20:30）、
- * 不调 pickSchedule 却编造具体时段，且单轮 38–60 秒，长场景慢到撞 gateway
- * 超时（ECONNRESET / operation aborted due to timeout）。sonnet-4.5 更强更快
- * （22–30 秒一轮），项目里批判器 / 终审已用它，接入零额外依赖；单价虽高，
- * 但短信量低，绝对金额可忽略。
+ * 默认 `deepseek/deepseek-v4-flash`（老板 2026-09-07 拍板：**不上 opus、保持
+ * 便宜**）。同一条真实投诉它 $0.004–0.011 一轮、sonnet-4.5 $0.127，便宜约 18 倍，
+ * 三个安全探针（非法驱逐 / 自杀信号 / 住房公平陷阱）全过（见 AGENT_LOG 2026-08-30）。
+ * 它在多轮冲突协调上的不可靠（跨轮忘偏好 / 编时段 / 慢到撞 gateway 超时）已由
+ * **确定性代码**兜底：软偏好注入、自动补发漏人、6.x 打回重算、简单肯定短路等，
+ * 不再靠换贵模型硬扛。
  *
- * 要回退到便宜的旧默认：设 `COLIVING_MODEL=deepseek/deepseek-v4-flash`。
+ * 想临时换更强模型验一把：设 `COLIVING_MODEL=anthropic/claude-sonnet-4.5`。
  * 同在 gateway 上、值得一试的还有 `deepseek/deepseek-v4-pro`、
  * `minimax/minimax-m3`、`zai/glm-5.3`。
  * **注意 `zai/glm-5.3-flash` 试过，不行**——它反问问题、一个工具都不调。
  */
-export const COLIVING_DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
+export const COLIVING_DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
 export function colivingModelId(): string {
   return process.env.COLIVING_MODEL?.trim() || COLIVING_DEFAULT_MODEL;
