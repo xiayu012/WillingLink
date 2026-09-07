@@ -1925,6 +1925,41 @@ export async function linkResponse(args: {
 }
 
 /**
+ * 排班征询的「已确认该时段」持久事实。
+ *
+ * 住户对一条排班征询（act 为 ask/propose/confirm、正文含「你用 HH:MM-HH:MM」）
+ * 回了**简单肯定**，`linkResponse` 已把那条回复关联回原沟通
+ * （communication.response_message_id → 那条 inbound message）。这些行就是
+ * 「谁确认过哪段」的记录。
+ *
+ * 复用 communication 的 responded 状态，**不新增写入**：比起另记一条
+ * schedule 记忆，不会和「偏好/习惯」类 schedule 记忆混淆，也不占
+ * `coliving.memory` 每人的上下文 note 名额。72h 窗口与 linkResponse 一致，
+ * 把确认限定在「同一个协调段内」，防止上周的确认误伤这周的新排班。
+ */
+export async function listScheduleInquiryConfirmations(
+  householdId: string,
+  withinHours = 72
+): Promise<
+  Array<{ personId: string; inquiryBody: string; responseBody: string }>
+> {
+  return await db()<
+    { personId: string; inquiryBody: string; responseBody: string }[]
+  >`
+    select c.to_person_id as "personId", c.body as "inquiryBody", m.body as "responseBody"
+    from coliving.communication c
+    join coliving.message m on m.id = c.response_message_id
+    where c.household_id = ${householdId}
+      and c.status = 'sent'
+      and c.responded_at is not null
+      and c.act in ('ask', 'propose', 'confirm')
+      and m.direction = 'inbound'
+      and c.sent_at > now() - (${withinHours} || ' hours')::interval
+    order by c.sent_at desc
+  `;
+}
+
+/**
  * 记一条环境观察。**属于地点和时间，不属于某个人**（设计稿第三点）。
  *
  * 住户说「外面今天特别臭」——这既是一个 Event（他报告了这件事），

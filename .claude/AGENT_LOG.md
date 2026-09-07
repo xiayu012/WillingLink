@@ -5626,3 +5626,45 @@ Sonnet、medium。第一次长时间无输出后为节省额度主动中断；�
 formatMinutes(endMinutes) 与 selfStatedSlotsByWindow 比对，同样豁免 gate，不再触发"未征询"。
 
 41 offline quality checks pass. tsc clean.
+
+---
+
+## 2026-09-07 · 根治“定案回合重复征询已确认住户”（Codex 监督，Claude Sonnet medium 实现）
+
+**生产事故**：老孙 03:58:02 对傍晚厨房灶台 17:30-18:00 回「愿意」并收到
+「好，17:30-18:00 就定给你了」；整整一分钟后 03:58:45 一个「定案收尾」回合
+（decision kind=propose_rule）又给他发了一条正文仍是「你愿意吗？这不是定案」的
+短信，且该条 act=inform、expects_reply=false。决策 rationale 自己都写明「老孙
+17:30-18:00 也已确认、三人都已表态、要定案通知到位」。这不是并发竞态，而是
+**定案/通知回合复用了「提议」文案**，且系统没有持久记录「老孙已确认该时段」。
+
+**实现（Claude Sonnet，Codex 两轮代码级审查）**：
+1. `turn.ts` 新增纯函数 `scheduleContactTextForAct`：contactPerson 排班正文按
+   `act` 分支——inform/remind 出「…定在 X-Y，就这样定了，有变动随时说」，
+   绝不含「你愿意吗/这不是定案/我会继续协调」；propose/confirm/ask 沿用征询正文。
+2. `turn.ts` 新增 `extractWindowLabelFromInquiry`、`scheduleInquiryConfirmation`：
+   从征询正文 + 回复里解析「谁确认过哪段」。
+3. `repo.ts` 新增 `listScheduleInquiryConfirmations`：复用 communication 的
+   responded 状态（linkResponse 回执 + responded_at），查询 72h 内对排班征询
+   回过简单肯定的人，**不新增写库**。
+4. `runColivingTurn` 在轮次开始加载 `confirmedScheduleSlots`；`contactPerson`
+   排班分支对「已确认同一精确 slot」的人直接 `preConsented+skipped` 返回，
+   不发新短信；`missingSelectedScheduleParticipants()` 也把这些人视为已处理。
+
+**验证（Codex 独立）**：
+- `coliving:quality`：45 项通过（新增 4 项行为级断言覆盖 scheduleContactTextForAct、
+  scheduleInquiryConfirmation、durable confirmation 接线、无内联重复模板）。
+- `tsc --noEmit`：仅既有 speech-input.tsx 两条 TS2717，无新增。
+- `git diff --check`：干净。
+- 新增场景 `settle-round-no-reask-confirmed-2026-09-07`：`--judge-off` 实跑，
+  结构性 1/1 通过——定案回合 outbound 不再出现「你愿意吗/这不是定案」；报告
+  里 scheduleContactTextForAct 的 inform 分支实际生效（对小周生成「定在 18:00-18:30，
+  就这样定了」），对老孙定案回合发的是「定下来了…就这样执行」。语义 judge 为省额度
+  关闭故标「未验收」，非功能回归。
+
+**残余风险（如实）**：
+- 跳过已确认者依赖 linkResponse 把回复关联回征询 communication；若某次征询从未
+  落成 propose/ask（模型未带 scheduleSlot），「愿意」不会被记为 durable confirmation，
+  该人可能仍被再次征询——但此时正文已按 act 分支，不会再出现「你愿意吗」。
+- `isSimpleAffirmation` 只认单词语义肯定（愿意/行/可以…），「可以，没问题」这类
+  复合短句不命中，属保守的漏记（可能多问一次），不是误跳过。

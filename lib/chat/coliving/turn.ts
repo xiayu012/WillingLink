@@ -159,6 +159,70 @@ export function scheduleSlotMatchesSelfStatement(
   );
 }
 
+/**
+ * 根据 contactPerson 的 act 生成排班联系正文。抽成纯函数只为可测试性——
+ * 真实事故（生产日志，2026-09-06）：03:58:45 的定案/通知回合 act=inform、
+ * expects_reply=false，正文却仍是「你愿意吗/这不是定案」，把已确认过
+ * 17:30-18:00 的老孙又问了一遍。
+ *
+ * - inform/remind：**定案通知**，不含任何征询字眼。
+ * - propose/confirm/ask（及未单列的其他 act）：沿用「待确认安排」征询正文。
+ *
+ * 代码只负责按 act 分支生成正文、不负责措辞之外的判断；选哪个 act 仍是模型的活。
+ */
+export function scheduleContactTextForAct(args: {
+  act: string;
+  salutation: string;
+  windowLabel: string;
+  scheduleSlot: { start: string; end: string };
+}): string {
+  if (args.act === "inform" || args.act === "remind") {
+    // windowLabel 常以「时段」结尾（模型填的窗口名，如「傍晚厨房灶台时段」），
+    // 这里只在需要时补「时段」，避免拼出「时段时段定在」。
+    const label = args.windowLabel.endsWith("时段")
+      ? args.windowLabel
+      : `${args.windowLabel}时段`;
+    return (
+      `${args.salutation}${label}定在 ${args.scheduleSlot.start}-${args.scheduleSlot.end}，` +
+      "就这样定了，有变动随时说。"
+    );
+  }
+  return (
+    `${args.salutation}关于${args.windowLabel}，我先提出一个待确认的安排：` +
+    `你用 ${args.scheduleSlot.start}-${args.scheduleSlot.end}。这不是定案；你愿意吗？` +
+    "如果不合适直接告诉我，我会根据大家的回复继续协调。"
+  );
+}
+
+/**
+ * 从征询消息体里取窗口名：正文模板是「关于${scheduleWindowLabel}，我…」。
+ * 取不到返回 null（旧消息/非模板），不影响 slot 级匹配。
+ */
+export function extractWindowLabelFromInquiry(body: string): string | null {
+  const m = body.match(/关于(.+?)，/);
+  return m?.[1]?.trim() ?? null;
+}
+
+/**
+ * 一条 communication + 它被 linkResponse 关联回的回复，是否构成「住户已确认
+ * 某排班时段」的持久事实。判据：回复是简单肯定（愿意/行/可以…整句就是同意），
+ * 且被回复的征询正文带「你用 HH:MM-HH:MM」的模板时段。
+ */
+export function scheduleInquiryConfirmation(raw: {
+  inquiryBody: string;
+  responseBody: string;
+}): { windowLabel: string | null; start: string; end: string } | null {
+  if (!isSimpleAffirmation(raw.responseBody)) return null;
+  const slot = extractSlotFromInquiry(raw.inquiryBody);
+  if (!slot) return null;
+  const [start, end] = slot.split("-");
+  return {
+    windowLabel: extractWindowLabelFromInquiry(raw.inquiryBody),
+    start,
+    end,
+  };
+}
+
 export function extractExplicitFixedStart(statement: string): number | null {
   // “没有要求必须18点开始”“不是固定在18点”是在明确否定固定开始。
   // 先吃掉否定，否则下面只截到后半句“必须18点”，会把相反事实当硬约束。
@@ -442,6 +506,35 @@ export async function runColivingTurn(args: {
     justJoined: history.length === 0,
     answering,
   });
+
+  /**
+   * 本屋近期住户对排班征询回过**简单肯定**的持久事实（复用 communication 的
+   * responded 状态，见 repo.listScheduleInquiryConfirmations）。这是"谁已确认
+   * 过哪段"的单一事实源：contactPerson 排班分支用它跳过「已确认该时段」的人，
+   * missingSelectedScheduleParticipants 也把这些人视为已处理。
+   *
+   * 只按 slot（start/end）精确相等匹配——被算法挪过时段的人要重新征询，不命中；
+   * 72h 窗口由查询兜着，跨协调段的旧确认不会误伤。
+   */
+  const confirmedScheduleSlots = new Map<
+    string,
+    Array<{ windowLabel: string | null; start: string; end: string }>
+  >();
+  for (const row of await repo.listScheduleInquiryConfirmations(sender.householdId)) {
+    const parsed = scheduleInquiryConfirmation(row);
+    if (!parsed) continue;
+    const list = confirmedScheduleSlots.get(row.personId);
+    if (list) list.push(parsed);
+    else confirmedScheduleSlots.set(row.personId, [parsed]);
+  }
+  const hasDurableConfirmedSlot = (
+    personId: string,
+    slot: { start: string; end: string }
+  ): boolean =>
+    (confirmedScheduleSlots.get(personId) ?? []).some(
+      (c) => c.start === slot.start && c.end === slot.end
+    );
+
   const modelId = args.modelId ?? colivingModelId();
 
   /**
@@ -910,10 +1003,34 @@ export async function runColivingTurn(args: {
               reason: `${name} 在对话里已明确说出这个精确时段，原话视作许可，不再发征询`,
             };
           }
-          message =
-            `${salutation}关于${scheduleWindowLabel}，我先提出一个待确认的安排：` +
-            `你用 ${scheduleSlot.start}-${scheduleSlot.end}。这不是定案；你愿意吗？` +
-            "如果不合适直接告诉我，我会根据大家的回复继续协调。";
+          /**
+           * **定案/通知回合不再联系「已确认该时段」的人。**
+           *
+           * 真实事故（生产日志，2026-09-06）：老孙对 17:30-18:00 回「愿意」、
+           * 系统已回「好，就定给你了」之后，03:58:45 的定案收尾回合又给他发
+           * 了一条正文仍是「你愿意吗/这不是定案」的短信。系统没有持久记录
+           * 他已经确认过，于是又去问了一遍已经点头的人。
+           *
+           * 判据只认「他确认过的那个精确 slot」：scheduleSlot 已与已选方案做过
+           * 结构化核对（字符串相等），命中即代表同一个时段他早已同意，任何 act
+           * 都不用再发。被算法挪过时段的人不命中，仍走正常征询/通知。
+           */
+          if (hasDurableConfirmedSlot(target.personId, scheduleSlot)) {
+            preConsentedForSchedule.add(target.personId);
+            return {
+              ok: true,
+              preConsented: true,
+              skipped: true,
+              reason: `${name} 之前已确认过 ${scheduleSlot.start}-${scheduleSlot.end} 这个时段，定案/通知不再重复发送`,
+            };
+          }
+          // 正文按 act 分支：inform/remind 出定案通知，其余出「待确认安排」征询。
+          message = scheduleContactTextForAct({
+            act,
+            salutation,
+            windowLabel: scheduleWindowLabel,
+            scheduleSlot,
+          });
           scheduleVerified = true;
         }
         if (target.personId === sender.personId) {
@@ -2824,6 +2941,20 @@ export async function runColivingTurn(args: {
           if (scheduleSlotMatchesSelfStatement(selfStated, assignmentSlot)) {
             contactedNames.add(assignment.name);
           }
+        }
+      }
+      // 已对同一精确时段回过「愿意」的人，同样视为已处理——定案/通知回合
+      // 不得把已确认的人再判成"未征询"、逼模型去重复联系。
+      for (const assignment of selected.plan.assignments) {
+        if (contactedNames.has(assignment.name)) continue;
+        const member = ctx.members.find((m) => m.name === assignment.name);
+        if (!member) continue;
+        const assignmentSlot = {
+          start: formatMinutes(assignment.startMinutes),
+          end: formatMinutes(assignment.endMinutes),
+        };
+        if (hasDurableConfirmedSlot(member.personId, assignmentSlot)) {
+          contactedNames.add(assignment.name);
         }
       }
     }

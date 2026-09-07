@@ -21,6 +21,8 @@ import {
   isPrematureCapacityEscape,
   isScheduleSlotInquiry,
   isSimpleAffirmation,
+  scheduleContactTextForAct,
+  scheduleInquiryConfirmation,
   scheduleSlotMatchesSelfStatement,
 } from "../lib/chat/coliving/turn";
 
@@ -460,6 +462,60 @@ async function main() {
     assert.equal(r.pass, true);
     assert.deepEqual(r.findings, []);
   });
+  check("scheduleContactTextForAct: inform/remind are final notices, propose stays an inquiry", () => {
+    const salutation = "老孙，";
+    const slot = { start: "17:30", end: "18:00" };
+    const inform = scheduleContactTextForAct({ act: "inform", salutation, windowLabel: "傍晚厨房灶台时段", scheduleSlot: slot });
+    assert(inform.includes("17:30-18:00") && inform.includes("定在"));
+    for (const banned of ["你愿意吗", "这不是定案", "我会根据大家的回复继续协调"]) {
+      assert(!inform.includes(banned), `inform 正文不应含「${banned}」：${inform}`);
+    }
+    const remind = scheduleContactTextForAct({ act: "remind", salutation, windowLabel: "傍晚厨房", scheduleSlot: slot });
+    assert(remind.includes("17:30-18:00") && remind.includes("定在"));
+    assert(!remind.includes("你愿意吗"));
+    for (const act of ["propose", "confirm", "ask"] as const) {
+      const inquiry = scheduleContactTextForAct({ act, salutation, windowLabel: "傍晚厨房灶台时段", scheduleSlot: slot });
+      assert(inquiry.includes("你愿意吗") && inquiry.includes("这不是定案"), `${act} 应沿用征询正文`);
+    }
+  });
+  check("contactPerson builds schedule text via scheduleContactTextForAct (no inline duplicate)", () => {
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    assert(src.includes("scheduleContactTextForAct("), "contactPerson 必须调用 scheduleContactTextForAct");
+    const actBranchIdx = src.indexOf("if (args.act === \"inform\" || args.act === \"remind\")");
+    assert(actBranchIdx > 0, "scheduleContactTextForAct 必须包含 inform/remind 分支");
+    const contactCallIdx = src.indexOf("message = scheduleContactTextForAct(");
+    assert(contactCallIdx > 0, "contactPerson 的 message 赋值必须来自 scheduleContactTextForAct");
+    // 内联征询模板只能在纯函数里以 args.scheduleSlot 出现一次；contactPerson 直接拼
+    // 「你用 ${scheduleSlot.start}-…」的旧写法不应再存在。
+    assert(src.indexOf("你用 ${scheduleSlot.start}-${scheduleSlot.end}。这不是定案") === -1,
+      "contactPerson 不应再内联征询模板");
+  });
+  check("durable confirmation: repo exposes responded schedule inquiries, turn skips confirmed slots", () => {
+    const repo = readFileSync("lib/chat/coliving/repo.ts", "utf8");
+    const src = readFileSync("lib/chat/coliving/turn.ts", "utf8");
+    assert(repo.includes("export async function listScheduleInquiryConfirmations"));
+    assert(repo.includes("c.response_message_id"), "必须 join 回复消息确认 responded 状态");
+    assert(repo.includes("responded_at is not null"));
+    assert(repo.includes("c.act in ('ask', 'propose', 'confirm')"));
+    assert(src.includes("await repo.listScheduleInquiryConfirmations(sender.householdId)"));
+    assert(src.includes("hasDurableConfirmedSlot("), "contactPerson/门禁必须用持久确认判断");
+    assert(src.includes("之前已确认过 ${scheduleSlot.start}-${scheduleSlot.end} 这个时段"), "持久确认的跳过返回必须带明确原因");
+    assert(src.includes("preConsentedForSchedule.add(target.personId)"), "持久确认跳过必须计入 preConsented");
+  });
+  check("scheduleInquiryConfirmation parses yes-only responses to real slot inquiries", () => {
+    assert.deepEqual(
+      scheduleInquiryConfirmation({
+        inquiryBody: "老孙，关于傍晚厨房灶台时段，我先提出一个待确认的安排：你用 17:30-18:00。这不是定案；你愿意吗？",
+        responseBody: "愿意",
+      }),
+      { windowLabel: "傍晚厨房灶台时段", start: "17:30", end: "18:00" }
+    );
+    // 非简单肯定（追问/拒绝/纯信息）不构成确认
+    assert.equal(scheduleInquiryConfirmation({ inquiryBody: "你用 17:30-18:00，愿意吗？", responseBody: "愿意，但为什么我最后用？" }), null);
+    assert.equal(scheduleInquiryConfirmation({ inquiryBody: "今天吃什么？", responseBody: "愿意" }), null);
+    assert.equal(scheduleInquiryConfirmation({ inquiryBody: "你用 17:30-18:00，愿意吗？", responseBody: "不行" }), null);
+  });
+
   const previous = process.env.COLIVING_JUDGE_OFF;
   process.env.COLIVING_JUDGE_OFF = "1";
   const off = await judgeConversation({ scenarioId: "off", source: "offline", roster: [], turns: bad });
