@@ -48,6 +48,12 @@ LLM 只做一件事：把住户说的一句话翻译成一个结构化 `Intent`�
 | `ask_status` | 对 pending 的人补 `reminded`（催一次，不重复问） |
 | `other` | 无状态转移 |
 
+排不出可行方案时（`allocateSlots` 返回 null），不再静默停在原地：出站动作发一条
+`{ type: "blocked", reasons }`，`reasons` 是 `diagnoseInfeasibility` 产出的结构化诊断
+（总时长超窗口 / 某人最早开始已超窗口尾 / 最晚开始早于最早开始 / 锚点空当放不下）。
+这条 **不向住户发任何内容**，只把「为什么排不开」交给上层去生成协调建议——这是
+「看见排不开却假装没看见」的消除。
+
 ## 不变量（Invariants，代码强制）
 
 1. 一人同一窗口只占一段，不重叠。
@@ -58,13 +64,23 @@ LLM 只做一件事：把住户说的一句话翻译成一个结构化 `Intent`�
 ## LLM 的唯一职责
 
 ```ts
-parseIntent(message, context): Intent
+llmParseIntent(message, snapshot): Intent
 ```
 
 `Intent ∈ { report_availability, confirm, reject, counter_propose, add_constraint, ask_status, other }`
 
-这一步可以先用**确定性的关键词/stub 解析器**跑通，之后再把 LLM 挂进去做真正的
-意图理解——但无论解析器怎么换，状态机这一层不变。
+三个 availability 意图（report / counter / add_constraint）都带 `start` + `duration`，
+可选 `latestStart`（「八点太晚 / 不能晚于八点」落成最晚开始上限）。解析只吃
+`projectState` 的紧凑投影 + 当前这一条消息，**不吃历史原文**；投影里可带一段由调用方
+维护的 `recentDialogue`（最近几条真实对话，含 AI 出站），专门用来消歧「这句话在回什么」。
+
+两个关键消歧（都在 `llm.ts` 的 SYSTEM_PROMPT + 快速路径里）：
+
+- **接受时间建议 ≠ confirm**：AI 刚征询/建议过「17:30 先做，方便吗」，住户回「可以」
+  是接受那个新时间（更新可用时间到 17:30），不是确认旧方案。
+- **纯寒暄/纯确认走确定性快速路径**：`fastIntent` 只拦截「无论上下文都只有一种解」的
+  整句（你好/在吗/可以/行/没问题），带时间、数字、否定、疑问、犹豫的一律交回 LLM——
+  省模型调用、不降聪明。
 
 ## 持久化（append-only JSONL）
 
@@ -111,14 +127,24 @@ offset + 当时完整 Snapshot」，丢了或坏了随时可从事件日志全�
 ```
 lib/coordination/
   README.md       本文件
-  types.ts        State / Event / Intent / OutboundAction 类型
+  types.ts        State / Event / Intent / OutboundAction / Infeasibility 类型
   machine.ts      fold/foldFrom（事件日志→派生快照）、reduce、step、allocateSlots、
-                  不变量；snapToJson/snapFromJson（快照 ⇄ JSON）
+                  不变量、diagnoseInfeasibility；snapToJson/snapFromJson（快照 ⇄ JSON）
   intent.ts       parseIntent 接口 + 一个确定性 stub
+  llm.ts          上下文感知的 LLM 意图解析（薄意图层胶水）+ fastIntent 快速路径
   store.ts        append-only JSONL 持久化 + checkpoint 物化快照（appendEvents /
                   loadEvents / readLatest / saveCheckpoint / loadCheckpoint / resume）
+  runtime.ts      runCoordinationTurn：把「恢复→投影→解析→step→落盘/推进 checkpoint」
+                  收成一个完整一轮的运行时入口
   machine.test.ts 纯函数单测（不调 LLM）
   store.test.ts   持久化层纯 IO 单测（node 临时目录，不连库）
+  llm.test.ts     意图快速路径 + 接受时间建议上下文闸 的纯函数单测（不调 LLM）
+  runtime.test.ts 运行时入口纯 Node 单测（注入 stub 解析器，不调 LLM）
+  real-case-regression.test.ts  真实 kitchen_contention 的 golden 回归（手工 Intent，
+                   断言状态机复现真实定案）
+  e2e.test.ts     合成场景端到端（golden + 真实 LLM 两层）
+  real-data-e2e.ts          硬编码真实入站消息回放
+  real-data-db-e2e.ts       数据库双向消息回放 + 按 case 切分
 ```
 
 ## 设计目标
@@ -128,3 +154,18 @@ lib/coordination/
 - **零耦合**：不 import 项目里任何 coliving 代码，便于整体删除或替换。
 - **可渐进落地**：先在旁边跑通，验证思路后，再决定是否把现有
   `pickSchedule`/`contactPerson`/确认逻辑逐步迁移进来。
+
+## 接入生产的适配路径（路标，不是当前实现）
+
+实验内核已能在真实 kitchen_contention 上复现真实定案（`real-case-regression.test.ts`
+锁死），但要真正接管生产，还需要一个**只读适配层**把 coliving 世界投影成这里的输入：
+
+1. `participants` ← 该 household 当前 membership（`valid_to is null`）的 `display_name`；
+2. `window` ← 该「共享资源」的可用时间窗（这是**产品配置**：厨房排班是傍晚窗，垃圾/清洁
+   是另一套；适配层需要一张 `资源 → 窗口` 的显式映射，而不是散落的硬编码）；
+3. 消息流 ← 按 case 切分的真实入站/出站（`real-data-db-e2e.ts` 已做派生 case 标签）；
+4. 出站动作 → 交给 coliving 的措辞/发送层，`blocked` 诊断交给 coliving 大脑生成协调
+   建议（措辞归 doctrine，代码只给事实，见 CLAUDE.md）。
+
+**安全边界**：本目录不 import 任何发送/真实住户写入逻辑；接入前必须先走 shadow
+（只读、不向真人发送）对照，确认状态机方案与真实方案/住户约束一致，再谈替换。
