@@ -89,6 +89,11 @@ const OTHER_WORDS = new Set([
 /**
  * 纯确认 → `{ type: "confirm" }`。这些词只在「回应当前一版方案、表示接受」这一种
  * 语义下成立；后两个是「可以，没问题 / 没问题，可以」去标点后的常见组合。
+ *
+ * 注意“纯”的边界：若最近对话里 AI 刚**征询/建议过一个具体时间**（“17:30 先做，这个
+ * 点方便吗”），住户回“可以/没问题”更可能是「接受那个建议时间」而不是对方案的
+ * confirm——那种句子由 `llmParseIntent` 用上下文闸拦下、交给 LLM 消歧；`fastIntent`
+ * 本身只看词形、不越权（见 `aiRecentlySuggestedTimeToSender`）。
  */
 const CONFIRM_WORDS = new Set([
   "可以",
@@ -141,6 +146,10 @@ function normalizeForMatch(text: string): string {
  * 高置信度确定性意图：只拦截**绝对无歧义的整句**（纯寒暄、纯确认、空串/只标点），
  * 命中返回对应 Intent，否则返回 null（由调用方继续走 LLM）。
  *
+ * 纯确认词（可以/行/没问题）的“绝对无歧义”只在没有「AI 刚征询过具体时间」的上下文
+ * 时才成立；那种上下文由 `llmParseIntent` 拦截、交回 LLM（见
+ * `aiRecentlySuggestedTimeToSender`）。
+ *
  * 保守性设计：先把整句剥成「只含字母」的规范形，再对整个规范形**精确匹配**有限
  * 词表。因为剥除只动标点/空白、绝不动数字和汉字——`八点可以` / `不行` / `排好了吗` /
  * `我7点用30分钟` 这类带时间、数字、否定或语气词的句子，剥完后必然不是词表成员，
@@ -171,6 +180,47 @@ export function fastIntent(message: string): Intent | null {
   return null;
 }
 
+/* ------------------------------------------------------------------ *
+ * 上下文闸：纯确认词在「AI 刚征询/建议过一个具体时间」时不能被 fastIntent 短路
+ * ------------------------------------------------------------------ */
+
+/**
+ * AI 出站里“正在征询/建议一个新时间”的口气词——而不是在通知已经定好的方案。命中其一、
+ * 且句子里看得到钟点，就说明住户这句“可以/行/没问题”可能是「接受那个建议时间」，
+ * 而不是对已排好方案的 confirm（真伪由 LLM 按 SYSTEM_PROMPT 判，这里只决定要不要叫
+ * LLM）。
+ */
+const TIME_SUGGESTION_MARKERS = [
+  "方便吗", "行吗", "可以吗", "好吗", "行不行", "行得通", "怎么样", "可否",
+  "能不能", "可不可以", "要不要", "要不", "走法", "愿意吗", "愿不愿意",
+  "挪到", "改到", "提前到", "您看", "你看",
+] as const;
+
+/** 句子里带钟点/时刻的说法（阿拉伯数字、几点、点半、“这个点/那个点”）。 */
+const HAS_TIME_HINT = /[0-9０-９]|几点|点半|这个点|那个点/;
+
+/**
+ * 快照的【最近对话】里，AI 是否刚对这个发消息的人“征询/建议过一个具体开始时间”。
+ * 是 → 住户只回纯确认词时，不能短路成 confirm，应交给 LLM 按上下文消歧。
+ *
+ * 只看 AI→这个人 的出站行；普通“通知定案”（排好了/定了/你的时段是 X）没有上面的征询
+ * 口气词，不会在这里触发，仍按纯确认短路。
+ */
+function aiRecentlySuggestedTimeToSender(s: StateSnapshot): boolean {
+  const sender = s.sender;
+  if (!sender) return false;
+  const dial = s.recentDialogue;
+  if (!dial || dial.length === 0) return false;
+  const prefix = `AI→${sender}：`;
+  for (const line of dial) {
+    if (!line.startsWith(prefix)) continue;
+    if (TIME_SUGGESTION_MARKERS.some((m) => line.includes(m)) && HAS_TIME_HINT.test(line)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 const AVAILABILITY_TYPES = [
   "report_availability",
   "counter_propose",
@@ -190,6 +240,8 @@ const SYSTEM_PROMPT = [
   "（“我 X 点有空/能开始/开始做/用 Y 分钟”）。是提供信息，不是在对某个方案表态。",
   "2. confirm —— 同意、确认当前排好的方案：可以/行/没问题/同意/定案/就这版。",
   "即使提到钟点（如“8点可以”），也是“这个时段我接受”，不是重新报空闲。",
+  "例外：若“可以/行/没问题”是在回应 AI 刚建议/征询的一个**具体新时间**（如“17:30 先",
+  "做，这个点方便吗”），那是接受那个建议、等于更新自己的可用时间，不是 confirm（见下）。",
   "3. reject —— 明确拒绝当前方案，而且没有给任何替代时间。只表达“不行/不同意/不合适”，",
   "不带“几点开始/用多久”这类新信息。",
   "4. counter_propose —— 一边否定当前方案，一边给出自己新的可用时间",
@@ -204,12 +256,24 @@ const SYSTEM_PROMPT = [
   "  （如“你最早只能排到8点后：20:00到20:30”），住户接的“不行/不合适/太晚了/不接",
   "  受八点”就是对**那条建议、那个时段**的拒绝或补上限——不要把它凭空当成一个",
   "  新的可用开始时间，也别脱离【最近对话】另找靶子。",
+  "- 【接受时间建议 ≠ confirm】若【最近对话】里 AI 刚给这个人**建议/征询过一个具体开始",
+  "  时间**（“还有个走法：您排最前头，17:30 到 18:00 先做，这个点您方便吗”“能不能改到",
+  "  17:30”“您 17:30 这档方便吗”这类），住户只回“可以/行/没问题/好/同意”等确认，是",
+  "  在**接受那个建议时间**——不是 confirm（confirm 只表示接受**已经排好的方案**）。",
+  "  应输出 report_availability 或 counter_propose：start = AI 建议里的那个具体时间",
+  "  （换算成分钟数），duration 沿用【每人已报】里这个人已报的时长、没报过才用默认 30；",
+  "  不要凭空再造一个别的时间。",
+  "- 反过来，若 AI 只是在**通知已经排好的方案**（“排好了/定稿了/定了/你的时段是 X”），",
+  "  住户的“可以/没问题”才是 confirm。判别依据是 AI 那句的口气：是“征询/建议一个新",
+  "  时间”（方便吗/行吗/可以吗/能不能改/有个走法/要不要挪到），还是“通知已定案”——",
+  "  优先看有没有征询/建议的口气。",
   "- 【发消息的人】就是正在说这句话的人；消息里的“我”都指 ta。",
   "- 若这句话在报/改自己的可用时间，只给了“几点开始”、没给时长：沿用【每人已报】里",
   "  这个发消息的人之前报过的时长；ta 之前没报过才用默认 30。",
   "- 已有方案在等人确认时：不带新时间的“不行/不合适”是对自己分到的那段 reject；",
-  "  带新时间（“不行，我 X 点才行”“换到 X 点”）是 counter_propose；“可以/没问题”",
-  "  是对方案的 confirm。",
+  "  带新时间（“不行，我 X 点才行”“换到 X 点”）是 counter_propose；住户回的",
+  "  “可以/没问题”是对方案的 confirm（除非是在回应 AI 刚建议/征询的一个**新时间**——",
+  "  那是上面的【接受时间建议≠confirm】）。",
   "- “X 点太晚了 / 我不接受 X 点 / 不能晚于 X 点开始 / X 点才开始就来不及了”这类用",
   "  钟点表达“不能再晚”的话，是在给自己加**最晚开始**上限，不是无信息的 reject，也",
   "  不是在报一个新的可用开始时间。输出带 latestStart 的意图（add_constraint 或",
@@ -371,13 +435,17 @@ function coerceIntent(o: Record<string, unknown>): Intent | null {
  * 先走 `fastIntent` 确定性快速路径：只有「无论上下文如何都只有一种解」的整句
  * （纯寒暄/纯确认/空串）会被拦截，**不花一次模型调用**。拦截不了才真实请求模型。
  * 语义不变——快路径只抢走绝对无歧义的句子，带任何歧义信号的都继续走 LLM。
+ *
+ * 唯一的例外是「纯确认词 + 最近对话里 AI 刚征询/建议过一个具体时间」：这种“可以/没
+ * 问题”可能是「接受 AI 建议的那个时间」（=更新自己的可用时间），不是对已排方案的
+ * confirm——上下文歧义，快路径不能短路，必须交给 LLM 用【最近对话】消歧。
  */
 export async function llmParseIntent(message: string, snapshot: StateSnapshot): Promise<Intent> {
   const text = (message ?? "").trim();
   if (!text) return { type: "other" };
 
   const fast = fastIntent(text);
-  if (fast) return fast;
+  if (fast && !(fast.type === "confirm" && aiRecentlySuggestedTimeToSender(snapshot))) return fast;
 
   try {
     const result = await generateText({
