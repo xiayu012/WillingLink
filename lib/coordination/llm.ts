@@ -32,6 +32,15 @@
  *   的 duration，不落回默认 30（否则会把别人报过的两小时悄悄覆盖掉）。
  * - 「不行 / 八点太晚了」到底在拒绝什么：用快照里的当前方案（谁被分到哪段）来消歧。
  *
+ * ## 最近对话（recentDialogue，2026-09-07 加）
+ *
+ * 快照里还可选带 `recentDialogue`——由调用方（数据库回放脚本等）维护的**最近几条
+ * 对话原文（含 AI 出站）**，上限很小（脚本截到 ~6 条、渲染层每条再截到 ~160 字），
+ * 是「整段历史不进 prompt」这条规矩的唯一例外：它专门用来补「一句话在回什么」的
+ * 指代——例如小五的「不合适。八点太晚了」，只有看到 AI 刚跟她说过「你最早只能排
+ * 到 8 点后：20:00 到 20:30」，才知道她拒的是那档、而不是凭空报了个「八点有空」。
+ * 状态机本身不依赖它做任何转移，只是透传进快照给本层看。
+ *
  * ## 失败语义
  *
  * 解析失败 / 不是 JSON / 模型调用异常 → 一律退化成 `{ type: "other" }`，不抛错。
@@ -81,6 +90,10 @@ const SYSTEM_PROMPT = [
   "7. other —— 其它无关/寒暄/说不准的话。",
   "",
   "用【当前状态】消歧（重要）：",
+  "- 若给了【最近对话】，先用它判断这句话在回什么：看到 AI 刚建议过某个时段",
+  "  （如“你最早只能排到8点后：20:00到20:30”），住户接的“不行/不合适/太晚了/不接",
+  "  受八点”就是对**那条建议、那个时段**的拒绝或补上限——不要把它凭空当成一个",
+  "  新的可用开始时间，也别脱离【最近对话】另找靶子。",
   "- 【发消息的人】就是正在说这句话的人；消息里的“我”都指 ta。",
   "- 若这句话在报/改自己的可用时间，只给了“几点开始”、没给时长：沿用【每人已报】里",
   "  这个发消息的人之前报过的时长；ta 之前没报过才用默认 30。",
@@ -126,10 +139,19 @@ function fmtMinute(minute: number): string {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
+/** 按码点截断到约 max 个字，超长补 "…"（避免把聊天原文整段塞进 prompt）。 */
+function truncateAt(text: string, max: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  return `${chars.slice(0, max).join("")}…`;
+}
+
 /**
  * 把 `projectState(events)` 的紧凑快照渲染成一段中文状态说明。只放解析这一条消息
- * 必需的事实：状态、窗口、发消息的人、每人已报、当前方案、已确认/还在等。每个时间
- * 都附上分钟数，免得模型再心算 18:00=1080 之类的换算。
+ * 必需的事实：状态、窗口、发消息的人、每人已报、当前方案、已确认/还在等，末尾再附
+ * 一段由调用方提供的【最近对话】（仅列出 `recentDialogue` 里的条目，每条截到约
+ * 160 字），供模型判断「这句话在回什么」。每个时间都附上分钟数，免得模型再心算
+ * 18:00=1080 之类的换算。
  */
 function renderSnapshot(s: StateSnapshot): string {
   const lines: string[] = [];
@@ -164,6 +186,10 @@ function renderSnapshot(s: StateSnapshot): string {
   lines.push(`已确认：${s.confirmed.length ? s.confirmed.join("、") : "无"}`);
   lines.push(`还在等：${s.waiting.length ? s.waiting.join("、") : "无"}`);
   if (s.reminded.length > 0) lines.push(`已催过：${s.reminded.join("、")}`);
+  if (s.recentDialogue.length > 0) {
+    lines.push("最近对话（用于判断“这句话在回什么”；AI→某人 是 AI 说出站原文）：");
+    for (const line of s.recentDialogue) lines.push(`- ${truncateAt(line, 160)}`);
+  }
   return lines.join("\n");
 }
 

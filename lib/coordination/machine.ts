@@ -71,6 +71,12 @@ export interface ProjectContext {
   window?: TimeWindow;
   /** 正在发当前这条消息的人（turn 上下文，跟 machine.step 的 StepContext.sender 同源）。 */
   sender?: PersonId;
+  /**
+   * 最近几条对话原文（含 AI 出站），**仅供 LLM 意图解析消歧用**。由调用方
+   * （回放脚本等）在每次解析前维护并传入；状态机本身不依赖它做任何转移——
+   * 它只是透传进 `StateSnapshot` 给 LLM 看的旁证，缺省表示调用方没提供。
+   */
+  recentDialogue?: readonly string[];
 }
 
 /** 某人已报的可用时间（投影里的一个人一条）。 */
@@ -83,8 +89,9 @@ export interface ProjectedAvailability {
 
 /**
  * `projectState(events)` 的输出：把不可变事件日志**重放投影**成当前事实的紧凑结构。
- * 它是给 LLM 意图解析吃的「单一事实来源」——只含状态机当前知道的事实，绝不含任何
- * 一条聊天原文（不会倒退到把整段历史塞进 prompt 的旧做法）。
+ * 它是给 LLM 意图解析吃的「单一事实来源」——主要含状态机当前知道的事实，不倒退到
+ * 把整段历史塞进 prompt 的旧做法。唯一的例外是 `recentDialogue`：那是由调用方截到
+ * 最近几条、可选的对话原文（渲染层还会再截断），只用来帮 LLM 判断「这句话在回什么」。
  *
  * 注意：事件日志只记录「开过口的人」，所以沉默的参与者/共享窗口/当前说话人不在
  * 事件里，由 `ProjectContext` 补进来；缺省时参与者退化为事件里出现过的人。
@@ -110,6 +117,12 @@ export interface StateSnapshot {
   waiting: PersonId[];
   /** 已被催过的人（「催一次不重复问」的去重依据）。 */
   reminded: PersonId[];
+  /**
+   * 最近几条对话原文（用于消歧的「这句话在回什么」），透传自 `ProjectContext.recentDialogue`。
+   * 由调用方（回放脚本）维护并截到最近 N 条，渲染层每条还会再截断；状态机本身
+   * 不依赖它做任何转移。缺省为 `[]`。
+   */
+  recentDialogue: string[];
 }
 
 /* ------------------------------------------------------------------ *
@@ -339,6 +352,7 @@ export function projectState(events: readonly Event[], ctx: ProjectContext = {})
     confirmed,
     waiting,
     reminded,
+    recentDialogue: ctx.recentDialogue ? [...ctx.recentDialogue] : [],
   };
 }
 

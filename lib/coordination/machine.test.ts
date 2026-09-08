@@ -125,6 +125,20 @@ test("projectState：gathering 阶段——列已报到的人、还在等谁、�
   assert.deepEqual(snap.reminded, []);
 });
 
+test("projectState：recentDialogue 透传——ctx 给了就原样列出，没给就是空数组", () => {
+  const log = loggedProposal();
+  const snap = projectState(log, {
+    ...projCtx(A),
+    recentDialogue: ["AI→小五：你最早只能排到 8 点后：20:00 到 20:30", "小五：不合适。八点太晚了"],
+  });
+  assert.deepEqual(snap.recentDialogue, [
+    "AI→小五：你最早只能排到 8 点后：20:00 到 20:30",
+    "小五：不合适。八点太晚了",
+  ]);
+  // 没传 recentDialogue 时缺省为空数组（不破坏既有调用方）
+  assert.deepEqual(projectState(log, projCtx(B)).recentDialogue, []);
+});
+
 test("projectState：proposed + 一人确认后——有方案、列出确认与还在等谁", () => {
   const log = loggedProposal();
   const log2 = push(log, step(log, confirmIntent(), ctxOf(A)));
