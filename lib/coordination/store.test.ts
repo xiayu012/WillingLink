@@ -11,14 +11,19 @@
  * - append 是追加不是覆盖：写 A、再写 B，load 得到 [A, B]；
  * - 空/不存在文件 load 返回 `[]`；
  * - `readLatest` 只返回最后 N 条、`total` 是全部条数；
- * - 手工塞一行坏 JSON，load 跳过坏行仍能解析其它行。
+ * - 手工塞一行坏 JSON，load 跳过坏行仍能解析其它行；
+ * - checkpoint save/load roundtrip（snap 等价、offset 保留）；缺失/损坏/形状不对返回 null；
+ * - `resume` 对「空 checkpoint + 全量事件」「已有 checkpoint + 后半增量」「checkpoint
+ *   过时」「checkpoint 损坏」四种情况都等价于 `fold(loadEvents(...))`。
  */
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { appendEvents, loadEvents, readLatest } from "./store";
+import { appendEvents, loadCheckpoint, loadEvents, readLatest, resume, saveCheckpoint } from "./store";
+import { fold, snapToJson } from "./machine";
+import type { Snap } from "./machine";
 import type { Event } from "./types";
 
 /* ------------------------------------------------------------------ *
@@ -43,6 +48,56 @@ const SLOT_B = { start: 19 * 60, end: 20 * 60 };
 /** 每轮测试共用一个临时目录（mkdtemp），测试用不同文件名避免互相干扰。 */
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "coordination-store-"));
 const tmpFile = (name: string): string => path.join(tmpDir, name);
+
+/**
+ * 一段非平凡日志：报到 → 第一版方案 → A 确认 → B 反提（重排成第二版，A 时段没变
+ * 承袭确认）→ C 确认新版 → 催 B。终点有 currentProposal / confirmed / reminded，
+ * lastProposalIndex 与 lastDisruptIndex 都非 -1。
+ */
+function scenarioEvents(): Event[] {
+  const A = "A";
+  const B = "B";
+  const C = "C";
+  const a1 = { person: A, slot: { start: 18 * 60, end: 18 * 60 + 30 } };
+  const c1 = { person: C, slot: { start: 18 * 60 + 30, end: 19 * 60 + 15 } };
+  const b1 = { person: B, slot: { start: 19 * 60 + 15, end: 20 * 60 + 15 } };
+  const b2 = { person: B, slot: { start: 19 * 60 + 30, end: 20 * 60 + 30 } };
+  return [
+    { type: "availability_reported", person: A, start: 18 * 60, duration: 30 },
+    { type: "availability_reported", person: B, start: 19 * 60, duration: 60 },
+    { type: "availability_reported", person: C, start: 18 * 60 + 30, duration: 45 },
+    { type: "schedule_proposed", window: WINDOW, assignments: [a1, c1, b1] },
+    { type: "confirmed", person: A },
+    // B 反提：更新可用时间 + 重排第二版（A 时段没变 → 承袭确认）
+    { type: "availability_reported", person: B, start: 19 * 60 + 30, duration: 60 },
+    { type: "schedule_proposed", window: WINDOW, assignments: [a1, c1, b2] },
+    { type: "confirmed", person: C },
+    { type: "reminded", person: B },
+  ];
+}
+
+/** 把 Snap 摊平排序成规范形，供 sameSnap 判等价（Map/Set 内部顺序可不定）。 */
+function canonicalSnap(s: Snap): unknown {
+  const j = snapToJson(s);
+  return {
+    settled: j.settled,
+    currentProposal: j.currentProposal,
+    reported: Object.fromEntries(
+      Object.entries(j.reported).sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0))
+    ),
+    confirmed: [...j.confirmed].sort(),
+    reminded: [...j.reminded].sort(),
+    activeDisputants: [...j.activeDisputants].sort(),
+    allConfirmed: j.allConfirmed,
+    lastProposalIndex: j.lastProposalIndex,
+    lastDisruptIndex: j.lastDisruptIndex,
+  };
+}
+
+/** 两张 Snap 是否等价（成员与数值一致即可，不要求 Map/Set 内部顺序）。 */
+function sameSnap(a: Snap, b: Snap): boolean {
+  return JSON.stringify(canonicalSnap(a)) === JSON.stringify(canonicalSnap(b));
+}
 
 /* ------------------------------------------------------------------ *
  * 用例
@@ -178,6 +233,91 @@ test("readLatest 同样不受坏行影响：按可解析的事件取尾", () => 
     { type: "reminded", person: "C" },
     { type: "confirmed", person: "D" },
   ]);
+});
+
+/* ------------------------------------------------------------------ *
+ * checkpoint：save/load roundtrip、resume 增量续放等价性
+ * ------------------------------------------------------------------ */
+
+test("checkpoint save/load roundtrip：snap 等价、offset 保留", () => {
+  const eventsFile = tmpFile("ckpt-events.jsonl");
+  const ckptFile = tmpFile("ckpt.json");
+  const events = scenarioEvents();
+  appendEvents(eventsFile, events);
+
+  const snap = fold(events);
+  const offset = events.length;
+  saveCheckpoint(ckptFile, snap, offset);
+
+  const loaded = loadCheckpoint(ckptFile);
+  assert.ok(loaded, "checkpoint 应能读回");
+  assert.equal(loaded.offset, offset);
+  assert.ok(sameSnap(loaded.snap, snap));
+});
+
+test("checkpoint 缺失/损坏/形状不对时 loadCheckpoint 返回 null", () => {
+  assert.equal(loadCheckpoint(tmpFile("no-such-ckpt.json")), null, "文件不存在返回 null");
+
+  const bad = tmpFile("bad-ckpt.json");
+  fs.writeFileSync(bad, "{ 这不是合法 JSON");
+  assert.equal(loadCheckpoint(bad), null, "JSON 解析失败返回 null");
+
+  const wrong = tmpFile("wrong-ckpt.json");
+  fs.writeFileSync(wrong, JSON.stringify({ snap: 42, offset: "oops" }));
+  assert.equal(loadCheckpoint(wrong), null, "形状不对返回 null");
+});
+
+test("resume：空 checkpoint + 全量事件，等价于 fold(loadEvents)", () => {
+  const eventsFile = tmpFile("resume-empty-events.jsonl");
+  const ckptFile = tmpFile("resume-empty-ckpt.json"); // 不存在
+  const events = scenarioEvents();
+  appendEvents(eventsFile, events);
+
+  const r = resume(eventsFile, ckptFile);
+  assert.equal(r.offset, events.length);
+  assert.ok(sameSnap(r.snap, fold(events)));
+});
+
+test("resume：已有 checkpoint（前 k 条）+ 后半增量，等价于 fold(loadEvents)", () => {
+  const eventsFile = tmpFile("resume-tail-events.jsonl");
+  const ckptFile = tmpFile("resume-tail-ckpt.json");
+  const events = scenarioEvents();
+  appendEvents(eventsFile, events);
+
+  // 在任意中间位置 k 存一个 checkpoint：只物化前 k 条事件的快照。
+  const k = 3; // 前三条都是 availability_reported，快照停留在 gathering
+  saveCheckpoint(ckptFile, fold(events.slice(0, k)), k);
+
+  const r = resume(eventsFile, ckptFile);
+  assert.equal(r.offset, events.length);
+  assert.ok(sameSnap(r.snap, fold(events)), "从 checkpoint 续放必须与整段重放等价");
+});
+
+test("resume：checkpoint 已过时（offset 小于事件总数）也能续放到最新", () => {
+  const eventsFile = tmpFile("resume-stale-events.jsonl");
+  const ckptFile = tmpFile("resume-stale-ckpt.json");
+  const events = scenarioEvents();
+  appendEvents(eventsFile, events);
+
+  // 先存一个只覆盖更早前缀（k=0 之前不可能，用 1）的 checkpoint，模拟日志又追加过。
+  const stale = fold(events.slice(0, 1));
+  saveCheckpoint(ckptFile, stale, 1);
+
+  const r = resume(eventsFile, ckptFile);
+  assert.equal(r.offset, events.length);
+  assert.ok(sameSnap(r.snap, fold(events)));
+});
+
+test("resume：checkpoint 损坏时回退全量重放，仍与 fold(loadEvents) 等价", () => {
+  const eventsFile = tmpFile("resume-corrupt-events.jsonl");
+  const ckptFile = tmpFile("resume-corrupt-ckpt.json");
+  const events = scenarioEvents();
+  appendEvents(eventsFile, events);
+  fs.writeFileSync(ckptFile, "坏 checkpoint");
+
+  const r = resume(eventsFile, ckptFile);
+  assert.equal(r.offset, events.length);
+  assert.ok(sameSnap(r.snap, fold(events)));
 });
 
 /* ------------------------------------------------------------------ *

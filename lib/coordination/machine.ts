@@ -136,8 +136,12 @@ interface Availability {
   latestStart?: Minute; // 最晚必须开始；缺省表示没有上限
 }
 
-/** 重放事件日志得到的派生快照（只在本文件内使用）。 */
-interface Snap {
+/**
+ * 重放事件日志得到的派生快照。本模块内部 `reduce` / `projectState` / `step` 都建立在
+ * 它上面；导出是为了让持久化层（`store.ts`）把快照物化成 checkpoint、以及从 checkpoint
+ * 继续增量重放（`foldFrom`）。
+ */
+export interface Snap {
   /** 日志里出现过 settled（终态）。 */
   settled: boolean;
   /** 当前这版方案；没排过就是 null。 */
@@ -170,22 +174,46 @@ function overlaps(a: TimeSlot, b: TimeSlot): boolean {
 }
 
 /* ------------------------------------------------------------------ *
- * fold：事件日志 → 派生快照
+ * fold / foldFrom：事件日志 → 派生快照
  * ------------------------------------------------------------------ */
 
-function fold(events: readonly Event[]): Snap {
-  const reported = new Map<PersonId, Availability>();
-  let currentProposal: Snap["currentProposal"] = null;
-  let settled = false;
-  let confirmed = new Set<PersonId>();
-  let reminded = new Set<PersonId>();
-  let active = new Set<PersonId>();
-  let lastProposalIndex = -1;
-  let lastDisruptIndex = -1;
+/** 返回「还没有任何事件」的初始快照。 */
+export function emptySnap(): Snap {
+  return {
+    settled: false,
+    currentProposal: null,
+    reported: new Map(),
+    confirmed: new Set(),
+    reminded: new Set(),
+    activeDisputants: new Set(),
+    allConfirmed: false,
+    lastProposalIndex: -1,
+    lastDisruptIndex: -1,
+  };
+}
 
-  // 用普通 for 循环而不是 forEach：`currentProposal` 在循环体里会被赋值，forEach
-  // 回调里看不见这些赋值，会把它错误窄化成一个 never/null，for 循环没这个问题。
+/**
+ * 从 `base` 快照继续处理 `events`（增量重放），返回**新**快照（Map/Set 都复制，
+ * 不原地改 `base`）。`events` 里的第 i 个事件在完整日志里的下标视为
+ * `baseIndex + i`——这对 `lastProposalIndex` / `lastDisruptIndex` 的取值是关键，
+ * 否则增量续放会破坏 `reduce` 里 `renegotiating` 的判定。
+ *
+ * `fold(events)` 等价于 `foldFrom(emptySnap(), events, 0)`，本函数是真正实现。
+ */
+export function foldFrom(base: Snap, events: readonly Event[], baseIndex: number): Snap {
+  const reported = new Map(base.reported);
+  let currentProposal = base.currentProposal;
+  let settled = base.settled;
+  let confirmed = new Set(base.confirmed);
+  let reminded = new Set(base.reminded);
+  let active = new Set(base.activeDisputants);
+  let lastProposalIndex = base.lastProposalIndex;
+  let lastDisruptIndex = base.lastDisruptIndex;
+
+  // 用普通 for 循环而不是 forEach：`currentProposal`/`confirmed` 在循环体里会被赋值，
+  // forEach 回调里看不见这些赋值，会把它错误窄化成一个 never/null，for 循环没这个问题。
   for (let i = 0; i < events.length; i++) {
+    const idx = baseIndex + i; // 事件在完整日志里的绝对下标
     const e = events[i];
     switch (e.type) {
       case "availability_reported": {
@@ -198,7 +226,7 @@ function fold(events: readonly Event[]): Snap {
           // 方案已经在等确认时又改可用时间 = 反提/加约束：解除该人确认，标记为待重排。
           confirmed.delete(e.person);
           active.add(e.person);
-          lastDisruptIndex = i;
+          lastDisruptIndex = idx;
         }
         break;
       }
@@ -218,7 +246,7 @@ function fold(events: readonly Event[]): Snap {
         reminded = new Set();
         active = new Set();
         currentProposal = { window: e.window, assignments: e.assignments };
-        lastProposalIndex = i;
+        lastProposalIndex = idx;
         break;
       }
       case "confirmed": {
@@ -232,7 +260,7 @@ function fold(events: readonly Event[]): Snap {
         if (currentProposal && findAssignment(currentProposal.assignments, e.person)) {
           confirmed.delete(e.person);
           active.add(e.person);
-          lastDisruptIndex = i;
+          lastDisruptIndex = idx;
         }
         break;
       }
@@ -261,6 +289,85 @@ function fold(events: readonly Event[]): Snap {
     allConfirmed,
     lastProposalIndex,
     lastDisruptIndex,
+  };
+}
+
+/**
+ * 从头重放一整段事件日志，推导派生快照。等价于
+ * `foldFrom(emptySnap(), events, 0)`——保留这个名字当「从零全量重放」的惯用入口。
+ */
+export function fold(events: readonly Event[]): Snap {
+  return foldFrom(emptySnap(), events, 0);
+}
+
+/* ------------------------------------------------------------------ *
+ * Snap ⇄ SnapJson：checkpoint 物化快照的 JSON 序列化
+ * ------------------------------------------------------------------ */
+
+/**
+ * `Snap` 的可 JSON 化 plain 形状（checkpoint 落盘用）。`reported` 的键是
+ * `PersonId`，值是那次可用时间的紧凑对象；`confirmed` / `reminded` /
+ * `activeDisputants` 是数组（Map/Set 落到 JSON 前摊平成数组）。
+ */
+export interface SnapJson {
+  settled: boolean;
+  currentProposal: { window: TimeWindow; assignments: Assignment[] } | null;
+  reported: Record<PersonId, { start: Minute; duration: number; latestStart?: Minute }>;
+  confirmed: PersonId[];
+  reminded: PersonId[];
+  activeDisputants: PersonId[];
+  allConfirmed: boolean;
+  lastProposalIndex: number;
+  lastDisruptIndex: number;
+}
+
+/** 把派生快照 `Snap` 摊平成可 JSON 序列化的 `SnapJson`。 */
+export function snapToJson(snap: Snap): SnapJson {
+  const reported: SnapJson["reported"] = {};
+  for (const [person, a] of snap.reported) {
+    reported[person] =
+      a.latestStart !== undefined
+        ? { start: a.start, duration: a.duration, latestStart: a.latestStart }
+        : { start: a.start, duration: a.duration };
+  }
+  return {
+    settled: snap.settled,
+    currentProposal: snap.currentProposal
+      ? { window: snap.currentProposal.window, assignments: snap.currentProposal.assignments }
+      : null,
+    reported,
+    confirmed: [...snap.confirmed],
+    reminded: [...snap.reminded],
+    activeDisputants: [...snap.activeDisputants],
+    allConfirmed: snap.allConfirmed,
+    lastProposalIndex: snap.lastProposalIndex,
+    lastDisruptIndex: snap.lastDisruptIndex,
+  };
+}
+
+/** 从 `SnapJson` 还原派生快照 `Snap`（roundtrip 保持等价：成员与数值一致即可）。 */
+export function snapFromJson(json: SnapJson): Snap {
+  const reported = new Map<PersonId, Availability>();
+  for (const person of Object.keys(json.reported)) {
+    const a = json.reported[person];
+    reported.set(person, {
+      start: a.start,
+      duration: a.duration,
+      ...(a.latestStart !== undefined ? { latestStart: a.latestStart } : {}),
+    });
+  }
+  return {
+    settled: json.settled,
+    currentProposal: json.currentProposal
+      ? { window: json.currentProposal.window, assignments: json.currentProposal.assignments }
+      : null,
+    reported,
+    confirmed: new Set(json.confirmed),
+    reminded: new Set(json.reminded),
+    activeDisputants: new Set(json.activeDisputants),
+    allConfirmed: json.allConfirmed,
+    lastProposalIndex: json.lastProposalIndex,
+    lastDisruptIndex: json.lastDisruptIndex,
   };
 }
 

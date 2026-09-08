@@ -82,18 +82,29 @@ JSON 事件、行尾换行）存成文件。存储层是自包含的 `store.ts`�
 - `readLatest(filePath, limit)` —— 读最后 `limit` 条事件（正序）并返回事件总数。
   这是「最近窗口」的底层：把尾部事件喂 `projectState`，就在有限窗口里恢复最近
   事实，不必每次整段重放。
+- `saveCheckpoint(filePath, snap, offset)` / `loadCheckpoint(filePath)` —— 把派生
+  快照 `Snap` 摊平成 JSON（`machine.ts` 的 `snapToJson`）连同「已重放到的 offset」
+  **覆盖写**到 checkpoint 文件；读回时 `snapFromJson` 还原成 `Snap`。文件不存在或
+  解析失败时 `loadCheckpoint` 返回 `null`。
+- `resume(eventsFile, checkpointFile)` —— 读 checkpoint（没有就 `emptySnap()` +
+  offset 0），`loadEvents` 后取 `slice(offset)` 的增量事件，用 `foldFrom` 从快照
+  续放，返回最新 snap 和新的 offset（= 当前事件总数）。**等价性保证**：
+  `resume(...).snap` 与 `fold(loadEvents(...))` 完全等价（有测试锁死）。
+
+**checkpoint 与事件日志性质不同，不混为一谈**：事件日志仍是 append-only JSONL，
+只追加、从不覆盖；checkpoint 是**覆盖写**的派生物化快照，保存「已重放到的
+offset + 当时完整 Snapshot」，丢了或坏了随时可从事件日志全量重放重建，不是事实
+的原始记录。
 
 设计不是自创，是**偷思想、不搬依赖**：
 
 1. **事件溯源（数据库）**——只追加不可变事件、从不改状态；当前状态永远可回放。
-2. **sqlite 物化投影**——把"状态 = 对日志的物化投影、只落日志本身"这一套搬下来，
-   但落盘格式是纯文本 JSONL，不是 SQLite。
-3. **最近窗口（流式系统）**——`readLatest` 只取尾部一段 + 投影，恢复最近上下文。
-
-留作后续：**checkpoint 物化快照**。现在 `loadEvents`/`readLatest` 每次整读整解析
-日志；等日志变大，再在文件里持久化"已重放到的条数"光标或定期写一份物化快照，
-让重放只从最近的位置续起。这一步不做，是因为当前状态机还要求从头完整重放（例如
-确认承袭依赖跨版历史），先保证语义正确，再谈增量。
+2. **sqlite 物化投影 / 流式系统 checkpoint**——把"状态 = 对日志的物化投影"搬下来，
+   落盘格式是纯文本 JSONL，不是 SQLite；等日志变大时用「物化快照 + 从快照续放」
+   让重放只从最近的位置续起，不必每次整读整解析。`fold` / `foldFrom` 用同一套
+   循环（`fold` 只是 `foldFrom(emptySnap(), events, 0)` 的薄封装），续放把事件
+   下标看成 `baseIndex + 局部下标`，保证 `lastProposalIndex` / `lastDisruptIndex`
+   仍记绝对位置、`renegotiating` 判定不被增量续放破坏。
 
 ## 目录结构（自包含）
 
@@ -101,9 +112,11 @@ JSON 事件、行尾换行）存成文件。存储层是自包含的 `store.ts`�
 lib/coordination/
   README.md       本文件
   types.ts        State / Event / Intent / OutboundAction 类型
-  machine.ts      reduce（事件日志→状态）、step（状态+Intent→新事件+动作）、不变量
+  machine.ts      fold/foldFrom（事件日志→派生快照）、reduce、step、allocateSlots、
+                  不变量；snapToJson/snapFromJson（快照 ⇄ JSON）
   intent.ts       parseIntent 接口 + 一个确定性 stub
-  store.ts        append-only JSONL 持久化（appendEvents / loadEvents / readLatest）
+  store.ts        append-only JSONL 持久化 + checkpoint 物化快照（appendEvents /
+                  loadEvents / readLatest / saveCheckpoint / loadCheckpoint / resume）
   machine.test.ts 纯函数单测（不调 LLM）
   store.test.ts   持久化层纯 IO 单测（node 临时目录，不连库）
 ```

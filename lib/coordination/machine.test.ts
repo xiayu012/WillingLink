@@ -15,8 +15,18 @@
  */
 
 import assert from "node:assert/strict";
-import { allocateSlots, checkInvariants, projectState, reduce, step } from "./machine";
-import type { StepContext } from "./machine";
+import {
+  allocateSlots,
+  checkInvariants,
+  emptySnap,
+  fold,
+  foldFrom,
+  projectState,
+  reduce,
+  snapToJson,
+  step,
+} from "./machine";
+import type { Snap, StepContext } from "./machine";
 import type { Assignment, Event, PersonId, TimeSlot } from "./types";
 import { parseIntent } from "./intent";
 
@@ -88,6 +98,27 @@ const lastProposalAssignments = (log: Event[]): Assignment[] => {
 };
 
 const hasEventOfType = (log: Event[], type: Event["type"]): boolean => log.some((e) => e.type === type);
+
+/**
+ * 把 Snap 摊平排序成可比较的规范形：Map 摊成按 person 排序的记录、Set 摊成排序数组，
+ * 让「成员与数值一致但内部遍历顺序可不定」的两张快照也能用 deepEqual 比等价。
+ */
+function canonicalSnap(s: Snap): unknown {
+  const j = snapToJson(s);
+  return {
+    settled: j.settled,
+    currentProposal: j.currentProposal,
+    reported: Object.fromEntries(
+      Object.entries(j.reported).sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0))
+    ),
+    confirmed: [...j.confirmed].sort(),
+    reminded: [...j.reminded].sort(),
+    activeDisputants: [...j.activeDisputants].sort(),
+    allConfirmed: j.allConfirmed,
+    lastProposalIndex: j.lastProposalIndex,
+    lastDisruptIndex: j.lastDisruptIndex,
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * reduce：空日志 / 简单派生
@@ -462,6 +493,48 @@ test("parseIntent 主映射：确认 / 拒绝 / 反提 / 报到 / 问进度", ()
   assert.deepEqual(parseIntent("晚上7点用45分钟"), { type: "report_availability", start: 19 * 60, duration: 45 });
   assert.deepEqual(parseIntent("你们排好了吗"), { type: "ask_status" });
   assert.deepEqual(parseIntent("在吗"), { type: "other" });
+});
+
+/* ------------------------------------------------------------------ *
+ * fold / foldFrom / checkpoint 物化：增量续放与整段重放等价
+ * ------------------------------------------------------------------ */
+
+test("emptySnap 就是没有任何事件的初始快照", () => {
+  assert.deepEqual(canonicalSnap(emptySnap()), canonicalSnap(fold([])));
+});
+
+test("foldFrom(base, 后半段, 前半长度) 与 fold(整段) 等价，且不原地改 base", () => {
+  // 一段有确认、反提重排、再确认、催人的日志，让快照非平凡（currentProposal /
+  // confirmed / reminded / lastProposalIndex / lastDisruptIndex 都有内容）。
+  let log: Event[] = loggedProposal(); // 全员报齐 → 第一版方案
+  log = push(log, step(log, confirmIntent(), ctxOf(A))); // A 确认第一版
+  log = push(log, step(log, counterIntent(19 * 60 + 30, 60), ctxOf(B))); // B 反提 → 第二版方案
+  log = push(log, step(log, confirmIntent(), ctxOf(C))); // C 确认新版
+  log = push(log, step(log, askStatusIntent(), ctxOf(B))); // 催还没确认的 B
+  const whole = fold(log);
+
+  // 在每个可能的分割点都验证：先 fold 前半得到 base，再 foldFrom 续放后半，结果
+  // 必须与 fold(整段) 等价。快照里 lastProposalIndex/lastDisruptIndex 记的是绝对
+  // 下标，续放时下标要看成 baseIndex + 局部下标，这里每个分割点都试一遍能抓住
+  // 下标算错导致的 renegotiating 误判。
+  for (let split = 0; split <= log.length; split++) {
+    const base = fold(log.slice(0, split));
+    const resumed = foldFrom(base, log.slice(split), split);
+    assert.deepEqual(
+      canonicalSnap(resumed),
+      canonicalSnap(whole),
+      `分割点 ${split} 处从快照续放应与整段重放等价`
+    );
+  }
+
+  // foldFrom 不原地改 base：拿一个「A 已确认第一版」的 base，续放会把 A 的确认
+  // 解除的事件，base 本身应该原封不动。
+  const k = log.findIndex((e) => e.type === "schedule_proposed") + 2; // 第一个方案 + A 的 confirmed
+  const base = fold(log.slice(0, k));
+  const before = canonicalSnap(base);
+  const resumed = foldFrom(base, log.slice(k), k);
+  assert.notDeepEqual(canonicalSnap(resumed), before, "续放出的新快照应不同于 base");
+  assert.deepEqual(canonicalSnap(base), before, "foldFrom 不应原地改动传入的 base");
 });
 
 /* ------------------------------------------------------------------ *
