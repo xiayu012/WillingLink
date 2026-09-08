@@ -66,6 +66,35 @@ parseIntent(message, context): Intent
 这一步可以先用**确定性的关键词/stub 解析器**跑通，之后再把 LLM 挂进去做真正的
 意图理解——但无论解析器怎么换，状态机这一层不变。
 
+## 持久化（append-only JSONL）
+
+状态是**派生**的、不落库；落盘的只有**追加的事件日志**，用 **JSONL**（每行一个
+JSON 事件、行尾换行）存成文件。存储层是自包含的 `store.ts`：只 import node 内置
+`fs`/`path` 和 `types.ts` 的 `Event` 类型，不 import 任何项目业务代码、不 import
+通用聊天框架或第三方持久化依赖。
+
+- `appendEvents(filePath, events)` —— 把事件**追加**到文件末尾，绝不覆盖已有行；
+  目录不存在自动建。空数组不写。
+- `loadEvents(filePath)` —— 读整个 JSONL，按行解析成 `Event[]`；文件不存在返回
+  `[]`，单行解析失败**跳过该行**，不让一条坏行毁掉整次重放。取回的日志直接喂给
+  `projectState`（`reduce`/`fold`）重放，得到当前状态——**状态 = 日志重放出的
+  物化投影**，磁盘上不另存一份"当前状态"。
+- `readLatest(filePath, limit)` —— 读最后 `limit` 条事件（正序）并返回事件总数。
+  这是「最近窗口」的底层：把尾部事件喂 `projectState`，就在有限窗口里恢复最近
+  事实，不必每次整段重放。
+
+设计不是自创，是**偷思想、不搬依赖**：
+
+1. **事件溯源（数据库）**——只追加不可变事件、从不改状态；当前状态永远可回放。
+2. **sqlite 物化投影**——把"状态 = 对日志的物化投影、只落日志本身"这一套搬下来，
+   但落盘格式是纯文本 JSONL，不是 SQLite。
+3. **最近窗口（流式系统）**——`readLatest` 只取尾部一段 + 投影，恢复最近上下文。
+
+留作后续：**checkpoint 物化快照**。现在 `loadEvents`/`readLatest` 每次整读整解析
+日志；等日志变大，再在文件里持久化"已重放到的条数"光标或定期写一份物化快照，
+让重放只从最近的位置续起。这一步不做，是因为当前状态机还要求从头完整重放（例如
+确认承袭依赖跨版历史），先保证语义正确，再谈增量。
+
 ## 目录结构（自包含）
 
 ```
@@ -74,7 +103,9 @@ lib/coordination/
   types.ts        State / Event / Intent / OutboundAction 类型
   machine.ts      reduce（事件日志→状态）、step（状态+Intent→新事件+动作）、不变量
   intent.ts       parseIntent 接口 + 一个确定性 stub
+  store.ts        append-only JSONL 持久化（appendEvents / loadEvents / readLatest）
   machine.test.ts 纯函数单测（不调 LLM）
+  store.test.ts   持久化层纯 IO 单测（node 临时目录，不连库）
 ```
 
 ## 设计目标
