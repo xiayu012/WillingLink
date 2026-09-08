@@ -78,6 +78,7 @@ export interface ProjectedAvailability {
   person: PersonId;
   start: Minute; // 最早能开始
   duration: number; // 需要占用
+  latestStart?: Minute; // 最晚必须开始；缺省表示没有上限
 }
 
 /**
@@ -115,10 +116,11 @@ export interface StateSnapshot {
  * 内部小类型
  * ------------------------------------------------------------------ */
 
-/** 某人「最早能开始 + 需要多久」的可用性约束。 */
+/** 某人「最早能开始 + 需要多久 + 最晚必须开始」的可用性约束。 */
 interface Availability {
   start: Minute;
   duration: number;
+  latestStart?: Minute; // 最晚必须开始；缺省表示没有上限
 }
 
 /** 重放事件日志得到的派生快照（只在本文件内使用）。 */
@@ -174,7 +176,11 @@ function fold(events: readonly Event[]): Snap {
     const e = events[i];
     switch (e.type) {
       case "availability_reported": {
-        reported.set(e.person, { start: e.start, duration: e.duration });
+        reported.set(e.person, {
+          start: e.start,
+          duration: e.duration,
+          ...(e.latestStart !== undefined ? { latestStart: e.latestStart } : {}),
+        });
         if (currentProposal) {
           // 方案已经在等确认时又改可用时间 = 反提/加约束：解除该人确认，标记为待重排。
           confirmed.delete(e.person);
@@ -291,7 +297,14 @@ export function projectState(events: readonly Event[], ctx: ProjectContext = {})
   const reported: ProjectedAvailability[] = [];
   for (const p of participants) {
     const a = s.reported.get(p);
-    if (a) reported.push({ person: p, start: a.start, duration: a.duration });
+    if (a) {
+      reported.push({
+        person: p,
+        start: a.start,
+        duration: a.duration,
+        ...(a.latestStart !== undefined ? { latestStart: a.latestStart } : {}),
+      });
+    }
   }
 
   const confirmed: PersonId[] = [];
@@ -333,11 +346,13 @@ export function projectState(events: readonly Event[], ctx: ProjectContext = {})
  * 时段分配（确定性求解）
  * ------------------------------------------------------------------ */
 
-/** allocateSlots 的自由人输入：最早能开始 + 需要多久。 */
+/** allocateSlots 的自由人输入：最早能开始 + 需要多久（+ 可选的最晚必须开始）。 */
 export interface SlotConstraint {
   person: PersonId;
   earliestStart: Minute;
   durationMinutes: number;
+  /** 最晚必须开始：分到的时段起点不得晚于它；缺省表示没有上限。 */
+  latestStart?: Minute;
 }
 
 /** 已钉死的锚点（已确认的人，时段不允许被挪动）。 */
@@ -348,7 +363,8 @@ export interface FixedSlot {
 
 /**
  * 在窗口里给自由人排不重叠的时段。`fixed` 是已钉死的锚点时段，先占住；自由人
- * 只能塞进锚点留下的空当，各自不得早于 `earliestStart`、不得超出 `window`。
+ * 只能塞进锚点留下的空当，各自不得早于 `earliestStart`、不得晚于自己的
+ * `latestStart`（若设了）、不得超出 `window`。
  *
  * 求解方式：按人名字典序穷举自由人的全部排列，对每种排列贪心地把每个人放进「不
  * 冲突的最早空当」。因为会试遍所有排列，只要存在一个可行排法就找得到。然后在全部
@@ -356,7 +372,8 @@ export interface FixedSlot {
  * 为延误（delay ≥ 0，硬约束保证不早于 earliestStart），再除以 ta 自己的时长得到
  * 「偏离自己时长的比例」。目标是让**最坏的那个比例**最小（并列时再看总和），也就
  * 是短时长者优先靠前、长时长者垫后——不再按字典序把长时长者无条件排最前。人数很
- * 少（协商场景一般 2~6 人），穷举足够快。
+ * 少（协商场景一般 2~6 人），穷举足够快。`latestStart` 只是多一条参与可行性判断的
+ * 硬约束，不参与公平打分。
  *
  * 排不出返回 null。同样的输入永远给同样的输出（确定性）：分数相同时保留先枚举到
  * 的排列（字典序排列），不引入随机。
@@ -387,7 +404,7 @@ export function allocateSlots(
 
     let feasible = true;
     for (const c of order) {
-      const slot = earliestFit(window, occupied, c.earliestStart, c.durationMinutes);
+      const slot = earliestFit(window, occupied, c.earliestStart, c.durationMinutes, c.latestStart);
       if (!slot) {
         feasible = false;
         break;
@@ -419,18 +436,28 @@ export function allocateSlots(
   return best;
 }
 
-/** 从窗口起点开始扫描空当，把 [earliest, earliest+duration) 放进最早能放下的空当。 */
+/**
+ * 从窗口起点开始扫描空当，把 [earliest, earliest+duration) 放进最早能放下的空当。
+ * `latestStart` 若给了：候选起点还必须 `<= latestStart`——一旦扫描到的空当起点已经
+ * 晚于它，后面的空当只会更晚，直接判不可行。起点只会随扫描单调变晚，所以这是安全
+ * 的提前终止。
+ */
 function earliestFit(
   window: TimeWindow,
   occupied: readonly TimeSlot[],
   earliestStart: Minute,
-  duration: number
+  duration: number,
+  latestStart?: Minute
 ): TimeSlot | null {
+  const withinLatest = (candidate: Minute): boolean =>
+    latestStart === undefined || candidate <= latestStart;
+
   let cursor = window.start;
   for (const o of occupied) {
     if (o.end <= window.start || o.start >= window.end) continue;
     if (o.start > cursor) {
       const candidate = Math.max(cursor, earliestStart);
+      if (!withinLatest(candidate)) return null;
       if (candidate + duration <= o.start) {
         return { start: candidate, end: candidate + duration };
       }
@@ -438,6 +465,7 @@ function earliestFit(
     cursor = Math.max(cursor, o.end);
   }
   const candidate = Math.max(cursor, earliestStart);
+  if (!withinLatest(candidate)) return null;
   if (candidate + duration <= window.end) {
     return { start: candidate, end: candidate + duration };
   }
@@ -490,7 +518,12 @@ function noop(): StepResult {
 function constraintOf(reported: Map<PersonId, Availability>, person: PersonId): SlotConstraint | null {
   const a = reported.get(person);
   if (!a) return null;
-  return { person, earliestStart: a.start, durationMinutes: a.duration };
+  return {
+    person,
+    earliestStart: a.start,
+    durationMinutes: a.duration,
+    ...(a.latestStart !== undefined ? { latestStart: a.latestStart } : {}),
+  };
 }
 
 /**
@@ -522,7 +555,7 @@ export function step(events: readonly Event[], intent: Intent, ctx: StepContext)
     case "add_constraint":
       // 三种意图本质都是「更新自己的可用时间」：gathering 里是报到，已有方案里
       // 就是反提/加约束（要重排）。处理逻辑一致，只是当前阶段不同走不同分支。
-      return stepAvailability(events, base, ctx, intent.start, intent.duration);
+      return stepAvailability(events, base, ctx, intent.start, intent.duration, intent.latestStart);
     case "reject":
       return stepRejectOrChange(events, base, ctx, intent.reason ?? null);
   }
@@ -533,20 +566,30 @@ export function step(events: readonly Event[], intent: Intent, ctx: StepContext)
  *
  * - 还没有方案（gathering）：累计可用时间，全员报齐才排第一版。
  * - 已有方案在等确认：这等于反提/加约束，追加事件后重排（见 `stepRejectOrChange`）。
+ *
+ * `latestStart` 是该人「最晚必须开始」的上限（缺省 = 没有上限）；它与 start/duration
+ * 一起构成这次「更新可用时间」的完整内容。
  */
 function stepAvailability(
   events: readonly Event[],
   base: Snap,
   ctx: StepContext,
   start: Minute,
-  duration: number
+  duration: number,
+  latestStart?: Minute
 ): StepResult {
   if (!ctx.participants.includes(ctx.sender)) return noop();
 
   // 报到与这个人已有的可用时间一字不差 = 没有新信息。不追加事件（否则会把它误判
-  // 成一次反提，把已经确认的人静默解除确认——他只是把原话又说了一遍）。
+  // 成一次反提，把已经确认的人静默解除确认——他只是把原话又说了一遍）。注意 latestStart
+  // 也要一样才算真的一字不差：只补一条「不能晚于 X 点」的上限是有新信息的。
   const existing = base.reported.get(ctx.sender);
-  if (existing && existing.start === start && existing.duration === duration) {
+  if (
+    existing &&
+    existing.start === start &&
+    existing.duration === duration &&
+    existing.latestStart === latestStart
+  ) {
     return noop();
   }
 
@@ -555,6 +598,7 @@ function stepAvailability(
     person: ctx.sender,
     start,
     duration,
+    ...(latestStart !== undefined ? { latestStart } : {}),
   };
 
   // 还没有方案 = gathering：累计可用时间，齐了才排第一版。
@@ -588,7 +632,11 @@ function stepAvailability(
   }
 
   // 方案已存在时的再报到 = 更新约束并重排。
-  return stepRejectOrChange(events, base, ctx, null, { start, duration });
+  return stepRejectOrChange(events, base, ctx, null, {
+    start,
+    duration,
+    ...(latestStart !== undefined ? { latestStart } : {}),
+  });
 }
 
 function stepConfirm(events: readonly Event[], base: Snap, ctx: StepContext): StepResult {
@@ -625,14 +673,15 @@ function stepConfirm(events: readonly Event[], base: Snap, ctx: StepContext): St
  * 重排结果跟当前方案一样（等于没变化）或排不出时，不追加新版方案，停在
  * renegotiating，避免对同一件事反复 propose。
  *
- * `newAvailability` 非空时表示打断者同时给出了新的可用时间（counter/add）。
+ * `newAvailability` 非空时表示打断者同时给出了新的可用时间（counter/add）；
+ * 里面可选的 `latestStart` 是该人「最晚必须开始」的上限。
  */
 function stepRejectOrChange(
   events: readonly Event[],
   base: Snap,
   ctx: StepContext,
   reason: string | null,
-  newAvailability?: { start: Minute; duration: number }
+  newAvailability?: { start: Minute; duration: number; latestStart?: Minute }
 ): StepResult {
   if (!ctx.participants.includes(ctx.sender)) return noop();
 
@@ -647,6 +696,7 @@ function stepRejectOrChange(
         person: ctx.sender,
         start: newAvailability.start,
         duration: newAvailability.duration,
+        ...(newAvailability.latestStart !== undefined ? { latestStart: newAvailability.latestStart } : {}),
       }
     : { type: "rejected", person: ctx.sender, ...(reason ? { reason } : {}) };
 

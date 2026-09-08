@@ -29,7 +29,9 @@ LLM 只做一件事：把住户说的一句话翻译成一个结构化 `Intent`�
 
 ## 事件（Event，只追加，不可变）
 
-- `availability_reported { person, start, duration }`
+- `availability_reported { person, start, duration, latestStart? }`
+  —— `latestStart` 是「最晚必须开始」的分钟数，缺省表示没有上限（「八点太晚 / 不能晚于
+  八点开始」的落点）；它与 `start`（最早能开始）合起来把可用起点圈成 `[start, latestStart]`。
 - `schedule_proposed { window, assignments[] }`
 - `confirmed { person }`
 - `rejected { person, reason }`

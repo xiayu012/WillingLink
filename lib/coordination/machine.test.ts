@@ -393,6 +393,48 @@ test("allocateSlots 尊重已钉死的锚点", () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * allocateSlots：latestStart（最晚必须开始）上限约束
+ * ------------------------------------------------------------------ */
+
+test("allocateSlots 尊重 latestStart：带最晚上限的人不会被排到上限之后", () => {
+  // 窗口 0–90。A 必须 30 分钟起步、不得晚于 30 开始；B 要用满 60 分钟。
+  // 唯一可行排法是把 A 放在 0–30（start=0 ≤ 30），B 再填 30–90。
+  const win = { start: 0, end: 90 };
+  const plan = allocateSlots(win, [
+    { person: A, earliestStart: 0, durationMinutes: 30, latestStart: 30 },
+    { person: B, earliestStart: 0, durationMinutes: 60 },
+  ]);
+  assert.ok(plan, "应能找到同时满足两人约束的排法");
+  assert.equal(plan.length, 2);
+  const aSlot = slotOf(plan, A)!;
+  const bSlot = slotOf(plan, B)!;
+  assert.ok(aSlot.start <= 30, `A 不得晚于 30 开始，实际 start=${aSlot.start}`);
+  assert.equal(aSlot.start, 0, "A 只能落在 0–30");
+  assert.ok(aSlot.end <= bSlot.start || bSlot.end <= aSlot.start, "两段不该重叠");
+  assert.ok(bSlot.start >= aSlot.end, "B 必须排在 A 之后");
+});
+
+test("allocateSlots 尊重 latestStart：上限让原本可排的场景变成排不出 → null", () => {
+  // 窗口 0–120。B 已确认、钉死在 0–90，A 只能塞 90–120 的空当；但 A 带着
+  // latestStart=30（不得晚于 30 开始），放进去就违约 → 必须返回 null。
+  const win = { start: 0, end: 120 };
+  const planWithLatest = allocateSlots(
+    win,
+    [{ person: A, earliestStart: 0, durationMinutes: 30, latestStart: 30 }],
+    [{ person: B, slot: { start: 0, end: 90 } }]
+  );
+  assert.equal(planWithLatest, null);
+  // 对照组：同样的场景去掉 latestStart 就排得出来，证明是这个上限导致排不出。
+  const planNoLatest = allocateSlots(
+    win,
+    [{ person: A, earliestStart: 0, durationMinutes: 30 }],
+    [{ person: B, slot: { start: 0, end: 90 } }]
+  );
+  assert.ok(planNoLatest, "去掉 latestStart 后应能排进 90–120 的空当");
+  assert.deepEqual(slotOf(planNoLatest!, A), { start: 90, end: 120 });
+});
+
+/* ------------------------------------------------------------------ *
  * parseIntent：确定性 stub 的几条主映射
  * ------------------------------------------------------------------ */
 

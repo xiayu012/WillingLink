@@ -58,9 +58,21 @@ export type State = "gathering" | "proposed" | "settled" | "renegotiating";
  * 注意：反提（counter_propose）/加约束（add_constraint）这类意图在事件层用
  * `availability_reported` 表达——它们本质上都是「更新自己的可用时间」，而事件
  * 词表里没有第三种「改约束」事件。意图层保留细分，事件层保持 README 的六个词。
+ *
+ * `latestStart` 是「最晚必须开始」的分钟数，缺省表示没有上限。一个人报了它，就
+ * 意味着他分到的时段起点不得晚于这个值（"八点太晚 / 我不接受八点 / 不能晚于八点
+ * 开始"这类话的落点）。它与 `start`（最早能开始）合起来把可用起点圈成一个区间
+ * [start, latestStart]。
  */
 export type Event =
-  | { type: "availability_reported"; person: PersonId; start: Minute; duration: number }
+  | {
+      /** 报可用时间：start 是最早能开始；latestStart 可选，是最晚必须开始，缺省表示没有上限。 */
+      type: "availability_reported";
+      person: PersonId;
+      start: Minute;
+      duration: number;
+      latestStart?: Minute;
+    }
   | { type: "schedule_proposed"; window: TimeWindow; assignments: Assignment[] }
   | { type: "confirmed"; person: PersonId }
   | { type: "rejected"; person: PersonId; reason?: string }
@@ -74,15 +86,20 @@ export type Event =
  * 「说话人是谁、共享窗口是什么、有哪些参与者」属于运行时上下文，不放进意图——
  * 它们由 `machine.step` 的 `StepContext` 传入。
  *
+ * 三个 availability 类型（report_availability / counter_propose / add_constraint）
+ * 各带一个可选的 `latestStart`：它是「最晚必须开始」的分钟数，缺省表示没有上限。
+ * 「X 点太晚了 / 我不接受 X 点 / 不能晚于 X 点开始」这类话就该落在这里，而不是退
+ * 化成无信息的 reject。
+ *
  * 当前先用 intent.ts 里的确定性 stub 顶替 LLM；将来把 stub 换成 LLM 即可，
  * 状态机这一层不动。
  */
 export type Intent =
-  | { type: "report_availability"; start: Minute; duration: number }
+  | { type: "report_availability"; start: Minute; duration: number; latestStart?: Minute }
   | { type: "confirm" }
   | { type: "reject"; reason?: string }
-  | { type: "counter_propose"; start: Minute; duration: number }
-  | { type: "add_constraint"; start: Minute; duration: number }
+  | { type: "counter_propose"; start: Minute; duration: number; latestStart?: Minute }
+  | { type: "add_constraint"; start: Minute; duration: number; latestStart?: Minute }
   | { type: "ask_status" }
   | { type: "other" };
 

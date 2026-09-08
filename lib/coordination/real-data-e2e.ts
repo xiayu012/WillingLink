@@ -7,7 +7,15 @@ import { config } from "dotenv";
 config({ path: ".env.local" });
 import { projectState, reduce, step } from "./machine";
 import { llmParseIntent } from "./llm";
-import type { Event, TimeWindow } from "./types";
+import type { Event, Intent, TimeWindow } from "./types";
+
+/** 诊断用：把意图打成人能读的一行（availability 三类带上 start/duration/可选的 latestStart）。 */
+function intentDesc(i: Intent): string {
+  if (i.type === "report_availability" || i.type === "counter_propose" || i.type === "add_constraint") {
+    return `${i.type}@${i.start}+${i.duration}${i.latestStart !== undefined ? ` latestStart=${i.latestStart}` : ""}`;
+  }
+  return i.type;
+}
 
 const WINDOW: TimeWindow = { start: 18 * 60, end: 21 * 60 }; // 18:00–21:00
 const PARTICIPANTS = ["老孙", "小五", "老四"];
@@ -48,7 +56,7 @@ async function main() {
       )
       .join(" | ");
     console.log(
-      `${r.who}「${r.text}」 → ${intent.type}${"start" in intent ? `@${intent.start}+${intent.duration}` : ""} ⇒ [${before}→${after}] ⇒ ${acts}`
+      `${r.who}「${r.text}」 → ${intentDesc(intent)} ⇒ [${before}→${after}] ⇒ ${acts}`
     );
   }
   console.log("FINAL_STATE", reduce(events));
@@ -61,14 +69,17 @@ async function main() {
 function renderSnapshotForDiag(s: {
   state: string;
   participants: readonly string[];
-  reported: ReadonlyArray<{ person: string; start: number; duration: number }>;
+  reported: ReadonlyArray<{ person: string; start: number; duration: number; latestStart?: number }>;
   proposal: { assignments: ReadonlyArray<{ person: string; slot: { start: number; end: number } }> } | null;
   confirmed: readonly string[];
   waiting: readonly string[];
 }): string {
   const fmt = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
   const lines = [`state=${s.state}`];
-  for (const r of s.reported) lines.push(`  reported ${r.person}: 最早${fmt(r.start)}(${r.start}) +${r.duration}min`);
+  for (const r of s.reported) {
+    const latest = r.latestStart !== undefined ? ` 最晚开始${fmt(r.latestStart)}(${r.latestStart})` : "";
+    lines.push(`  reported ${r.person}: 最早${fmt(r.start)}(${r.start}) +${r.duration}min${latest}`);
+  }
   if (s.proposal) {
     for (const a of s.proposal.assignments) {
       lines.push(`  slot ${a.person}: ${fmt(a.slot.start)}(${a.slot.start})-${fmt(a.slot.end)}(${a.slot.end})`);

@@ -87,24 +87,34 @@ const SYSTEM_PROMPT = [
   "- 已有方案在等人确认时：不带新时间的“不行/不合适”是对自己分到的那段 reject；",
   "  带新时间（“不行，我 X 点才行”“换到 X 点”）是 counter_propose；“可以/没问题”",
   "  是对方案的 confirm。",
-  "- “八点太晚了 / 太早了 / 我不接受 X 点”这类用钟点表达不满、但没有给出自己替代时间",
-  "  的话，是 reject，不是 add_constraint——那个钟点是在拒绝某一段，不是在报新的可用",
-  "  开始时间。",
-  "- “最早/必须/只能 X 点以后才有空”“X 点才到家/下班”才是 add_constraint。",
+  "- “X 点太晚了 / 我不接受 X 点 / 不能晚于 X 点开始 / X 点才开始就来不及了”这类用",
+  "  钟点表达“不能再晚”的话，是在给自己加**最晚开始**上限，不是无信息的 reject，也",
+  "  不是在报一个新的可用开始时间。输出带 latestStart 的意图（add_constraint 或",
+  "  counter_propose 都行，机器等价）：latestStart = X 点对应的分钟数；start 沿用",
+  "  【每人已报】里这个人已报的 start（没报过 start 就沿用当前方案分给他的时段起点，",
+  "  还没有方案就取共享窗口起点）；duration 沿用已报值、没报过用默认 30。",
+  "- 光一句“不行 / 不合适 / 我安排不了”、不带任何新时间或钟点的，才是 reject。",
+  "- “X 点太早了”是嫌“X 点开始太早、要晚点才开始”：把**最早能开始**往后调",
+  "  （counter_propose 带一个更晚的 start），不要设 latestStart。",
+  "- “最早/必须/只能 X 点以后才有空”“X 点才到家/下班”才是加“最早开始”的",
+  "  add_constraint（给 start，不带 latestStart）。",
   "",
   "时间换算成“当天 00:00 起的分钟数”：18:00=1080，18:30=1110，19:00=1140，",
   "19:30=1170，20:00=1200，20:30=1230，21:00=1260，22:00=1320。",
   "duration 是“需要占用的分钟数”：半小时=30、一小时=60、45分钟=45、40分钟=40、",
   "一个半小时=90、两个小时=120。话里没给时长时按上面的消歧规则（沿用已报或默认 30）。",
+  "latestStart 是“最晚必须开始”的分钟数：只有“不能晚于 X 点开始 / X 点太晚 / 不接",
+  "受 X 点”这类才给；没说不带。",
   "这是晚上做饭/排班的语境：没写“早上/凌晨”的“6点/7点/8点”一律按晚上算",
   "（6点=1080，7点=1140，8点=1200）。",
   "",
-  "JSON 形状（start/duration 必须是整数）：",
+  "JSON 形状（start/duration/latestStart 必须是整数分钟数；latestStart 可选）：",
   '{"type":"report_availability","start":1110,"duration":30}',
   '{"type":"confirm"}',
   '{"type":"reject","reason":"这个时间不行"}',
   '{"type":"counter_propose","start":1140,"duration":60}',
   '{"type":"add_constraint","start":1170,"duration":45}',
+  '{"type":"add_constraint","start":1080,"duration":30,"latestStart":1200}',
   '{"type":"ask_status"}',
   '{"type":"other"}',
 ].join("\n");
@@ -132,9 +142,11 @@ function renderSnapshot(s: StateSnapshot): string {
   lines.push(`发消息的人：${s.sender ?? "未知"}`);
   lines.push(`参与者：${s.participants.length ? s.participants.join("、") : "（暂无）"}`);
   if (s.reported.length > 0) {
-    lines.push("每人已报（最早能开始 + 需用时长）：");
+    lines.push("每人已报（最早能开始 + 需用时长；如标了最晚必须开始会写出来）：");
     for (const r of s.reported) {
-      lines.push(`- ${r.person}：${fmtMinute(r.start)}(=${r.start}) 起，${r.duration} 分钟`);
+      const latest =
+        r.latestStart !== undefined ? `，且不能晚于 ${fmtMinute(r.latestStart)}(=${r.latestStart}) 开始` : "";
+      lines.push(`- ${r.person}：${fmtMinute(r.start)}(=${r.start}) 起，${r.duration} 分钟${latest}`);
     }
   } else {
     lines.push("每人已报：还没人报到可用时间");
@@ -198,7 +210,16 @@ function coerceIntent(o: Record<string, unknown>): Intent | null {
     const durRaw = coerceToInt(o.duration);
     const duration = durRaw === null ? DEFAULT_DURATION_MINUTES : durRaw;
     if (!(duration >= 1)) return null;
-    return { type: t, start, duration };
+    // latestStart 可选：必须是合法分钟数（整数、在一天内）才保留，否则丢弃为无上限。
+    const latestRaw = coerceToInt(o.latestStart);
+    const latestStart =
+      latestRaw !== null && latestRaw >= 0 && latestRaw < MINUTES_PER_DAY ? latestRaw : undefined;
+    return {
+      type: t,
+      start,
+      duration,
+      ...(latestStart !== undefined ? { latestStart } : {}),
+    };
   }
   return null;
 }
