@@ -61,6 +61,116 @@ const DEFAULT_DURATION_MINUTES = 30;
 /** 一天的分界：start 必须是 [0, 1440) 的整数分钟数。 */
 const MINUTES_PER_DAY = 24 * 60;
 
+/* ------------------------------------------------------------------ *
+ * fastIntent：高置信度确定性快速路径（不调 LLM）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 纯寒暄/无信息 → `{ type: "other" }`。无论协商走到哪一步，这些词都不携带可行动作
+ * （报时间/确认/拒绝/催办），机器当没听见即可。注意「嗯」是最软的承认语：在回应
+ * 方案时它**有可能**被读成确认——正因为这种读法既不可靠又危险（把一版方案定在含糊
+ * 的「嗯」上），这里刻意归 other，宁可让它多等一轮催办，也不把一个不确定的 ack 当
+ * 成正式同意。
+ */
+const OTHER_WORDS = new Set([
+  "在吗",
+  "你好",
+  "您好",
+  "hi",
+  "hello",
+  "早上好",
+  "中午好",
+  "晚上好",
+  "谢谢",
+  "多谢",
+  "嗯",
+]);
+
+/**
+ * 纯确认 → `{ type: "confirm" }`。这些词只在「回应当前一版方案、表示接受」这一种
+ * 语义下成立；后两个是「可以，没问题 / 没问题，可以」去标点后的常见组合。
+ */
+const CONFIRM_WORDS = new Set([
+  "可以",
+  "行",
+  "好的",
+  "好",
+  "没问题",
+  "同意",
+  "ok",
+  "是的",
+  "对",
+  "中",
+  "成交",
+  "可以没问题",
+  "没问题可以",
+]);
+
+/**
+ * 剥除用的装饰性标点/空白（整句归一化时逐字去掉）。中文字符单码点，`includes` 按
+ * 字判断足够；不做正则，避免字符类转义坑。
+ *
+ * 疑问号/波浪号也在剥除表里（否则 `在吗？` 归一化后带个 `？` 就匹配不上 `在吗`），
+ * 但它们的**语义翻转**已在 `fastIntent` 里用对原始串的前置检查拦住：归一化前先看
+ * 原始串有没有问号/波浪号，确认词带问号（可以？=在问）一律交回 LLM。剥除本身只做
+ * 字形归整，不负责语义安全。
+ */
+const DECORATIVE = [
+  " ", "\t", "\r", "\n", "\u3000", // 空白 + 全角空格
+  ",", ".", ";", ":", "!", "'", '"', "(", ")", "[", "]", "{", "}", "<", ">", "/", "\\",
+  "、", "，", "。", "！", "；", "：", "…", "—", "–", "·", // 中文句读/省略/连接号
+  "“", "”", "‘", "’", "「", "」", "『", "』", "【", "】", "《", "》", "〈", "〉", "（", "）",
+  "？", "?", "～", "~",
+].join("");
+
+/**
+ * 去掉装饰性标点/空白后整体转小写（ASCII）。数字、汉字、语气词（吗/呢/吧/啊）都
+ * 是「字母」，不会被剥掉——这正是保守性的来源：任何带时间/数字/否定/换时段成分的
+ * 句子剥完后都进不了下面的精确词表，只能落回 LLM。
+ */
+function normalizeForMatch(text: string): string {
+  const chars: string[] = [];
+  for (const ch of text) {
+    if (DECORATIVE.includes(ch)) continue;
+    chars.push(ch);
+  }
+  return chars.join("").toLowerCase();
+}
+
+/**
+ * 高置信度确定性意图：只拦截**绝对无歧义的整句**（纯寒暄、纯确认、空串/只标点），
+ * 命中返回对应 Intent，否则返回 null（由调用方继续走 LLM）。
+ *
+ * 保守性设计：先把整句剥成「只含字母」的规范形，再对整个规范形**精确匹配**有限
+ * 词表。因为剥除只动标点/空白、绝不动数字和汉字——`八点可以` / `不行` / `排好了吗` /
+ * `我7点用30分钟` 这类带时间、数字、否定或语气词的句子，剥完后必然不是词表成员，
+ * 直接返回 null，绝不抢 LLM 的活。需要单独前置检查的、会被剥掉而语义翻转的信号：
+ * 疑问号会让确认词从「接受」翻成「在问」（`可以？` → null）；波浪号表犹豫（`可以～`
+ * → null）。寒暄类词即使带疑问号（`在吗？`）语义仍是无信息的 other，不受影响。
+ *
+ * 空串 / 只含标点 → `{ type: "other" }`。
+ */
+export function fastIntent(message: string): Intent | null {
+  const trimmed = message.trim();
+  if (!trimmed) return { type: "other" };
+
+  // 疑问/犹豫是「含歧义信号 → null」的硬闸：剥标点会把 `可以？` 的语义从「在问」
+  // 翻转成「确认」，所以疑问号必须在归一化前检测、命中即交回 LLM。寒暄类词带疑问号
+  // （在吗？）语义仍是无信息的 other，不受影响——词表命中时只拦确认词的带问号形式。
+  const hasQuestion = /[?？]/.test(trimmed);
+  if (/[~～]/.test(trimmed)) return null;
+
+  const norm = normalizeForMatch(trimmed);
+  if (!norm) return { type: "other" };
+  if (OTHER_WORDS.has(norm)) return { type: "other" };
+  if (CONFIRM_WORDS.has(norm)) {
+    // 确认词 + 疑问号（可以？/行？/好的？）= 在问对方，不是在接受，交给 LLM。
+    if (hasQuestion) return null;
+    return { type: "confirm" };
+  }
+  return null;
+}
+
 const AVAILABILITY_TYPES = [
   "report_availability",
   "counter_propose",
@@ -258,11 +368,16 @@ function coerceIntent(o: Record<string, unknown>): Intent | null {
  * - 解析成功 → 对应的 Intent（start 是当天 00:00 起的分钟数）。
  * - 解析失败 / 不是 JSON / 模型异常 → `{ type: "other" }`（不抛错）。
  *
- * 每次调用都会真实请求一次模型。意图很短、模型很便宜，单次开销可忽略。
+ * 先走 `fastIntent` 确定性快速路径：只有「无论上下文如何都只有一种解」的整句
+ * （纯寒暄/纯确认/空串）会被拦截，**不花一次模型调用**。拦截不了才真实请求模型。
+ * 语义不变——快路径只抢走绝对无歧义的句子，带任何歧义信号的都继续走 LLM。
  */
 export async function llmParseIntent(message: string, snapshot: StateSnapshot): Promise<Intent> {
   const text = (message ?? "").trim();
   if (!text) return { type: "other" };
+
+  const fast = fastIntent(text);
+  if (fast) return fast;
 
   try {
     const result = await generateText({
