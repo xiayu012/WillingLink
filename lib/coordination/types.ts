@@ -104,15 +104,42 @@ export type Intent =
   | { type: "other" };
 
 /**
+ * 不可行诊断：状态机看得到、却排不出可行方案时，**结构化地说出为什么**。
+ *
+ * 语义：`step` 在全员已报/重排却排不出时，不再静默停在原状态（那种「假装没看见」
+ * 等于把困难推给住户），而是产出一条 `{ type: "blocked" }` 出站动作、带上一组
+ * `Infeasibility`，让调用方（协调层/LLM）拿到具体的「为什么排不开」去生成建议
+ * （例如「总时长超窗口 → 建议某人缩短」）。注意 `blocked` **不发任何内容给住户**，
+ * 只是把诊断交到调用方手里。
+ *
+ * `kind` 对应四类确定性原因：
+ * - `duration_over_window` —— 所有人合计需占用（自由人时长 + 已确认锚点占用）> 窗口长度；
+ * - `earliest_too_late` —— 某人「最早开始 + 时长」已超出窗口结束（即使没有别人也放不下）；
+ * - `latest_before_earliest` —— 某人给了最晚开始、却早于自己的最早开始（自相矛盾）；
+ * - `no_fit_given_anchors` —— 上面都不足以解释时：锚点把窗口切出的空当，放不下剩余人。
+ *
+ * `person` 只在原因落到某个人身上时给出（`duration_over_window` / `no_fit_given_anchors`
+ * 是全局性原因，没有特定人）。`message` 是中文、带分钟数的事实陈述，供上层直接读懂。
+ */
+export interface Infeasibility {
+  kind: "duration_over_window" | "earliest_too_late" | "latest_before_earliest" | "no_fit_given_anchors";
+  person?: PersonId;
+  message: string;
+}
+
+/**
  * 出站动作：状态机判定「下一步该对谁说什么」的结果，由调用方（未来是短信/LLM
- * 层）真正发出去。`type:"none"` 表示这轮没有要发的消息。
+ * 层）真正发出去。`type:"none"` 表示这轮没有要发的消息；`type:"blocked"` 表示这轮
+ * **排不出可行方案**，同样不发任何内容给住户，但带上 `reasons` 诊断交给调用方去协调。
  *
  * - `propose` —— 把方案里这个人分到的时段发给他，请他确认。
  * - `settle` —— 全员确认后，把定案时段发给每个人。
  * - `remind` —— 催一下 pending 的人（只催，不重发方案）。
+ * - `blocked` —— 排不出可行方案：不向住户发内容，`reasons` 说明为什么（见 `Infeasibility`）。
  */
 export type OutboundAction =
   | { type: "propose"; person: PersonId; slot: TimeSlot }
   | { type: "settle"; person: PersonId; slot: TimeSlot }
   | { type: "remind"; person: PersonId }
+  | { type: "blocked"; reasons: Infeasibility[] }
   | { type: "none" };

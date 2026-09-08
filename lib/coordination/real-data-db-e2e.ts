@@ -104,9 +104,17 @@ function intentDesc(i: Intent): string {
 function actionsDesc(actions: readonly OutboundAction[]): string {
   if (actions.length === 0) return "none";
   return actions
-    .map((a) =>
-      a.type === "none" ? "none" : `${a.type}:${a.person} ${"slot" in a ? `${fmtMinute(a.slot.start)}(${a.slot.start})-${fmtMinute(a.slot.end)}(${a.slot.end})` : ""}`
-    )
+    .map((a) => {
+      if (a.type === "none") return "none";
+      // blocked：不发任何内容给住户，这里只打印原因摘要，供诊断时一眼看懂为什么排不开。
+      if (a.type === "blocked") {
+        const summary = a.reasons
+          .map((r) => `${r.kind}${r.person ? ":" + r.person : ""} ${clip(r.message, 80)}`)
+          .join("；");
+        return `blocked(${summary})`;
+      }
+      return `${a.type}:${a.person} ${"slot" in a ? `${fmtMinute(a.slot.start)}(${a.slot.start})-${fmtMinute(a.slot.end)}(${a.slot.end})` : ""}`;
+    })
     .join(" | ");
 }
 

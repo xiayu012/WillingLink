@@ -49,11 +49,15 @@ async function main() {
     events = [...events, ...res.events];
     const after = reduce(events);
     const acts = res.actions
-      .map((a) =>
-        a.type === "none"
-          ? "none"
-          : `${a.type}:${a.person} ${"slot" in a ? `${a.slot.start}-${a.slot.end}` : ""}`
-      )
+      .map((a) => {
+        if (a.type === "none") return "none";
+        // blocked：不向住户发内容，这里只打印原因摘要，供诊断时看为什么排不开。
+        if (a.type === "blocked") {
+          const summary = a.reasons.map((r) => `${r.kind}${r.person ? ":" + r.person : ""}`).join("；");
+          return `blocked(${summary})`;
+        }
+        return `${a.type}:${a.person} ${"slot" in a ? `${a.slot.start}-${a.slot.end}` : ""}`;
+      })
       .join(" | ");
     console.log(
       `${r.who}「${r.text}」 → ${intentDesc(intent)} ⇒ [${before}→${after}] ⇒ ${acts}`

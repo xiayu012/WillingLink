@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 import {
   allocateSlots,
   checkInvariants,
+  diagnoseInfeasibility,
   emptySnap,
   fold,
   foldFrom,
@@ -28,7 +29,7 @@ import {
   step,
 } from "./machine";
 import type { Snap, StepContext } from "./machine";
-import type { Assignment, Event, PersonId, TimeSlot } from "./types";
+import type { Assignment, Event, OutboundAction, PersonId, TimeSlot } from "./types";
 import { parseIntent } from "./intent";
 
 /* ------------------------------------------------------------------ *
@@ -528,6 +529,96 @@ test("allocateSlots 尊重 latestStart：上限让原本可排的场景变成排
   );
   assert.ok(planNoLatest, "去掉 latestStart 后应能排进 90–120 的空当");
   assert.deepEqual(slotOf(planNoLatest!, A), { start: 90, end: 120 });
+});
+
+/* ------------------------------------------------------------------ *
+ * step 排不出 → blocked 诊断（不再静默失败）
+ * ------------------------------------------------------------------ */
+
+test("全员报齐但总时长超窗口：step 返回 blocked（duration_over_window），住户报到事件不丢", () => {
+  const W = { start: 0, end: 90 }; // 窗口只有 90 分钟
+  const two: readonly PersonId[] = [A, B];
+  const ctx = (sender: PersonId): StepContext => ({ participants: [...two], window: W, sender });
+
+  let log: Event[] = [];
+  // A：60 分钟。单独看放得下（0–60 ≤ 90），还没到全员报齐，不排方案。
+  const rA = step(log, reportIntent(0, 60), ctx(A));
+  assert.equal(hasEventOfType(rA.events, "schedule_proposed"), false);
+  assert.deepEqual(rA.actions, [{ type: "none" }]);
+  log = push(log, rA);
+
+  // B 也报 60 分钟 → 合计 120 > 90，allocateSlots 排不出 → blocked，而不是静默 none。
+  const rB = step(log, reportIntent(0, 60), ctx(B));
+  assert.equal(hasEventOfType(rB.events, "schedule_proposed"), false);
+  assert.equal(hasEventOfType(rB.events, "availability_reported"), true, "住户已报的事实不能因排不出而丢");
+  const blocked = rB.actions.find((a): a is Extract<OutboundAction, { type: "blocked" }> => a.type === "blocked");
+  assert.ok(blocked, `应返回 blocked，实际 ${JSON.stringify(rB.actions)}`);
+  assert.ok(
+    blocked.reasons.some((r) => r.kind === "duration_over_window" && r.message.length > 0),
+    `diagnose 应命中 duration_over_window 且 message 非空，实际 ${JSON.stringify(blocked.reasons)}`
+  );
+  // 没硬排出一版 → 状态仍留在 gathering；但不沉默——调用方拿得到诊断。
+  assert.equal(reduce(push(log, rB)), "gathering");
+
+  // diagnoseInfeasibility 直接调用也应命中同一原因。
+  const diag = diagnoseInfeasibility(W, [
+    { person: A, earliestStart: 0, durationMinutes: 60 },
+    { person: B, earliestStart: 0, durationMinutes: 60 },
+  ]);
+  assert.ok(
+    diag.some((r) => r.kind === "duration_over_window" && r.message.length > 0),
+    `直接诊断应命中 duration_over_window，实际 ${JSON.stringify(diag)}`
+  );
+});
+
+test("某人最晚开始早于最早开始（自相矛盾）：step 排不出 → blocked 命中 latest_before_earliest", () => {
+  const W = { start: 0, end: 100 };
+  const two: readonly PersonId[] = [A, B];
+  const ctx = (sender: PersonId): StepContext => ({ participants: [...two], window: W, sender });
+
+  let log: Event[] = [];
+  // A：最早 30 开始、用 30 分钟，却给最晚开始 20 → [20,30] 为空，自相矛盾。
+  const rA = step(log, { type: "report_availability", start: 30, duration: 30, latestStart: 20 }, ctx(A));
+  assert.deepEqual(rA.actions, [{ type: "none" }]);
+  log = push(log, rA);
+
+  // B 报齐 → allocateSlots 因 A 的 latestStart < earliestStart 排不出 → blocked。
+  const rB = step(log, reportIntent(0, 30), ctx(B));
+  assert.equal(hasEventOfType(rB.events, "schedule_proposed"), false);
+  const blocked = rB.actions.find((a): a is Extract<OutboundAction, { type: "blocked" }> => a.type === "blocked");
+  assert.ok(blocked, `应返回 blocked，实际 ${JSON.stringify(rB.actions)}`);
+  assert.ok(
+    blocked.reasons.some((r) => r.kind === "latest_before_earliest" && r.person === A && r.message.length > 0),
+    `diagnose 应命中 latest_before_earliest(A)，实际 ${JSON.stringify(blocked.reasons)}`
+  );
+
+  // diagnoseInfeasibility 直接调用也要命中同一 kind。
+  const diag = diagnoseInfeasibility(W, [
+    { person: A, earliestStart: 30, durationMinutes: 30, latestStart: 20 },
+    { person: B, earliestStart: 0, durationMinutes: 30 },
+  ]);
+  assert.ok(
+    diag.some((r) => r.kind === "latest_before_earliest" && r.person === A),
+    `直接诊断应命中 latest_before_earliest(A)，实际 ${JSON.stringify(diag)}`
+  );
+});
+
+test("锚点切碎的空当放不下剩余人（前三类都不足以解释）：diagnose 回退 no_fit_given_anchors", () => {
+  const W = { start: 0, end: 100 };
+  // 锚点占住 20–30 / 60–70，窗口剩 0–20、30–60、70–100；A 必须 0 点开始、用 30 分钟，
+  // 0–30 会被 20–30 的锚点挡住 → 排布失败，但总时长没超、也非某人最早太晚/自相矛盾。
+  const diag = diagnoseInfeasibility(
+    W,
+    [{ person: A, earliestStart: 0, durationMinutes: 30, latestStart: 0 }],
+    [
+      { person: B, slot: { start: 20, end: 30 } },
+      { person: C, slot: { start: 60, end: 70 } },
+    ]
+  );
+  assert.ok(
+    diag.some((r) => r.kind === "no_fit_given_anchors" && r.message.length > 0),
+    `应回退 no_fit_given_anchors 且 message 非空，实际 ${JSON.stringify(diag)}`
+  );
 });
 
 /* ------------------------------------------------------------------ *

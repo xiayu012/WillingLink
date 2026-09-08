@@ -34,6 +34,7 @@
 import type {
   Assignment,
   Event,
+  Infeasibility,
   Intent,
   Minute,
   OutboundAction,
@@ -589,6 +590,104 @@ export function allocateSlots(
   return best;
 }
 
+/* ------------------------------------------------------------------ *
+ * 不可行诊断：allocateSlots 排不出时，结构化地说出为什么
+ * ------------------------------------------------------------------ */
+
+/** 把「当天 00:00 起的分钟数」格式成 HH:MM（纯算术；分钟不是一天内也只是照常进位）。 */
+function fmtMinute(m: Minute): string {
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+
+/**
+ * 对「为什么排不出」做**确定性快速诊断**，返回一组 `Infeasibility`。纯函数，只做
+ * 简单的算术检查，不调用 `allocateSlots` 本身（它是给 `step` 在 `allocateSlots` 已
+ * 返回 null 之后、向调用方解释原因用的）。
+ *
+ * 检查顺序（能落到具体人的尽量落到具体人）：
+ * 1. `duration_over_window` —— 自由人的时长 + 已确认锚点占用，合计已超过窗口长度；
+ *    这是「总时长超窗口 → 需要有人压缩时长」的信号。
+ * 2. `earliest_too_late` —— 某人「最早开始 + 时长」已超过窗口结束（即使窗口里没有
+ *    别人也放不下）。
+ * 3. `latest_before_earliest` —— 某人给的最晚开始早于自己的最早开始（自相矛盾）。
+ * 4. 上面都不命中时，回退成 `no_fit_given_anchors` —— 锚点把窗口切出的空当放不下
+ *    剩余人（含各自最早/最晚开始限制共同导致的排布失败）。
+ *
+ * 返回的是诊断数组：凡是命中的具体原因都会列出；只有一条也不要用空数组。
+ */
+export function diagnoseInfeasibility(
+  window: TimeWindow,
+  free: readonly SlotConstraint[],
+  fixed: readonly FixedSlot[] = []
+): Infeasibility[] {
+  const windowLen = window.end - window.start;
+
+  // 锚点对窗口的实际占用（只算落在窗口内的部分；正常情况下锚点都在窗口内）。
+  let fixedLen = 0;
+  for (const f of fixed) {
+    const s = Math.max(f.slot.start, window.start);
+    const e = Math.min(f.slot.end, window.end);
+    if (e > s) fixedLen += e - s;
+  }
+  let freeLen = 0;
+  for (const c of free) freeLen += c.durationMinutes;
+
+  const reasons: Infeasibility[] = [];
+
+  // 1) 总时长超窗口。
+  const total = freeLen + fixedLen;
+  if (total > windowLen) {
+    reasons.push({
+      kind: "duration_over_window",
+      message:
+        `所有人合计需占用 ${total} 分钟（自由人 ${freeLen} 分钟 + 已确认锚点 ${fixedLen} 分钟），` +
+        `超出共享窗口 ${windowLen} 分钟（${fmtMinute(window.start)}–${fmtMinute(window.end)}），比窗口长 ${total - windowLen} 分钟`,
+    });
+  }
+
+  // 2) 某人最早开始 + 时长已经超出窗口结束。
+  for (const c of free) {
+    if (c.earliestStart + c.durationMinutes > window.end) {
+      reasons.push({
+        kind: "earliest_too_late",
+        person: c.person,
+        message:
+          `「${c.person}」最早只能 ${fmtMinute(c.earliestStart)}(${c.earliestStart}) 开始、需 ${c.durationMinutes} 分钟，` +
+          `最早开始加时长到 ${fmtMinute(c.earliestStart + c.durationMinutes)}(${c.earliestStart + c.durationMinutes})，` +
+          `已超过窗口结束 ${fmtMinute(window.end)}(${window.end})`,
+      });
+    }
+  }
+
+  // 3) 某人最晚开始早于最早开始（自己的时间范围就是空的）。
+  for (const c of free) {
+    if (c.latestStart !== undefined && c.latestStart < c.earliestStart) {
+      reasons.push({
+        kind: "latest_before_earliest",
+        person: c.person,
+        message:
+          `「${c.person}」给的最晚开始 ${fmtMinute(c.latestStart)}(${c.latestStart}) ` +
+          `早于最早开始 ${fmtMinute(c.earliestStart)}(${c.earliestStart})，自己的时间范围就是空的`,
+      });
+    }
+  }
+
+  // 4) 上面都不足以解释：锚点切碎的空当放不下剩余人。
+  if (reasons.length === 0) {
+    const available = Math.max(0, windowLen - fixedLen);
+    reasons.push({
+      kind: "no_fit_given_anchors",
+      message:
+        `已确认锚点共占 ${fixedLen} 分钟，窗口 ${fmtMinute(window.start)}–${fmtMinute(window.end)} 剩余 ${available} 分钟；` +
+        `剩余自由人合计还需 ${freeLen} 分钟，受各自最早/最晚开始限制，锚点留下的空当放不下剩余人`,
+    });
+  }
+
+  return reasons;
+}
+
 /**
  * 从窗口起点开始扫描空当，把 [earliest, earliest+duration) 放进最早能放下的空当。
  * `latestStart` 若给了：候选起点还必须 `<= latestStart`——一旦扫描到的空当起点已经
@@ -762,8 +861,9 @@ function stepAvailability(
     }
     const plan = allocateSlots(ctx.window, free, []);
     if (!plan) {
-      // 全员都报了但排不出可行方案：先不硬发一版，状态留在 gathering，由上层协调。
-      return { events: [reportEvent], actions: [{ type: "none" }] };
+      // 全员都报了但排不出可行方案：住户已报的事实照记（reportEvent 不丢），不硬发
+      // 一版，也不静默沉默——发一条 blocked 诊断，让上层能拿到「为什么排不开」去协调。
+      return { events: [reportEvent], actions: [{ type: "blocked", reasons: diagnoseInfeasibility(ctx.window, free) }] };
     }
     const proposalEvent: Event = {
       type: "schedule_proposed",
@@ -869,8 +969,9 @@ function stepRejectOrChange(
 
   const plan = allocateSlots(ctx.window, free, fixed);
   if (!plan) {
-    // 钉死已确认的人之后排不出：先不硬发，停在 renegotiating，等上层协调新约束。
-    return { events: [disruptEvent], actions: [{ type: "none" }] };
+    // 钉死已确认的人之后排不出：打断事件照记（disruptEvent 不丢），停在
+    // renegotiating 不硬发，也不静默沉默——发一条 blocked 诊断让上层拿原因去协调。
+    return { events: [disruptEvent], actions: [{ type: "blocked", reasons: diagnoseInfeasibility(ctx.window, free, fixed) }] };
   }
   if (sameAssignments(plan, proposal.assignments)) {
     // 结果跟被拒绝的这版一模一样：重发只是骚扰，不追加新方案。
