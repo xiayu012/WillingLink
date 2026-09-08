@@ -60,6 +60,58 @@ export interface StepResult {
 }
 
 /* ------------------------------------------------------------------ *
+ * projectState：事件日志 → 紧凑状态快照（给 LLM 的「单一事实来源」）
+ * ------------------------------------------------------------------ */
+
+/** projectState 的可选运行时上下文：补齐事件日志里没有的参与全员 / 共享窗口 / 当前说话人。 */
+export interface ProjectContext {
+  /** 参与这轮协商的全部成员（事件日志只记开过口的人，沉默的成员要靠这里补）。 */
+  participants?: readonly PersonId[];
+  /** 共享可用窗口。 */
+  window?: TimeWindow;
+  /** 正在发当前这条消息的人（turn 上下文，跟 machine.step 的 StepContext.sender 同源）。 */
+  sender?: PersonId;
+}
+
+/** 某人已报的可用时间（投影里的一个人一条）。 */
+export interface ProjectedAvailability {
+  person: PersonId;
+  start: Minute; // 最早能开始
+  duration: number; // 需要占用
+}
+
+/**
+ * `projectState(events)` 的输出：把不可变事件日志**重放投影**成当前事实的紧凑结构。
+ * 它是给 LLM 意图解析吃的「单一事实来源」——只含状态机当前知道的事实，绝不含任何
+ * 一条聊天原文（不会倒退到把整段历史塞进 prompt 的旧做法）。
+ *
+ * 注意：事件日志只记录「开过口的人」，所以沉默的参与者/共享窗口/当前说话人不在
+ * 事件里，由 `ProjectContext` 补进来；缺省时参与者退化为事件里出现过的人。
+ */
+export interface StateSnapshot {
+  /** 派生状态：gathering / proposed / settled / renegotiating。 */
+  state: State;
+  /** 日志里是否已出现过 settled（终态）。 */
+  settled: boolean;
+  /** 参与全员（顺序按 ctx.participants；缺省按事件里首次出现的顺序）。 */
+  participants: PersonId[];
+  /** 正在发当前这条消息的人；不知道为 null。 */
+  sender: PersonId | null;
+  /** 共享窗口：ctx.window，缺省取最近一版方案的窗口。 */
+  window: TimeWindow | null;
+  /** 每人已报的可用时间（按 participants 顺序；没报过的人不出现）。 */
+  reported: ProjectedAvailability[];
+  /** 当前这版方案（谁被分到哪段、待确认）；没排过就是 null。 */
+  proposal: { window: TimeWindow; assignments: Assignment[] } | null;
+  /** 当前方案里已确认的人。 */
+  confirmed: PersonId[];
+  /** 还在等谁：有方案 → 方案里还没确认的人；没方案 → 还没报到的人。 */
+  waiting: PersonId[];
+  /** 已被催过的人（「催一次不重复问」的去重依据）。 */
+  reminded: PersonId[];
+}
+
+/* ------------------------------------------------------------------ *
  * 内部小类型
  * ------------------------------------------------------------------ */
 
@@ -194,6 +246,90 @@ function fold(events: readonly Event[]): Snap {
 }
 
 /* ------------------------------------------------------------------ *
+ * projectState：事件日志 → 紧凑状态快照（给 LLM 的「单一事实来源」）
+ * ------------------------------------------------------------------ */
+
+/** 参与者名单缺省时的兜底：按事件里首次出现的顺序收集开过口的人。 */
+function participantOrderFromEvents(events: readonly Event[]): PersonId[] {
+  const order: PersonId[] = [];
+  const seen = new Set<PersonId>();
+  const visit = (p: PersonId) => {
+    if (p && !seen.has(p)) {
+      seen.add(p);
+      order.push(p);
+    }
+  };
+  for (const e of events) {
+    switch (e.type) {
+      case "availability_reported":
+        visit(e.person);
+        break;
+      case "schedule_proposed":
+      case "settled":
+        for (const a of e.assignments) visit(a.person);
+        break;
+      case "confirmed":
+      case "rejected":
+      case "reminded":
+        visit(e.person);
+        break;
+    }
+  }
+  return order;
+}
+
+/**
+ * 把事件日志重放投影成紧凑的 `StateSnapshot`（见文件头说明）。纯函数、无副作用，
+ * 不 import 任何业务代码——它就是「当前状态」的单一事实来源。供 LLM 意图解析在
+ * 解析每条新消息前调用：只吃这一小段事实，不吃聊天原文。
+ */
+export function projectState(events: readonly Event[], ctx: ProjectContext = {}): StateSnapshot {
+  const s = fold(events);
+  const participants = ctx.participants ? [...ctx.participants] : participantOrderFromEvents(events);
+  const window = ctx.window ?? s.currentProposal?.window ?? null;
+
+  const reported: ProjectedAvailability[] = [];
+  for (const p of participants) {
+    const a = s.reported.get(p);
+    if (a) reported.push({ person: p, start: a.start, duration: a.duration });
+  }
+
+  const confirmed: PersonId[] = [];
+  if (s.currentProposal) {
+    for (const p of participants) {
+      if (s.confirmed.has(p) && findAssignment(s.currentProposal.assignments, p)) confirmed.push(p);
+    }
+  }
+
+  let waiting: PersonId[];
+  if (s.currentProposal) {
+    waiting = participants.filter(
+      (p) => !!findAssignment(s.currentProposal!.assignments, p) && !s.confirmed.has(p)
+    );
+  } else {
+    // 还没排过方案：等还没报到的人开口。
+    waiting = participants.filter((p) => !s.reported.has(p));
+  }
+
+  const reminded = participants.filter((p) => s.reminded.has(p));
+
+  return {
+    state: reduce(events),
+    settled: s.settled,
+    participants,
+    sender: ctx.sender ?? null,
+    window,
+    reported,
+    proposal: s.currentProposal
+      ? { window: s.currentProposal.window, assignments: s.currentProposal.assignments }
+      : null,
+    confirmed,
+    waiting,
+    reminded,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * 时段分配（确定性求解）
  * ------------------------------------------------------------------ */
 
@@ -214,9 +350,16 @@ export interface FixedSlot {
  * 在窗口里给自由人排不重叠的时段。`fixed` 是已钉死的锚点时段，先占住；自由人
  * 只能塞进锚点留下的空当，各自不得早于 `earliestStart`、不得超出 `window`。
  *
- * 按人名字典序穷举自由人的全部排列，对每种排列贪心地把每个人放进「不冲突的最早
- * 空当」。因为会试遍所有排列，只要存在一个可行排法就找得到；返回第一个可行解，
- * 所以是确定性的。排不出返回 null。
+ * 求解方式：按人名字典序穷举自由人的全部排列，对每种排列贪心地把每个人放进「不
+ * 冲突的最早空当」。因为会试遍所有排列，只要存在一个可行排法就找得到。然后在全部
+ * 可行排法里选**公平**的一版：对每个人，把「实际开始比 ta 的最早能开始晚多少」记
+ * 为延误（delay ≥ 0，硬约束保证不早于 earliestStart），再除以 ta 自己的时长得到
+ * 「偏离自己时长的比例」。目标是让**最坏的那个比例**最小（并列时再看总和），也就
+ * 是短时长者优先靠前、长时长者垫后——不再按字典序把长时长者无条件排最前。人数很
+ * 少（协商场景一般 2~6 人），穷举足够快。
+ *
+ * 排不出返回 null。同样的输入永远给同样的输出（确定性）：分数相同时保留先枚举到
+ * 的排列（字典序排列），不引入随机。
  */
 export function allocateSlots(
   window: TimeWindow,
@@ -229,12 +372,18 @@ export function allocateSlots(
 
   const sorted = [...free].sort((a, b) => (a.person < b.person ? -1 : a.person > b.person ? 1 : 0));
 
+  let best: Assignment[] | null = null;
+  let bestWorst = Infinity;
+  let bestTotal = Infinity;
+
   for (const order of permutations(sorted)) {
     const occupied = fixed.map((f) => ({ start: f.slot.start, end: f.slot.end }));
     const placed: Assignment[] = fixed.map((f) => ({
       person: f.person,
       slot: { start: f.slot.start, end: f.slot.end },
     }));
+    // 自由人各自的安排，用于算公平分数（锚点不算：ta 的时段已被确认，不重新评判）。
+    const placedFree: Array<{ constraint: SlotConstraint; slot: TimeSlot }> = [];
 
     let feasible = true;
     for (const c of order) {
@@ -246,10 +395,28 @@ export function allocateSlots(
       occupied.push(slot);
       occupied.sort((x, y) => x.start - y.start);
       placed.push({ person: c.person, slot });
+      placedFree.push({ constraint: c, slot });
     }
-    if (feasible) return placed;
+    if (!feasible) continue;
+
+    let worst = 0;
+    let total = 0;
+    for (const { constraint: c, slot } of placedFree) {
+      // earliestFit 保证 slot.start >= c.earliestStart，所以 delay >= 0。
+      const delay = slot.start - c.earliestStart;
+      const ratio = delay / c.durationMinutes;
+      if (ratio > worst) worst = ratio;
+      total += ratio;
+    }
+
+    if (worst < bestWorst || (worst === bestWorst && total < bestTotal)) {
+      bestWorst = worst;
+      bestTotal = total;
+      best = placed;
+    }
   }
-  return null;
+
+  return best;
 }
 
 /** 从窗口起点开始扫描空当，把 [earliest, earliest+duration) 放进最早能放下的空当。 */

@@ -15,7 +15,7 @@
  */
 
 import assert from "node:assert/strict";
-import { allocateSlots, checkInvariants, reduce, step } from "./machine";
+import { allocateSlots, checkInvariants, projectState, reduce, step } from "./machine";
 import type { StepContext } from "./machine";
 import type { Assignment, Event, PersonId, TimeSlot } from "./types";
 import { parseIntent } from "./intent";
@@ -95,6 +95,57 @@ const hasEventOfType = (log: Event[], type: Event["type"]): boolean => log.some(
 
 test("reduce([]) === gathering", () => {
   assert.equal(reduce([]), "gathering");
+});
+
+/* ------------------------------------------------------------------ *
+ * projectState：紧凑状态快照（给 LLM 的「单一事实来源」）
+ * ------------------------------------------------------------------ */
+
+const projCtx = (sender: PersonId): Parameters<typeof projectState>[1] => ({
+  participants: [...PARTICIPANTS],
+  window: WINDOW,
+  sender,
+});
+
+test("projectState：gathering 阶段——列已报到的人、还在等谁、窗口、说话人", () => {
+  let log: Event[] = [];
+  log = push(log, step(log, reportIntent(18 * 60, 30), ctxOf(A)));
+
+  const snap = projectState(log, projCtx(A));
+  assert.equal(snap.state, "gathering");
+  assert.equal(snap.settled, false);
+  assert.equal(snap.sender, A);
+  assert.deepEqual(snap.participants, [A, B, C]);
+  assert.deepEqual(snap.window, WINDOW);
+  assert.equal(snap.proposal, null);
+  // 已报到的人只有 A；B、C 还没开口 → 在等他们
+  assert.deepEqual(snap.reported, [{ person: A, start: 18 * 60, duration: 30 }]);
+  assert.deepEqual(snap.confirmed, []);
+  assert.deepEqual(snap.waiting, [B, C]);
+  assert.deepEqual(snap.reminded, []);
+});
+
+test("projectState：proposed + 一人确认后——有方案、列出确认与还在等谁", () => {
+  const log = loggedProposal();
+  const log2 = push(log, step(log, confirmIntent(), ctxOf(A)));
+
+  const snap = projectState(log2, projCtx(B));
+  assert.equal(snap.state, "proposed");
+  assert.ok(snap.proposal, "有当前方案");
+  if (snap.proposal) {
+    // 方案覆盖全员、时段不重叠、不早于各自最早能开始
+    const slotOf = (p: PersonId) => snap.proposal!.assignments.find((a) => a.person === p)!.slot;
+    assert.ok(slotOf(A).start >= 18 * 60);
+    assert.ok(slotOf(B).start >= 19 * 60);
+    assert.ok(slotOf(C).start >= 18 * 60 + 30);
+    const starts = snap.proposal.assignments.map((a) => a.slot.start).sort((x, y) => x - y);
+    const ends = snap.proposal.assignments.map((a) => a.slot.end).sort((x, y) => x - y);
+    for (let i = 1; i < starts.length; i++) assert.ok(starts[i]! >= ends[i - 1]!, "时段不该重叠");
+  }
+  assert.deepEqual(snap.confirmed, [A]);
+  // 发消息的人是 B；还没确认的是 B、C
+  assert.equal(snap.sender, B);
+  assert.deepEqual(snap.waiting, [B, C]);
 });
 
 /* ------------------------------------------------------------------ *

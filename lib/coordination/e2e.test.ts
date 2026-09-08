@@ -10,7 +10,8 @@
  * 1. **golden**：用「理想 Intent」（手工标注的正确答案）喂状态机。这是纯确定性
  *    检查：证明「只要意图解析对，这条分支状态机就能跑到预期终态、不破不变量」。
  *    万一这里挂了，是机器/场景设计问题，不是 LLM 问题。
- * 2. **llm**：用 `llmParseIntent` 真实解析住户原话，再把 Intent 喂状态机。
+ * 2. **llm**：用 `llmParseIntent` 真实解析住户原话（喂的是 `projectState` 的紧凑
+ *    快照 + 当前这一条消息，不是历史原文），再把 Intent 喂状态机。
  *    这一遍的结论由 LLM 的解析质量决定——解析错了、分支没跑到预期终态，如实报，
  *    不重试、不硬凑。
  *
@@ -30,8 +31,8 @@ for (const k of ["AI_GATEWAY_API_KEY"]) {
 }
 
 import assert from "node:assert/strict";
-import { checkInvariants, reduce, step } from "./machine";
-import type { StepContext, StepResult } from "./machine";
+import { checkInvariants, projectState, reduce, step } from "./machine";
+import type { StateSnapshot, StepContext, StepResult } from "./machine";
 import type { Event, Intent, OutboundAction, PersonId, State } from "./types";
 import { llmParseIntent } from "./llm";
 
@@ -245,7 +246,8 @@ const branches: Branch[] = [
       { sender: "小张", text: "我7点开始，用一小时", ideal: report(1140, 60), okTypes: AVAIL },
       { sender: "小李", text: "我7点半开始，用45分钟", ideal: report(1170, 45), okTypes: AVAIL },
       { sender: "房东", text: "可以", ideal: confirm(), okTypes: CONFIRM },
-      { sender: "小张", text: "我想换到7点半开始", ideal: counter(1170, 30), okTypes: AVAIL },
+      // 小张 msg2 已报过时长 60；这句「换到7点半开始」没重说时长 → 沿用 60，不落回默认 30。
+      { sender: "小张", text: "我想换到7点半开始", ideal: counter(1170, 60), okTypes: AVAIL },
       { sender: "小李", text: "我这边没问题", ideal: confirm(), okTypes: CONFIRM },
       { sender: "小张", text: "行，同意", ideal: confirm(), okTypes: CONFIRM },
     ],
@@ -336,12 +338,20 @@ function test(name: string, fn: () => Promise<void> | void): void {
   tests.push({ name, fn });
 }
 
-/** 跑一遍分支（喂 intent 的方式可换成理想或 LLM 解析），返回逐步记录。 */
-async function feedBranch(branch: Branch, resolve: (m: StepMsg) => Promise<Intent> | Intent): Promise<StepRecord[]> {
+/**
+ * 跑一遍分支（喂 intent 的方式可换成理想或 LLM 解析），返回逐步记录。
+ * 每一步在解析前先拿**当前已累积的 events** 投影出一份紧凑快照（含发消息的人），
+ * 交给解析器；golden 分支忽略快照，LLM 分支把它传给 `llmParseIntent`。
+ */
+async function feedBranch(
+  branch: Branch,
+  resolve: (m: StepMsg, snap: StateSnapshot) => Promise<Intent> | Intent
+): Promise<StepRecord[]> {
   let log: Event[] = [];
   const recs: StepRecord[] = [];
   for (const m of branch.msgs) {
-    const intent = await resolve(m);
+    const snap = projectState(log, { participants: branch.participants, window: WINDOW, sender: m.sender });
+    const intent = await resolve(m, snap);
     const result = step(log, intent, ctxOf(branch.participants, m.sender));
     recs.push({ sender: m.sender, text: m.text, intent, result });
     log = push(log, result);
@@ -363,7 +373,7 @@ async function runGolden(branch: Branch): Promise<void> {
 /** 跑 LLM 解析版，打印逐步解析判读，再跑同样断言。 */
 async function runLlm(branch: Branch): Promise<void> {
   console.log(`\n--- ${branch.name}（LLM 解析）---`);
-  const recs = await feedBranch(branch, (m) => llmParseIntent(m.text));
+  const recs = await feedBranch(branch, (m, snap) => llmParseIntent(m.text, snap));
   const log = recs.reduce<Event[]>((acc, r) => [...acc, ...r.result.events], []);
 
   let nExact = 0;
