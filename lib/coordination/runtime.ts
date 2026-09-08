@@ -26,7 +26,7 @@
  * 只 import 本模块的 `store` / `machine` / `llm` / `types`，不 import 项目业务代码。
  */
 
-import { fold, projectStateFromSnap, stateFromSnap, step } from "./machine";
+import { foldFrom, projectStateFromSnap, stateFromSnap, step } from "./machine";
 import type { ProjectContext, StateSnapshot, StepContext } from "./machine";
 import { appendEvents, resume, saveCheckpoint } from "./store";
 import { llmParseIntent } from "./llm";
@@ -84,7 +84,7 @@ export async function runCoordinationTurn(
 
   // 5) 追加事件 + 推进 checkpoint。
   const newEvents = result.events;
-  const nextSnap = newEvents.length > 0 ? fold([...events, ...newEvents]) : snap;
+  const nextSnap = newEvents.length > 0 ? foldFrom(snap, newEvents, events.length) : snap;
   const nextOffset = events.length + newEvents.length;
   if (newEvents.length > 0) appendEvents(opts.eventsFile, newEvents);
   saveCheckpoint(opts.checkpointFile, nextSnap, nextOffset);
