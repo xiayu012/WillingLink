@@ -205,8 +205,10 @@ const HAS_TIME_HINT = /[0-9０-９]|几点|点半|这个点|那个点/;
  *
  * 只看 AI→这个人 的出站行；普通“通知定案”（排好了/定了/你的时段是 X）没有上面的征询
  * 口气词，不会在这里触发，仍按纯确认短路。
+ *
+ * 导出只为单测（llm.test.ts 直接锁这个闸），模块外不应使用。
  */
-function aiRecentlySuggestedTimeToSender(s: StateSnapshot): boolean {
+export function aiRecentlySuggestedTimeToSender(s: StateSnapshot): boolean {
   const sender = s.sender;
   if (!sender) return false;
   const dial = s.recentDialogue;
