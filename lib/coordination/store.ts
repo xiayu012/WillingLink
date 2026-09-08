@@ -112,20 +112,24 @@ export function loadCheckpoint(filePath: string): { snap: Snap; offset: number }
 
 /**
  * 从事件日志恢复最新快照：先读 checkpoint（没有就 `emptySnap()` + offset 0），取
- * `slice(offset)` 的增量事件用 `foldFrom` 续放，返回最新 snap 和新的 offset
- * （= 当前事件总数）。
+ * `slice(offset)` 的增量事件用 `foldFrom` 续放，返回最新 snap、新的 offset
+ * （= 当前事件总数）以及读到的**整段事件**（`runCoordinationTurn` 这类入口要喂给
+ * `machine.step`，不用再读一遍文件）。
  *
  * **等价性保证**：`resume(...).snap` 与 `fold(loadEvents(eventsFile))` 完全等价——
  * checkpoint 只是「事件前缀的物化快照」，续放等价于从头重放。
  */
-export function resume(eventsFile: string, checkpointFile: string): { snap: Snap; offset: number } {
+export function resume(
+  eventsFile: string,
+  checkpointFile: string
+): { snap: Snap; offset: number; events: Event[] } {
   const ckpt = loadCheckpoint(checkpointFile);
   const base = ckpt ? ckpt.snap : emptySnap();
   const baseOffset = ckpt ? ckpt.offset : 0;
   const all = loadEvents(eventsFile);
   const incremental = baseOffset >= all.length ? [] : all.slice(baseOffset);
   const snap = foldFrom(base, incremental, baseOffset);
-  return { snap, offset: all.length };
+  return { snap, offset: all.length, events: all };
 }
 
 /** 文件存在读全文；不存在返回 null（区别于其它 IO 错误，后者照抛）。 */

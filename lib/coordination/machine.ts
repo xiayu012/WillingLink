@@ -159,6 +159,13 @@ export interface Snap {
   lastProposalIndex: number;
   /** 最后一次「打断」事件（rejected / 方案存在时的 availability_reported）的下标。 */
   lastDisruptIndex: number;
+  /**
+   * 事件里出现过的人、按**首次出现顺序**排列（去重）。由 `fold`/`foldFrom` 在重放时
+   * 顺带维护——它是 `projectState` 缺省参与者名单（不传 ctx.participants 时）的兜底，
+   * 等价于旧的 `participantOrderFromEvents`，只是随快照一起算好，让投影可以从 `Snap`
+   * 直接出、不必再拿整段 events 重新扫一遍。
+   */
+  participantOrder: PersonId[];
 }
 
 function slotsEqual(a: TimeSlot, b: TimeSlot): boolean {
@@ -189,6 +196,7 @@ export function emptySnap(): Snap {
     allConfirmed: false,
     lastProposalIndex: -1,
     lastDisruptIndex: -1,
+    participantOrder: [],
   };
 }
 
@@ -209,6 +217,14 @@ export function foldFrom(base: Snap, events: readonly Event[], baseIndex: number
   let active = new Set(base.activeDisputants);
   let lastProposalIndex = base.lastProposalIndex;
   let lastDisruptIndex = base.lastDisruptIndex;
+  const participantOrder = [...base.participantOrder];
+  const seenParticipants = new Set(participantOrder);
+  const visitParticipant = (p: PersonId): void => {
+    if (p && !seenParticipants.has(p)) {
+      seenParticipants.add(p);
+      participantOrder.push(p);
+    }
+  };
 
   // 用普通 for 循环而不是 forEach：`currentProposal`/`confirmed` 在循环体里会被赋值，
   // forEach 回调里看不见这些赋值，会把它错误窄化成一个 never/null，for 循环没这个问题。
@@ -217,6 +233,7 @@ export function foldFrom(base: Snap, events: readonly Event[], baseIndex: number
     const e = events[i];
     switch (e.type) {
       case "availability_reported": {
+        visitParticipant(e.person);
         reported.set(e.person, {
           start: e.start,
           duration: e.duration,
@@ -231,6 +248,7 @@ export function foldFrom(base: Snap, events: readonly Event[], baseIndex: number
         break;
       }
       case "schedule_proposed": {
+        for (const a of e.assignments) visitParticipant(a.person);
         // 新一轮方案：把「上一轮确认过、且这一轮时段没变」的人承袭为已确认。
         const prevProposal = currentProposal;
         const prevConfirmed = confirmed;
@@ -250,6 +268,7 @@ export function foldFrom(base: Snap, events: readonly Event[], baseIndex: number
         break;
       }
       case "confirmed": {
+        visitParticipant(e.person);
         // 只对「当前这版方案里真的有这个人」的确认计数。
         if (currentProposal && findAssignment(currentProposal.assignments, e.person)) {
           confirmed.add(e.person);
@@ -257,6 +276,7 @@ export function foldFrom(base: Snap, events: readonly Event[], baseIndex: number
         break;
       }
       case "rejected": {
+        visitParticipant(e.person);
         if (currentProposal && findAssignment(currentProposal.assignments, e.person)) {
           confirmed.delete(e.person);
           active.add(e.person);
@@ -265,10 +285,12 @@ export function foldFrom(base: Snap, events: readonly Event[], baseIndex: number
         break;
       }
       case "reminded": {
+        visitParticipant(e.person);
         reminded.add(e.person);
         break;
       }
       case "settled": {
+        for (const a of e.assignments) visitParticipant(a.person);
         settled = true;
         break;
       }
@@ -289,6 +311,7 @@ export function foldFrom(base: Snap, events: readonly Event[], baseIndex: number
     allConfirmed,
     lastProposalIndex,
     lastDisruptIndex,
+    participantOrder,
   };
 }
 
@@ -319,6 +342,7 @@ export interface SnapJson {
   allConfirmed: boolean;
   lastProposalIndex: number;
   lastDisruptIndex: number;
+  participantOrder: PersonId[];
 }
 
 /** 把派生快照 `Snap` 摊平成可 JSON 序列化的 `SnapJson`。 */
@@ -342,10 +366,17 @@ export function snapToJson(snap: Snap): SnapJson {
     allConfirmed: snap.allConfirmed,
     lastProposalIndex: snap.lastProposalIndex,
     lastDisruptIndex: snap.lastDisruptIndex,
+    participantOrder: [...snap.participantOrder],
   };
 }
 
-/** 从 `SnapJson` 还原派生快照 `Snap`（roundtrip 保持等价：成员与数值一致即可）。 */
+/**
+ * 从 `SnapJson` 还原派生快照 `Snap`（roundtrip 保持等价：成员与数值一致即可）。
+ *
+ * `participantOrder` 是后加的投影兜底字段：读旧版本（没有该字段）的 checkpoint 时缺省
+ * `[]`——那只影响「缺省参与者名单」的兜底顺序，事件日志仍可全量重放重建（等价性不受
+ * 影响，`resume` 从事件续放时会把它补全）。
+ */
 export function snapFromJson(json: SnapJson): Snap {
   const reported = new Map<PersonId, Availability>();
   for (const person of Object.keys(json.reported)) {
@@ -356,6 +387,7 @@ export function snapFromJson(json: SnapJson): Snap {
       ...(a.latestStart !== undefined ? { latestStart: a.latestStart } : {}),
     });
   }
+  const participantOrder = Array.isArray(json.participantOrder) ? [...json.participantOrder] : [];
   return {
     settled: json.settled,
     currentProposal: json.currentProposal
@@ -368,50 +400,42 @@ export function snapFromJson(json: SnapJson): Snap {
     allConfirmed: json.allConfirmed,
     lastProposalIndex: json.lastProposalIndex,
     lastDisruptIndex: json.lastDisruptIndex,
+    participantOrder,
   };
 }
 
 /* ------------------------------------------------------------------ *
- * projectState：事件日志 → 紧凑状态快照（给 LLM 的「单一事实来源」）
+ * projectState：事件日志 / Snap → 紧凑状态快照（给 LLM 的「单一事实来源」）
  * ------------------------------------------------------------------ */
 
-/** 参与者名单缺省时的兜底：按事件里首次出现的顺序收集开过口的人。 */
-function participantOrderFromEvents(events: readonly Event[]): PersonId[] {
-  const order: PersonId[] = [];
-  const seen = new Set<PersonId>();
-  const visit = (p: PersonId) => {
-    if (p && !seen.has(p)) {
-      seen.add(p);
-      order.push(p);
-    }
-  };
-  for (const e of events) {
-    switch (e.type) {
-      case "availability_reported":
-        visit(e.person);
-        break;
-      case "schedule_proposed":
-      case "settled":
-        for (const a of e.assignments) visit(a.person);
-        break;
-      case "confirmed":
-      case "rejected":
-      case "reminded":
-        visit(e.person);
-        break;
-    }
-  }
-  return order;
+/**
+ * 从派生快照 `Snap` 直接出当前状态（`reduce` 的映射核心）。纯函数。
+ *
+ * 映射关系（README：状态是派生的，不落库）：
+ * - 日志里出现过 `settled` → `settled`（终态）。
+ * - 还没排过任何方案 → `gathering`。
+ * - 最新的方案之后还有 reject / 反提等打断事件（重排没排出新方案）→ `renegotiating`。
+ * - 否则有一版方案在等人确认 → `proposed`。
+ */
+export function stateFromSnap(s: Snap): State {
+  if (s.settled) return "settled";
+  if (!s.currentProposal) return "gathering";
+  if (s.lastDisruptIndex > s.lastProposalIndex) return "renegotiating";
+  return "proposed";
 }
 
 /**
- * 把事件日志重放投影成紧凑的 `StateSnapshot`（见文件头说明）。纯函数、无副作用，
- * 不 import 任何业务代码——它就是「当前状态」的单一事实来源。供 LLM 意图解析在
- * 解析每条新消息前调用：只吃这一小段事实，不吃聊天原文。
+ * 把派生快照 `Snap`（`fold` / `foldFrom` / `resume` 的结果）投影成紧凑的
+ * `StateSnapshot`——不重复 `fold`。纯函数、无副作用、不 import 任何业务代码；它就是
+ * 「当前状态」的单一事实来源，供 LLM 意图解析在解析每条新消息前调用：只吃这一小段
+ * 事实，不吃聊天原文。
+ *
+ * `participants/window/sender/recentDialogue` 来自 `ctx`：事件日志只记录「开过口的人」，
+ * 沉默的参与者/共享窗口/当前说话人不在事件里，由 `ctx` 补进来；缺省时参与者退化为
+ * 快照里按首次出现顺序记下的人（`snap.participantOrder`），窗口退化为当前这版方案的窗口。
  */
-export function projectState(events: readonly Event[], ctx: ProjectContext = {}): StateSnapshot {
-  const s = fold(events);
-  const participants = ctx.participants ? [...ctx.participants] : participantOrderFromEvents(events);
+export function projectStateFromSnap(s: Snap, ctx: ProjectContext = {}): StateSnapshot {
+  const participants = ctx.participants ? [...ctx.participants] : [...s.participantOrder];
   const window = ctx.window ?? s.currentProposal?.window ?? null;
 
   const reported: ProjectedAvailability[] = [];
@@ -447,7 +471,7 @@ export function projectState(events: readonly Event[], ctx: ProjectContext = {})
   const reminded = participants.filter((p) => s.reminded.has(p));
 
   return {
-    state: reduce(events),
+    state: stateFromSnap(s),
     settled: s.settled,
     participants,
     sender: ctx.sender ?? null,
@@ -461,6 +485,14 @@ export function projectState(events: readonly Event[], ctx: ProjectContext = {})
     reminded,
     recentDialogue: ctx.recentDialogue ? [...ctx.recentDialogue] : [],
   };
+}
+
+/**
+ * 把事件日志 `fold` 成派生快照再投影成紧凑的 `StateSnapshot`——薄封装：
+ * `projectStateFromSnap(fold(events), ctx)`（给既有的、手里只有 events 的调用方）。
+ */
+export function projectState(events: readonly Event[], ctx: ProjectContext = {}): StateSnapshot {
+  return projectStateFromSnap(fold(events), ctx);
 }
 
 /* ------------------------------------------------------------------ *
@@ -614,18 +646,10 @@ function* permutations<T>(xs: T[]): IterableIterator<T[]> {
 /**
  * 从事件日志重放推导当前状态（README：状态是派生的，不落库）。
  *
- * 映射关系：
- * - 日志里出现过 `settled` → `settled`（终态）。
- * - 还没排过任何方案 → `gathering`。
- * - 最新的方案之后还有 reject / 反提等打断事件（重排没排出新方案）→ `renegotiating`。
- * - 否则有一版方案在等人确认 → `proposed`。
+ * 薄封装：`stateFromSnap(fold(events))`。映射关系见 `stateFromSnap`。
  */
 export function reduce(events: readonly Event[]): State {
-  const s = fold(events);
-  if (s.settled) return "settled";
-  if (!s.currentProposal) return "gathering";
-  if (s.lastDisruptIndex > s.lastProposalIndex) return "renegotiating";
-  return "proposed";
+  return stateFromSnap(fold(events));
 }
 
 /* ------------------------------------------------------------------ *

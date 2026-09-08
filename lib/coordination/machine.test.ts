@@ -22,6 +22,7 @@ import {
   fold,
   foldFrom,
   projectState,
+  projectStateFromSnap,
   reduce,
   snapToJson,
   step,
@@ -191,6 +192,56 @@ test("projectState：proposed + 一人确认后——有方案、列出确认与
   // 发消息的人是 B；还没确认的是 B、C
   assert.equal(snap.sender, B);
   assert.deepEqual(snap.waiting, [B, C]);
+});
+
+test("projectStateFromSnap(fold(events), ctx) 与 projectState(events, ctx) 等价", () => {
+  // 若干非平凡日志，覆盖 gathering / proposed / renegotiating / settled 各状态，
+  // 且包含「催过但还没报」的人（兜底参与者名单不能只按 reported 键序猜）。
+  const logs: Event[][] = [];
+
+  // (1) gathering：只有 A 报了可用时间
+  let log: Event[] = [];
+  log = push(log, step(log, reportIntent(18 * 60, 30), ctxOf(A)));
+  logs.push(log);
+
+  // (2) gathering + 全员报齐前被 ask_status 催过的人（B、C 收到 reminded、还没全报到）
+  log = [];
+  log = push(log, step(log, reportIntent(18 * 60, 30), ctxOf(A)));
+  log = push(log, step(log, askStatusIntent(), ctxOf(A))); // 催还没报的 B、C
+  log = push(log, step(log, reportIntent(19 * 60, 60), ctxOf(B))); // B 之后才报
+  logs.push(log);
+
+  // (3) proposed + 一人确认 → 反提重排 → 定案（settled；lastProposal/lastDisrupt 非 -1）
+  log = loggedProposal();
+  log = push(log, step(log, confirmIntent(), ctxOf(A)));
+  log = push(log, step(log, counterIntent(19 * 60 + 30, 60), ctxOf(B)));
+  log = push(log, step(log, confirmIntent(), ctxOf(C)));
+  log = push(log, step(log, confirmIntent(), ctxOf(B)));
+  logs.push(log);
+
+  // (4) renegotiating：A 已确认，B 只拒绝不改约束 → 停在重排
+  log = loggedProposal();
+  log = push(log, step(log, confirmIntent(), ctxOf(A)));
+  log = push(log, step(log, { type: "reject", reason: "这个时间不太行" }, ctxOf(B)));
+  logs.push(log);
+
+  // ctx 变体：显式参与者 / 兜底参与者 / 带 recentDialogue / 全缺省
+  const ctxs: Parameters<typeof projectState>[1][] = [
+    { participants: [...PARTICIPANTS], window: WINDOW, sender: A },
+    { window: WINDOW, sender: A },
+    { participants: [...PARTICIPANTS], window: WINDOW, sender: B, recentDialogue: ["AI→B：你最早 20:00 起。", "B：不合适。太晚了"] },
+    {},
+  ];
+
+  for (let i = 0; i < logs.length; i++) {
+    for (const ctx of ctxs) {
+      assert.deepEqual(
+        projectStateFromSnap(fold(logs[i]!), ctx),
+        projectState(logs[i]!, ctx),
+        `log#${i} ctx=${JSON.stringify(ctx)} 两条入口投影应等价`
+      );
+    }
+  }
 });
 
 /* ------------------------------------------------------------------ *
